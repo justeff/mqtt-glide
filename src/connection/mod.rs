@@ -1,0 +1,628 @@
+//! Connection coordinator: `run()`, state machine, channels, task supervision.
+
+mod channels;
+mod handshake;
+mod io_batch;
+mod lifecycle;
+pub(crate) mod packet_id;
+pub(crate) mod read;
+pub(crate) mod session_policy;
+mod state;
+pub(crate) mod subscriptions;
+mod transport;
+pub(crate) mod write;
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use arc_swap::ArcSwap;
+
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
+use tokio_util::codec::{FramedRead, FramedWrite};
+
+use tokio_util::sync::CancellationToken;
+
+use self::write::WriteOutcome;
+use crate::client::{ReconnectPolicy, SharedCredentials};
+use crate::codec::DisconnectReasonCode;
+use crate::codec::V5Codec;
+use crate::error::{AppError, AuthError, ConnectionOutcome, ProtocolError, ShutdownError, TransportError};
+use crate::inbound_sink::InboundSink;
+use crate::options::ConnectOptions;
+
+pub use crate::options::COMMAND_CHANNEL_CAPACITY;
+pub use channels::{CONTROL_CHANNEL_CAPACITY, control_channel_capacity};
+pub(crate) use channels::{
+    ClientCommand, CommandReceiver, CommandSender, ControlMessage, ControlReceiver, PublishReply, SubscribeReply,
+    UnsubscribeReply,
+};
+pub use handshake::{SessionParams, TlsMode, resolve_tls_mode};
+pub(crate) use io_batch::effective_io_batch;
+pub use lifecycle::{LifecycleHook, NoopLifecycle, SessionPhase};
+pub(crate) use session_policy::{inbound_publish_policy, validate_publish_against_broker_limits};
+pub use state::{ConnectionState, Generation};
+pub(crate) use subscriptions::SubscriptionRegistry;
+
+use self::read::ReadOutcome;
+
+/// Per-connection channel bundle created by [`crate::connect`].
+pub(crate) struct ConnectionChannels<H: InboundSink> {
+    pub control_tx: channels::ControlSender,
+    pub control_rx: ControlReceiver,
+    /// Shared with [`crate::MqttClient`]; replaced on each reconnect session (lock-free load).
+    pub command_tx: Arc<ArcSwap<CommandSender>>,
+    pub command_rx: CommandReceiver,
+    pub handoff: H,
+    /// Extra sink handle kept for the [`Connection`] lifetime so the injectable handoff
+    /// never closes when a read-task sender is dropped/respawned.
+    /// Single handoff channel; the anchor sender is not the application consumer.
+    #[allow(dead_code)] // held for channel lifetime, not sent on
+    pub(crate) handoff_anchor: H,
+    /// Latest session phase for application readiness (source of truth).
+    pub phase_tx: watch::Sender<SessionPhase>,
+    /// Optional sync side effects for lifecycle transitions.
+    pub lifecycle: Arc<dyn LifecycleHook>,
+    /// Test/supervision hooks: clone senders before [`Connection::run`].
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub read_stub_exit_tx: mpsc::Sender<()>,
+    #[cfg(test)]
+    pub read_stub_exit_rx: mpsc::Receiver<()>,
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub write_stub_exit_tx: mpsc::Sender<()>,
+    #[cfg(test)]
+    pub write_stub_exit_rx: mpsc::Receiver<()>,
+}
+
+impl<H: InboundSink> std::fmt::Debug for ConnectionChannels<H> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectionChannels")
+            .field("handoff", &std::any::type_name::<H>())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<H: InboundSink> ConnectionChannels<H> {
+    /// Recreates per-session control/command channels after a connection loss.
+    ///
+    /// Updates the shared command sender so [`crate::MqttClient`] keeps working across reconnects.
+    /// Under `cfg(test)`, stub-exit channels are also replenished so supervision hooks that clone
+    /// senders before [`Connection::run`] remain valid across reconnect sessions.
+    pub(crate) fn replenish_session_channels(
+        &mut self,
+        command_channel_capacity: usize,
+        control_channel_capacity: usize,
+    ) {
+        let (control_tx, control_rx) = mpsc::channel(control_channel_capacity);
+        let (command_tx, command_rx) = mpsc::channel(command_channel_capacity);
+        self.control_tx = control_tx;
+        self.control_rx = control_rx;
+        self.command_tx.store(Arc::new(command_tx));
+        self.command_rx = command_rx;
+
+        #[cfg(test)]
+        {
+            let (read_stub_exit_tx, read_stub_exit_rx) = mpsc::channel(1);
+            self.read_stub_exit_tx = read_stub_exit_tx;
+            self.read_stub_exit_rx = read_stub_exit_rx;
+            let (write_stub_exit_tx, write_stub_exit_rx) = mpsc::channel(1);
+            self.write_stub_exit_tx = write_stub_exit_tx;
+            self.write_stub_exit_rx = write_stub_exit_rx;
+        }
+    }
+}
+
+/// I/O driver: connect, read/write tasks, reconnect until shutdown.
+pub struct Connection<H: InboundSink = flume::Sender<crate::codec::PublishMessage>> {
+    options: ConnectOptions,
+    credentials: SharedCredentials,
+    #[allow(dead_code)] // reconnect-loop field
+    reconnect: Arc<dyn ReconnectPolicy>,
+    channels: ConnectionChannels<H>,
+    cancel: CancellationToken,
+    /// Priority graceful-shutdown notify shared with [`crate::MqttClient`].
+    shutdown_notify: CancellationToken,
+    generation: Generation,
+    state: ConnectionState,
+    /// Publish vs subscribe/unsubscribe Packet-ID pots.
+    ///
+    /// Moved into the write task when [`Connection::run`] starts.
+    inflight: packet_id::InflightPots,
+    /// Topic filters to restore after Clean Start reconnect.
+    subscription_registry: std::sync::Arc<std::sync::RwLock<SubscriptionRegistry>>,
+}
+
+impl<H: InboundSink> std::fmt::Debug for Connection<H> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Connection")
+            .field("generation", &self.generation)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<H: InboundSink> Connection<H> {
+    /// Builds a connection driver with per-connection channels (no global state).
+    pub(crate) fn new(
+        options: ConnectOptions,
+        credentials: SharedCredentials,
+        reconnect: Arc<dyn ReconnectPolicy>,
+        channels: ConnectionChannels<H>,
+        cancel: CancellationToken,
+        shutdown_notify: CancellationToken,
+    ) -> Self {
+        let inflight = packet_id::InflightPots::new(options.receive_maximum);
+        Self {
+            options,
+            credentials,
+            reconnect,
+            channels,
+            cancel,
+            shutdown_notify,
+            generation: Generation(0),
+            state: ConnectionState::Stopped,
+            inflight,
+            subscription_registry: std::sync::Arc::new(std::sync::RwLock::new(SubscriptionRegistry::default())),
+        }
+    }
+
+    /// Returns the active connection generation.
+    pub fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    /// Returns the current lifecycle state.
+    pub fn state(&self) -> ConnectionState {
+        self.state
+    }
+
+    /// Returns a clone of the read-stub exit signal sender (test/supervision hook).
+    #[cfg(test)]
+    pub(crate) fn read_stub_exit_sender(&self) -> mpsc::Sender<()> {
+        self.channels.read_stub_exit_tx.clone()
+    }
+
+    /// Returns a clone of the write-stub exit signal sender (test/supervision hook).
+    #[cfg(test)]
+    pub(crate) fn write_stub_exit_sender(&self) -> mpsc::Sender<()> {
+        self.channels.write_stub_exit_tx.clone()
+    }
+
+    /// Returns a clone of the control-path sender (test hook for dual-task isolation tests).
+    #[cfg(test)]
+    pub(crate) fn control_sender(&self) -> channels::ControlSender {
+        self.channels.control_tx.clone()
+    }
+
+    /// Publishes `Connected` on the phase watch and invokes the lifecycle hook (sync).
+    fn notify_connected(&self, generation: u64, session: SessionParams) {
+        let phase = SessionPhase::Connected { generation, session };
+        self.channels.phase_tx.send_replace(phase.clone());
+        self.channels.lifecycle.on_lifecycle(&phase);
+    }
+
+    /// Publishes `Disconnected` on the phase watch and invokes the lifecycle hook (sync).
+    fn notify_disconnected(&self, outcome: ConnectionOutcome) {
+        let phase = SessionPhase::Disconnected(outcome);
+        self.channels.phase_tx.send_replace(phase.clone());
+        self.channels.lifecycle.on_lifecycle(&phase);
+    }
+
+    /// Runs the connection driver until shutdown or a fatal outcome.
+    ///
+    /// Spawn on a Tokio runtime (for example `tokio::spawn(connection.run())`) and
+    /// **await** the returned future — it is not fire-and-forget.
+    ///
+    /// Reconnects on transport/protocol loss per [`ReconnectPolicy`]; auth and shutdown stop.
+    pub async fn run(mut self) -> Result<(), ConnectionOutcome> {
+        loop {
+            if self.cancel.is_cancelled() {
+                self.state = ConnectionState::Stopped;
+                return Err(ConnectionOutcome::Shutdown(ShutdownError::Cancelled));
+            }
+
+            // First session uses channels from `connect()`; reconnect sessions already
+            // replenished command/control in [`Self::backoff_then_retry`] so the shared
+            // sender stays live across the reconnect/backoff gap.
+            match self.run_one_session().await {
+                SessionDisposition::Retry => continue,
+                SessionDisposition::Stop(result) => return result,
+            }
+        }
+    }
+
+    /// One TCP connect + supervised read/write session.
+    async fn run_one_session(&mut self) -> SessionDisposition {
+        self.state = ConnectionState::Connecting;
+        let deadline = Instant::now() + self.options.connect_timeout;
+
+        // Dial under `select!` with borrowed `options` (no per-attempt `ConnectOptions` clone).
+        // Scope the dial so `&self.options` / `&self.cancel` end before `&mut self` resume.
+        match resolve_tls_mode(&self.options) {
+            TlsMode::PlainTcp => {
+                let dialed = {
+                    let options = &self.options;
+                    let cancel = &self.cancel;
+                    tokio::select! {
+                        result = async {
+                            let tcp_stream = transport::open_tcp(options, deadline).await?;
+                            Ok(tcp_stream.into_split())
+                        } => Some(result),
+                        () = cancel.cancelled() => None,
+                    }
+                };
+                match dialed {
+                    Some(Ok((read_half, write_half))) => {
+                        self.run_one_session_from_halves(read_half, write_half, deadline).await
+                    }
+                    Some(Err(outcome)) => self.finish_session(outcome, false).await,
+                    None => {
+                        self.finish_session(ConnectionOutcome::Shutdown(ShutdownError::Cancelled), false)
+                            .await
+                    }
+                }
+            }
+            TlsMode::RustlsSystemRoots => {
+                let dialed = {
+                    let options = &self.options;
+                    let cancel = &self.cancel;
+                    tokio::select! {
+                        result = async {
+                            let tcp_stream = transport::open_tcp(options, deadline).await?;
+                            transport::tls_handshake(options, tcp_stream, deadline).await
+                        } => Some(result),
+                        () = cancel.cancelled() => None,
+                    }
+                };
+                match dialed {
+                    Some(Ok((read_half, write_half))) => {
+                        self.run_one_session_from_halves(read_half, write_half, deadline).await
+                    }
+                    Some(Err(outcome)) => self.finish_session(outcome, false).await,
+                    None => {
+                        self.finish_session(ConnectionOutcome::Shutdown(ShutdownError::Cancelled), false)
+                            .await
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs CONNECT/CONNACK on dialed halves, then supervises the session.
+    async fn run_one_session_from_halves<R, W>(
+        &mut self,
+        read_half: R,
+        write_half: W,
+        deadline: Instant,
+    ) -> SessionDisposition
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let establish =
+            transport::establish_session_on(read_half, write_half, &self.options, &self.credentials, deadline);
+
+        let (framed_read, framed_write, session) = tokio::select! {
+            result = establish => {
+                match result {
+                    Ok(established) => established,
+                    Err(outcome) => return self.finish_session(outcome, false).await,
+                }
+            }
+            () = self.cancel.cancelled() => {
+                return self
+                    .finish_session(ConnectionOutcome::Shutdown(ShutdownError::Cancelled), false)
+                    .await;
+            }
+        };
+
+        self.run_supervised_session(framed_read, framed_write, session).await
+    }
+
+    /// Post-handshake session: resubscribe, spawn read/write tasks, supervise until exit.
+    async fn run_supervised_session<R, W>(
+        &mut self,
+        mut framed_read: FramedRead<R, V5Codec>,
+        mut framed_write: FramedWrite<W, V5Codec>,
+        session: SessionParams,
+    ) -> SessionDisposition
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        self.generation = self.generation.next();
+        let keep_alive = session.keep_alive;
+        let max_qos = session.max_qos;
+        let retain_available = session.retain_available;
+        self.inflight.set_publish_capacity(session.server_receive_maximum);
+
+        if self.options.clean_start {
+            let pending = match subscriptions::snapshot_for_resubscribe(&self.subscription_registry) {
+                Ok(filters) => filters,
+                Err(outcome) => return self.finish_session(outcome, false).await,
+            };
+            if !pending.is_empty()
+                && let Err(outcome) = subscriptions::resubscribe_pending(
+                    &mut framed_read,
+                    &mut framed_write,
+                    &mut self.inflight,
+                    pending,
+                    self.options.ack_timeout,
+                    &self.cancel,
+                    &self.channels.handoff,
+                )
+                .await
+            {
+                return self.finish_session(outcome, false).await;
+            }
+        }
+
+        // Session cancel is a child of the client reconnect cancel so `MqttClient::shutdown`
+        // stops an active session even when the command channel is full. Graceful
+        // DISCONNECT still wins via `shutdown_notify`, which the write task selects first.
+        let session_cancel = self.cancel.child_token();
+        let read_cancel = session_cancel.child_token();
+        let write_cancel = session_cancel.child_token();
+
+        let control_tx = self.channels.control_tx.clone();
+        let handoff = self.channels.handoff.clone();
+        let generation = self.generation;
+
+        #[cfg(test)]
+        let read_stub_exit_rx = std::mem::replace(&mut self.channels.read_stub_exit_rx, mpsc::channel(1).1);
+        #[cfg(test)]
+        let write_stub_exit_rx = std::mem::replace(&mut self.channels.write_stub_exit_rx, mpsc::channel(1).1);
+        let control_rx = std::mem::replace(
+            &mut self.channels.control_rx,
+            mpsc::channel(control_channel_capacity(self.options.receive_maximum)).1,
+        );
+        let command_rx = std::mem::replace(
+            &mut self.channels.command_rx,
+            mpsc::channel(self.options.command_channel_capacity.get()).1,
+        );
+        let inflight = std::mem::replace(
+            &mut self.inflight,
+            packet_id::InflightPots::new(self.options.receive_maximum),
+        );
+
+        // Connected is published on the watch (never dropped for readiness) before
+        // read/write spawn so session start cannot stall on a consumer.
+        self.notify_connected(self.generation.0, session);
+        if self.cancel.is_cancelled() {
+            return self
+                .finish_session(ConnectionOutcome::Shutdown(ShutdownError::Cancelled), false)
+                .await;
+        }
+        self.state = ConnectionState::Connected;
+
+        // Read-join before DISCONNECT: write waits for this oneshot (fired when read drops).
+        let (read_done_tx, read_done_rx) = tokio::sync::oneshot::channel();
+        // Shared with write-task keepalive watchdog: stall skip + any-inbound liveness.
+        let handoff_stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inbound_activity = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let read_handle = tokio::spawn(read::run(
+            read::ReadSession {
+                cancel: read_cancel.clone(),
+                shutdown_notify: self.shutdown_notify.clone(),
+                generation,
+                receive_maximum: self.options.receive_maximum,
+                handoff_stalled: Arc::clone(&handoff_stalled),
+                inbound_activity: Arc::clone(&inbound_activity),
+            },
+            #[cfg(test)]
+            read_stub_exit_rx,
+            framed_read,
+            handoff,
+            control_tx,
+            read::ReadDoneSignal::new(read_done_tx),
+        ));
+
+        let write_handle = tokio::spawn(write::run(
+            control_rx,
+            command_rx,
+            #[cfg(test)]
+            write_stub_exit_rx,
+            framed_write,
+            write::WriteSession {
+                generation,
+                keep_alive,
+                subscription_registry: Arc::clone(&self.subscription_registry),
+                cancel: write_cancel.clone(),
+                shutdown_notify: self.shutdown_notify.clone(),
+                graceful_disconnect_timeout: self.options.graceful_disconnect_timeout,
+                max_qos,
+                retain_available,
+                receive_maximum: self.options.receive_maximum,
+                handoff_stalled,
+                inbound_activity,
+                bench_inbound_publish_ack_counter: self.options.bench_inbound_publish_ack_counter.clone(),
+            },
+            inflight,
+            read_done_rx,
+        ));
+
+        let outcome = Self::supervise_tasks(read_handle, write_handle, read_cancel, write_cancel).await;
+        // Drop session token so any lingering child work observes cancel.
+        drop(session_cancel);
+        self.finish_session(outcome, true).await
+    }
+
+    /// Emits `Disconnected`, applies reconnect policy, and decides whether to retry.
+    async fn finish_session(&mut self, outcome: ConnectionOutcome, from_active_session: bool) -> SessionDisposition {
+        self.state = ConnectionState::Draining;
+        self.notify_disconnected(outcome.clone());
+
+        if matches!(&outcome, ConnectionOutcome::Auth(AuthError::NotAuthorized)) && from_active_session {
+            self.credentials.invalidate().await;
+        }
+
+        match &outcome {
+            ConnectionOutcome::Shutdown(_) | ConnectionOutcome::Application(_) => {
+                self.state = ConnectionState::Stopped;
+                SessionDisposition::Stop(Self::map_final_result(outcome))
+            }
+            ConnectionOutcome::Auth(_) => match self.reconnect.delay_after(&outcome) {
+                None => {
+                    self.state = ConnectionState::Stopped;
+                    SessionDisposition::Stop(Err(outcome))
+                }
+                Some(delay) => self.backoff_then_retry(delay).await,
+            },
+            ConnectionOutcome::Transport(_) | ConnectionOutcome::Protocol(_) => {
+                match self.reconnect.delay_after(&outcome) {
+                    None => {
+                        self.state = ConnectionState::Stopped;
+                        SessionDisposition::Stop(Err(outcome))
+                    }
+                    Some(delay) => self.backoff_then_retry(delay).await,
+                }
+            }
+        }
+    }
+
+    async fn backoff_then_retry(&mut self, delay: Duration) -> SessionDisposition {
+        // Replenish before sleeping so `MqttClient`'s shared `command_tx` stays open while
+        // the previous write task (and its command receiver) is already gone.
+        self.channels.replenish_session_channels(
+            self.options.command_channel_capacity.get(),
+            control_channel_capacity(self.options.receive_maximum),
+        );
+        self.inflight = packet_id::InflightPots::new(self.options.receive_maximum);
+
+        self.state = ConnectionState::Backoff;
+        if self.cancel.is_cancelled() {
+            self.state = ConnectionState::Stopped;
+            return SessionDisposition::Stop(Err(ConnectionOutcome::Shutdown(ShutdownError::Cancelled)));
+        }
+        if delay.is_zero() {
+            return SessionDisposition::Retry;
+        }
+
+        tokio::select! {
+            () = tokio::time::sleep(delay) => SessionDisposition::Retry,
+            () = self.cancel.cancelled() => {
+                self.state = ConnectionState::Stopped;
+                SessionDisposition::Stop(Err(ConnectionOutcome::Shutdown(ShutdownError::Cancelled)))
+            }
+        }
+    }
+
+    fn map_final_result(outcome: ConnectionOutcome) -> Result<(), ConnectionOutcome> {
+        match &outcome {
+            ConnectionOutcome::Shutdown(ShutdownError::Requested) => Err(outcome),
+            ConnectionOutcome::Application(AppError::CommandChannelClosed) => Ok(()),
+            ConnectionOutcome::Shutdown(ShutdownError::Cancelled) => Ok(()),
+            _ => Err(outcome),
+        }
+    }
+
+    async fn supervise_tasks(
+        read_handle: JoinHandle<ReadOutcome>,
+        write_handle: JoinHandle<WriteOutcome>,
+        read_cancel: CancellationToken,
+        write_cancel: CancellationToken,
+    ) -> ConnectionOutcome {
+        tokio::pin!(read_handle);
+        tokio::pin!(write_handle);
+
+        enum FirstResult {
+            Read(Result<ReadOutcome, tokio::task::JoinError>),
+            Write(Result<WriteOutcome, tokio::task::JoinError>),
+        }
+
+        let first = tokio::select! {
+            read_result = read_handle.as_mut() => FirstResult::Read(read_result),
+            write_result = write_handle.as_mut() => FirstResult::Write(write_result),
+        };
+
+        match first {
+            FirstResult::Read(read_result) => {
+                write_cancel.cancel();
+                let write_result = write_handle.as_mut().await;
+                // Prefer write's graceful DISCONNECT over read cut-off Cancelled.
+                if matches!(&write_result, Ok(WriteOutcome::Shutdown)) {
+                    return Self::map_write_outcome(write_result);
+                }
+                Self::map_read_outcome(read_result)
+            }
+            FirstResult::Write(write_result) => {
+                read_cancel.cancel();
+                let _ = read_handle.as_mut().await;
+                Self::map_write_outcome(write_result)
+            }
+        }
+    }
+
+    fn map_read_outcome(result: Result<ReadOutcome, tokio::task::JoinError>) -> ConnectionOutcome {
+        match result {
+            Ok(ReadOutcome::Cancelled) => ConnectionOutcome::Shutdown(ShutdownError::Cancelled),
+            #[cfg(test)]
+            Ok(ReadOutcome::StubExit) => ConnectionOutcome::Application(AppError::NotImplemented),
+            Ok(ReadOutcome::InboundSinkClosed) => ConnectionOutcome::Application(AppError::InboundSinkClosed),
+            Ok(ReadOutcome::PeerClosed) => {
+                ConnectionOutcome::Transport(TransportError::Connection("peer closed".into()))
+            }
+            Ok(ReadOutcome::BrokerDisconnect(reason)) => map_broker_disconnect_outcome(reason),
+            Ok(ReadOutcome::Transport(error)) => ConnectionOutcome::Transport(error),
+            Ok(ReadOutcome::Protocol(error)) => ConnectionOutcome::Protocol(error),
+            Err(join_err) => ConnectionOutcome::Application(AppError::TaskJoin(join_err.to_string())),
+        }
+    }
+
+    fn map_write_outcome(result: Result<WriteOutcome, tokio::task::JoinError>) -> ConnectionOutcome {
+        match result {
+            Ok(WriteOutcome::Cancelled) => ConnectionOutcome::Shutdown(ShutdownError::Cancelled),
+            Ok(WriteOutcome::Shutdown) => ConnectionOutcome::Shutdown(ShutdownError::Requested),
+            #[cfg(test)]
+            Ok(WriteOutcome::StubExit) => ConnectionOutcome::Application(AppError::NotImplemented),
+            Ok(WriteOutcome::CommandChannelClosed) => ConnectionOutcome::Application(AppError::CommandChannelClosed),
+            Ok(WriteOutcome::ControlChannelClosed) => ConnectionOutcome::Application(AppError::CommandChannelClosed),
+            Ok(WriteOutcome::Transport(error)) => ConnectionOutcome::Transport(error),
+            Ok(WriteOutcome::Protocol(error)) => ConnectionOutcome::Protocol(error),
+            Err(join_err) => ConnectionOutcome::Application(AppError::TaskJoin(join_err.to_string())),
+        }
+    }
+}
+
+/// Whether [`Connection::run`] should attempt another session after a disconnect.
+enum SessionDisposition {
+    /// Backoff elapsed (or zero delay) — start a new session.
+    Retry,
+    /// Driver finished; return this result to the caller.
+    Stop(Result<(), ConnectionOutcome>),
+}
+
+/// Maps a broker DISCONNECT reason to a typed connection outcome.
+pub(crate) fn map_broker_disconnect_outcome(reason: DisconnectReasonCode) -> ConnectionOutcome {
+    match reason {
+        DisconnectReasonCode::NotAuthorized | DisconnectReasonCode::BadAuthenticationMethod => {
+            ConnectionOutcome::Auth(AuthError::NotAuthorized)
+        }
+        DisconnectReasonCode::KeepAliveTimeout => {
+            ConnectionOutcome::Transport(TransportError::Connection("broker keep-alive timeout".into()))
+        }
+        DisconnectReasonCode::ProtocolError
+        | DisconnectReasonCode::MalformedPacket
+        | DisconnectReasonCode::TopicAliasInvalid
+        | DisconnectReasonCode::PacketTooLarge => {
+            ConnectionOutcome::Protocol(ProtocolError::Violation(format!("broker DISCONNECT: {reason:?}")))
+        }
+        _ => ConnectionOutcome::Transport(TransportError::Connection(format!("broker DISCONNECT: {reason:?}"))),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
+mod io_mock_tests;
+
+#[cfg(test)]
+#[allow(clippy::box_default, clippy::manual_async_fn)]
+mod tests;

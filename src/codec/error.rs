@@ -1,0 +1,110 @@
+//! Error types for MQTT protocol encoding and decoding operations.
+//!
+//! This module defines codec-local failures:
+//! - [`DecodeError`]: parsing MQTT packets from bytes
+//! - [`EncodeError`]: serializing MQTT packets to bytes
+
+use std::io;
+
+use bytestring::ByteString;
+
+use crate::codec::v5::{DisconnectReasonCode, ToReasonCode};
+
+/// Errors that occur when decoding/parsing MQTT packets from a byte stream
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum DecodeError {
+    #[error("Invalid protocol")]
+    InvalidProtocol,
+    #[error("Invalid length")]
+    InvalidLength,
+    #[error("Malformed packet")]
+    MalformedPacket,
+    #[error("Unsupported protocol level")]
+    UnsupportedProtocolLevel,
+    #[error("Connect frame's reserved flag is set")]
+    ConnectReservedFlagSet,
+    #[error("ConnectAck frame's reserved flag is set")]
+    ConnectAckReservedFlagSet,
+    #[error("Unsupported packet type")]
+    UnsupportedPacketType,
+    #[error("Packet id is required")]
+    PacketIdRequired,
+    #[error("Max size exceeded: size={size}, max={max}")]
+    MaxSizeExceeded { size: u32, max: u32 },
+    #[error("io error, {:?}", _0)]
+    Io(ByteString),
+}
+
+impl From<io::Error> for DecodeError {
+    fn from(e: io::Error) -> DecodeError {
+        DecodeError::Io(e.to_string().into())
+    }
+}
+
+impl ToReasonCode for DecodeError {
+    fn to_reason_code(&self) -> DisconnectReasonCode {
+        match self {
+            DecodeError::InvalidProtocol => DisconnectReasonCode::ProtocolError,
+            DecodeError::InvalidLength => DisconnectReasonCode::MalformedPacket,
+            DecodeError::MalformedPacket => DisconnectReasonCode::MalformedPacket,
+            DecodeError::UnsupportedProtocolLevel => DisconnectReasonCode::ImplementationSpecificError,
+            DecodeError::ConnectReservedFlagSet => DisconnectReasonCode::ProtocolError,
+            DecodeError::ConnectAckReservedFlagSet => DisconnectReasonCode::ProtocolError,
+            DecodeError::UnsupportedPacketType => DisconnectReasonCode::ImplementationSpecificError,
+            DecodeError::PacketIdRequired => DisconnectReasonCode::ProtocolError,
+            DecodeError::MaxSizeExceeded { .. } => DisconnectReasonCode::PacketTooLarge,
+            DecodeError::Io(_) => DisconnectReasonCode::UnspecifiedError,
+        }
+    }
+}
+
+/// Errors that occur when encoding/serializing MQTT packets to a byte stream
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum EncodeError {
+    #[error("Packet is bigger than peer's Maximum Packet Size: size={size}, max={max}")]
+    OverMaxPacketSize { size: u32, max: u32 },
+    #[error("Invalid length")]
+    InvalidLength,
+    #[error("Malformed packet")]
+    MalformedPacket,
+    #[error("Packet id is required")]
+    PacketIdRequired,
+    #[error("Unsupported version")]
+    UnsupportedVersion,
+    #[error("io error, {:?}", _0)]
+    Io(ByteString),
+}
+
+impl From<io::Error> for EncodeError {
+    fn from(e: io::Error) -> EncodeError {
+        EncodeError::Io(e.to_string().into())
+    }
+}
+
+impl ToReasonCode for EncodeError {
+    fn to_reason_code(&self) -> DisconnectReasonCode {
+        match self {
+            EncodeError::OverMaxPacketSize { .. } => DisconnectReasonCode::PacketTooLarge,
+            EncodeError::InvalidLength => DisconnectReasonCode::MalformedPacket,
+            EncodeError::MalformedPacket => DisconnectReasonCode::MalformedPacket,
+            EncodeError::PacketIdRequired => DisconnectReasonCode::ProtocolError,
+            EncodeError::UnsupportedVersion => DisconnectReasonCode::ImplementationSpecificError,
+            EncodeError::Io(_) => DisconnectReasonCode::UnspecifiedError,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::v5::ToReasonCode;
+
+    #[test]
+    fn malformed_packet_decode_error_maps_to_malformed_packet_reason() {
+        // [MQTT-1.5.4-1], [MQTT-1.5.4-2] — ill-formed UTF-8 / U+0000 use MalformedPacket.
+        assert_eq!(
+            DecodeError::MalformedPacket.to_reason_code(),
+            DisconnectReasonCode::MalformedPacket
+        );
+    }
+}

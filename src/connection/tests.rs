@@ -1,0 +1,1438 @@
+use std::num::NonZeroU16;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use tokio::time::timeout;
+
+use super::test_support::*;
+use super::*;
+use crate::QoS;
+use crate::client::connect;
+use crate::codec::{DecodedFrame, Packet, PublishMessage};
+use crate::error::{AuthError, ProtocolError};
+use crate::options::ConnectOptions;
+use crate::util::BrokerUrl;
+
+/// [MQTT-4.13.2-1] DISCONNECT reason codes ≥0x80 classify as session/network termination.
+#[test]
+fn map_broker_disconnect_classifies_error_reason_codes() {
+    use crate::codec::DisconnectReasonCode;
+
+    assert!(matches!(
+        map_broker_disconnect_outcome(DisconnectReasonCode::NotAuthorized),
+        ConnectionOutcome::Auth(AuthError::NotAuthorized)
+    ));
+    assert!(matches!(
+        map_broker_disconnect_outcome(DisconnectReasonCode::UnspecifiedError),
+        ConnectionOutcome::Transport(_)
+    ));
+    assert!(matches!(
+        map_broker_disconnect_outcome(DisconnectReasonCode::ProtocolError),
+        ConnectionOutcome::Protocol(_)
+    ));
+}
+
+/// flume disconnects permanently when the last sender drops; anchor + Connection sender must survive read respawn.
+#[tokio::test]
+async fn handoff_channel_survives_read_sender_drop() {
+    use crate::codec::{PublishMessage, PublishProperties};
+    use bytes::Bytes;
+    use bytestring::ByteString;
+
+    let (tx, rx) = flume::bounded::<PublishMessage>(8);
+    let anchor = tx.clone();
+    let conn = tx;
+    drop(conn.clone()); // simulate read-task sender drop
+    assert!(!anchor.is_disconnected());
+    assert!(!rx.is_disconnected());
+    let msg = PublishMessage {
+        topic: ByteString::from_static("t"),
+        payload: Bytes::from_static(b"x"),
+        properties: PublishProperties::default(),
+    };
+    anchor.send_async(msg).await.expect("send after read drop");
+    let got = rx.recv_async().await.expect("recv after read drop");
+    assert_eq!(&*got.payload, b"x");
+}
+
+#[tokio::test]
+async fn run_returns_observable_result_on_shutdown() {
+    let (client, connection, mut phase) = test_connect().await;
+    let run = tokio::spawn(connection.run());
+    // Wait until the session is active so Shutdown reaches the write task (DISCONNECT path).
+    await_connected(&mut phase).await;
+    client.shutdown().await.expect("shutdown not backpressured");
+    let result = run.await.expect("join run task");
+    assert!(
+        matches!(result, Err(ConnectionOutcome::Shutdown(ShutdownError::Requested))),
+        "expected Shutdown(Requested) after active-session shutdown, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn read_task_exit_cancels_write_and_joins() {
+    let (_client, connection, mut phase) = test_connect().await;
+    let read_exit = connection.read_stub_exit_sender();
+    let run = tokio::spawn(connection.run());
+    // Wait until CONNACK session is active so the read task is running.
+    await_connected(&mut phase).await;
+    read_exit.send(()).await.expect("signal read exit");
+    let result = run.await.expect("join run task");
+    assert!(matches!(
+        result,
+        Err(ConnectionOutcome::Application(AppError::NotImplemented))
+    ));
+}
+
+#[tokio::test]
+async fn write_task_exit_cancels_read_and_joins() {
+    let (_client, connection, mut phase) = test_connect().await;
+    let write_exit = connection.write_stub_exit_sender();
+    let run = tokio::spawn(connection.run());
+    await_connected(&mut phase).await;
+    write_exit.send(()).await.expect("signal write exit");
+    let result = run.await.expect("join run task");
+    assert!(matches!(
+        result,
+        Err(ConnectionOutcome::Application(AppError::NotImplemented))
+    ));
+}
+
+#[test]
+fn generation_binding_smoke() {
+    let current = Generation(1);
+    assert!(current.accepts(Generation(1)));
+    assert!(!current.accepts(Generation(0)));
+}
+
+/// Read and Write are separate tasks; Write can progress on the control path while Read
+/// blocks on a full handoff. Uses the same bounded flume sender injected into [`connect`]
+/// (Connection's real handoff) and Connection's control channel — not a standalone demo
+/// queue. While Read is parked on `send_async` to a full handoff, Write/control must still
+/// accept work (`PingReq`).
+#[tokio::test]
+async fn write_can_progress_while_handoff_stalls() {
+    use crate::codec::{PublishMessage, PublishProperties};
+    use crate::connection::ControlMessage;
+    use bytes::Bytes;
+    use bytestring::ByteString;
+
+    fn sample_publish(topic: &'static str, payload: &'static [u8]) -> PublishMessage {
+        PublishMessage {
+            topic: ByteString::from_static(topic),
+            payload: Bytes::from_static(payload),
+            properties: PublishProperties::default(),
+        }
+    }
+
+    // Connection-bound handoff: capacity 1 so one fill saturates it.
+    let port = spawn_mock_broker().await;
+    let (handoff_tx, _handoff_rx) = flume::bounded::<PublishMessage>(1);
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
+    let (client, connection, _phase) = connect(
+        options,
+        static_test_credentials(),
+        NoReconnect,
+        handoff_tx.clone(),
+        NoopLifecycle,
+    )
+    .expect("connect wiring");
+
+    handoff_tx
+        .send_async(sample_publish("fill", b"1"))
+        .await
+        .expect("fill Connection handoff to capacity");
+
+    // Simulated Read stall: blocked push on the **same** injectable handoff.
+    let stall_tx = handoff_tx.clone();
+    let stall = tokio::spawn(async move { stall_tx.send_async(sample_publish("stall", b"2")).await });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !stall.is_finished(),
+        "handoff push must still be waiting (simulates Read blocked on Connection handoff, §3.2)"
+    );
+
+    // Observable Write/control path on **this** Connection — must accept while handoff is full.
+    let control_tx = connection.control_sender();
+    control_tx
+        .try_send(ControlMessage::PingReq)
+        .expect("Connection control path must accept PingReq while its handoff is stalled (§3.2)");
+
+    let run = tokio::spawn(connection.run());
+    client.shutdown().await.expect("shutdown");
+    let _ = run.await.expect("join run");
+
+    assert!(
+        !stall.is_finished(),
+        "handoff stall must still be blocked (consumer never drained)"
+    );
+    stall.abort();
+}
+
+/// MQTT §3.2: keep-alive must send PINGREQ during a full-handoff stall; stall must not
+/// cause keepalive-death or a spurious reconnect (self-induced Read stall ≠ PINGRESP timeout).
+#[tokio::test]
+async fn keep_alive_survives_handoff_stall_without_spurious_reconnect() {
+    use crate::codec::{PublishMessage, PublishProperties};
+    use bytes::Bytes;
+    use bytestring::ByteString;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let keep_alive = Duration::from_secs(1);
+    // Broker closes if no PINGREQ within this idle window (stricter than Mosquitto for TDD).
+    let idle = Duration::from_millis(1500);
+    let ping_count = Arc::new(AtomicUsize::new(0));
+    let port = spawn_mock_broker_keepalive_enforcer(idle, true, true, false, Arc::clone(&ping_count)).await;
+
+    let (handoff_tx, handoff_rx) = flume::bounded::<PublishMessage>(1);
+    // Pre-fill so the inbound stall PUBLISH parks Read on handoff push.
+    handoff_tx
+        .send_async(PublishMessage {
+            topic: ByteString::from_static("fill"),
+            payload: Bytes::from_static(b"1"),
+            properties: PublishProperties::default(),
+        })
+        .await
+        .expect("pre-fill handoff");
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url)
+        .keep_alive(keep_alive)
+        .receive_maximum(NonZeroU16::new(8).expect("nz"));
+    // NoReconnect: a keepalive-death must surface as Disconnected, not be masked by retry.
+    let (client, connection, mut phase) = connect(
+        options,
+        static_test_credentials(),
+        NoReconnect,
+        handoff_tx,
+        NoopLifecycle,
+    )
+    .expect("connect wiring");
+
+    let run = tokio::spawn(connection.run());
+
+    await_connected(&mut phase).await;
+    let gen_before = match &*phase.borrow() {
+        SessionPhase::Connected { generation, .. } => *generation,
+        other => panic!("expected Connected, got {other:?}"),
+    };
+
+    // Allow the stall PUBLISH to park Read, then wait past one keep-alive interval.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let liveness_window = keep_alive + Duration::from_millis(500);
+    match timeout(
+        liveness_window,
+        phase.wait_for(|p| match p {
+            SessionPhase::Disconnected(_) => true,
+            SessionPhase::Connected { generation, .. } => *generation != gen_before,
+            SessionPhase::NeverConnected => false,
+        }),
+    )
+    .await
+    {
+        Err(_) => {
+            // No lifecycle transition during the window — good if PINGs were also observed.
+        }
+        Ok(Ok(guard)) => match &*guard {
+            SessionPhase::Disconnected(outcome) => {
+                panic!(
+                    "handoff stall must not cause keepalive-death; got Disconnected({outcome:?}) — \
+                     driver must schedule PINGREQ while Read is stalled (§3.2)"
+                );
+            }
+            SessionPhase::Connected { generation, .. } => {
+                panic!(
+                    "handoff stall must not cause spurious reconnect (Connected gen={generation}, was {gen_before})"
+                );
+            }
+            other => panic!("unexpected phase change under stall: {other:?}"),
+        },
+        Ok(Err(_)) => panic!("phase watch closed while connection should stay alive under stall"),
+    }
+
+    assert!(
+        ping_count.load(Ordering::SeqCst) >= 1,
+        "driver must auto-send PINGREQ during a full-handoff stall (got {} PINGREQs); \
+         manual PingReq injection does not satisfy this invariant",
+        ping_count.load(Ordering::SeqCst)
+    );
+
+    // Handoff still held the pre-fill (consumer never drained during the window).
+    assert!(
+        handoff_rx.is_full(),
+        "handoff must remain full for the duration of the stall window"
+    );
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+}
+
+/// MQTT §3.1.2.10 SHOULD: no PINGRESP within ~keep_alive after PINGREQ → transport disconnect.
+#[tokio::test]
+async fn missing_pingresp_disconnects_after_keep_alive() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let keep_alive = Duration::from_secs(1);
+    // Broker stays up (long idle) but never answers PINGREQ.
+    let idle = Duration::from_secs(30);
+    let ping_count = Arc::new(AtomicUsize::new(0));
+    let port = spawn_mock_broker_keepalive_enforcer(idle, false, false, false, Arc::clone(&ping_count)).await;
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url)
+        .keep_alive(keep_alive)
+        .receive_maximum(NonZeroU16::new(8).expect("nz"));
+    let (client, connection, mut phase) = connect(
+        options,
+        static_test_credentials(),
+        NoReconnect,
+        flume::bounded(4).0,
+        NoopLifecycle,
+    )
+    .expect("connect wiring");
+
+    let run = tokio::spawn(connection.run());
+    await_connected(&mut phase).await;
+
+    // First ping at ~KA; watchdog fires on the next tick (~2× KA from connect).
+    let disconnected = timeout(
+        keep_alive.mul_f32(3.5),
+        phase.wait_for(|p| matches!(p, SessionPhase::Disconnected(_))),
+    )
+    .await
+    .expect("PINGRESP watchdog must disconnect")
+    .expect("phase watch");
+
+    match &*disconnected {
+        SessionPhase::Disconnected(ConnectionOutcome::Transport(TransportError::Connection(msg))) => {
+            assert!(
+                msg.contains("PINGRESP timed out"),
+                "expected PINGRESP timeout message, got {msg}"
+            );
+        }
+        other => panic!("expected Transport PINGRESP timeout, got {other:?}"),
+    }
+    assert!(
+        ping_count.load(Ordering::SeqCst) >= 1,
+        "client must have sent at least one PINGREQ before timing out"
+    );
+
+    let _ = client.shutdown().await;
+    let _ = timeout(Duration::from_secs(5), run).await;
+}
+
+/// Inbound PUBLISH without PINGRESP must clear the keepalive watchdog.
+#[tokio::test]
+async fn inbound_publish_clears_keepalive_watchdog_without_pingresp() {
+    use crate::codec::PublishMessage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let keep_alive = Duration::from_secs(1);
+    let idle = Duration::from_secs(30);
+    let ping_count = Arc::new(AtomicUsize::new(0));
+    let port = spawn_mock_broker_keepalive_enforcer(idle, false, false, true, Arc::clone(&ping_count)).await;
+
+    let (handoff_tx, handoff_rx) = flume::bounded::<PublishMessage>(8);
+    let drain = tokio::spawn(async move { while handoff_rx.recv_async().await.is_ok() {} });
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url)
+        .keep_alive(keep_alive)
+        .receive_maximum(NonZeroU16::new(8).expect("nz"));
+    let (client, connection, mut phase) = connect(
+        options,
+        static_test_credentials(),
+        NoReconnect,
+        handoff_tx,
+        NoopLifecycle,
+    )
+    .expect("connect wiring");
+
+    let run = tokio::spawn(connection.run());
+    await_connected(&mut phase).await;
+    let gen_before = match &*phase.borrow() {
+        SessionPhase::Connected { generation, .. } => *generation,
+        other => panic!("expected Connected, got {other:?}"),
+    };
+
+    // Past first PINGREQ + watchdog tick (~2× KA). Must stay up thanks to PUBLISH liveness.
+    match timeout(
+        keep_alive.mul_f32(3.5),
+        phase.wait_for(|p| match p {
+            SessionPhase::Disconnected(_) => true,
+            SessionPhase::Connected { generation, .. } => *generation != gen_before,
+            SessionPhase::NeverConnected => false,
+        }),
+    )
+    .await
+    {
+        Err(_) => {}
+        Ok(Ok(guard)) => panic!("expected session to stay Connected; got {:?}", &*guard),
+        Ok(Err(_)) => panic!("phase watch closed while connection should stay alive"),
+    }
+
+    assert!(
+        ping_count.load(Ordering::SeqCst) >= 1,
+        "client must have sent PINGREQ (got {})",
+        ping_count.load(Ordering::SeqCst)
+    );
+    assert!(
+        matches!(
+            &*phase.borrow(),
+            SessionPhase::Connected { generation, .. } if *generation == gen_before
+        ),
+        "must still be Connected gen={gen_before}"
+    );
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+    drain.abort();
+}
+
+/// [MQTT-3.1.2-21] / [MQTT-3.2.2-21] Server Keep Alive from CONNACK drives PINGREQ cadence.
+#[tokio::test]
+async fn server_keep_alive_from_connack_drives_pingreq_interval() {
+    use crate::codec::ConnectAck;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Client keep_alive is 60s — without Server KA override, no PINGREQ within a few seconds.
+    let client_keep_alive = Duration::from_secs(60);
+    let idle = Duration::from_millis(1500);
+    let ping_count = Arc::new(AtomicUsize::new(0));
+    let pings = Arc::clone(&ping_count);
+
+    let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+        let ack = ConnectAck {
+            server_keepalive_sec: Some(1),
+            ..ConnectAck::default()
+        };
+        if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
+            return;
+        }
+        loop {
+            match timeout(idle, framed_read.next()).await {
+                Ok(Some(Ok((DecodedFrame::Control(Packet::PingRequest), _)))) => {
+                    pings.fetch_add(1, Ordering::SeqCst);
+                    if framed_write.send(Packet::PingResponse).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(_))) | Ok(None) | Err(_) => return,
+            }
+        }
+    })
+    .await;
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url)
+        .keep_alive(client_keep_alive)
+        .receive_maximum(NonZeroU16::new(8).expect("nz"));
+    let (client, connection, mut phase) = connect(
+        options,
+        static_test_credentials(),
+        NoReconnect,
+        flume::bounded(4).0,
+        NoopLifecycle,
+    )
+    .expect("connect wiring");
+
+    let run = tokio::spawn(connection.run());
+    await_connected(&mut phase).await;
+    let gen_before = match &*phase.borrow() {
+        SessionPhase::Connected { generation, .. } => *generation,
+        other => panic!("expected Connected, got {other:?}"),
+    };
+
+    // Server KA=1s → expect ≥1 PINGREQ within ~2–3s; connection must stay up.
+    match timeout(
+        Duration::from_secs(3),
+        phase.wait_for(|p| match p {
+            SessionPhase::Disconnected(_) => true,
+            SessionPhase::Connected { generation, .. } => *generation != gen_before,
+            SessionPhase::NeverConnected => false,
+        }),
+    )
+    .await
+    {
+        Err(_) => {}
+        Ok(Ok(guard)) => panic!("expected session to stay Connected; got {:?}", &*guard),
+        Ok(Err(_)) => panic!("phase watch closed while connection should stay alive"),
+    }
+
+    assert!(
+        ping_count.load(Ordering::SeqCst) >= 1,
+        "Server Keep Alive=1s must drive PINGREQ despite client keep_alive=60s (got {})",
+        ping_count.load(Ordering::SeqCst)
+    );
+    assert!(
+        matches!(
+            &*phase.borrow(),
+            SessionPhase::Connected { generation, .. } if *generation == gen_before
+        ),
+        "must still be Connected gen={gen_before}"
+    );
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+}
+
+/// Inbound `wire_topic_alias` on the live read path → Protocol Error.
+#[tokio::test]
+async fn inbound_topic_alias_on_read_path_disconnects() {
+    let port = spawn_mock_broker_with_inbound_topic_alias().await;
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
+    let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+    let (_client, connection, mut phase) =
+        connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
+
+    let run = tokio::spawn(connection.run());
+
+    // Session can disconnect immediately after CONNACK+bad PUBLISH; watch may skip Connected.
+    let disconnected = await_disconnected(&mut phase).await;
+    match disconnected {
+        SessionPhase::Disconnected(ConnectionOutcome::Protocol(ProtocolError::TopicAliasNotSupported)) => {}
+        other => panic!("expected Protocol(TopicAliasNotSupported), got {other:?}"),
+    }
+
+    let result = run.await.expect("join run task");
+    assert!(matches!(
+        result,
+        Err(ConnectionOutcome::Protocol(ProtocolError::TopicAliasNotSupported))
+    ));
+}
+
+// --- inbound enqueue-before-ack / flow-control contracts ---
+
+/// Inbound QoS 1 must not PUBACK before flume handoff accepts the message.
+#[tokio::test]
+async fn inbound_qos1_does_not_puback_before_handoff_accept() {
+    use std::sync::Arc;
+    use tokio::time::timeout;
+
+    let puback_ids = Arc::new(tokio::sync::Mutex::new(Vec::<NonZeroU16>::new()));
+    let pubacks = Arc::clone(&puback_ids);
+    let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+        if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+            return;
+        }
+        send_inbound_qos1_publish(
+            &mut framed_write,
+            "in/handoff",
+            b"blocked",
+            NonZeroU16::new(7).expect("nz"),
+            crate::codec::PublishProperties::default(),
+        )
+        .await;
+        loop {
+            match framed_read.next().await {
+                Some(Ok((DecodedFrame::Control(Packet::PublishAck(ack)), _))) => {
+                    pubacks.lock().await.push(ack.packet_id);
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => break,
+            }
+        }
+    })
+    .await;
+
+    // Capacity 0: rendezvous — no message is accepted until a receiver appears.
+    let (handoff_tx, handoff_rx) = flume::bounded::<PublishMessage>(0);
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(2).expect("nz"));
+    let (client, connection, mut phase) = connect(
+        options,
+        static_test_credentials(),
+        NoReconnect,
+        handoff_tx,
+        NoopLifecycle,
+    )
+    .expect("connect");
+
+    let run = tokio::spawn(connection.run());
+    await_connected(&mut phase).await;
+
+    // Accepted/unacked invariant before handoff accept: nothing in handoff, no PUBACK on wire.
+    // Do not call try_recv here — with capacity 0 that would complete the rendezvous.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        handoff_rx.is_empty(),
+        "handoff must not show an accepted message while send_async is still blocked (capacity 0)"
+    );
+    assert!(
+        puback_ids.lock().await.is_empty(),
+        "must not PUBACK before flume accept (regression against auto-ack-on-read); unacked until accept"
+    );
+
+    // After the consumer accepts, PUBACK must carry the inbound packet id (enqueue-before-ack).
+    let received = timeout(Duration::from_secs(2), handoff_rx.recv_async())
+        .await
+        .expect("handoff receive timed out")
+        .expect("handoff closed");
+    assert_eq!(&*received.payload, b"blocked");
+
+    let acked_id = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(id) = puback_ids.lock().await.first().copied() {
+                break id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("PUBACK must be sent only after successful handoff accept");
+
+    assert_eq!(
+        acked_id,
+        NonZeroU16::new(7).expect("nz"),
+        "PUBACK packet id must match the accepted inbound QoS1 publish"
+    );
+    assert_eq!(
+        puback_ids.lock().await.len(),
+        1,
+        "exactly one PUBACK after handoff accept"
+    );
+
+    client.shutdown().await.expect("shutdown");
+    let _ = run.await;
+}
+
+/// [MQTT-4.3.2-5] After PUBACK, the same Packet Identifier may identify a new Application Message.
+#[tokio::test]
+async fn inbound_qos1_same_packet_id_after_puback_is_new_message() {
+    use crate::codec::PublishMessage;
+    use std::sync::Arc;
+    use tokio::time::timeout;
+
+    let puback_ids = Arc::new(tokio::sync::Mutex::new(Vec::<NonZeroU16>::new()));
+    let pubacks = Arc::clone(&puback_ids);
+    let (second_tx, mut second_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+        if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+            return;
+        }
+        send_inbound_qos1_publish(
+            &mut framed_write,
+            "in/reuse",
+            b"first",
+            NonZeroU16::new(7).expect("nz"),
+            crate::codec::PublishProperties::default(),
+        )
+        .await;
+        // Wait for first PUBACK before reusing packet id 7.
+        loop {
+            match framed_read.next().await {
+                Some(Ok((DecodedFrame::Control(Packet::PublishAck(ack)), _))) => {
+                    pubacks.lock().await.push(ack.packet_id);
+                    if ack.packet_id == NonZeroU16::new(7).expect("nz") {
+                        break;
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => return,
+            }
+        }
+        send_inbound_qos1_publish(
+            &mut framed_write,
+            "in/reuse",
+            b"second",
+            NonZeroU16::new(7).expect("nz"),
+            crate::codec::PublishProperties::default(),
+        )
+        .await;
+        let _ = second_tx.send(()).await;
+        loop {
+            match framed_read.next().await {
+                Some(Ok((DecodedFrame::Control(Packet::PublishAck(ack)), _))) => {
+                    pubacks.lock().await.push(ack.packet_id);
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => break,
+            }
+        }
+    })
+    .await;
+
+    let (handoff_tx, handoff_rx) = flume::bounded::<PublishMessage>(4);
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(2).expect("nz"));
+    let (client, connection, mut phase) = connect(
+        options,
+        static_test_credentials(),
+        NoReconnect,
+        handoff_tx,
+        NoopLifecycle,
+    )
+    .expect("connect");
+
+    let run = tokio::spawn(connection.run());
+    await_connected(&mut phase).await;
+
+    let first = timeout(Duration::from_secs(2), handoff_rx.recv_async())
+        .await
+        .expect("first handoff timed out")
+        .expect("handoff closed");
+    assert_eq!(&*first.payload, b"first");
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if !puback_ids.lock().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first PUBACK id=7");
+
+    second_rx.recv().await.expect("second publish sent");
+
+    let second = timeout(Duration::from_secs(2), handoff_rx.recv_async())
+        .await
+        .expect("second handoff timed out")
+        .expect("handoff closed");
+    assert_eq!(&*second.payload, b"second");
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if puback_ids.lock().await.len() >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second PUBACK id=7");
+
+    let ids = puback_ids.lock().await.clone();
+    assert_eq!(ids.len(), 2, "exactly two PUBACKs for two Application Messages");
+    assert_eq!(ids[0], NonZeroU16::new(7).expect("nz"));
+    assert_eq!(ids[1], NonZeroU16::new(7).expect("nz"));
+
+    client.shutdown().await.expect("shutdown");
+    let _ = run.await;
+}
+
+/// Full handoff: no further inbound PUBACKs until push succeeds; inflight ≤ client Receive Maximum.
+#[tokio::test]
+async fn full_handoff_defers_pubacks_within_client_receive_maximum() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::mpsc as tokio_mpsc;
+    use tokio::time::timeout;
+
+    let puback_ids = Arc::new(tokio::sync::Mutex::new(Vec::<NonZeroU16>::new()));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (ready_tx, mut ready_rx) = tokio_mpsc::channel::<()>(1);
+    let pubacks = Arc::clone(&puback_ids);
+    let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+        if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+            return;
+        }
+        let _ = ready_tx.send(()).await;
+        for id in 1u16..=3 {
+            send_inbound_qos1_publish(
+                &mut framed_write,
+                "in/rm",
+                b"x",
+                NonZeroU16::new(id).expect("nz"),
+                crate::codec::PublishProperties::default(),
+            )
+            .await;
+        }
+        loop {
+            match framed_read.next().await {
+                Some(Ok((DecodedFrame::Control(Packet::PublishAck(ack)), _))) => {
+                    pubacks.lock().await.push(ack.packet_id);
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => break,
+            }
+        }
+    })
+    .await;
+
+    // Handoff capacity 1 + blocking consumer: after one accept, further pushes stall.
+    let (handoff_tx, handoff_rx) = flume::bounded::<PublishMessage>(1);
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(2).expect("nz"));
+    let (client, connection, mut phase) = connect(
+        options,
+        static_test_credentials(),
+        NoReconnect,
+        handoff_tx,
+        NoopLifecycle,
+    )
+    .expect("connect");
+
+    let run = tokio::spawn(connection.run());
+    await_connected(&mut phase).await;
+    ready_rx.recv().await.expect("broker ready");
+
+    // Wait until the first message is accepted into the handoff (capacity 1 fills).
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if !handoff_rx.is_empty() {
+                accepted.store(1, Ordering::SeqCst);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first inbound publish must be accepted into the handoff");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let acked_while_stalled = puback_ids.lock().await.len();
+    let accepted_count = accepted.load(Ordering::SeqCst);
+    assert_eq!(accepted_count, 1, "exactly one message accepted while consumer blocked");
+    assert!(
+        acked_while_stalled <= accepted_count,
+        "PUBACKs ({acked_while_stalled}) must not exceed accepted handoff messages ({accepted_count}) — enqueue-before-ack"
+    );
+    assert!(
+        acked_while_stalled <= 2,
+        "inbound unacked/inflight must respect client_receive_maximum=2; saw {acked_while_stalled} PUBACKs"
+    );
+    // While stalled on the second push, at most the one accepted message may be acked.
+    assert!(
+        acked_while_stalled <= 1,
+        "while handoff is full/stalled, PUBACKs must not advance beyond accepted messages; saw {acked_while_stalled}"
+    );
+
+    // Drain one → another accept can complete → PUBACK count may advance by one, still ≤ RM.
+    let _ = handoff_rx.recv_async().await;
+    accepted.fetch_add(1, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let after_drain = puback_ids.lock().await.len();
+    assert!(
+        after_drain > acked_while_stalled,
+        "draining handoff must allow further PUBACKs (enqueue-before-ack); before={acked_while_stalled} after={after_drain}"
+    );
+    assert!(
+        after_drain <= 2,
+        "still capped by client_receive_maximum; saw {after_drain}"
+    );
+    assert!(
+        after_drain <= accepted.load(Ordering::SeqCst),
+        "PUBACKs must remain ≤ accepted messages after drain"
+    );
+
+    client.shutdown().await.expect("shutdown");
+    let _ = run.await;
+}
+
+/// [MQTT-4.6.0-2] inbound PUBACKs must follow PUBLISH receipt order.
+#[tokio::test]
+async fn inbound_pubacks_sent_in_publish_receipt_order() {
+    use std::sync::Arc;
+    use tokio::time::timeout;
+
+    let puback_order = Arc::new(tokio::sync::Mutex::new(Vec::<u16>::new()));
+    let order = Arc::clone(&puback_order);
+    let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+        if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+            return;
+        }
+        for id in [5u16, 9] {
+            send_inbound_qos1_publish(
+                &mut framed_write,
+                "in/order",
+                b"x",
+                NonZeroU16::new(id).expect("nz"),
+                crate::codec::PublishProperties::default(),
+            )
+            .await;
+        }
+        loop {
+            match framed_read.next().await {
+                Some(Ok((DecodedFrame::Control(Packet::PublishAck(ack)), _))) => {
+                    order.lock().await.push(ack.packet_id.get());
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => break,
+            }
+        }
+    })
+    .await;
+
+    let (handoff_tx, handoff_rx) = flume::bounded::<PublishMessage>(4);
+    let drain = tokio::spawn(async move { while handoff_rx.recv_async().await.is_ok() {} });
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(4).expect("nz"));
+    let (client, connection, mut phase) = connect(
+        options,
+        static_test_credentials(),
+        NoReconnect,
+        handoff_tx,
+        NoopLifecycle,
+    )
+    .expect("connect");
+
+    let run = tokio::spawn(connection.run());
+    await_connected(&mut phase).await;
+
+    let observed = timeout(Duration::from_secs(2), async {
+        loop {
+            let guard = puback_order.lock().await;
+            if guard.len() >= 2 {
+                return guard.clone();
+            }
+            drop(guard);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("two inbound PUBACKs must be observed");
+
+    assert_eq!(
+        observed,
+        vec![5, 9],
+        "PUBACK packet identifiers must follow inbound QoS1 PUBLISH receipt order"
+    );
+
+    client.shutdown().await.expect("shutdown");
+    let _ = run.await;
+    drain.abort();
+}
+
+// --- (critical-review hardening) ---
+
+/// app commands must keep a live `command_tx` across the reconnect/backoff gap.
+#[tokio::test]
+async fn command_sender_remains_usable_during_reconnect_backoff() {
+    let port = spawn_mock_broker_close_after_connack().await;
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
+    let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+    let (client, connection, mut phase) = connect(
+        options,
+        static_test_credentials(),
+        DelayedReconnect {
+            delay: Duration::from_secs(5),
+        },
+        tx,
+        NoopLifecycle,
+    )
+    .expect("connect wiring");
+
+    let run = tokio::spawn(connection.run());
+
+    // Close-after-CONNACK is fast: watch may only observe Disconnected (Connected overwritten).
+    let _ = await_disconnected(&mut phase).await;
+
+    // During Backoff the shared sender must still accept work (not CommandChannelClosed).
+    let send_result = client.try_send_noop();
+    assert!(
+        !matches!(send_result, Err(AppError::CommandChannelClosed)),
+        "command_tx must stay usable during reconnect backoff; got {send_result:?}"
+    );
+    assert!(
+        send_result.is_ok(),
+        "expected Ok (or Backpressure), not a dead channel; got {send_result:?}"
+    );
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+}
+
+/// Shared `command_tx` must point at the post-replenish channel (ArcSwap store).
+#[test]
+fn replenish_session_channels_swaps_shared_command_sender() {
+    let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
+    let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+    let shared = Arc::new(ArcSwap::from_pointee(command_tx));
+    let (handoff, _handoff_rx) = flume::bounded::<PublishMessage>(4);
+    let (read_stub_exit_tx, read_stub_exit_rx) = mpsc::channel(1);
+    let (write_stub_exit_tx, write_stub_exit_rx) = mpsc::channel(1);
+
+    let mut channels = ConnectionChannels {
+        control_tx,
+        control_rx,
+        command_tx: Arc::clone(&shared),
+        command_rx,
+        handoff: handoff.clone(),
+        handoff_anchor: handoff,
+        phase_tx: watch::channel(SessionPhase::initial()).0,
+        lifecycle: Arc::new(NoopLifecycle),
+        read_stub_exit_tx,
+        read_stub_exit_rx,
+        write_stub_exit_tx,
+        write_stub_exit_rx,
+    };
+
+    // Pre-replenish: shared sender feeds the original receiver.
+    shared.load().try_send(ClientCommand::Noop).expect("pre-swap send");
+    assert!(matches!(channels.command_rx.try_recv(), Ok(ClientCommand::Noop)));
+
+    // Detach the old receiver so we can assert disconnect after swap.
+    let mut old_command_rx = {
+        let (_placeholder_tx, placeholder_rx) = mpsc::channel(1);
+        std::mem::replace(&mut channels.command_rx, placeholder_rx)
+    };
+
+    channels.replenish_session_channels(COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY);
+
+    // Old receiver closes once ArcSwap drops the previous sender.
+    assert!(matches!(
+        old_command_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+    ));
+
+    // Hot-path load must hit the new session channel.
+    shared.load().try_send(ClientCommand::Noop).expect("post-swap send");
+    assert!(matches!(channels.command_rx.try_recv(), Ok(ClientCommand::Noop)));
+}
+
+/// cancel during auto-resubscribe wait must abort promptly.
+#[tokio::test]
+async fn resubscribe_aborts_on_cancel() {
+    use crate::client::Subscription;
+    use crate::codec::{QoS, SubscribeAckReason};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let holding_suback = Arc::new(AtomicBool::new(false));
+    let holding_flag = Arc::clone(&holding_suback);
+    let sessions = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let port = spawn_broker_loop({
+        let sessions = Arc::clone(&sessions);
+        let holding_flag = Arc::clone(&holding_flag);
+        move |mut framed_read, mut framed_write| {
+            let n = sessions.fetch_add(1, Ordering::SeqCst) + 1;
+            let holding_flag = Arc::clone(&holding_flag);
+            async move {
+                if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+                    return;
+                }
+                loop {
+                    match framed_read.next().await {
+                        Some(Ok((DecodedFrame::Control(Packet::Subscribe(sub)), _))) => {
+                            if n == 1 {
+                                let _ = framed_write
+                                    .send(Packet::SubscribeAck(crate::codec::SubscribeAck {
+                                        packet_id: sub.packet_id,
+                                        properties: Vec::new(),
+                                        reason_string: None,
+                                        status: vec![SubscribeAckReason::GrantedQos1],
+                                    }))
+                                    .await;
+                                return; // drop → reconnect
+                            }
+                            holding_flag.store(true, Ordering::SeqCst);
+                            // Never SUBACK — resubscribe must be aborted by cancel.
+                            loop {
+                                tokio::time::sleep(Duration::from_secs(60)).await;
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(_)) | None => return,
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url)
+        .receive_maximum(NonZeroU16::new(8).expect("nz"))
+        .ack_timeout(Duration::from_secs(30));
+    let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+    let (client, connection, mut phase) = connect(
+        options,
+        static_test_credentials(),
+        DelayedReconnect { delay: Duration::ZERO },
+        tx,
+        NoopLifecycle,
+    )
+    .expect("connect");
+
+    let run = tokio::spawn(connection.run());
+    await_connected(&mut phase).await;
+
+    let reasons = client
+        .subscribe(vec![Subscription::new("resub/cancel", QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe");
+    assert!(matches!(
+        reasons.as_slice(),
+        [SubscribeAckReason::GrantedQos0 | SubscribeAckReason::GrantedQos1]
+    ));
+
+    let _ = await_disconnected(&mut phase).await;
+
+    timeout(Duration::from_secs(5), async {
+        while !holding_suback.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("broker must observe resubscribe SUBSCRIBE");
+
+    client.shutdown().await.expect("shutdown");
+    let finished = timeout(Duration::from_secs(1), run).await;
+    assert!(
+        finished.is_ok(),
+        "resubscribe_pending must respect cancel — run must finish well before SubAck timeout"
+    );
+}
+
+/// PUBLISH arriving during resubscribe wait must reach the handoff (not discarded).
+#[tokio::test]
+async fn resubscribe_does_not_silently_drop_inbound_publish() {
+    use crate::client::Subscription;
+    use crate::codec::{QoS, SubscribeAckReason};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let sessions = Arc::new(AtomicU32::new(0));
+    let port = spawn_broker_loop({
+        let sessions = Arc::clone(&sessions);
+        move |mut framed_read, mut framed_write| {
+            let n = sessions.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+                    return;
+                }
+                loop {
+                    match framed_read.next().await {
+                        Some(Ok((DecodedFrame::Control(Packet::Subscribe(sub)), _))) => {
+                            if n == 1 {
+                                let _ = framed_write
+                                    .send(Packet::SubscribeAck(crate::codec::SubscribeAck {
+                                        packet_id: sub.packet_id,
+                                        properties: Vec::new(),
+                                        reason_string: None,
+                                        status: vec![SubscribeAckReason::GrantedQos1],
+                                    }))
+                                    .await;
+                                return;
+                            }
+                            // PUBLISH first, then matching SUBACK — today PUBLISH is dropped.
+                            send_inbound_qos1_publish(
+                                &mut framed_write,
+                                "resub/during",
+                                b"keep-me",
+                                NonZeroU16::new(9).expect("nz"),
+                                crate::codec::PublishProperties::default(),
+                            )
+                            .await;
+                            let _ = framed_write
+                                .send(Packet::SubscribeAck(crate::codec::SubscribeAck {
+                                    packet_id: sub.packet_id,
+                                    properties: Vec::new(),
+                                    reason_string: None,
+                                    status: vec![SubscribeAckReason::GrantedQos1],
+                                }))
+                                .await;
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(_)) | None => return,
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
+    let (tx, rx) = flume::bounded::<PublishMessage>(8);
+    let (client, connection, mut phase) = connect(
+        options,
+        static_test_credentials(),
+        DelayedReconnect { delay: Duration::ZERO },
+        tx,
+        NoopLifecycle,
+    )
+    .expect("connect");
+
+    let run = tokio::spawn(connection.run());
+    await_connected(&mut phase).await;
+    client
+        .subscribe(vec![Subscription::new("resub/during", QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe");
+    let _ = await_disconnected(&mut phase).await;
+
+    // After reconnect + resubscribe, the mid-wait PUBLISH must not be lost.
+    let msg = timeout(Duration::from_secs(5), rx.recv_async())
+        .await
+        .expect("inbound PUBLISH during resubscribe must reach handoff (not silently discarded)")
+        .expect("handoff closed");
+    assert_eq!(&*msg.payload, b"keep-me");
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+}
+
+/// non-granted auto-resubscribe SUBACK must not look like Connected-and-fine.
+#[tokio::test]
+async fn resubscribe_fails_when_suback_not_granted() {
+    use crate::client::Subscription;
+    use crate::codec::{QoS, SubscribeAckReason};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let sessions = Arc::new(AtomicU32::new(0));
+    let port = spawn_broker_loop({
+        let sessions = Arc::clone(&sessions);
+        move |mut framed_read, mut framed_write| {
+            let n = sessions.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+                    return;
+                }
+                loop {
+                    match framed_read.next().await {
+                        Some(Ok((DecodedFrame::Control(Packet::Subscribe(sub)), _))) => {
+                            let reason = if n == 1 {
+                                SubscribeAckReason::GrantedQos1
+                            } else {
+                                SubscribeAckReason::NotAuthorized
+                            };
+                            let _ = framed_write
+                                .send(Packet::SubscribeAck(crate::codec::SubscribeAck {
+                                    packet_id: sub.packet_id,
+                                    properties: Vec::new(),
+                                    reason_string: None,
+                                    status: vec![reason],
+                                }))
+                                .await;
+                            if n == 1 {
+                                return;
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(_)) | None => return,
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
+    let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+    let (client, connection, mut phase) = connect(
+        options,
+        static_test_credentials(),
+        DelayedReconnect { delay: Duration::ZERO },
+        tx,
+        NoopLifecycle,
+    )
+    .expect("connect");
+
+    let run = tokio::spawn(connection.run());
+    await_connected(&mut phase).await;
+    client
+        .subscribe(vec![Subscription::new("resub/denied", QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe");
+
+    let disconnected = await_disconnected(&mut phase).await;
+    assert!(matches!(disconnected, SessionPhase::Disconnected(_)));
+    // Mark the first Disconnected as seen so the next wait observes the post-resub failure.
+    let _ = phase.borrow_and_update();
+
+    timeout(Duration::from_secs(5), phase.changed())
+        .await
+        .expect("post-resubscribe phase change")
+        .expect("phase watch closed");
+    let next = phase.borrow().clone();
+    assert!(
+        matches!(next, SessionPhase::Disconnected(_)),
+        "non-granted auto-resubscribe must error/reconnect — not silent Connected; got {next:?}"
+    );
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+}
+
+/// after connect+run, watch shows Connected and QoS0 publish works
+/// (session start is not blocked by lifecycle consumers).
+#[tokio::test]
+async fn session_start_sets_watch_connected_and_allows_qos0() {
+    use crate::codec::{PublishMessage, PublishProperties};
+    use bytes::Bytes;
+    use bytestring::ByteString;
+
+    let (client, connection, mut phase) = test_connect().await;
+    let run = tokio::spawn(connection.run());
+
+    await_connected(&mut phase).await;
+    assert!(matches!(
+        *phase.borrow(),
+        SessionPhase::Connected {
+            session: SessionParams { from_connack: true, .. },
+            ..
+        }
+    ));
+
+    let published = timeout(
+        Duration::from_secs(3),
+        client.publish(
+            PublishMessage {
+                topic: ByteString::from_static("f10/go"),
+                payload: Bytes::from_static(b"go"),
+                properties: PublishProperties::default(),
+            },
+            QoS::AtMostOnce,
+            false,
+        ),
+    )
+    .await
+    .expect("session start must not block QoS 0 publish (watch Connected is non-blocking)");
+    assert!(
+        published.is_ok(),
+        "QoS 0 publish confirms write task is running; got {published:?}"
+    );
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+}
+
+/// Recording [`LifecycleHook`] sees Connected then Disconnected (order + delivery).
+#[tokio::test]
+async fn lifecycle_hook_records_connected_then_disconnected() {
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Recorded {
+        Connected { generation: u64 },
+        Disconnected,
+    }
+
+    struct RecordingHook {
+        events: Mutex<Vec<Recorded>>,
+    }
+
+    impl LifecycleHook for RecordingHook {
+        fn on_lifecycle(&self, phase: &SessionPhase) {
+            let recorded = match phase {
+                SessionPhase::Connected { generation, .. } => Recorded::Connected {
+                    generation: *generation,
+                },
+                SessionPhase::Disconnected(_) => Recorded::Disconnected,
+                SessionPhase::NeverConnected => {
+                    panic!("hook must not receive SessionPhase::NeverConnected")
+                }
+            };
+            self.events.lock().expect("recording hook lock").push(recorded);
+        }
+    }
+
+    let hook = Arc::new(RecordingHook {
+        events: Mutex::new(Vec::new()),
+    });
+    let port = spawn_mock_broker().await;
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
+    let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+    let (client, connection, mut phase) =
+        connect(options, static_test_credentials(), NoReconnect, tx, Arc::clone(&hook)).expect("connect wiring");
+
+    let run = tokio::spawn(connection.run());
+    await_connected(&mut phase).await;
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+
+    let events = hook.events.lock().expect("recording hook lock").clone();
+    assert!(
+        matches!(
+            events.as_slice(),
+            [Recorded::Connected { generation }, Recorded::Disconnected] if *generation >= 1
+        ),
+        "hook must see Connected then Disconnected in order, got {events:?}"
+    );
+}
+
+/// handoff-accepted publishes remain available to the consumer after shutdown.
+///
+/// Also asserts wire order PUBACK before DISCONNECT (requires the mock broker below).
+#[tokio::test]
+async fn handoff_survives_shutdown() {
+    use tokio::sync::mpsc as tokio_mpsc;
+    use tokio::sync::oneshot;
+
+    let (ready_tx, mut ready_rx) = tokio_mpsc::channel::<()>(1);
+    let (order_tx, order_rx) = oneshot::channel::<Vec<(&'static str, u16)>>();
+    let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+        if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+            return;
+        }
+        let _ = ready_tx.send(()).await;
+        send_inbound_qos1_publish(
+            &mut framed_write,
+            "in/handoff",
+            b"keep-me",
+            NonZeroU16::new(9).expect("nz"),
+            crate::codec::PublishProperties::default(),
+        )
+        .await;
+        let mut order = Vec::new();
+        while let Some(frame) = framed_read.next().await {
+            match frame {
+                Ok((DecodedFrame::Control(Packet::PublishAck(ack)), _)) => {
+                    order.push(("puback", ack.packet_id.get()));
+                }
+                Ok((DecodedFrame::Control(Packet::Disconnect(_)), _)) => {
+                    order.push(("disconnect", 0));
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let _ = order_tx.send(order);
+    })
+    .await;
+
+    let (handoff_tx, handoff_rx) = flume::bounded::<PublishMessage>(4);
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(2).expect("nz"));
+    let (client, connection, mut phase) = connect(
+        options,
+        static_test_credentials(),
+        NoReconnect,
+        handoff_tx,
+        NoopLifecycle,
+    )
+    .expect("connect");
+
+    let run = tokio::spawn(connection.run());
+    await_connected(&mut phase).await;
+    ready_rx.recv().await.expect("broker ready");
+
+    timeout(Duration::from_secs(2), async {
+        while handoff_rx.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("message must land in handoff before shutdown");
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+
+    let got = timeout(Duration::from_secs(2), handoff_rx.recv_async())
+        .await
+        .expect("handoff recv after shutdown must not hang")
+        .expect("handoff must still deliver the accepted publish after shutdown");
+    assert_eq!(&*got.payload, b"keep-me");
+
+    let order = timeout(Duration::from_secs(2), order_rx)
+        .await
+        .expect("peer order timeout")
+        .expect("peer order");
+    let puback_pos = order.iter().position(|(k, _)| *k == "puback");
+    let disconnect_pos = order.iter().position(|(k, _)| *k == "disconnect");
+    assert!(
+        matches!((puback_pos, disconnect_pos), (Some(p), Some(d)) if p < d),
+        "PUBACK must precede DISCONNECT after handoff-accepted QoS1 (got {order:?})"
+    );
+    assert_eq!(order[puback_pos.expect("puback")].1, 9);
+}
