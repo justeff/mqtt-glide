@@ -12,6 +12,13 @@ homepage = "https://github.com/justeff/mqtt-glide"
 documentation = "https://docs.rs/mqtt-glide"
 keywords = ["mqtt", "mqtt5", "tokio", "async", "client"]
 categories = ["network-programming", "asynchronous"]
+# Keep the crates.io tarball lean; benches/tests stay in git for CI.
+exclude = [
+    "/benches/",
+    "/tests/",
+    "/BENCHMARKS.md",
+    "/CONTRIBUTING.md",
+]
 
 [lints.rust]
 unsafe_code = "deny"
