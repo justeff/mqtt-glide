@@ -35,7 +35,7 @@ Each JSONL line is one cell (`status: ok` or `n/a` with `reason`).
 
 | Value | Crate | Baseline version |
 |-------|--------|------------------|
-| `glide` | mqtt-glide (this crate) | **0.1.0** (`CARGO_PKG_VERSION`; not every release is re-benched) |
+| `glide` | mqtt-glide (this crate) | **0.1.1** (`CARGO_PKG_VERSION`; not every release is re-benched) |
 | `rumqttc` | `rumqttc-next` | **0.33.3** (pinned; do not bump to 0.34+ without a full re-bench) |
 | `mqtt5` | LabOverWire `mqtt5` | **0.37.2** (pinned) |
 
