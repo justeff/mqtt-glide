@@ -34,7 +34,7 @@ pub(crate) fn ensure_empty_body(src: &mut Bytes) -> Result<(), DecodeError> {
 #[inline]
 pub(crate) fn ensure_exact_fixed_header(actual: u8, expected: u8) -> Result<(), DecodeError> {
     if (actual & 0xF0) == (expected & 0xF0) && actual != expected {
-        return Err(DecodeError::MalformedPacket);
+        return Err(DecodeError::MalformedPacket("invalid fixed header flags"));
     }
     Ok(())
 }
@@ -50,13 +50,13 @@ pub(crate) fn decode_variable_length(src: &[u8]) -> Result<Option<(u32, usize)>,
     let mut cur = Cursor::new(src);
     match decode_variable_length_cursor(&mut cur) {
         Ok(len) => Ok(Some((len, cur.position() as usize))),
-        Err(DecodeError::MalformedPacket) => {
+        Err(DecodeError::MalformedPacket(_)) => {
             let consumed = cur.position() as usize;
             // Continuation bit on the last consumed byte means the varint is truncated.
             if consumed > 0 && src[consumed - 1] & 0x80 != 0 {
                 Ok(None)
             } else {
-                Err(DecodeError::MalformedPacket)
+                Err(DecodeError::MalformedPacket("invalid variable byte integer"))
             }
         }
         Err(e) => Err(e),
@@ -89,14 +89,17 @@ pub(crate) fn decode_variable_length_cursor<B: Buf>(src: &mut B) -> Result<u32, 
     let mut shift: u32 = 0;
     let mut len: u32 = 0;
     loop {
-        ensure!(src.has_remaining(), DecodeError::MalformedPacket);
+        ensure!(
+            src.has_remaining(),
+            DecodeError::MalformedPacket("truncated variable byte integer")
+        );
         let val = src.get_u8();
         len += ((val & 0b0111_1111) as u32) << shift;
         if val & 0b1000_0000 == 0 {
             let consumed = start - src.remaining();
             ensure!(
                 consumed == minimal_variable_length_bytes(len),
-                DecodeError::MalformedPacket
+                DecodeError::MalformedPacket("non-minimal variable byte integer")
             );
             return Ok(len);
         }
@@ -184,12 +187,12 @@ mod tests {
         // 0 must be a single 0x00 byte, not 0x80 0x00. [MQTT-1.5.5-1]
         assert!(matches!(
             decode_variable_length(&[0x80, 0x00]),
-            Err(DecodeError::MalformedPacket)
+            Err(DecodeError::MalformedPacket(_))
         ));
         // 128 must be 0x80 0x01, not 0x80 0x80 0x00.
         assert!(matches!(
             decode_variable_length(&[0x80, 0x80, 0x00]),
-            Err(DecodeError::MalformedPacket)
+            Err(DecodeError::MalformedPacket(_))
         ));
         // Trailing continuation without follow-up stays incomplete.
         assert_eq!(decode_variable_length(&[0x80]).unwrap(), None);
@@ -202,7 +205,7 @@ mod tests {
         let mut non_empty = Bytes::from_static(b"\x00");
         assert!(matches!(
             ensure_empty_body(&mut non_empty),
-            Err(DecodeError::MalformedPacket)
+            Err(DecodeError::MalformedPacket(_))
         ));
     }
 
@@ -212,7 +215,7 @@ mod tests {
         assert!(ensure_exact_fixed_header(0x10, 0x20).is_ok()); // different type nibble
         assert!(matches!(
             ensure_exact_fixed_header(0x83, 0x82),
-            Err(DecodeError::MalformedPacket)
+            Err(DecodeError::MalformedPacket(_))
         ));
     }
 }

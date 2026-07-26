@@ -228,7 +228,7 @@ Broker-dependent: Message Expiry *drop after interval* (property round-trip is t
 
 ## Performance
 
-Absolute multi-client matrix (mqtt-glide / rumqttc-next / mqtt5). Full tables, host, caveats: [`BENCHMARKS.md`](BENCHMARKS.md). How to run / fairness: [`benches/README.md`](benches/README.md).
+Results: [`BENCHMARKS.md`](BENCHMARKS.md). How to run: [`benches/README.md`](benches/README.md).
 
 **Host:** Apple MacBook Pro, M1 Max (8P+2E), 32 GB, macOS 26.5.2. **Baseline broker:** Mosquitto `2.1.2-alpine` (median-of-100).
 
@@ -257,16 +257,14 @@ Defaults (`command_channel_capacity` / `receive_maximum` = **32**) favour many l
 Do not confuse Cap (app → write admission) with MQTT Receive Maximum (inbound QoS 1 window) or CONNACK server Receive Maximum (outbound QoS 1 inflight). Internal write coalesce / soft-flush sizes are fixed implementation details, not `ConnectOptions`.
 
 ```shell
-# Requires Podman or Docker for Mosquitto (published baseline: median-of-100)
+# Mosquitto via Podman or Docker (median-of-100 baseline)
 MQTT_COMPARE_RUNS=100 cargo bench --bench mqtt_compare
 
 # Quick smoke (no container)
 MQTT_COMPARE_BROKER=mock MQTT_COMPARE_RUNS=1 cargo bench --bench mqtt_compare
 ```
 
-When refreshing, update [`BENCHMARKS.md`](BENCHMARKS.md) from JSONL, then sync the highlight table above.
-
-## License / publish
+## License
 
 Licensed under either of
 
@@ -274,7 +272,3 @@ Licensed under either of
 - MIT license ([`LICENSE-MIT`](LICENSE-MIT) or https://opensource.org/licenses/MIT)
 
 at your option.
-
-**MSRV:** Rust **1.88** (library). Running the full `mqtt_compare` bench pulls `rumqttc-next` and needs **1.89**.
-
-Publish with `cargo publish --dry-run`, then `cargo publish` (requires a crates.io token).

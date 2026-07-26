@@ -102,7 +102,7 @@ impl TryFrom<u8> for DisconnectReasonCode {
             160 => Ok(Self::MaximumConnectTime),
             161 => Ok(Self::SubscriptionIdentifiersNotSupported),
             162 => Ok(Self::WildcardSubscriptionsNotSupported),
-            _ => Err(DecodeError::MalformedPacket),
+            _ => Err(DecodeError::MalformedPacket("unknown property or reason code")),
         }
     }
 }
@@ -151,7 +151,7 @@ impl Disconnect {
                         pt::REASON_STRING => reason_string.read_value(prop_src)?,
                         pt::USER => user_properties.push(UserProperty::decode(prop_src)?),
                         pt::SERVER_REF => server_reference.read_value(prop_src)?,
-                        _ => return Err(DecodeError::MalformedPacket),
+                        _ => return Err(DecodeError::MalformedPacket("unknown property or reason code")),
                     }
                 }
                 ensure!(!src.has_remaining(), DecodeError::InvalidLength);
@@ -238,7 +238,7 @@ mod tests {
         let mut src = Bytes::from_static(&[0x7F]);
         assert!(matches!(
             Disconnect::decode(&mut src),
-            Err(DecodeError::MalformedPacket)
+            Err(DecodeError::MalformedPacket(_))
         ));
     }
 

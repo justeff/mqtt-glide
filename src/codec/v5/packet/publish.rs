@@ -33,7 +33,7 @@ impl PublishPacket {
         let qos = QoS::try_from((packet_flags & 0b0110) >> 1)?; // [MQTT-3.3.1-4]
         if qos == QoS::AtMostOnce && dup {
             // [MQTT-3.3.1-2]
-            return Err(DecodeError::MalformedPacket);
+            return Err(DecodeError::MalformedPacket("PUBLISH QoS 0 with DUP"));
         }
 
         let topic = utils::decode_topic_name_allow_empty(&mut src)?;
@@ -45,14 +45,10 @@ impl PublishPacket {
         };
 
         let properties = parse_publish_properties(&mut src)?;
-        if properties.as_ref().is_some_and(|p| !p.subscription_ids.is_empty()) {
-            // [MQTT-3.3.4-6] Client→Server PUBLISH must not carry Subscription Identifier.
-            return Err(DecodeError::MalformedPacket);
-        }
         let wire_topic_alias = properties.as_ref().and_then(|p| p.topic_alias);
         if topic.is_empty() && wire_topic_alias.is_none() {
             // [MQTT-4.7.3-1] unless Topic Alias supplies the name [MQTT-3.3.2-3]
-            return Err(DecodeError::MalformedPacket);
+            return Err(DecodeError::MalformedPacket("empty topic without topic alias"));
         }
         let payload = src;
         let props = properties.unwrap_or_default();
@@ -95,7 +91,9 @@ fn reject_qos0_packet_identifier(src: &Bytes) -> Result<(), DecodeError> {
     if src.remaining() >= 3 {
         let mut after_packet_id = src.slice(2..);
         if utils::take_properties(&mut after_packet_id).is_ok() {
-            return Err(DecodeError::MalformedPacket);
+            return Err(DecodeError::MalformedPacket(
+                "QoS 0 PUBLISH must not include packet identifier",
+            ));
         }
     }
     Ok(())
@@ -126,7 +124,6 @@ fn parse_publish_properties(src: &mut Bytes) -> Result<Option<PublishWirePropert
     let mut topic_alias = None;
     let mut content_type = None;
     let mut correlation_data = None;
-    let mut subscription_ids = Vec::new();
     let mut response_topic = None;
     let mut is_utf8_payload = None;
     let mut user_props = Vec::new();
@@ -139,12 +136,15 @@ fn parse_publish_properties(src: &mut Bytes) -> Result<Option<PublishWirePropert
             pt::RESP_TOPIC => response_topic.read_value(prop_src)?,
             pt::CORR_DATA => correlation_data.read_value(prop_src)?,
             pt::SUB_ID => {
+                // Deferred: consume and discard (including illegal 0 from lenient peers).
                 let id = utils::decode_variable_length_cursor(prop_src)?;
-                subscription_ids.push(NonZeroU32::new(id).ok_or(DecodeError::MalformedPacket)?);
+                if id == 0 {
+                    tracing::debug!("ignoring inbound PUBLISH Subscription Identifier 0");
+                }
             }
             pt::TOPIC_ALIAS => topic_alias.read_value(prop_src)?,
             pt::USER => user_props.push(<(ByteString, ByteString)>::decode(prop_src)?),
-            _ => return Err(DecodeError::MalformedPacket),
+            _ => return Err(DecodeError::MalformedPacket("unknown PUBLISH property")),
         }
     }
 
@@ -153,7 +153,7 @@ fn parse_publish_properties(src: &mut Bytes) -> Result<Option<PublishWirePropert
         topic_alias,
         content_type,
         correlation_data,
-        subscription_ids,
+        subscription_ids: Vec::new(),
         response_topic,
         is_utf8_payload: is_utf8_payload.unwrap_or(false),
         user_properties: user_props,
@@ -199,12 +199,13 @@ mod tests {
         let result = PublishPacket::decode(topic_and_prop0_payload(b"data"), QOS0_DUP_FLAGS);
         assert_eq!(
             result.map_err(|e| e.to_string()),
-            Err(DecodeError::MalformedPacket.to_string())
+            Err(DecodeError::MalformedPacket("PUBLISH QoS 0 with DUP").to_string())
         );
     }
 
     #[test]
-    fn publish_decode_client_subscription_identifier_rejected() {
+    fn publish_decode_server_subscription_identifier_accepted_and_discarded() {
+        // Server→Client may carry Subscription Identifier; product API does not expose it.
         let mut body = BytesMut::new();
         ByteString::from_static("topic").encode(&mut body).unwrap();
         body.put_u8(2); // Property Length
@@ -212,11 +213,24 @@ mod tests {
         body.put_u8(1); // Subscription Identifier = 1
         body.put_slice(b"data");
 
-        let result = PublishPacket::decode(body.freeze(), QOS0_FLAGS);
-        assert_eq!(
-            result.map_err(|e| e.to_string()),
-            Err(DecodeError::MalformedPacket.to_string())
-        );
+        let publish = PublishPacket::decode(body.freeze(), QOS0_FLAGS).expect("inbound SUB_ID ok");
+        assert_eq!(&*publish.message.topic, "topic");
+        assert_eq!(publish.message.payload.as_ref(), b"data");
+        assert!(publish.message.properties.is_wire_empty());
+    }
+
+    #[test]
+    fn publish_decode_subscription_identifier_zero_accepted_and_discarded() {
+        let mut body = BytesMut::new();
+        ByteString::from_static("topic").encode(&mut body).unwrap();
+        body.put_u8(2); // Property Length
+        body.put_u8(pt::SUB_ID);
+        body.put_u8(0); // illegal per spec; tolerated inbound
+        body.put_slice(b"data");
+
+        let publish = PublishPacket::decode(body.freeze(), QOS0_FLAGS).expect("SUB_ID 0 ok");
+        assert_eq!(&*publish.message.topic, "topic");
+        assert_eq!(publish.message.payload.as_ref(), b"data");
     }
 
     #[test]
@@ -227,7 +241,7 @@ mod tests {
         let result = PublishPacket::decode(body, QOS1_FLAGS);
         assert!(matches!(
             result,
-            Err(DecodeError::InvalidLength) | Err(DecodeError::MalformedPacket)
+            Err(DecodeError::InvalidLength) | Err(DecodeError::MalformedPacket(_))
         ));
     }
 
@@ -239,14 +253,14 @@ mod tests {
         body.put_u16(0);
         body.put_u8(0);
         let result = PublishPacket::decode(body.freeze(), QOS1_FLAGS);
-        assert!(matches!(result, Err(DecodeError::MalformedPacket)));
+        assert!(matches!(result, Err(DecodeError::MalformedPacket(_))));
     }
 
     #[test]
     fn publish_decode_rejects_both_qos_bits_set() {
         const QOS3_FLAGS: u8 = 0b0110;
         let result = PublishPacket::decode(topic_and_prop0_payload(b""), QOS3_FLAGS);
-        assert!(matches!(result, Err(DecodeError::MalformedPacket)));
+        assert!(matches!(result, Err(DecodeError::MalformedPacket(_))));
     }
 
     #[test]
@@ -260,7 +274,7 @@ mod tests {
         let result = PublishPacket::decode(body.freeze(), QOS0_FLAGS);
         assert_eq!(
             result.map_err(|e| e.to_string()),
-            Err(DecodeError::MalformedPacket.to_string())
+            Err(DecodeError::MalformedPacket("QoS 0 PUBLISH must not include packet identifier").to_string())
         );
     }
 
@@ -275,7 +289,7 @@ mod tests {
         let result = PublishPacket::decode(body.freeze(), QOS0_FLAGS);
         assert_eq!(
             result.map_err(|e| e.to_string()),
-            Err(DecodeError::MalformedPacket.to_string())
+            Err(DecodeError::MalformedPacket("QoS 0 PUBLISH must not include packet identifier").to_string())
         );
     }
 
@@ -284,7 +298,7 @@ mod tests {
         let src = Bytes::from_static(&[0x00, 0x00, 0x00]);
         assert!(matches!(
             PublishPacket::decode(src, 0),
-            Err(DecodeError::MalformedPacket)
+            Err(DecodeError::MalformedPacket("empty topic without topic alias"))
         ));
     }
 
@@ -294,7 +308,7 @@ mod tests {
         let src = Bytes::from_static(&[0x00, 0x02, 0xC0, 0x80, 0x00]);
         assert!(matches!(
             PublishPacket::decode(src, QOS0_FLAGS),
-            Err(DecodeError::MalformedPacket)
+            Err(DecodeError::MalformedPacket(_))
         ));
     }
 
@@ -310,7 +324,7 @@ mod tests {
         body.put_u8(0); // payload (empty)
 
         let result = PublishPacket::decode(body.freeze(), QOS0_FLAGS);
-        assert!(matches!(result, Err(DecodeError::MalformedPacket)));
+        assert!(matches!(result, Err(DecodeError::MalformedPacket(_))));
     }
 
     #[test]

@@ -72,7 +72,7 @@ impl TryFrom<u8> for RetainHandling {
             0 => Ok(Self::AtSubscribe),
             1 => Ok(Self::AtSubscribeNew),
             2 => Ok(Self::NoAtSubscribe),
-            _ => Err(DecodeError::MalformedPacket),
+            _ => Err(DecodeError::MalformedPacket("unknown property or reason code")),
         }
     }
 }
@@ -148,7 +148,7 @@ impl TryFrom<u8> for SubscribeAckReason {
             158 => Ok(Self::SharedSubscriptionNotSupported),
             161 => Ok(Self::SubscriptionIdentifiersNotSupported),
             162 => Ok(Self::WildcardSubscriptionsNotSupported),
-            _ => Err(DecodeError::MalformedPacket),
+            _ => Err(DecodeError::MalformedPacket("unknown property or reason code")),
         }
     }
 }
@@ -184,7 +184,7 @@ impl TryFrom<u8> for UnsubscribeAckReason {
             135 => Ok(Self::NotAuthorized),
             143 => Ok(Self::TopicFilterInvalid),
             145 => Ok(Self::PacketIdentifierInUse),
-            _ => Err(DecodeError::MalformedPacket),
+            _ => Err(DecodeError::MalformedPacket("unknown property or reason code")),
         }
     }
 }
@@ -205,12 +205,12 @@ impl Subscribe {
             let prop_id = prop_src.get_u8();
             match prop_id {
                 pt::SUB_ID => {
-                    ensure!(sub_id.is_none(), DecodeError::MalformedPacket); // can't appear twice
+                    ensure!(sub_id.is_none(), DecodeError::MalformedPacket("invalid encoding")); // can't appear twice
                     let val = utils::decode_variable_length_cursor(prop_src)?;
-                    sub_id = Some(NonZeroU32::new(val).ok_or(DecodeError::MalformedPacket)?);
+                    sub_id = Some(NonZeroU32::new(val).ok_or(DecodeError::MalformedPacket("invalid encoding"))?);
                 }
                 pt::USER => user_properties.push(UserProperty::decode(prop_src)?),
-                _ => return Err(DecodeError::MalformedPacket),
+                _ => return Err(DecodeError::MalformedPacket("unknown property or reason code")),
             }
         }
 
@@ -222,7 +222,10 @@ impl Subscribe {
         }
 
         // [MQTT-3.8.3-2] SUBSCRIBE payload must contain at least one Topic Filter
-        ensure!(!topic_filters.is_empty(), DecodeError::MalformedPacket);
+        ensure!(
+            !topic_filters.is_empty(),
+            DecodeError::MalformedPacket("invalid encoding")
+        );
 
         Ok(Self {
             packet_id,
@@ -237,7 +240,7 @@ impl SubscribeAck {
     pub(crate) fn decode(src: &mut Bytes) -> Result<Self, DecodeError> {
         let packet_id = NonZeroU16::decode(src)?;
         let (properties, reason_string) = ack_props::decode(src)?;
-        ensure!(src.has_remaining(), DecodeError::MalformedPacket);
+        ensure!(src.has_remaining(), DecodeError::MalformedPacket("invalid encoding"));
         let mut status = Vec::with_capacity(src.remaining());
         for code in src.as_ref().iter().copied() {
             status.push(code.try_into()?);
@@ -261,7 +264,7 @@ impl Unsubscribe {
             let prop_id = prop_src.get_u8();
             match prop_id {
                 pt::USER => user_properties.push(UserProperty::decode(prop_src)?),
-                _ => return Err(DecodeError::MalformedPacket),
+                _ => return Err(DecodeError::MalformedPacket("unknown property or reason code")),
             }
         }
 
@@ -271,7 +274,10 @@ impl Unsubscribe {
         }
 
         // [MQTT-3.10.3-2] UNSUBSCRIBE payload must contain at least one Topic Filter
-        ensure!(!topic_filters.is_empty(), DecodeError::MalformedPacket);
+        ensure!(
+            !topic_filters.is_empty(),
+            DecodeError::MalformedPacket("invalid encoding")
+        );
 
         Ok(Self {
             packet_id,
@@ -285,7 +291,7 @@ impl UnsubscribeAck {
     pub(crate) fn decode(src: &mut Bytes) -> Result<Self, DecodeError> {
         let packet_id = NonZeroU16::decode(src)?;
         let (properties, reason_string) = ack_props::decode(src)?;
-        ensure!(src.has_remaining(), DecodeError::MalformedPacket);
+        ensure!(src.has_remaining(), DecodeError::MalformedPacket("invalid encoding"));
         let mut status = Vec::with_capacity(src.remaining());
         for code in src.as_ref().iter().copied() {
             status.push(code.try_into()?);
@@ -343,7 +349,10 @@ impl Decode for SubscriptionOptions {
         ensure!(src.has_remaining(), DecodeError::InvalidLength);
         let val = src.get_u8();
         // [MQTT-3.8.3-5] Subscription Options bits 6-7 are reserved
-        ensure!((val & 0b1100_0000) == 0, DecodeError::MalformedPacket);
+        ensure!(
+            (val & 0b1100_0000) == 0,
+            DecodeError::MalformedPacket("invalid encoding")
+        );
         let qos = (val & 0b0000_0011).try_into()?;
         let retain_handling = ((val & 0b0011_0000) >> 4).try_into()?;
         Ok(SubscriptionOptions {
@@ -576,16 +585,16 @@ mod tests {
         let mut src = Bytes::from(wire);
         let rejected_as_malformed = match target {
             SubscribeFamily::Subscribe => {
-                matches!(Subscribe::decode(&mut src), Err(DecodeError::MalformedPacket))
+                matches!(Subscribe::decode(&mut src), Err(DecodeError::MalformedPacket(_)))
             }
             SubscribeFamily::Unsubscribe => {
-                matches!(Unsubscribe::decode(&mut src), Err(DecodeError::MalformedPacket))
+                matches!(Unsubscribe::decode(&mut src), Err(DecodeError::MalformedPacket(_)))
             }
             SubscribeFamily::SubscribeAck => {
-                matches!(SubscribeAck::decode(&mut src), Err(DecodeError::MalformedPacket))
+                matches!(SubscribeAck::decode(&mut src), Err(DecodeError::MalformedPacket(_)))
             }
             SubscribeFamily::UnsubscribeAck => {
-                matches!(UnsubscribeAck::decode(&mut src), Err(DecodeError::MalformedPacket))
+                matches!(UnsubscribeAck::decode(&mut src), Err(DecodeError::MalformedPacket(_)))
             }
         };
         assert!(rejected_as_malformed);
@@ -594,7 +603,10 @@ mod tests {
     #[test]
     fn subscribe_rejects_empty_filter_string() {
         let mut src = Bytes::from_static(&[0x12, 0x34, 0x00, 0x00, 0x00]);
-        assert!(matches!(Subscribe::decode(&mut src), Err(DecodeError::MalformedPacket)));
+        assert!(matches!(
+            Subscribe::decode(&mut src),
+            Err(DecodeError::MalformedPacket(_))
+        ));
     }
 
     #[test]
@@ -602,7 +614,7 @@ mod tests {
         let mut src = Bytes::from_static(&[0x12, 0x34, 0x00]);
         assert!(matches!(
             SubscribeAck::decode(&mut src),
-            Err(DecodeError::MalformedPacket)
+            Err(DecodeError::MalformedPacket("invalid encoding"))
         ));
     }
 
@@ -611,7 +623,7 @@ mod tests {
         let mut src = Bytes::from_static(&[0x12, 0x34, 0x00]);
         assert!(matches!(
             UnsubscribeAck::decode(&mut src),
-            Err(DecodeError::MalformedPacket)
+            Err(DecodeError::MalformedPacket("invalid encoding"))
         ));
     }
 
@@ -620,7 +632,7 @@ mod tests {
         let mut src = Bytes::from_static(&[0xC0]);
         assert!(matches!(
             SubscriptionOptions::decode(&mut src),
-            Err(DecodeError::MalformedPacket)
+            Err(DecodeError::MalformedPacket("invalid encoding"))
         ));
     }
 

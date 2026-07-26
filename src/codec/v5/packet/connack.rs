@@ -206,7 +206,7 @@ impl ConnectAck {
                 pt::SESS_EXPIRY_INT => session_expiry_interval_secs.read_value(prop_src)?,
                 pt::RECEIVE_MAX => receive_max.read_value(prop_src)?,
                 pt::MAX_QOS => {
-                    ensure!(max_qos.is_none(), DecodeError::MalformedPacket); // property is set twice while not allowed
+                    ensure!(max_qos.is_none(), DecodeError::MalformedPacket("invalid encoding")); // property is set twice while not allowed
                     ensure!(prop_src.has_remaining(), DecodeError::InvalidLength);
                     max_qos = Some(prop_src.get_u8().try_into()?);
                 }
@@ -224,7 +224,7 @@ impl ConnectAck {
                 pt::SERVER_REF => server_reference.read_value(prop_src)?,
                 pt::AUTH_METHOD => auth_method.read_value(prop_src)?,
                 pt::AUTH_DATA => auth_data.read_value(prop_src)?,
-                _ => return Err(DecodeError::MalformedPacket),
+                _ => return Err(DecodeError::MalformedPacket("unknown property or reason code")),
             }
         }
         ensure!(!src.has_remaining(), DecodeError::InvalidLength);

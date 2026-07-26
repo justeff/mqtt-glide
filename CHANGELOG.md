@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Inbound PUBLISH `Subscription Identifier` (including illegal `0`) is parsed and discarded instead of disconnecting; `0` is logged at `debug`
+- `DecodeError::MalformedPacket` now carries an ops-facing reason (`decode error: Malformed packet: …`)
+
 ## [0.1.0] - 2026-07-24
 
 ### Added

@@ -199,7 +199,7 @@ pub mod ack_props {
             match prop_id {
                 pt::REASON_STRING => reason_string.read_value(prop_src)?,
                 pt::USER => user_props.push(<(ByteString, ByteString)>::decode(prop_src)?),
-                _ => return Err(DecodeError::MalformedPacket),
+                _ => return Err(DecodeError::MalformedPacket("unknown property or reason code")),
             }
         }
 

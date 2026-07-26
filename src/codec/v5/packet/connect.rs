@@ -124,10 +124,13 @@ impl Connect {
             // [MQTT-3.1.2-11] Will QoS bits must be zero when Will Flag is 0
             ensure!(
                 (flags & ConnectFlags::WILL_QOS).is_empty(),
-                DecodeError::MalformedPacket
+                DecodeError::MalformedPacket("Will QoS set without Will Flag")
             );
             // [MQTT-3.1.2-13] Will Retain must be 0 when Will Flag is 0
-            ensure!(!flags.contains(ConnectFlags::WILL_RETAIN), DecodeError::MalformedPacket);
+            ensure!(
+                !flags.contains(ConnectFlags::WILL_RETAIN),
+                DecodeError::MalformedPacket("Will Retain set without Will Flag")
+            );
         }
         let keep_alive = src.get_u16();
 
@@ -153,14 +156,14 @@ impl Connect {
                 pt::TOPIC_ALIAS_MAX => topic_alias_max.read_value(prop_src)?,
                 pt::USER => user_properties.push(UserProperty::decode(prop_src)?),
                 pt::MAX_PACKET_SIZE => max_packet_size.read_value(prop_src)?,
-                _ => return Err(DecodeError::MalformedPacket),
+                _ => return Err(DecodeError::MalformedPacket("unknown CONNECT property")),
             }
         }
 
         // CONNECT property rules: Authentication Data requires Authentication Method
         ensure!(
             auth_data.is_none() || auth_method.is_some(),
-            DecodeError::MalformedPacket
+            DecodeError::MalformedPacket("Authentication Data without Authentication Method")
         );
 
         let client_id = ByteString::decode(src)?;
@@ -254,7 +257,7 @@ fn decode_last_will(src: &mut Bytes, flags: ConnectFlags) -> Result<LastWill, De
             pt::UTF8_PAYLOAD => is_utf8_payload.read_value(prop_src)?,
             pt::RESP_TOPIC => response_topic.read_value(prop_src)?,
             pt::USER => user_properties.push(UserProperty::decode(prop_src)?),
-            _ => return Err(DecodeError::MalformedPacket),
+            _ => return Err(DecodeError::MalformedPacket("unknown property or reason code")),
         }
     }
 
@@ -402,15 +405,15 @@ mod tests {
     // [MQTT-3.1.2-19] Password Flag 1 → Password must be present
     #[case::password_missing_with_password_flag_set(0x40, b"\x00".as_slice(), b"\x00\x0512345".as_slice(), DecodeError::InvalidLength)]
     // [MQTT-3.1.3-4] ClientID must be a UTF-8 Encoded String
-    #[case::invalid_utf8_client_id(0x02, b"\x00".as_slice(), b"\x00\x02\xFF\xFE".as_slice(), DecodeError::MalformedPacket)]
+    #[case::invalid_utf8_client_id(0x02, b"\x00".as_slice(), b"\x00\x02\xFF\xFE".as_slice(), DecodeError::MalformedPacket("invalid UTF-8 string"))]
     // [MQTT-3.1.3-12] User Name must be UTF-8 when User Name Flag is 1
-    #[case::invalid_utf8_username_when_flag_set(0x80, b"\x00".as_slice(), b"\x00\x0512345\x00\x02\xFF\xFE".as_slice(), DecodeError::MalformedPacket)]
+    #[case::invalid_utf8_username_when_flag_set(0x80, b"\x00".as_slice(), b"\x00\x0512345\x00\x02\xFF\xFE".as_slice(), DecodeError::MalformedPacket("invalid UTF-8 string"))]
     // [MQTT-3.1.2-11] Will QoS bits must be zero when Will Flag is 0
-    #[case::will_qos_bits_set_without_will_flag(0x08, b"\x00".as_slice(), b"\x00\x0512345".as_slice(), DecodeError::MalformedPacket)]
+    #[case::will_qos_bits_set_without_will_flag(0x08, b"\x00".as_slice(), b"\x00\x0512345".as_slice(), DecodeError::MalformedPacket("Will QoS set without Will Flag"))]
     // [MQTT-3.1.2-13] Will Retain must be 0 when Will Flag is 0
-    #[case::will_retain_set_without_will_flag(0x20, b"\x00".as_slice(), b"\x00\x0512345".as_slice(), DecodeError::MalformedPacket)]
+    #[case::will_retain_set_without_will_flag(0x20, b"\x00".as_slice(), b"\x00\x0512345".as_slice(), DecodeError::MalformedPacket("Will Retain set without Will Flag"))]
     // CONNECT property rules: Authentication Data requires Authentication Method
-    #[case::auth_data_without_auth_method(0x02, b"\x05\x16\x00\x02ab".as_slice(), b"\x00\x0512345".as_slice(), DecodeError::MalformedPacket)]
+    #[case::auth_data_without_auth_method(0x02, b"\x05\x16\x00\x02ab".as_slice(), b"\x00\x0512345".as_slice(), DecodeError::MalformedPacket("Authentication Data without Authentication Method"))]
     fn connect_decode_rejects_invalid_flags(
         #[case] flags: u8,
         #[case] properties: &[u8],

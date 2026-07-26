@@ -43,7 +43,7 @@ impl TryFrom<u8> for AuthReasonCode {
             0 => Ok(Self::Success),
             24 => Ok(Self::ContinueAuth),
             25 => Ok(Self::ReAuth),
-            _ => Err(DecodeError::MalformedPacket),
+            _ => Err(DecodeError::MalformedPacket("unknown property or reason code")),
         }
     }
 }
@@ -82,7 +82,7 @@ impl Auth {
                             pt::AUTH_DATA => auth_data.read_value(prop_src)?,
                             pt::REASON_STRING => reason_string.read_value(prop_src)?,
                             pt::USER => user_properties.push(UserProperty::decode(prop_src)?),
-                            _ => return Err(DecodeError::MalformedPacket),
+                            _ => return Err(DecodeError::MalformedPacket("unknown property or reason code")),
                         }
                     }
                     ensure!(!src.has_remaining(), DecodeError::InvalidLength);
@@ -91,7 +91,7 @@ impl Auth {
                 if matches!(reason_code, AuthReasonCode::ContinueAuth | AuthReasonCode::ReAuth) && auth_method.is_none()
                 {
                     // [MQTT-3.15.2.2.2] Continue Authentication / Re-authenticate must include Authentication Method.
-                    return Err(DecodeError::MalformedPacket);
+                    return Err(DecodeError::MalformedPacket("invalid encoding"));
                 }
 
                 Self {
@@ -104,7 +104,7 @@ impl Auth {
             } else {
                 // Only Success (0x00) with no Properties may omit Reason Code body.
                 if reason_code != AuthReasonCode::Success {
-                    return Err(DecodeError::MalformedPacket);
+                    return Err(DecodeError::MalformedPacket("invalid encoding"));
                 }
                 Self {
                     reason_code,
@@ -182,8 +182,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case::continue_auth_reason_only(0x18, DecodeError::MalformedPacket)]
-    #[case::reauth_reason_only(0x19, DecodeError::MalformedPacket)]
+    #[case::continue_auth_reason_only(0x18, DecodeError::MalformedPacket("invalid encoding"))]
+    #[case::reauth_reason_only(0x19, DecodeError::MalformedPacket("invalid encoding"))]
     fn auth_decode_non_success_reason_only_rejected(#[case] reason: u8, #[case] error: DecodeError) {
         let mut src = Bytes::from(vec![reason]);
         let result = Auth::decode(&mut src);
@@ -196,7 +196,7 @@ mod tests {
         let result = Auth::decode(&mut src);
         assert_eq!(
             result.map_err(|e| e.to_string()),
-            Err(DecodeError::MalformedPacket.to_string())
+            Err(DecodeError::MalformedPacket("invalid encoding").to_string())
         );
     }
 }

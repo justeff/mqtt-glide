@@ -25,7 +25,7 @@ pub(super) fn decode_packet(mut src: Bytes, first_byte: u8) -> Result<DecodedFra
         0x3 => {
             ensure!(
                 (packet_type::PUBLISH_START..=packet_type::PUBLISH_END).contains(&first_byte),
-                DecodeError::MalformedPacket
+                DecodeError::MalformedPacket("invalid encoding")
             );
             Ok(DecodedFrame::Publish(PublishPacket::decode(
                 src,
@@ -487,14 +487,14 @@ mod tests {
     #[case::unsubscribe_flags_all_clear(&[0xA0, 0x06, 0x12, 0x34, 0x00, 0x00, 0x01, b't'])]
     #[case::unsubscribe_flags_extra_bit(&[0xA3, 0x06, 0x12, 0x34, 0x00, 0x00, 0x01, b't'])]
     fn test_decode_rejects_malformed_fixed_headers(#[case] wire: &[u8]) {
-        assert!(matches!(decode_wire(wire), Err(DecodeError::MalformedPacket)));
+        assert!(matches!(decode_wire(wire), Err(DecodeError::MalformedPacket(_))));
     }
 
     #[rstest]
     #[case::pingreq(&[0xC0, 0x01, 0x00])]
     #[case::pingresp(&[0xD0, 0x01, 0x00])]
     fn test_decode_rejects_ping_non_empty_body(#[case] wire: &[u8]) {
-        assert!(matches!(decode_wire(wire), Err(DecodeError::MalformedPacket)));
+        assert!(matches!(decode_wire(wire), Err(DecodeError::MalformedPacket(_))));
     }
 
     /// [MQTT-1.5.7-1] Both strings in a UTF-8 String Pair must be well-formed UTF-8.
@@ -505,7 +505,7 @@ mod tests {
         let mut src = Bytes::copy_from_slice(wire);
         assert!(matches!(
             UserProperty::decode(&mut src),
-            Err(DecodeError::MalformedPacket)
+            Err(DecodeError::MalformedPacket(_))
         ));
     }
 }

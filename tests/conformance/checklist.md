@@ -126,7 +126,7 @@ Populate with concrete `[MQTT-…]` IDs when extracted. Do not restate README po
 | [MQTT-3.3.1-1]  | no QoS1 redelivery (Clean Start / no session resume)                     |
 | [MQTT-3.3.1-3]  | no QoS1 redelivery (Clean Start / no session resume)                     |
 | [MQTT-3.3.2-7]  | Topic Alias out of scope (Maximum=0)                                     |
-| [MQTT-3.3.4-6]  | Subscription Identifiers deferred                                        |
+| [MQTT-3.3.4-6]  | Inbound Subscription Identifier accepted and discarded (feature deferred); Client→Server not sent |
 | [MQTT-3.3.4-7]  | QoS 2 out of scope                                                       |
 | [MQTT-3.5.2-1]  | QoS 2 out of scope                                                       |
 | [MQTT-3.5.2-2]  | QoS 2 out of scope                                                       |

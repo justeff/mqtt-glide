@@ -17,8 +17,9 @@ pub enum DecodeError {
     InvalidProtocol,
     #[error("Invalid length")]
     InvalidLength,
-    #[error("Malformed packet")]
-    MalformedPacket,
+    /// Packet bytes violate MQTT framing or field rules (`reason` is ops-facing).
+    #[error("Malformed packet: {0}")]
+    MalformedPacket(&'static str),
     #[error("Unsupported protocol level")]
     UnsupportedProtocolLevel,
     #[error("Connect frame's reserved flag is set")]
@@ -46,7 +47,7 @@ impl ToReasonCode for DecodeError {
         match self {
             DecodeError::InvalidProtocol => DisconnectReasonCode::ProtocolError,
             DecodeError::InvalidLength => DisconnectReasonCode::MalformedPacket,
-            DecodeError::MalformedPacket => DisconnectReasonCode::MalformedPacket,
+            DecodeError::MalformedPacket(_) => DisconnectReasonCode::MalformedPacket,
             DecodeError::UnsupportedProtocolLevel => DisconnectReasonCode::ImplementationSpecificError,
             DecodeError::ConnectReservedFlagSet => DisconnectReasonCode::ProtocolError,
             DecodeError::ConnectAckReservedFlagSet => DisconnectReasonCode::ProtocolError,
@@ -103,7 +104,7 @@ mod tests {
     fn malformed_packet_decode_error_maps_to_malformed_packet_reason() {
         // [MQTT-1.5.4-1], [MQTT-1.5.4-2] — ill-formed UTF-8 / U+0000 use MalformedPacket.
         assert_eq!(
-            DecodeError::MalformedPacket.to_reason_code(),
+            DecodeError::MalformedPacket("utf-8").to_reason_code(),
             DisconnectReasonCode::MalformedPacket
         );
     }

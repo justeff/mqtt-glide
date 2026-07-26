@@ -90,7 +90,7 @@ impl TryFrom<u8> for PublishAckReason {
             145 => Ok(Self::PacketIdentifierInUse),
             151 => Ok(Self::QuotaExceeded),
             153 => Ok(Self::PayloadFormatInvalid),
-            _ => Err(DecodeError::MalformedPacket),
+            _ => Err(DecodeError::MalformedPacket("unknown property or reason code")),
         }
     }
 }
@@ -146,7 +146,7 @@ impl TryFrom<u8> for PubRelCompReason {
         match v {
             0 => Ok(Self::Success),
             146 => Ok(Self::PacketIdNotFound),
-            _ => Err(DecodeError::MalformedPacket),
+            _ => Err(DecodeError::MalformedPacket("unknown property or reason code")),
         }
     }
 }
@@ -370,7 +370,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::packet_id_zero(b"\x00\x00", DecodeError::MalformedPacket)]
+    #[case::packet_id_zero(b"\x00\x00", DecodeError::MalformedPacket("invalid encoding"))]
     #[case::properties_promised(b"\x00\x01\x00\x01", DecodeError::InvalidLength)]
     fn puback_decode_must_fail(#[case] input: &'static [u8], #[case] error: DecodeError) {
         let mut input = input.into();

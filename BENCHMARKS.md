@@ -3,7 +3,7 @@
 Absolute multi-client results for **mqtt-glide**, **rumqttc-next**, and LabOverWire **mqtt5**.
 Compare clients only within the same cell (scenario × QoS × payload × ack policy × broker).
 
-How to run / fairness / caps: [`benches/README.md`](benches/README.md).
+How to run: [`benches/README.md`](benches/README.md).
 
 ## Host
 

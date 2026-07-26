@@ -31,7 +31,7 @@ pub(in crate::codec) trait Property {
 
 impl<T: Decode> Property for Option<T> {
     fn read_value(&mut self, src: &mut Bytes) -> Result<(), DecodeError> {
-        ensure!(self.is_none(), DecodeError::MalformedPacket);
+        ensure!(self.is_none(), DecodeError::MalformedPacket("invalid encoding"));
         *self = Some(T::decode(src)?);
         Ok(())
     }
@@ -41,7 +41,7 @@ impl<T: Decode> Property for Option<T> {
 impl Decode for bool {
     fn decode(src: &mut Bytes) -> Result<Self, DecodeError> {
         let v = WireReader::new(src).read_u8()?;
-        ensure!(v <= 0x1, DecodeError::MalformedPacket);
+        ensure!(v <= 0x1, DecodeError::MalformedPacket("invalid encoding"));
         Ok(v == 0x1)
     }
 }
@@ -60,13 +60,13 @@ impl Decode for u32 {
 
 impl Decode for NonZeroU32 {
     fn decode(src: &mut Bytes) -> Result<Self, DecodeError> {
-        NonZeroU32::new(u32::decode(src)?).ok_or(DecodeError::MalformedPacket)
+        NonZeroU32::new(u32::decode(src)?).ok_or(DecodeError::MalformedPacket("invalid encoding"))
     }
 }
 
 impl Decode for NonZeroU16 {
     fn decode(src: &mut Bytes) -> Result<Self, DecodeError> {
-        NonZeroU16::new(u16::decode(src)?).ok_or(DecodeError::MalformedPacket)
+        NonZeroU16::new(u16::decode(src)?).ok_or(DecodeError::MalformedPacket("invalid encoding"))
     }
 }
 
@@ -86,9 +86,9 @@ impl Decode for Bytes {
 pub(crate) fn decode_mqtt_utf8_string(bytes: Bytes) -> Result<ByteString, DecodeError> {
     // U+0000 is a single 0x00 byte in UTF-8 — reject before wrapping.
     if bytes.as_ref().contains(&0) {
-        return Err(DecodeError::MalformedPacket);
+        return Err(DecodeError::MalformedPacket("MQTT UTF-8 string contains U+0000"));
     }
-    ByteString::try_from(bytes).map_err(|_| DecodeError::MalformedPacket)
+    ByteString::try_from(bytes).map_err(|_| DecodeError::MalformedPacket("invalid UTF-8 string"))
 }
 
 impl Decode for ByteString {
@@ -144,7 +144,7 @@ pub(crate) fn decode_non_empty_topic(src: &mut Bytes) -> Result<ByteString, Deco
 #[inline]
 pub(crate) fn decode_topic_name(src: &mut Bytes) -> Result<ByteString, DecodeError> {
     let raw = Bytes::decode(src)?;
-    ensure!(!raw.is_empty(), DecodeError::MalformedPacket);
+    ensure!(!raw.is_empty(), DecodeError::MalformedPacket("invalid encoding"));
     decode_mqtt_topic_name(raw)
 }
 
@@ -162,14 +162,14 @@ pub(crate) fn decode_topic_name_allow_empty(src: &mut Bytes) -> Result<ByteStrin
 #[inline]
 fn decode_mqtt_topic_name(bytes: Bytes) -> Result<ByteString, DecodeError> {
     if topic_name_bytes_forbidden(bytes.as_ref()) {
-        return Err(DecodeError::MalformedPacket);
+        return Err(DecodeError::MalformedPacket("topic name contains NUL, '+' or '#'"));
     }
-    ByteString::try_from(bytes).map_err(|_| DecodeError::MalformedPacket)
+    ByteString::try_from(bytes).map_err(|_| DecodeError::MalformedPacket("invalid UTF-8 topic name"))
 }
 
 #[inline]
 pub(crate) fn ensure_non_empty_topic(topic: &ByteString) -> Result<(), DecodeError> {
-    ensure!(!topic.is_empty(), DecodeError::MalformedPacket);
+    ensure!(!topic.is_empty(), DecodeError::MalformedPacket("invalid encoding"));
     Ok(())
 }
 
@@ -312,7 +312,7 @@ mod tests {
         let mut src = Bytes::from_static(&[0x00, 0x00]);
         assert!(matches!(
             decode_non_empty_topic(&mut src),
-            Err(DecodeError::MalformedPacket)
+            Err(DecodeError::MalformedPacket(_))
         ));
     }
 
@@ -331,7 +331,10 @@ mod tests {
     #[case::nul([0x00, 0x03, b'a', 0x00, b'c'])]
     fn decode_topic_name_rejects_forbidden(#[case] wire: [u8; 5]) {
         let mut src = Bytes::copy_from_slice(&wire);
-        assert!(matches!(decode_topic_name(&mut src), Err(DecodeError::MalformedPacket)));
+        assert!(matches!(
+            decode_topic_name(&mut src),
+            Err(DecodeError::MalformedPacket(_))
+        ));
     }
 
     /// [MQTT-4.7.1-1] `#` alone or after `/`, and last character only.
@@ -393,7 +396,7 @@ mod tests {
         let bytes = Bytes::from_static(b"a\0b");
         assert!(matches!(
             decode_mqtt_utf8_string(bytes),
-            Err(DecodeError::MalformedPacket)
+            Err(DecodeError::MalformedPacket(_))
         ));
     }
 
@@ -427,7 +430,7 @@ mod tests {
         let mut src = Bytes::from_static(&[0x00, 0x03, b'a', 0x00, b'b']);
         assert!(matches!(
             ByteString::decode(&mut src),
-            Err(DecodeError::MalformedPacket)
+            Err(DecodeError::MalformedPacket(_))
         ));
     }
 

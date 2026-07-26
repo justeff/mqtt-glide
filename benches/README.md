@@ -14,8 +14,6 @@ Numbers in [`BENCHMARKS.md`](../BENCHMARKS.md) / README highlights were measured
 | Memory | 32 GB |
 | OS | macOS 26.5.2 |
 
-Re-run on other hosts will differ; update the host table when refreshing the published baseline.
-
 ## Perf matrix: absolute multi-client (`mqtt_compare`)
 
 Custom harness (no Criterion): measures each client × scenario cell **absolutely** (no paired deltas).

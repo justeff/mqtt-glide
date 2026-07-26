@@ -45,7 +45,7 @@ impl TryFrom<u8> for QoS {
             0 => Ok(Self::AtMostOnce),
             1 => Ok(Self::AtLeastOnce),
             2 => Ok(Self::ExactlyOnce),
-            _ => Err(DecodeError::MalformedPacket),
+            _ => Err(DecodeError::MalformedPacket("unknown property or reason code")),
         }
     }
 }

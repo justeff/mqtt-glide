@@ -338,6 +338,6 @@ mod tests {
     fn v5_codec_decode_rejects_non_minimal_remaining_length() {
         let mut codec = V5Codec::new(0, 0);
         let mut buf = BytesMut::from(&[0xC0, 0x80, 0x00][..]);
-        assert!(matches!(codec.decode(&mut buf), Err(DecodeError::MalformedPacket)));
+        assert!(matches!(codec.decode(&mut buf), Err(DecodeError::MalformedPacket(_))));
     }
 }

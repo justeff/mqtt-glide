@@ -38,7 +38,10 @@ impl<'a> WireReader<'a> {
     }
 
     pub(crate) fn ensure_empty(&self) -> Result<(), DecodeError> {
-        ensure!(!self.src.has_remaining(), DecodeError::MalformedPacket);
+        ensure!(
+            !self.src.has_remaining(),
+            DecodeError::MalformedPacket("invalid encoding")
+        );
         Ok(())
     }
 
@@ -75,7 +78,7 @@ mod tests {
     fn ensure_empty_rejects_trailing_bytes() {
         let mut src = Bytes::from_static(&[0x00]);
         let reader = WireReader::new(&mut src);
-        assert!(matches!(reader.ensure_empty(), Err(DecodeError::MalformedPacket)));
+        assert!(matches!(reader.ensure_empty(), Err(DecodeError::MalformedPacket(_))));
     }
 
     #[test]
