@@ -1,7 +1,9 @@
-//! Extension hooks: `CredentialsProvider` + `StandardReconnectPolicy::mark_live`.
+//! Extension hooks: `CredentialsProvider`, `LifecycleHook`, `StandardReconnectPolicy::mark_live`.
 //!
 //! - `credentials()` runs before each `CONNECT` (async; return username + password).
 //! - `invalidate()` runs on CONNECT-level `NotAuthorized` only (never SUBACK ACL).
+//! - `on_lifecycle` runs on the driver task for Connected / Disconnected side effects
+//!   (keep it short — prefer the `SessionPhase` watch for readiness checks).
 //! - `mark_live()` arms one immediate transport retry after the session is fully ready.
 //!
 //! ```shell
@@ -11,7 +13,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mqtt_glide::{AuthError, ClientBuilder, CredentialsProvider, QoS, StandardReconnectPolicy};
+use mqtt_glide::{
+    AuthError, ClientBuilder, CredentialsProvider, LifecycleHook, QoS, SessionPhase, StandardReconnectPolicy,
+};
 use secrecy::SecretString;
 use tokio::sync::Mutex;
 
@@ -32,6 +36,23 @@ impl CredentialsProvider for TokenProvider {
     }
 }
 
+/// Fire-and-forget lifecycle logging (no await).
+struct LogLifecycle;
+
+impl LifecycleHook for LogLifecycle {
+    fn on_lifecycle(&self, phase: &SessionPhase) {
+        match phase {
+            SessionPhase::Connected { generation, .. } => {
+                println!("lifecycle: connected generation={generation}");
+            }
+            SessionPhase::Disconnected(outcome) => {
+                println!("lifecycle: disconnected {outcome:?}");
+            }
+            SessionPhase::NeverConnected => {}
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broker = std::env::var("MQTT_GLIDE_BROKER").unwrap_or_else(|_| "mqtt://127.0.0.1:1883".into());
@@ -47,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             token: Arc::new(Mutex::new("initial-token".into())),
         })
         .reconnect(policy.clone())
+        .lifecycle(LogLifecycle)
         .inbound_sink(tx)
         .connect()
         .await?;

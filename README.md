@@ -160,24 +160,30 @@ Shared filters: build with `shared_filter(group, topic)` (validates ShareName).
 |----------------|------|
 | `CredentialsProvider` | Async `credentials()` before each `CONNECT`; `invalidate()` on CONNECT-level `NotAuthorized` only |
 | `ReconnectPolicy` | `delay_after(outcome) -> Option<Duration>` (`None` = stop). Ready-made: `StandardReconnectPolicy` + `mark_live()` |
+| `LifecycleHook` | Sync Connected / Disconnected side effects on the driver task — keep short (no await). Prefer the `SessionPhase` watch for readiness |
 | `InboundSink` | Injectable inbound handoff; built-ins: `flume`, `tokio::mpsc`, `OnInboundSink` (`.on_inbound`). Custom sinks **MUST** be cancel-safe |
 
 ### Examples
 
-Broader flows live under [`examples/`](examples/) (broker via `MQTT_GLIDE_BROKER`, default `mqtt://127.0.0.1:1883`). Prefer those over copying README snippets.
+Broader flows live under [`examples/`](examples/) (broker via `MQTT_GLIDE_BROKER`, default `mqtt://127.0.0.1:1883`). Prefer those over copying README snippets. Fluent APIs are the default path; power APIs appear only where they are clearly simpler or more flexible.
 
 | Example | Shows |
 |---------|--------|
-| [`subscribe.rs`](examples/subscribe.rs) | `inbound_sink` + subscribe loop (enqueue-before-ack) |
+| [`subscribe.rs`](examples/subscribe.rs) | `inbound_sink`, `Subscription` options, receive, `unsubscribe`, `shutdown` |
 | [`on_inbound.rs`](examples/on_inbound.rs) | Inline `.on_inbound` handler (read-task; keep short) |
-| [`publish.rs`](examples/publish.rs) | Fluent publish, properties, shared subscription |
-| [`pipeline.rs`](examples/pipeline.rs) | `publish_window` + fluent `.push_retry()` / `.drain()` |
-| [`hooks.rs`](examples/hooks.rs) | Custom `CredentialsProvider`, `mark_live()` |
+| [`publish.rs`](examples/publish.rs) | `publish_with`, `PublishMessage::new` + `publish`, `publish_batch`, shared filter |
+| [`pipeline.rs`](examples/pipeline.rs) | `publish_window` + fluent `.push_retry()` / `.drain()` (mixed topics) |
+| [`request_response.rs`](examples/request_response.rs) | Properties R/R by hand (no RPC helper yet) |
+| [`tls.rs`](examples/tls.rs) | `mqtts://`, rustls system roots, `connect_timeout` / `ack_timeout` |
+| [`hooks.rs`](examples/hooks.rs) | `CredentialsProvider`, `LifecycleHook`, `mark_live()` |
 
 ```shell
 cargo run --example subscribe
 cargo run --example on_inbound
+cargo run --example publish
 cargo run --example pipeline
+cargo run --example request_response
+cargo run --example tls
 cargo run --example hooks
 ```
 
@@ -215,7 +221,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | Cap / Receive Maximum flow control | ✅ | See Cap vs Window above |
 | Graceful `shutdown` | ✅ | Budget via `graceful_disconnect_timeout` |
 | Subscription identifiers | ⚠️ | Deferred |
-| Request/response *negotiation* | ⚠️ | Properties still usable for many apps |
+| Request/response *helper* / CONNECT negotiation | ⚠️ | Properties ✅ (`response_topic` / `correlation_data`); no inbox RPC API; `request_response_info` deferred |
 | Will message (`CONNECT`) | ⚠️ | Codec has `LastWill`; connection API not exposed yet |
 | Optional `SO_SNDBUF` / `SO_RCVBUF` | ⚠️ | OS defaults today |
 | Enhanced AUTH | ❌ | |
