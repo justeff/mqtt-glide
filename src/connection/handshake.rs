@@ -7,8 +7,8 @@ use bytes::Bytes;
 use bytestring::ByteString;
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::codec::{Connect, ConnectAck, ConnectAckReason, QoS};
-use crate::error::{AuthError, ConnectionOutcome, ProtocolError};
+use crate::codec::{Connect, ConnectAck, ConnectAckReason, QoS, WillMessage};
+use crate::error::{AppError, AuthError, ConnectionOutcome, ProtocolError};
 use crate::options::{ConnectOptions, TlsConfig};
 
 /// Session parameters captured from a successful CONNACK.
@@ -53,6 +53,9 @@ pub(crate) struct ConnectCredentials {
 ///
 /// Empty username / password strings are omitted on the wire (no USERNAME /
 /// PASSWORD flags) so [`crate::AnonymousCredentials`] produces an anonymous CONNECT.
+///
+/// Caller **MUST** have validated [`ConnectOptions::will_message`] via [`validate_will_message`]
+/// when present (Topic Name / QoS rules).
 pub(crate) fn build_connect(options: &ConnectOptions, client_id: &str, credentials: &ConnectCredentials) -> Connect {
     let keep_alive = u16::try_from(options.keep_alive.as_secs()).unwrap_or(u16::MAX);
     let username = if credentials.username.is_empty() {
@@ -75,7 +78,41 @@ pub(crate) fn build_connect(options: &ConnectOptions, client_id: &str, credentia
         client_id: ByteString::from(client_id),
         username,
         password,
+        will_message: options.will_message.clone(),
         ..Default::default()
+    }
+}
+
+/// Validates a CONNECT Will Message for the client API (Topic Name rules, QoS 0|1 only).
+///
+/// [MQTT-3.1.2-9] Will Topic + Payload present when Will is set (enforced by `Some(WillMessage)`).
+/// [MQTT-3.1.2-12] Will QoS may be 0|1|2 on the wire; this client rejects QoS 2 like PUBLISH.
+/// [MQTT-3.1.3-11] Will Topic MUST be a UTF-8 Topic Name (no wildcards / U+0000 / empty).
+pub(crate) fn validate_will_message(will: &WillMessage) -> Result<(), AppError> {
+    if matches!(will.qos, QoS::ExactlyOnce) {
+        return Err(AppError::InvalidRequest("Will QoS 2 is not supported".into()));
+    }
+    if let Some(reason) = topic_name_invalid_reason(will.topic.as_ref()) {
+        return Err(AppError::InvalidRequest(format!("will topic: {reason}")));
+    }
+    if let Some(response_topic) = will.response_topic.as_ref()
+        && let Some(reason) = topic_name_invalid_reason(response_topic.as_ref())
+    {
+        return Err(AppError::InvalidRequest(format!("will response_topic: {reason}")));
+    }
+    Ok(())
+}
+
+/// Topic Name rules for Will Topic / Will Response Topic (mirrors outbound PUBLISH checks).
+pub(crate) fn topic_name_invalid_reason(topic: &str) -> Option<&'static str> {
+    if topic.is_empty() {
+        Some("topic must not be empty")
+    } else if topic.as_bytes().contains(&0) {
+        Some("topic must not contain U+0000")
+    } else if topic.as_bytes().iter().any(|&b| matches!(b, b'+' | b'#')) {
+        Some("topic must not contain wildcard characters")
+    } else {
+        None
     }
 }
 
@@ -166,8 +203,11 @@ mod tests {
     use nonzero_ext::nonzero;
     use secrecy::{ExposeSecret, SecretString};
 
+    use rstest::rstest;
+
     use super::*;
-    use crate::codec::{ConnectAck, ConnectAckReason, QoS, RECEIVE_MAX_DEFAULT};
+    use crate::codec::{ConnectAck, ConnectAckReason, QoS, RECEIVE_MAX_DEFAULT, WillMessage};
+    use crate::error::AppError;
     use crate::options::{ConnectOptions, DEFAULT_RECEIVE_MAXIMUM, TlsConfig};
     use crate::util::{BrokerUrl, ClientId};
 
@@ -255,6 +295,39 @@ mod tests {
             packet.topic_alias_max, 0,
             "Topic Alias Maximum must be 0 (product policy)"
         );
+        assert!(packet.will_message.is_none(), "default ConnectOptions has no Will");
+    }
+
+    #[test]
+    fn build_connect_maps_will_message() {
+        let options = sample_options()
+            .will("status/offline", "dead")
+            .will_qos(QoS::AtLeastOnce)
+            .will_retain(true)
+            .will_delay_interval(10);
+        let will = options.will_message.clone().expect("will set");
+        validate_will_message(&will).expect("valid will");
+        assert_eq!(will.qos, QoS::AtLeastOnce);
+        assert!(will.retain);
+        assert_eq!(will.will_delay_interval, Some(10));
+        let client_id = resolve_client_id_str(&options);
+        let packet = build_connect(&options, &client_id, &sample_credentials());
+        assert_eq!(packet.will_message.as_ref(), Some(&will));
+    }
+
+    #[rstest]
+    #[case::qos2(WillMessage::new("t", "p").qos(QoS::ExactlyOnce))]
+    #[case::empty_topic(WillMessage::new("", "p"))]
+    #[case::wildcard(WillMessage::new("a/+/b", "p"))]
+    #[case::nul(WillMessage::new("a\0b", "p"))]
+    #[case::bad_response_topic(WillMessage::new("ok", "p").response_topic("bad/#"))]
+    fn validate_will_message_rejects_invalid(#[case] will: WillMessage) {
+        assert!(matches!(validate_will_message(&will), Err(AppError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn validate_will_message_accepts_qos1() {
+        validate_will_message(&WillMessage::new("ok", "p").qos(QoS::AtLeastOnce)).expect("qos1 ok");
     }
 
     #[test]

@@ -49,7 +49,7 @@ pub struct Connect {
     pub max_packet_size: Option<NonZeroU32>,
 
     /// Will Message (§3.1.2.5, §3.1.3.2–§3.1.3.4).
-    pub last_will: Option<LastWill>,
+    pub will_message: Option<WillMessage>,
     /// Client Identifier (§3.1.3.1).
     pub client_id: ByteString,
     /// User Name (§3.1.3.5).
@@ -60,7 +60,7 @@ pub struct Connect {
 
 /// Will Message fields carried in CONNECT (§3.1.2.5, §3.1.3.2–§3.1.3.4).
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub struct LastWill {
+pub struct WillMessage {
     /// Will QoS (§3.1.2.6).
     pub qos: QoS,
     /// Will Retain (§3.1.2.7).
@@ -86,7 +86,97 @@ pub struct LastWill {
     pub response_topic: Option<ByteString>,
 }
 
-impl LastWill {
+impl WillMessage {
+    /// Builds a Will with QoS 0, retain false, and empty Will Properties.
+    ///
+    /// `topic` / `payload` accept any [`Into<ByteString>`] / [`Into<Bytes>`] (same contract
+    /// as [`crate::PublishMessage::new`]).
+    #[inline]
+    pub fn new(topic: impl Into<ByteString>, payload: impl Into<Bytes>) -> Self {
+        Self {
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: topic.into(),
+            payload: payload.into(),
+            will_delay_interval: None,
+            correlation_data: None,
+            message_expiry_interval: None,
+            content_type: None,
+            user_properties: Vec::new(),
+            payload_format_indicator: None,
+            response_topic: None,
+        }
+    }
+
+    /// Sets Will QoS (§3.1.2.6). QoS 2 is rejected when connecting (client API).
+    #[inline]
+    pub fn qos(mut self, qos: QoS) -> Self {
+        self.qos = qos;
+        self
+    }
+
+    /// Sets Will Retain (§3.1.2.7).
+    #[inline]
+    pub fn retain(mut self, retain: bool) -> Self {
+        self.retain = retain;
+        self
+    }
+
+    /// Sets Will Delay Interval in **seconds** (§3.1.3.2.2).
+    #[inline]
+    pub fn will_delay_interval(mut self, seconds: u32) -> Self {
+        self.will_delay_interval = Some(seconds);
+        self
+    }
+
+    /// Sets Payload Format Indicator (§3.1.3.2.3); `true` means UTF-8 payload.
+    ///
+    /// `None` (default) omits the property; `Some(false)` encodes indicator `0` on the wire
+    /// (unlike [`crate::PublishProperties::payload_format_indicator`], which is a plain `bool`
+    /// that omits the default `false`).
+    #[inline]
+    pub fn payload_format_indicator(mut self, is_utf8: bool) -> Self {
+        self.payload_format_indicator = Some(is_utf8);
+        self
+    }
+
+    /// Sets Message Expiry Interval in **seconds** (§3.1.3.2.4).
+    ///
+    /// `0` clears expiry (property omitted).
+    #[inline]
+    pub fn message_expiry(mut self, seconds: u32) -> Self {
+        self.message_expiry_interval = NonZeroU32::new(seconds);
+        self
+    }
+
+    /// Sets Content Type (§3.1.3.2.5).
+    #[inline]
+    pub fn content_type(mut self, content_type: impl Into<ByteString>) -> Self {
+        self.content_type = Some(content_type.into());
+        self
+    }
+
+    /// Sets Response Topic (§3.1.3.2.6).
+    #[inline]
+    pub fn response_topic(mut self, response_topic: impl Into<ByteString>) -> Self {
+        self.response_topic = Some(response_topic.into());
+        self
+    }
+
+    /// Sets Correlation Data (§3.1.3.2.7).
+    #[inline]
+    pub fn correlation_data(mut self, data: impl Into<Bytes>) -> Self {
+        self.correlation_data = Some(data.into());
+        self
+    }
+
+    /// Appends one User Property (§3.1.3.2.8).
+    #[inline]
+    pub fn user_property(mut self, name: impl Into<ByteString>, value: impl Into<ByteString>) -> Self {
+        self.user_properties.push(UserProperty::from((name, value)));
+        self
+    }
+
     fn properties_len(&self) -> usize {
         encoded_property_size(&self.will_delay_interval)
             + encoded_property_size(&self.correlation_data)
@@ -198,8 +288,8 @@ impl Connect {
 
         let client_id = ByteString::decode(src)?;
 
-        let last_will = if flags.contains(ConnectFlags::WILL) {
-            Some(decode_last_will(src, flags)?)
+        let will_message = if flags.contains(ConnectFlags::WILL) {
+            Some(decode_will_message(src, flags)?)
         } else {
             None
         };
@@ -231,7 +321,7 @@ impl Connect {
             max_packet_size,
 
             client_id,
-            last_will,
+            will_message,
             username,
             password,
         })
@@ -261,7 +351,7 @@ impl Default for Connect {
             topic_alias_max: 0,
             user_properties: Vec::new(),
             max_packet_size: None,
-            last_will: None,
+            will_message: None,
             client_id: ByteString::default(),
             username: None,
             password: None,
@@ -269,7 +359,7 @@ impl Default for Connect {
     }
 }
 
-fn decode_last_will(src: &mut Bytes, flags: ConnectFlags) -> Result<LastWill, DecodeError> {
+fn decode_will_message(src: &mut Bytes, flags: ConnectFlags) -> Result<WillMessage, DecodeError> {
     let mut will_delay_interval = None;
     let mut correlation_data = None;
     let mut message_expiry_interval = None;
@@ -293,7 +383,7 @@ fn decode_last_will(src: &mut Bytes, flags: ConnectFlags) -> Result<LastWill, De
 
     let topic = decode_topic_name(src)?;
     let payload = Bytes::decode(src)?;
-    Ok(LastWill {
+    Ok(WillMessage {
         qos: QoS::try_from((flags & ConnectFlags::WILL_QOS).bits() >> WILL_QOS_SHIFT)?,
         retain: flags.contains(ConnectFlags::WILL_RETAIN),
         topic,
@@ -318,7 +408,7 @@ impl WireBodyEncode for Connect {
             + var_int_len(prop_len) as usize // properties len
             + prop_len // properties
             + self.client_id.encoded_size()
-            + self.last_will.as_ref().map_or(0, |will| { // will message content
+            + self.will_message.as_ref().map_or(0, |will| { // will message content
                 let prop_len = will.properties_len();
                 var_int_len(prop_len) as usize + prop_len + will.topic.encoded_size() + will.payload.encoded_size()
             })
@@ -338,7 +428,7 @@ impl WireBodyEncode for Connect {
             flags |= ConnectFlags::PASSWORD;
         }
 
-        if let Some(will) = self.last_will.as_ref() {
+        if let Some(will) = self.will_message.as_ref() {
             flags |= ConnectFlags::WILL;
 
             if will.retain {
@@ -371,7 +461,7 @@ impl WireBodyEncode for Connect {
 
         self.client_id.encode(buf)?;
 
-        if let Some(will) = self.last_will.as_ref() {
+        if let Some(will) = self.will_message.as_ref() {
             if will.topic.is_empty() {
                 return Err(EncodeError::MalformedPacket);
             }

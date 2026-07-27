@@ -38,6 +38,7 @@ pub(crate) use channels::{
     ClientCommand, CommandReceiver, CommandSender, ControlMessage, ControlReceiver, PublishReply, SubscribeReply,
     UnsubscribeReply,
 };
+pub(crate) use handshake::validate_will_message;
 pub use handshake::{SessionParams, TlsMode, resolve_tls_mode};
 pub(crate) use io_batch::effective_io_batch;
 pub use lifecycle::{LifecycleHook, NoopLifecycle, SessionPhase};

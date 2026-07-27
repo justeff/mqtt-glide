@@ -333,7 +333,7 @@ mod tests {
                 clean_start: false,
                 keep_alive: 60,
                 client_id: ByteString::from_static("12345"),
-                last_will: None,
+                will_message: None,
                 username: Some(ByteString::from_static("user")),
                 password: Some(Bytes::from_static(b"pass")),
                 session_expiry_interval: 0,
@@ -355,7 +355,7 @@ mod tests {
                 clean_start: false,
                 keep_alive: 60,
                 client_id: ByteString::from_static("12345"),
-                last_will: Some(LastWill {
+                will_message: Some(WillMessage {
                     qos: QoS::ExactlyOnce,
                     retain: false,
                     topic: ByteString::from_static("topic"),
@@ -389,7 +389,7 @@ mod tests {
                 clean_start: false,
                 keep_alive: 60,
                 client_id: ByteString::from_static("12345"),
-                last_will: Some(LastWill {
+                will_message: Some(WillMessage {
                     qos: QoS::ExactlyOnce,
                     retain: true,
                     topic: ByteString::from_static("topic"),

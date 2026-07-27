@@ -1,4 +1,4 @@
-//! Fluent publish paths, MQTT 5 properties, `publish_batch`, and a shared subscription filter.
+//! Fluent publish paths, MQTT 5 properties, `publish_batch`, shared filter, and Will Message.
 //!
 //! Prefer [`MqttClient::publish_with`](mqtt_glide::MqttClient::publish_with) for one-shots.
 //! Use [`PublishMessage::new`](mqtt_glide::PublishMessage::new) when the message is built
@@ -19,7 +19,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broker = std::env::var("MQTT_GLIDE_BROKER").unwrap_or_else(|_| "mqtt://127.0.0.1:1883".into());
     let (tx, _rx) = flume::bounded(256);
 
-    let client = ClientBuilder::new(&broker)?.inbound_sink(tx).connect().await?;
+    let client = ClientBuilder::new(&broker)?
+        // Graceful `shutdown()` → Normal DISCONNECT → broker deletes the Will.
+        .will("demo/glide/lwt", "offline")
+        .will_qos(QoS::AtLeastOnce)
+        .will_retain(true)
+        .inbound_sink(tx)
+        .connect()
+        .await?;
 
     // Fluent one-shot (default path).
     client

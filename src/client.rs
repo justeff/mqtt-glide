@@ -627,6 +627,9 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
     if inbound.is_closed() {
         return Err(ConnectError::Application(AppError::InboundSinkClosed));
     }
+    if let Some(will) = options.will_message.as_ref() {
+        crate::connection::validate_will_message(will)?;
+    }
 
     let command_channel_capacity = options.command_channel_capacity.get();
     let (command_tx, command_rx) = mpsc::channel(command_channel_capacity);
@@ -724,6 +727,16 @@ mod tests {
         assert!(sub.options.no_local);
         assert!(sub.options.retain_as_published);
         assert_eq!(sub.options.retain_handling, RetainHandling::NoAtSubscribe);
+    }
+
+    #[test]
+    fn connect_rejects_invalid_will_message_before_dial() {
+        let url = BrokerUrl::parse("mqtt://127.0.0.1:9").expect("url");
+        let options = ConnectOptions::new(url).will("wild/+/card", "x");
+        let (tx, _rx) = flume::bounded(1);
+        let err = connect(options, AnonymousCredentials, NoReconnect, tx, NoopLifecycle)
+            .expect_err("wildcard will topic must fail before dial");
+        assert!(matches!(err, ConnectError::Application(AppError::InvalidRequest(_))));
     }
 
     /// Reconnects immediately after transport/protocol outcomes — used by tests that never wire a

@@ -216,8 +216,7 @@ mod tests {
 
     #[test]
     fn publish_message_properties_chain() {
-        let msg = PublishMessage::new("t", "p")
-            .properties(PublishProperties::default().content_type("text/plain"));
+        let msg = PublishMessage::new("t", "p").properties(PublishProperties::default().content_type("text/plain"));
         assert_eq!(msg.properties.content_type.as_deref(), Some("text/plain"));
     }
 }

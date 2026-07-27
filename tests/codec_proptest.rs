@@ -391,7 +391,7 @@ fn arb_v5_connect() -> impl Strategy<Value = Connect> {
                 topic_alias_max: 0,
                 user_properties: Vec::new(),
                 max_packet_size: None,
-                last_will: None,
+                will_message: None,
                 client_id: ByteString::from(client_id),
                 username,
                 password,

@@ -42,7 +42,7 @@ use crate::client::{
     AnonymousCredentials, CredentialsProvider, MqttClient, NoReconnect, ReconnectPolicy, SharedCredentials,
     connect_with_shared,
 };
-use crate::codec::PublishMessage;
+use crate::codec::{PublishMessage, QoS};
 use crate::connection::{LifecycleHook, NoopLifecycle, SessionParams, SessionPhase};
 use crate::error::{AppError, ConnectError, ConnectionOutcome, TransportError};
 use crate::inbound_sink::{InboundSink, OnInboundSink};
@@ -175,6 +175,33 @@ impl<H> ClientBuilder<H> {
     /// Transforms the current [`ConnectOptions`] (fluent overrides).
     pub fn options(mut self, f: impl FnOnce(ConnectOptions) -> ConnectOptions) -> Self {
         self.config.options = f(self.config.options);
+        self
+    }
+
+    /// Sets the Will Message for CONNECT (§3.1.2.5).
+    ///
+    /// Builds [`WillMessage`](crate::WillMessage) internally (QoS 0, retain `false` by default).
+    /// Chain [`Self::will_qos`] / [`Self::will_retain`] as needed. See [`ConnectOptions::will`].
+    pub fn will(mut self, topic: impl Into<bytestring::ByteString>, payload: impl Into<bytes::Bytes>) -> Self {
+        self.config.options = self.config.options.will(topic, payload);
+        self
+    }
+
+    /// Sets Will QoS (§3.1.2.6). Call after [`Self::will`]; no-op otherwise. Default: QoS 0.
+    pub fn will_qos(mut self, qos: QoS) -> Self {
+        self.config.options = self.config.options.will_qos(qos);
+        self
+    }
+
+    /// Sets Will Retain (§3.1.2.7). Call after [`Self::will`]; no-op otherwise. Default: `false`.
+    pub fn will_retain(mut self, retain: bool) -> Self {
+        self.config.options = self.config.options.will_retain(retain);
+        self
+    }
+
+    /// Sets Will Delay Interval in **seconds**. Call after [`Self::will`]; no-op otherwise.
+    pub fn will_delay_interval(mut self, seconds: u32) -> Self {
+        self.config.options = self.config.options.will_delay_interval(seconds);
         self
     }
 

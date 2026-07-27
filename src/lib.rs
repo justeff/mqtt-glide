@@ -49,7 +49,7 @@ pub use codec::{
     DisconnectReasonCode, EncodeError, Packet, PublishAck, PublishAckReason, PublishDelivery, PublishMessage,
     PublishPacket, PublishPacketMeta, PublishProperties, QoS, RECEIVE_MAX_DEFAULT, RetainHandling, Subscribe,
     SubscribeAck, SubscribeAckReason, SubscriptionOptions, Unsubscribe, UnsubscribeAck, UnsubscribeAckReason,
-    UserProperties, UserProperty, V5Codec, encode_publish, ensure_publish_wire_fits,
+    UserProperties, UserProperty, V5Codec, WillMessage, encode_publish, ensure_publish_wire_fits,
 };
 pub use connection::{
     Connection, ConnectionState, Generation, LifecycleHook, NoopLifecycle, SessionParams, SessionPhase, TlsMode,

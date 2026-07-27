@@ -29,9 +29,9 @@ pub(crate) use utils::topic_filter_bytes_invalid;
 pub(crate) use v5::encode_publish_ack;
 pub use v5::{
     Auth, AuthReasonCode, Connect, ConnectAck, ConnectAckReason, DecodedFrame, Disconnect, DisconnectReasonCode,
-    LastWill, Packet, PubRelComp, PubRelCompReason, PublishAck, PublishAckReason, RECEIVE_MAX_DEFAULT, RetainHandling,
-    Subscribe, SubscribeAck, SubscribeAckReason, SubscriptionOptions, Unsubscribe, UnsubscribeAck,
-    UnsubscribeAckReason, UserProperties, UserProperty, encode_publish,
+    Packet, PubRelComp, PubRelCompReason, PublishAck, PublishAckReason, RECEIVE_MAX_DEFAULT, RetainHandling, Subscribe,
+    SubscribeAck, SubscribeAckReason, SubscriptionOptions, Unsubscribe, UnsubscribeAck, UnsubscribeAckReason,
+    UserProperties, UserProperty, WillMessage, encode_publish,
 };
 
 /// PUBREL packet body (alias for the shared PUBREL/PUBCOMP payload type).

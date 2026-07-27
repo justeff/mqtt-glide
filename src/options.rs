@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use nonzero_ext::nonzero;
 
+use crate::codec::{QoS, WillMessage};
 use crate::util::{BrokerUrl, ClientId};
 
 /// Default capacity of the bounded application command/data path to the write task.
@@ -92,6 +93,12 @@ pub struct ConnectOptions {
     ///
     /// Default: [`COMMAND_CHANNEL_CAPACITY`] (32). Zero is rejected (`NonZeroUsize`).
     pub command_channel_capacity: NonZeroUsize,
+    /// Optional Will Message published by the broker on abnormal disconnect (§3.1.2.5).
+    ///
+    /// Default `None` (no Will Flag). Validated when connecting: Topic Name rules, QoS 0|1 only.
+    /// CONNACK Maximum QoS / Retain Available apply to later PUBLISH, not to this CONNECT field
+    /// (the Will is already on the wire before CONNACK).
+    pub will_message: Option<WillMessage>,
     /// Optional counter incremented when the write task feeds an inbound QoS-1 PUBACK.
     ///
     /// Bench / diagnostic hook only (`None` in production). Does not change enqueue-before-ack semantics.
@@ -119,6 +126,7 @@ impl ConnectOptions {
             graceful_disconnect_timeout: DEFAULT_GRACEFUL_DISCONNECT_TIMEOUT,
             command_channel_capacity: NonZeroUsize::new(COMMAND_CHANNEL_CAPACITY)
                 .expect("COMMAND_CHANNEL_CAPACITY is non-zero"),
+            will_message: None,
             bench_inbound_publish_ack_counter: None,
         }
     }
@@ -199,6 +207,55 @@ impl ConnectOptions {
         self.command_channel_capacity = command_channel_capacity;
         self
     }
+
+    /// Sets the Will Message for CONNECT (§3.1.2.5).
+    ///
+    /// Builds [`WillMessage`] internally with defaults: QoS 0, retain `false`. Chain
+    /// [`Self::will_qos`] / [`Self::will_retain`] (and other `will_*` helpers) as needed.
+    /// Topic Name / QoS rules are enforced at [`crate::connect`] /
+    /// [`crate::ClientBuilder::connect`] time.
+    ///
+    /// For a pre-built [`WillMessage`], use [`Self::will_message`].
+    pub fn will(mut self, topic: impl Into<bytestring::ByteString>, payload: impl Into<bytes::Bytes>) -> Self {
+        self.will_message = Some(WillMessage::new(topic, payload));
+        self
+    }
+
+    /// Sets Will QoS on an existing Will (§3.1.2.6). No-op if [`Self::will`] was not called.
+    ///
+    /// Default when unset: [`QoS::AtMostOnce`]. QoS 2 is rejected at connect.
+    pub fn will_qos(mut self, qos: QoS) -> Self {
+        if let Some(will) = self.will_message.as_mut() {
+            will.qos = qos;
+        }
+        self
+    }
+
+    /// Sets Will Retain on an existing Will (§3.1.2.7). No-op if [`Self::will`] was not called.
+    ///
+    /// Default when unset: `false`.
+    pub fn will_retain(mut self, retain: bool) -> Self {
+        if let Some(will) = self.will_message.as_mut() {
+            will.retain = retain;
+        }
+        self
+    }
+
+    /// Sets Will Delay Interval in **seconds** on an existing Will (§3.1.3.2.2).
+    ///
+    /// No-op if [`Self::will`] was not called. Only meaningful with non-zero Session Expiry.
+    pub fn will_delay_interval(mut self, seconds: u32) -> Self {
+        if let Some(will) = self.will_message.as_mut() {
+            will.will_delay_interval = Some(seconds);
+        }
+        self
+    }
+
+    /// Replaces the Will Message with a pre-built [`WillMessage`] (power path), or clears it with [`None`].
+    pub fn will_message(mut self, will_message: Option<WillMessage>) -> Self {
+        self.will_message = will_message;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +275,7 @@ mod tests {
         assert!(options.tcp_nodelay);
         assert!(options.session_expiry.is_none());
         assert!(options.tls.is_none());
+        assert!(options.will_message.is_none());
 
         assert_eq!(options.receive_maximum, DEFAULT_RECEIVE_MAXIMUM);
         assert_eq!(DEFAULT_RECEIVE_MAXIMUM.get(), 32);
@@ -270,5 +328,24 @@ mod tests {
         let custom = NonZeroUsize::new(128).expect("non-zero");
         let options = ConnectOptions::new(url).command_channel_capacity(custom);
         assert_eq!(options.command_channel_capacity, custom);
+    }
+
+    #[test]
+    fn will_fluent_sets_defaults_and_overrides() {
+        let url = BrokerUrl::parse("mqtt://broker.example").expect("valid url");
+        let options = ConnectOptions::new(url)
+            .will("status/offline", "gone")
+            .will_qos(QoS::AtLeastOnce)
+            .will_retain(true);
+        let will = options.will_message.expect("will");
+        assert_eq!(&*will.topic, "status/offline");
+        assert_eq!(will.payload.as_ref(), b"gone");
+        assert_eq!(will.qos, QoS::AtLeastOnce);
+        assert!(will.retain);
+
+        let url = BrokerUrl::parse("mqtt://broker.example").expect("valid url");
+        let will = ConnectOptions::new(url).will("t", "p").will_message.expect("will");
+        assert_eq!(will.qos, QoS::AtMostOnce);
+        assert!(!will.retain);
     }
 }

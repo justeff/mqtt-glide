@@ -171,7 +171,7 @@ Broader flows live under [`examples/`](examples/) (broker via `MQTT_GLIDE_BROKER
 |---------|--------|
 | [`subscribe.rs`](examples/subscribe.rs) | `inbound_sink`, `Subscription` options, receive, `unsubscribe`, `shutdown` |
 | [`on_inbound.rs`](examples/on_inbound.rs) | Inline `.on_inbound` handler (read-task; keep short) |
-| [`publish.rs`](examples/publish.rs) | `publish_with`, `PublishMessage::new` + `publish`, `publish_batch`, shared filter |
+| [`publish.rs`](examples/publish.rs) | `publish_with`, `PublishMessage::new` + `publish`, `publish_batch`, Will Message, shared filter |
 | [`pipeline.rs`](examples/pipeline.rs) | `publish_window` + fluent `.push_retry()` / `.drain()` (mixed topics) |
 | [`request_response.rs`](examples/request_response.rs) | Properties R/R by hand (no RPC helper yet) |
 | [`tls.rs`](examples/tls.rs) | `mqtts://`, rustls system roots, `connect_timeout` / `ack_timeout` |
@@ -222,7 +222,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | Graceful `shutdown` | ✅ | Budget via `graceful_disconnect_timeout` |
 | Subscription identifiers | ⚠️ | Deferred |
 | Request/response *helper* / CONNECT negotiation | ⚠️ | Properties ✅ (`response_topic` / `correlation_data`); no inbox RPC API; `request_response_info` deferred |
-| Will message (`CONNECT`) | ⚠️ | Codec has `LastWill`; connection API not exposed yet |
+| Will message (`CONNECT`) | ✅ | `.will(topic, payload)` (+ `.will_qos` / `.will_retain`); QoS 0\|1; power: `WillMessage` |
 | Optional `SO_SNDBUF` / `SO_RCVBUF` | ⚠️ | OS defaults today |
 | Enhanced AUTH | ❌ | |
 | WebSockets | ❌ | TCP (+ TLS) only |
