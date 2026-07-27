@@ -24,7 +24,7 @@ fn canonical_props_len(props: &PublishProperties) -> usize {
     let prop_len = encoded_property_size(&props.correlation_data)
         + encoded_property_size(&props.message_expiry_interval)
         + encoded_property_size(&props.content_type)
-        + encoded_property_size_default(&props.is_utf8_payload, false)
+        + encoded_property_size_default(&props.payload_format_indicator, false)
         + encoded_property_size(&props.response_topic)
         + props.user_properties.encoded_size();
     prop_len + var_int_len(prop_len) as usize
@@ -36,7 +36,7 @@ fn encode_canonical_props(props: &PublishProperties, buf: &mut BytesMut, max_out
     encode_property(&props.correlation_data, pt::CORR_DATA, buf)?;
     encode_property(&props.message_expiry_interval, pt::MSG_EXPIRY_INT, buf)?;
     encode_property(&props.content_type, pt::CONTENT_TYPE, buf)?;
-    encode_property_default(&props.is_utf8_payload, false, pt::UTF8_PAYLOAD, buf)?;
+    encode_property_default(&props.payload_format_indicator, false, pt::UTF8_PAYLOAD, buf)?;
     encode_property(&props.response_topic, pt::RESP_TOPIC, buf)?;
     props.user_properties.encode(buf)
 }
@@ -336,7 +336,7 @@ mod tests {
                 last_will: None,
                 username: Some(ByteString::from_static("user")),
                 password: Some(Bytes::from_static(b"pass")),
-                session_expiry_interval_secs: 0,
+                session_expiry_interval: 0,
                 auth_method: None,
                 auth_data: None,
                 request_problem_info: true,
@@ -359,18 +359,18 @@ mod tests {
                     qos: QoS::ExactlyOnce,
                     retain: false,
                     topic: ByteString::from_static("topic"),
-                    message: Bytes::from_static(b"message"),
-                    will_delay_interval_sec: None,
+                    payload: Bytes::from_static(b"message"),
+                    will_delay_interval: None,
                     correlation_data: None,
                     message_expiry_interval: None,
                     content_type: None,
                     user_properties: vec![],
-                    is_utf8_payload: None,
+                    payload_format_indicator: None,
                     response_topic: None,
                 }),
                 username: None,
                 password: None,
-                session_expiry_interval_secs: 0,
+                session_expiry_interval: 0,
                 auth_method: None,
                 auth_data: None,
                 request_problem_info: true,
@@ -393,20 +393,20 @@ mod tests {
                     qos: QoS::ExactlyOnce,
                     retain: true,
                     topic: ByteString::from_static("topic"),
-                    message: Bytes::from_static(b"message"),
-                    will_delay_interval_sec: Some(5),
+                    payload: Bytes::from_static(b"message"),
+                    will_delay_interval: Some(5),
                     correlation_data: Some(Bytes::from_static(b"correlationData")),
                     message_expiry_interval: NonZeroU32::new(7),
                     content_type: Some(ByteString::from_static("contentType")),
                     user_properties: vec![
                         (ByteString::from_static("name"), ByteString::from_static("value"))
                     ],
-                    is_utf8_payload: Some(true),
+                    payload_format_indicator: Some(true),
                     response_topic: Some(ByteString::from_static("responseTopic")),
                 }),
                 username: None,
                 password: None,
-                session_expiry_interval_secs: 0,
+                session_expiry_interval: 0,
                 auth_method: None,
                 auth_data: None,
                 request_problem_info: true,
@@ -423,7 +423,7 @@ mod tests {
         assert_encode_packet(
             &Packet::Disconnect(Disconnect {
                 reason_code: DisconnectReasonCode::NormalDisconnection,
-                session_expiry_interval_secs: None,
+                session_expiry_interval: None,
                 server_reference: None,
                 reason_string: None,
                 user_properties: vec![],

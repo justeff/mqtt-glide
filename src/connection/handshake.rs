@@ -69,7 +69,7 @@ pub(crate) fn build_connect(options: &ConnectOptions, client_id: &str, credentia
     Connect {
         clean_start: options.clean_start,
         keep_alive,
-        session_expiry_interval_secs: session_expiry_secs(options.session_expiry),
+        session_expiry_interval: session_expiry_secs(options.session_expiry),
         receive_max: Some(options.receive_maximum),
         topic_alias_max: 0,
         client_id: ByteString::from(client_id),
@@ -86,7 +86,7 @@ pub(crate) fn apply_connack(client_keep_alive: Duration, ack: &ConnectAck) -> Re
     }
 
     let keep_alive = ack
-        .server_keepalive_sec
+        .server_keep_alive
         .map(|secs| Duration::from_secs(u64::from(secs)))
         .unwrap_or(client_keep_alive);
 
@@ -247,10 +247,10 @@ mod tests {
 
         assert!(packet.clean_start);
         assert_eq!(
-            packet.session_expiry_interval_secs,
+            packet.session_expiry_interval,
             session_expiry_secs(options.session_expiry)
         );
-        assert_eq!(packet.session_expiry_interval_secs, 120);
+        assert_eq!(packet.session_expiry_interval, 120);
         assert_eq!(
             packet.topic_alias_max, 0,
             "Topic Alias Maximum must be 0 (product policy)"
@@ -274,7 +274,7 @@ mod tests {
         ConnectAck {
             session_present: false,
             reason_code: ConnectAckReason::Success,
-            session_expiry_interval_secs: None,
+            session_expiry_interval: None,
             receive_max: nonzero!(512u16),
             max_qos: QoS::AtLeastOnce,
             max_packet_size: Some(1_048_576),
@@ -284,7 +284,7 @@ mod tests {
             wildcard_subscription_available: true,
             subscription_identifiers_available: false,
             shared_subscription_available: false,
-            server_keepalive_sec: Some(30),
+            server_keep_alive: Some(30),
             response_info: None,
             server_reference: None,
             auth_method: None,
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn apply_connack_keeps_client_keep_alive_when_server_absent() {
         let mut ack = sample_connack();
-        ack.server_keepalive_sec = None;
+        ack.server_keep_alive = None;
         let session = apply_connack(Duration::from_secs(60), &ack).expect("success CONNACK");
         assert_eq!(session.keep_alive, Duration::from_secs(60));
     }

@@ -295,9 +295,9 @@ fn arb_v5_disconnect() -> impl Strategy<Value = Disconnect> {
         arb_v5_user_properties(),
     )
         .prop_map(
-            |(reason_code, session_expiry_interval_secs, reason_string, user_properties)| Disconnect {
+            |(reason_code, session_expiry_interval, reason_string, user_properties)| Disconnect {
                 reason_code,
-                session_expiry_interval_secs,
+                session_expiry_interval,
                 server_reference: None,
                 reason_string,
                 user_properties,
@@ -383,10 +383,10 @@ fn arb_v5_connect() -> impl Strategy<Value = Connect> {
         arb_optional_credentials(),
     )
         .prop_map(
-            |(clean_start, keep_alive, session_expiry_interval_secs, client_id, (username, password))| Connect {
+            |(clean_start, keep_alive, session_expiry_interval, client_id, (username, password))| Connect {
                 clean_start,
                 keep_alive,
-                session_expiry_interval_secs,
+                session_expiry_interval,
                 auth_method: None,
                 auth_data: None,
                 request_problem_info: true,
@@ -454,7 +454,7 @@ fn arb_v5_publish_with_properties() -> impl Strategy<Value = (PublishMessage, Pu
             prop::collection::vec((arb_valid_topic(), arb_valid_topic()), 0..=4),
             any::<bool>(),
         )
-            .prop_map(|(retain, topic, payload, user_properties, is_utf8_payload)| {
+            .prop_map(|(retain, topic, payload, user_properties, payload_format_indicator)| {
                 let user_properties = user_properties
                     .into_iter()
                     .map(|(key, value)| (ByteString::from(key), ByteString::from(value)))
@@ -465,7 +465,7 @@ fn arb_v5_publish_with_properties() -> impl Strategy<Value = (PublishMessage, Pu
                         payload,
                         properties: PublishProperties {
                             user_properties,
-                            is_utf8_payload,
+                            payload_format_indicator,
                             ..Default::default()
                         },
                     },
@@ -487,7 +487,7 @@ fn arb_v5_publish_with_properties() -> impl Strategy<Value = (PublishMessage, Pu
             any::<bool>(),
         )
             .prop_map(
-                |(dup, retain, topic, packet_id, payload, user_properties, is_utf8_payload)| {
+                |(dup, retain, topic, packet_id, payload, user_properties, payload_format_indicator)| {
                     let user_properties = user_properties
                         .into_iter()
                         .map(|(key, value)| (ByteString::from(key), ByteString::from(value)))
@@ -498,7 +498,7 @@ fn arb_v5_publish_with_properties() -> impl Strategy<Value = (PublishMessage, Pu
                             payload,
                             properties: PublishProperties {
                                 user_properties,
-                                is_utf8_payload,
+                                payload_format_indicator,
                                 ..Default::default()
                             },
                         },

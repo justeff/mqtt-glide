@@ -406,7 +406,7 @@ async fn server_keep_alive_from_connack_drives_pingreq_interval() {
 
     let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
         let ack = ConnectAck {
-            server_keepalive_sec: Some(1),
+            server_keep_alive: Some(1),
             ..ConnectAck::default()
         };
         if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {

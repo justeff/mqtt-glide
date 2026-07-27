@@ -14,18 +14,18 @@ use crate::codec::error::{DecodeError, EncodeError};
 use super::framing::decode_variable_length_cursor;
 use super::reader::WireReader;
 
-/// Trait for decoding types from network bytes
+/// Decode a value from MQTT wire bytes (§1.5).
 pub(crate) trait Decode: Sized {
-    /// Decodes from byte buffer, advancing position
+    /// Decodes from the buffer, advancing the cursor.
     ///
     /// # Errors
-    /// Returns `DecodeError` on invalid data or insufficient bytes
+    /// Returns [`DecodeError`] on invalid data or insufficient bytes.
     fn decode(src: &mut Bytes) -> Result<Self, DecodeError>;
 }
 
-/// Trait for reading MQTT properties with validation
+/// Read a property value once; duplicate identifiers are a protocol error ([MQTT-2.2.2-2]).
 pub(in crate::codec) trait Property {
-    /// Reads property value from buffer, ensuring single assignment
+    /// Reads the property value, rejecting a second assignment of the same field.
     fn read_value(&mut self, src: &mut Bytes) -> Result<(), DecodeError>;
 }
 
@@ -173,7 +173,7 @@ pub(crate) fn ensure_non_empty_topic(topic: &ByteString) -> Result<(), DecodeErr
     Ok(())
 }
 
-/// Extracts property bytes with length prefix
+/// Slice the Property Length prefix and return the property block (§2.2.2.1).
 #[inline]
 pub(crate) fn take_properties(src: &mut Bytes) -> Result<Bytes, DecodeError> {
     let prop_len = decode_variable_length_cursor(src)?;
@@ -181,12 +181,12 @@ pub(crate) fn take_properties(src: &mut Bytes) -> Result<Bytes, DecodeError> {
     Ok(src.split_to(prop_len as usize))
 }
 
-/// Trait for encoding types to network bytes
+/// Encode a value to MQTT wire bytes (§1.5).
 pub(crate) trait Encode {
-    /// Calculates serialized size in bytes
+    /// Serialized size in bytes.
     fn encoded_size(&self) -> usize;
 
-    /// Writes serialized data to buffer
+    /// Appends the serialized form to `buf`.
     fn encode(&self, buf: &mut BytesMut) -> Result<(), EncodeError>;
 }
 

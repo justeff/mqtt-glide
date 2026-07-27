@@ -1,7 +1,7 @@
-//! MQTT v5 property block encode/decode helpers.
+//! MQTT v5 property-block helpers (§2.2.2).
 //!
 //! Shared length budgeting and wire write logic for v5 property blocks.
-//! Per-packet validation (duplicate rejection, Lean-disabled props) stays in
+//! Per-packet validation (duplicate rejection, lean-disabled props) stays in
 //! each packet module — this module only handles common property wire ops.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};

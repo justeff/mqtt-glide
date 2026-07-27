@@ -1,6 +1,10 @@
-//! MQTT **AUTH** control packet — variable header and properties.
+//! MQTT AUTH (§3.15).
 //!
-//! - OASIS MQTT v5.0: §3.15 AUTH — Authentication exchange
+//! Variable header and properties per OASIS MQTT Version 5.0.
+//!
+//! # Errors
+//! Decode rejects unknown Reason Codes, Continue/Re-authenticate without Authentication
+//! Method (§3.15.2.2.2), and trailing bytes after the properties (§2.1.4).
 
 use std::convert::TryFrom;
 
@@ -16,7 +20,7 @@ use crate::codec::utils::{self, Decode, Property};
 use crate::codec::v5::body_encode::WireBodyEncode;
 use crate::codec::v5::{UserProperties, UserProperty, property_type as pt};
 
-/// AUTH message
+/// AUTH packet body (§3.15).
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Auth {
     pub reason_code: AuthReasonCode,
@@ -26,7 +30,7 @@ pub struct Auth {
     pub user_properties: UserProperties,
 }
 
-/// AUTH reason codes
+/// AUTH Reason Codes (§3.15.2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AuthReasonCode {
@@ -90,7 +94,7 @@ impl Auth {
 
                 if matches!(reason_code, AuthReasonCode::ContinueAuth | AuthReasonCode::ReAuth) && auth_method.is_none()
                 {
-                    // [MQTT-3.15.2.2.2] Continue Authentication / Re-authenticate must include Authentication Method.
+                    // §3.15.2.2.2 — Continue Authentication / Re-authenticate must include Authentication Method.
                     return Err(DecodeError::MalformedPacket("invalid encoding"));
                 }
 
@@ -135,14 +139,15 @@ impl WireBodyEncode for Auth {
         if self.is_minimal_success() {
             return Ok(0);
         }
-        const HEADER_LEN: usize = 1; // reason code
+        const HEADER_LEN: usize = 1; // Reason Code (§3.15.2.1)
 
         let mut prop_len = encoded_property_size(&self.auth_method) + encoded_property_size(&self.auth_data);
+        // Reason String / User Properties trimmed to fit; reserve ≤4 bytes for Property Length varint.
         let diag_len = encoded_size_opt_props(
             &self.user_properties,
             &self.reason_string,
             reduce_limit(max_out, prop_len + HEADER_LEN + 4),
-        ); // exclude other props and max of 4 bytes for property length value
+        );
         prop_len += diag_len;
         Ok(HEADER_LEN + var_int_len(prop_len) as usize + prop_len)
     }

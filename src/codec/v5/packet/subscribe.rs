@@ -1,9 +1,10 @@
-//! MQTT **SUBSCRIBE**, **SUBACK**, **UNSUBSCRIBE**, and **UNSUBACK** control packets.
+//! MQTT SUBSCRIBE (§3.8), SUBACK (§3.9), UNSUBSCRIBE (§3.10), and UNSUBACK (§3.11).
 //!
-//! - OASIS MQTT v5.0: §3.8 SUBSCRIBE — Subscribe request
-//! - OASIS MQTT v5.0: §3.9 SUBACK — Subscribe acknowledgement
-//! - OASIS MQTT v5.0: §3.10 UNSUBSCRIBE — Unsubscribe request
-//! - OASIS MQTT v5.0: §3.11 UNSUBACK — Unsubscribe acknowledgement
+//! Subscription control packets per OASIS MQTT Version 5.0.
+//!
+//! # Errors
+//! Decode rejects empty topic filter lists, malformed Subscription Options, unknown
+//! Reason Codes, and trailing bytes after the payload (§2.1.4).
 
 use std::convert::TryFrom;
 use std::num::{NonZeroU16, NonZeroU32};
@@ -18,22 +19,21 @@ use crate::codec::utils::{self, Decode, Encode, decode_non_empty_topic};
 use crate::codec::v5::body_encode::WireBodyEncode;
 use crate::codec::v5::{UserProperties, UserProperty, property_type as pt};
 
-/// Represents SUBSCRIBE packet
+/// SUBSCRIBE packet body (§3.8).
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Subscribe {
-    /// Packet Identifier
+    /// Packet Identifier (§2.2.1, §3.8.2).
     pub packet_id: NonZeroU16,
-    /// Subscription Identifier
+    /// Subscription Identifier property (§3.8.2.1.2).
     pub id: Option<NonZeroU32>,
     pub user_properties: UserProperties,
-    /// the list of Topic Filters and QoS to which the Client wants to subscribe.
+    /// Topic Filters and Subscription Options (§3.8.3).
     pub topic_filters: Vec<(ByteString, SubscriptionOptions)>,
 }
 
-/// Subscription options for MQTT v5 SUBSCRIBE packets
+/// Per-filter Subscription Options byte (§3.8.3.1).
 ///
-/// Contains per-subscription options including QoS, no-local, retain-as-published,
-/// and retain handling as defined in the MQTT v5.0 specification.
+/// Encodes QoS, No Local, Retain As Published, and Retain Handling.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct SubscriptionOptions {
     pub qos: QoS,
@@ -53,9 +53,7 @@ impl Default for SubscriptionOptions {
     }
 }
 
-/// Retain handling options for MQTT v5 subscriptions.
-///
-/// Controls how retained messages are sent when a subscription is established.
+/// Retain Handling values in the Subscription Options byte (§3.8.3.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RetainHandling {
@@ -83,37 +81,37 @@ impl From<RetainHandling> for u8 {
     }
 }
 
-/// Represents SUBACK packet
+/// SUBACK packet body (§3.9).
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct SubscribeAck {
     pub packet_id: NonZeroU16,
     pub properties: UserProperties,
     pub reason_string: Option<ByteString>,
-    /// corresponds to a Topic Filter in the SUBSCRIBE Packet being acknowledged.
+    /// One Reason Code per Topic Filter in the matching SUBSCRIBE (§3.9.3).
     pub status: Vec<SubscribeAckReason>,
 }
 
-/// Represents UNSUBSCRIBE packet
+/// UNSUBSCRIBE packet body (§3.10).
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Unsubscribe {
-    /// Packet Identifier
+    /// Packet Identifier (§2.2.1, §3.10.2).
     pub packet_id: NonZeroU16,
     pub user_properties: UserProperties,
-    /// the list of Topic Filters that the Client wishes to unsubscribe from.
+    /// Topic Filters to remove (§3.10.3).
     pub topic_filters: Vec<ByteString>,
 }
 
-/// Represents UNSUBACK packet
+/// UNSUBACK packet body (§3.11).
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct UnsubscribeAck {
-    /// Packet Identifier
+    /// Packet Identifier (§2.2.1, §3.11.2).
     pub packet_id: NonZeroU16,
     pub properties: UserProperties,
     pub reason_string: Option<ByteString>,
     pub status: Vec<UnsubscribeAckReason>,
 }
 
-/// SUBACK reason codes
+/// SUBACK Reason Codes (§3.9.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SubscribeAckReason {
@@ -159,7 +157,7 @@ impl From<SubscribeAckReason> for u8 {
     }
 }
 
-/// UNSUBACK reason codes
+/// UNSUBACK Reason Codes (§3.11.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum UnsubscribeAckReason {

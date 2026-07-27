@@ -1,4 +1,7 @@
-//! MQTT v5 `Packet` enum dispatch only.
+//! MQTT v5 control-packet enum and property identifiers.
+//!
+//! PUBLISH is decoded separately as [`DecodedFrame::Publish`]; this module covers the
+//! remaining control packets from OASIS MQTT Version 5.0 §3.
 
 use crate::codec::publish::PublishPacket;
 use crate::codec::types::packet_type;
@@ -21,47 +24,47 @@ pub use subscribe::*;
 /// Decoded inbound MQTT frame: PUBLISH data path or a control packet.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum DecodedFrame {
-    /// MQTT PUBLISH control packet.
+    /// PUBLISH (§3.3).
     Publish(PublishPacket),
     /// Any other MQTT control packet.
     Control(Packet),
 }
 
-/// MQTT control packets (excludes PUBLISH — use [`DecodedFrame::Publish`]).
+/// MQTT control packets excluding PUBLISH (see [`DecodedFrame::Publish`]).
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Packet {
-    /// Client request to connect to Server
+    /// CONNECT (§3.1).
     Connect(Box<Connect>),
-    /// Connect acknowledgment
+    /// CONNACK (§3.2).
     ConnectAck(Box<ConnectAck>),
-    /// Publish acknowledgment
+    /// PUBACK (§3.4).
     PublishAck(PublishAck),
-    /// Publish received (assured delivery part 1)
+    /// PUBREC (§3.5).
     PublishReceived(PublishAck),
-    /// Publish release (assured delivery part 2)
+    /// PUBREL (§3.6).
     PublishRelease(PubRelComp),
-    /// Publish complete (assured delivery part 3)
+    /// PUBCOMP (§3.7).
     PublishComplete(PubRelComp),
-    /// Client subscribe request
+    /// SUBSCRIBE (§3.8).
     Subscribe(Subscribe),
-    /// Subscribe acknowledgment
+    /// SUBACK (§3.9).
     SubscribeAck(SubscribeAck),
-    /// Unsubscribe request
+    /// UNSUBSCRIBE (§3.10).
     Unsubscribe(Unsubscribe),
-    /// Unsubscribe acknowledgment
+    /// UNSUBACK (§3.11).
     UnsubscribeAck(UnsubscribeAck),
-    /// PING request
+    /// PINGREQ (§3.12).
     PingRequest,
-    /// PING response
+    /// PINGRESP (§3.13).
     PingResponse,
-    /// Disconnection is advertised
+    /// DISCONNECT (§3.14).
     Disconnect(Disconnect),
-    /// Auth exchange
+    /// AUTH (§3.15).
     Auth(Auth),
 }
 
 impl Packet {
-    /// Returns the MQTT packet type byte for this packet
+    /// Fixed-header packet type nibble as a full first-byte value (§2.1.2).
     pub fn packet_type(&self) -> u8 {
         match self {
             Packet::Connect(_) => packet_type::CONNECT,
@@ -148,9 +151,7 @@ impl From<Auth> for Packet {
     }
 }
 
-/// MQTT v5 property type identifiers
-///
-/// Defines byte codes for all property types defined in the MQTT v5.0 specification.
+/// Property identifiers from OASIS MQTT Version 5.0 §2.2.2.2.
 pub(crate) mod property_type {
     pub(crate) const UTF8_PAYLOAD: u8 = 0x01;
     pub(crate) const MSG_EXPIRY_INT: u8 = 0x02;

@@ -1,6 +1,11 @@
-//! MQTT **CONNECT** control packet — variable header, properties, and payload.
+//! MQTT CONNECT (§3.1).
 //!
-//! - OASIS MQTT v5.0: §3.1 CONNECT — Connection Request
+//! Variable header, properties, and payload per OASIS MQTT Version 5.0.
+//!
+//! # Errors
+//! Decode rejects reserved Connect flags ([MQTT-3.1.2-3]), Will flag inconsistencies
+//! ([MQTT-3.1.2-11], [MQTT-3.1.2-13]), Authentication Data without Authentication Method,
+//! and trailing bytes after the payload (§2.1.4).
 
 use std::num::{NonZeroU16, NonZeroU32};
 
@@ -16,69 +21,85 @@ use crate::codec::utils::{self, Decode, Encode, Property, decode_topic_name};
 use crate::codec::v5::body_encode::WireBodyEncode;
 use crate::codec::v5::{RECEIVE_MAX_DEFAULT, UserProperties, UserProperty, property_type as pt};
 
+/// CONNECT packet body (§3.1).
 #[derive(Debug, PartialEq, Eq, Clone)]
-/// Connect packet content
 pub struct Connect {
-    /// the handling of the Session state.
+    /// Clean Start ([MQTT-3.1.2-4], §3.1.2.4).
     pub clean_start: bool,
-    /// a time interval measured in seconds.
+    /// Keep Alive in seconds (§3.1.2.10).
     pub keep_alive: u16,
 
-    pub session_expiry_interval_secs: u32,
+    /// Session Expiry Interval (§3.1.2.11.2).
+    pub session_expiry_interval: u32,
+    /// Authentication Method (§3.1.2.11.9).
     pub auth_method: Option<ByteString>,
+    /// Authentication Data (§3.1.2.11.10).
     pub auth_data: Option<Bytes>,
+    /// Request Problem Information (§3.1.2.11.7); default `true` when omitted.
     pub request_problem_info: bool,
+    /// Request Response Information (§3.1.2.11.6); default `false` when omitted.
     pub request_response_info: bool,
+    /// Receive Maximum (§3.1.2.11.3); absent means [`RECEIVE_MAX_DEFAULT`].
     pub receive_max: Option<NonZeroU16>,
+    /// Topic Alias Maximum (§3.1.2.11.5).
     pub topic_alias_max: u16,
+    /// User Property (§3.1.2.11.8).
     pub user_properties: UserProperties,
+    /// Maximum Packet Size (§3.1.2.11.4).
     pub max_packet_size: Option<NonZeroU32>,
 
-    /// Will Message be stored on the Server and associated with the Network Connection.
+    /// Will Message (§3.1.2.5, §3.1.3.2–§3.1.3.4).
     pub last_will: Option<LastWill>,
-    /// identifies the Client to the Server.
+    /// Client Identifier (§3.1.3.1).
     pub client_id: ByteString,
-    /// username can be used by the Server for authentication and authorization.
+    /// User Name (§3.1.3.5).
     pub username: Option<ByteString>,
-    /// password can be used by the Server for authentication and authorization.
+    /// Password (§3.1.3.6).
     pub password: Option<Bytes>,
 }
 
+/// Will Message fields carried in CONNECT (§3.1.2.5, §3.1.3.2–§3.1.3.4).
 #[derive(Debug, PartialEq, Eq, Clone)]
-/// Connection Will
 pub struct LastWill {
-    /// the QoS level to be used when publishing the Will Message.
+    /// Will QoS (§3.1.2.6).
     pub qos: QoS,
-    /// the Will Message is to be Retained when it is published.
+    /// Will Retain (§3.1.2.7).
     pub retain: bool,
-    /// the Will Topic
+    /// Will Topic (§3.1.3.3).
     pub topic: ByteString,
-    /// defines the Application Message that is to be published to the Will Topic
-    pub message: Bytes,
+    /// Will Payload (§3.1.3.4).
+    pub payload: Bytes,
 
-    pub will_delay_interval_sec: Option<u32>,
+    /// Will Delay Interval (§3.1.3.2.2).
+    pub will_delay_interval: Option<u32>,
+    /// Correlation Data (§3.1.3.2.7).
     pub correlation_data: Option<Bytes>,
+    /// Message Expiry Interval (§3.1.3.2.4).
     pub message_expiry_interval: Option<NonZeroU32>,
+    /// Content Type (§3.1.3.2.5).
     pub content_type: Option<ByteString>,
+    /// User Property (§3.1.3.2.8).
     pub user_properties: UserProperties,
-    pub is_utf8_payload: Option<bool>,
+    /// Payload Format Indicator (§3.1.3.2.3).
+    pub payload_format_indicator: Option<bool>,
+    /// Response Topic (§3.1.3.2.6).
     pub response_topic: Option<ByteString>,
 }
 
 impl LastWill {
     fn properties_len(&self) -> usize {
-        encoded_property_size(&self.will_delay_interval_sec)
+        encoded_property_size(&self.will_delay_interval)
             + encoded_property_size(&self.correlation_data)
             + encoded_property_size(&self.message_expiry_interval)
             + encoded_property_size(&self.content_type)
-            + encoded_property_size(&self.is_utf8_payload)
+            + encoded_property_size(&self.payload_format_indicator)
             + encoded_property_size(&self.response_topic)
             + self.user_properties.encoded_size()
     }
 }
 
 impl Connect {
-    /// Set client_id value
+    /// Sets Client Identifier (§3.1.3.1).
     pub fn client_id<T>(mut self, client_id: T) -> Self
     where
         ByteString: From<T>,
@@ -87,7 +108,7 @@ impl Connect {
         self
     }
 
-    /// Set receive_max value
+    /// Sets Receive Maximum (§3.1.2.11.3); `0` clears the property (wire default applies).
     pub fn receive_max(mut self, max: u16) -> Self {
         if let Some(num) = NonZeroU16::new(max) {
             self.receive_max = Some(num);
@@ -100,9 +121,9 @@ impl Connect {
     fn properties_len(&self) -> usize {
         encoded_property_size(&self.auth_method)
             + encoded_property_size(&self.auth_data)
-            + encoded_property_size_default(&self.session_expiry_interval_secs, 0)
-            + encoded_property_size_default(&self.request_problem_info, true) // 3.1.2.11.7 Request Problem Information
-            + encoded_property_size_default(&self.request_response_info, false) // 3.1.2.11.6 Request Response Information
+            + encoded_property_size_default(&self.session_expiry_interval, 0)
+            + encoded_property_size_default(&self.request_problem_info, true) // §3.1.2.11.7
+            + encoded_property_size_default(&self.request_response_info, false) // §3.1.2.11.6
             + encoded_property_size(&self.receive_max)
             + encoded_property_size(&self.max_packet_size)
             + encoded_property_size_default(&self.topic_alias_max, 0)
@@ -135,7 +156,7 @@ impl Connect {
         let keep_alive = src.get_u16();
 
         // reading properties
-        let mut session_expiry_interval_secs = None;
+        let mut session_expiry_interval = None;
         let mut auth_method = None;
         let mut auth_data = None;
         let mut request_problem_info = None;
@@ -147,7 +168,7 @@ impl Connect {
         let prop_src = &mut utils::take_properties(src)?;
         while prop_src.has_remaining() {
             match prop_src.get_u8() {
-                pt::SESS_EXPIRY_INT => session_expiry_interval_secs.read_value(prop_src)?,
+                pt::SESS_EXPIRY_INT => session_expiry_interval.read_value(prop_src)?,
                 pt::AUTH_METHOD => auth_method.read_value(prop_src)?,
                 pt::AUTH_DATA => auth_data.read_value(prop_src)?,
                 pt::REQ_PROB_INFO => request_problem_info.read_value(prop_src)?,
@@ -190,7 +211,7 @@ impl Connect {
         Ok(Connect {
             clean_start: flags.contains(ConnectFlags::CLEAN_START),
             keep_alive,
-            session_expiry_interval_secs: session_expiry_interval_secs.unwrap_or(0),
+            session_expiry_interval: session_expiry_interval.unwrap_or(0),
             auth_method,
             auth_data,
             receive_max,
@@ -222,7 +243,7 @@ impl Default for Connect {
         Connect {
             clean_start: false,
             keep_alive: 0,
-            session_expiry_interval_secs: 0,
+            session_expiry_interval: 0,
             auth_method: None,
             auth_data: None,
             request_problem_info: true,
@@ -240,21 +261,21 @@ impl Default for Connect {
 }
 
 fn decode_last_will(src: &mut Bytes, flags: ConnectFlags) -> Result<LastWill, DecodeError> {
-    let mut will_delay_interval_sec = None;
+    let mut will_delay_interval = None;
     let mut correlation_data = None;
     let mut message_expiry_interval = None;
     let mut content_type = None;
     let mut user_properties = Vec::new();
-    let mut is_utf8_payload = None;
+    let mut payload_format_indicator = None;
     let mut response_topic = None;
     let prop_src = &mut utils::take_properties(src)?;
     while prop_src.has_remaining() {
         match prop_src.get_u8() {
-            pt::WILL_DELAY_INT => will_delay_interval_sec.read_value(prop_src)?,
+            pt::WILL_DELAY_INT => will_delay_interval.read_value(prop_src)?,
             pt::CORR_DATA => correlation_data.read_value(prop_src)?,
             pt::MSG_EXPIRY_INT => message_expiry_interval.read_value(prop_src)?,
             pt::CONTENT_TYPE => content_type.read_value(prop_src)?,
-            pt::UTF8_PAYLOAD => is_utf8_payload.read_value(prop_src)?,
+            pt::UTF8_PAYLOAD => payload_format_indicator.read_value(prop_src)?,
             pt::RESP_TOPIC => response_topic.read_value(prop_src)?,
             pt::USER => user_properties.push(UserProperty::decode(prop_src)?),
             _ => return Err(DecodeError::MalformedPacket("unknown property or reason code")),
@@ -262,18 +283,18 @@ fn decode_last_will(src: &mut Bytes, flags: ConnectFlags) -> Result<LastWill, De
     }
 
     let topic = decode_topic_name(src)?;
-    let message = Bytes::decode(src)?;
+    let payload = Bytes::decode(src)?;
     Ok(LastWill {
         qos: QoS::try_from((flags & ConnectFlags::WILL_QOS).bits() >> WILL_QOS_SHIFT)?,
         retain: flags.contains(ConnectFlags::WILL_RETAIN),
         topic,
-        message,
-        will_delay_interval_sec,
+        payload,
+        will_delay_interval,
         correlation_data,
         message_expiry_interval,
         content_type,
         user_properties,
-        is_utf8_payload,
+        payload_format_indicator,
         response_topic,
     })
 }
@@ -290,7 +311,7 @@ impl WireBodyEncode for Connect {
             + self.client_id.encoded_size()
             + self.last_will.as_ref().map_or(0, |will| { // will message content
                 let prop_len = will.properties_len();
-                var_int_len(prop_len) as usize + prop_len + will.topic.encoded_size() + will.message.encoded_size()
+                var_int_len(prop_len) as usize + prop_len + will.topic.encoded_size() + will.payload.encoded_size()
             })
             + self.username.as_ref().map_or(0, |v| v.encoded_size())
             + self.password.as_ref().map_or(0, |v| v.encoded_size()))
@@ -329,11 +350,11 @@ impl WireBodyEncode for Connect {
         let prop_len = self.properties_len();
         utils::write_variable_length(prop_len as u32, buf)?; // safe: whole message size is vetted via max size check in codec
 
-        encode_property_default(&self.session_expiry_interval_secs, 0, pt::SESS_EXPIRY_INT, buf)?;
+        encode_property_default(&self.session_expiry_interval, 0, pt::SESS_EXPIRY_INT, buf)?;
         encode_property(&self.auth_method, pt::AUTH_METHOD, buf)?;
         encode_property(&self.auth_data, pt::AUTH_DATA, buf)?;
-        encode_property_default(&self.request_problem_info, true, pt::REQ_PROB_INFO, buf)?; // 3.1.2.11.7 Request Problem Information
-        encode_property_default(&self.request_response_info, false, pt::REQ_RESP_INFO, buf)?; // 3.1.2.11.6 Request Response Information
+        encode_property_default(&self.request_problem_info, true, pt::REQ_PROB_INFO, buf)?; // §3.1.2.11.7
+        encode_property_default(&self.request_response_info, false, pt::REQ_RESP_INFO, buf)?; // §3.1.2.11.6
         encode_property(&self.receive_max, pt::RECEIVE_MAX, buf)?;
         encode_property(&self.max_packet_size, pt::MAX_PACKET_SIZE, buf)?;
         encode_property_default(&self.topic_alias_max, 0, pt::TOPIC_ALIAS_MAX, buf)?;
@@ -348,15 +369,15 @@ impl WireBodyEncode for Connect {
             let prop_len = will.properties_len();
             utils::write_variable_length(prop_len as u32, buf)?; // safe: whole message size is checked for max already
 
-            encode_property(&will.will_delay_interval_sec, pt::WILL_DELAY_INT, buf)?;
-            encode_property(&will.is_utf8_payload, pt::UTF8_PAYLOAD, buf)?;
+            encode_property(&will.will_delay_interval, pt::WILL_DELAY_INT, buf)?;
+            encode_property(&will.payload_format_indicator, pt::UTF8_PAYLOAD, buf)?;
             encode_property(&will.message_expiry_interval, pt::MSG_EXPIRY_INT, buf)?;
             encode_property(&will.content_type, pt::CONTENT_TYPE, buf)?;
             encode_property(&will.response_topic, pt::RESP_TOPIC, buf)?;
             encode_property(&will.correlation_data, pt::CORR_DATA, buf)?;
             will.user_properties.encode(buf)?;
             will.topic.encode(buf)?;
-            will.message.encode(buf)?;
+            will.payload.encode(buf)?;
         }
         if let Some(s) = self.username.as_ref() {
             s.encode(buf)?;

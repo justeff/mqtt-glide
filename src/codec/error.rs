@@ -1,8 +1,7 @@
-//! Error types for MQTT protocol encoding and decoding operations.
+//! Codec errors for MQTT encode and decode.
 //!
-//! This module defines codec-local failures:
-//! - [`DecodeError`]: parsing MQTT packets from bytes
-//! - [`EncodeError`]: serializing MQTT packets to bytes
+//! - [`DecodeError`]: failures while parsing frames (§2 / §3 wire rules)
+//! - [`EncodeError`]: failures while serializing packets to bytes
 
 use std::io;
 
@@ -10,7 +9,7 @@ use bytestring::ByteString;
 
 use crate::codec::v5::{DisconnectReasonCode, ToReasonCode};
 
-/// Errors that occur when decoding/parsing MQTT packets from a byte stream
+/// Errors while decoding MQTT frames from a byte stream.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum DecodeError {
     #[error("Invalid protocol")]
@@ -59,7 +58,7 @@ impl ToReasonCode for DecodeError {
     }
 }
 
-/// Errors that occur when encoding/serializing MQTT packets to a byte stream
+/// Errors while encoding MQTT packets to a byte stream.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum EncodeError {
     #[error("Packet is bigger than peer's Maximum Packet Size: size={size}, max={max}")]

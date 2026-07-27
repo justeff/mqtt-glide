@@ -1,4 +1,4 @@
-//! Canonical PUBLISH model and delivery-time wire metadata.
+//! Canonical PUBLISH model and delivery-time wire metadata (§3.3).
 //!
 //! Type ladder: inbound wire decode → [`PublishPacket`] (with [`PublishPacketMeta`] and optional
 //! `wire_topic_alias`) → session policy → [`PublishMessage`] handoff → outbound
@@ -9,7 +9,8 @@
 //! carries outbound wire overrides (`dup`, `retain`, `qos`, `packet_id`).
 //!
 //! Topic Alias is **not** part of [`PublishProperties`]: it is connection-local wire state
-//! surfaced on [`PublishPacket::wire_topic_alias`] until session policy validates or resolves it.
+//! (§3.3.2.3.4) surfaced on [`PublishPacket::wire_topic_alias`] until session policy
+//! validates or resolves it.
 
 use std::num::{NonZeroU16, NonZeroU32};
 
@@ -21,11 +22,17 @@ use crate::codec::types::QoS;
 /// Transferable MQTT v5 PUBLISH properties (no Topic Alias, no Subscription Identifiers).
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct PublishProperties {
+    /// Correlation Data (§3.3.2.3.6).
     pub correlation_data: Option<Bytes>,
+    /// Message Expiry Interval (§3.3.2.3.3).
     pub message_expiry_interval: Option<NonZeroU32>,
+    /// Content Type (§3.3.2.3.9).
     pub content_type: Option<ByteString>,
+    /// User Property (§3.3.2.3.7).
     pub user_properties: Vec<(ByteString, ByteString)>,
-    pub is_utf8_payload: bool,
+    /// Payload Format Indicator (§3.3.2.3.2); `true` = UTF-8 payload.
+    pub payload_format_indicator: bool,
+    /// Response Topic (§3.3.2.3.5).
     pub response_topic: Option<ByteString>,
 }
 
@@ -35,7 +42,7 @@ impl PublishProperties {
         self.correlation_data.is_none()
             && self.message_expiry_interval.is_none()
             && self.content_type.is_none()
-            && !self.is_utf8_payload
+            && !self.payload_format_indicator
             && self.response_topic.is_none()
             && self.user_properties.is_empty()
     }

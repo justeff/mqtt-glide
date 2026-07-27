@@ -1,6 +1,9 @@
-//! MQTT **PUBLISH** control packet — variable header, properties, and payload.
+//! MQTT PUBLISH (§3.3) — variable header, properties, and payload decode.
 //!
-//! - OASIS MQTT v5.0: §3.3 PUBLISH — Publish message
+//! # Errors
+//! Rejects QoS 0 with DUP ([MQTT-3.3.1-2]), invalid Topic Names ([MQTT-3.3.2-2]),
+//! empty Topic Name without Topic Alias (§3.3.2.1), and trailing/malformed
+//! property blocks ([MQTT-2.2.2-2], §2.1.4).
 
 use std::{num::NonZeroU16, num::NonZeroU32};
 
@@ -21,7 +24,7 @@ pub(crate) struct PublishWireProperties {
     pub message_expiry_interval: Option<NonZeroU32>,
     pub content_type: Option<ByteString>,
     pub user_properties: UserProperties,
-    pub is_utf8_payload: bool,
+    pub payload_format_indicator: bool,
     pub response_topic: Option<ByteString>,
     pub subscription_ids: Vec<NonZeroU32>,
 }
@@ -47,7 +50,7 @@ impl PublishPacket {
         let properties = parse_publish_properties(&mut src)?;
         let wire_topic_alias = properties.as_ref().and_then(|p| p.topic_alias);
         if topic.is_empty() && wire_topic_alias.is_none() {
-            // [MQTT-4.7.3-1] unless Topic Alias supplies the name [MQTT-3.3.2-3]
+            // Protocol Error if Topic Name is zero length and there is no Topic Alias (§3.3.2.1).
             return Err(DecodeError::MalformedPacket("empty topic without topic alias"));
         }
         let payload = src;
@@ -62,7 +65,7 @@ impl PublishPacket {
                     message_expiry_interval: props.message_expiry_interval,
                     content_type: props.content_type,
                     user_properties: props.user_properties,
-                    is_utf8_payload: props.is_utf8_payload,
+                    payload_format_indicator: props.payload_format_indicator,
                     response_topic: props.response_topic,
                 },
             },
@@ -125,12 +128,12 @@ fn parse_publish_properties(src: &mut Bytes) -> Result<Option<PublishWirePropert
     let mut content_type = None;
     let mut correlation_data = None;
     let mut response_topic = None;
-    let mut is_utf8_payload = None;
+    let mut payload_format_indicator = None;
     let mut user_props = Vec::new();
 
     while prop_src.has_remaining() {
         match prop_src.get_u8() {
-            pt::UTF8_PAYLOAD => is_utf8_payload.read_value(prop_src)?,
+            pt::UTF8_PAYLOAD => payload_format_indicator.read_value(prop_src)?,
             pt::MSG_EXPIRY_INT => message_expiry_interval.read_value(prop_src)?,
             pt::CONTENT_TYPE => content_type.read_value(prop_src)?,
             pt::RESP_TOPIC => response_topic.read_value(prop_src)?,
@@ -155,7 +158,7 @@ fn parse_publish_properties(src: &mut Bytes) -> Result<Option<PublishWirePropert
         correlation_data,
         subscription_ids: Vec::new(),
         response_topic,
-        is_utf8_payload: is_utf8_payload.unwrap_or(false),
+        payload_format_indicator: payload_format_indicator.unwrap_or(false),
         user_properties: user_props,
     }))
 }

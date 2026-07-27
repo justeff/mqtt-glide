@@ -76,10 +76,6 @@ fn apply_session_limits_to_codecs<R, W>(
         framed_read.decoder_mut().set_max_inbound_size(max_packet_size);
         framed_write.encoder_mut().set_max_outbound_size(max_packet_size);
     }
-    framed_read.decoder_mut().set_retain_available(session.retain_available);
-    framed_write
-        .encoder_mut()
-        .set_retain_available(session.retain_available);
 }
 
 fn map_connect_send_error(error: crate::codec::EncodeError) -> ConnectionOutcome {

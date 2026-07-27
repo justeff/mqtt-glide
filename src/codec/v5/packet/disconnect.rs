@@ -1,6 +1,9 @@
-//! MQTT **DISCONNECT** control packet — variable header and properties.
+//! MQTT DISCONNECT (§3.14).
 //!
-//! - OASIS MQTT v5.0: §3.14 DISCONNECT — Disconnect notification
+//! Variable header and properties per OASIS MQTT Version 5.0.
+//!
+//! # Errors
+//! Decode rejects unknown Reason Codes and trailing bytes after the properties (§2.1.4).
 
 use std::convert::TryFrom;
 
@@ -16,22 +19,22 @@ use crate::codec::utils::{self, Decode, Property};
 use crate::codec::v5::body_encode::WireBodyEncode;
 use crate::codec::v5::{UserProperties, UserProperty, property_type as pt};
 
-/// DISCONNECT message
+/// DISCONNECT packet body (§3.14).
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Disconnect {
     pub reason_code: DisconnectReasonCode,
-    pub session_expiry_interval_secs: Option<u32>,
+    pub session_expiry_interval: Option<u32>,
     pub server_reference: Option<ByteString>,
     pub reason_string: Option<ByteString>,
     pub user_properties: UserProperties,
 }
 
-/// Trait for types that can be mapped to a `DisconnectReasonCode`
+/// Maps application or codec failures to a DISCONNECT Reason Code (§3.14.2.1).
 pub trait ToReasonCode {
     fn to_reason_code(&self) -> DisconnectReasonCode;
 }
 
-/// DISCONNECT reason codes
+/// DISCONNECT Reason Codes (§3.14.2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DisconnectReasonCode {
@@ -117,17 +120,17 @@ impl Disconnect {
     #[inline]
     pub(crate) fn is_minimal_success(&self) -> bool {
         self.reason_code == DisconnectReasonCode::NormalDisconnection
-            && self.session_expiry_interval_secs.is_none()
+            && self.session_expiry_interval.is_none()
             && self.server_reference.is_none()
             && self.reason_string.is_none()
             && self.user_properties.is_empty()
     }
 
-    /// Create new instance of `Disconnect` with specified code
+    /// Builds a DISCONNECT with the given Reason Code and empty properties (§3.14).
     pub fn new(reason_code: DisconnectReasonCode) -> Self {
         Self {
             reason_code,
-            session_expiry_interval_secs: None,
+            session_expiry_interval: None,
             server_reference: None,
             reason_string: None,
             user_properties: Vec::new(),
@@ -158,7 +161,7 @@ impl Disconnect {
 
                 Self {
                     reason_code,
-                    session_expiry_interval_secs: session_exp_secs,
+                    session_expiry_interval: session_exp_secs,
                     server_reference,
                     reason_string,
                     user_properties,
@@ -180,7 +183,7 @@ impl Default for Disconnect {
     fn default() -> Self {
         Self {
             reason_code: DisconnectReasonCode::NormalDisconnection,
-            session_expiry_interval_secs: None,
+            session_expiry_interval: None,
             server_reference: None,
             reason_string: None,
             user_properties: Vec::new(),
@@ -193,15 +196,16 @@ impl WireBodyEncode for Disconnect {
         if self.is_minimal_success() {
             return Ok(0);
         }
-        const HEADER_LEN: usize = 1; // reason code
+        const HEADER_LEN: usize = 1; // Reason Code (§3.14.2.1)
 
         let mut prop_len =
-            encoded_property_size(&self.session_expiry_interval_secs) + encoded_property_size(&self.server_reference);
+            encoded_property_size(&self.session_expiry_interval) + encoded_property_size(&self.server_reference);
+        // Reason String / User Properties trimmed to fit; reserve ≤4 bytes for Property Length varint.
         let diag_len = encoded_size_opt_props(
             &self.user_properties,
             &self.reason_string,
             reduce_limit(max_out, prop_len + HEADER_LEN + 4),
-        ); // exclude other props and max of 4 bytes for property length value
+        );
         prop_len += diag_len;
         Ok(HEADER_LEN + var_int_len(prop_len) as usize + prop_len)
     }
@@ -215,7 +219,7 @@ impl WireBodyEncode for Disconnect {
 
         let prop_len = var_int_len_from_size(max_out - 1);
         utils::write_variable_length(prop_len, buf)?;
-        encode_property(&self.session_expiry_interval_secs, pt::SESS_EXPIRY_INT, buf)?;
+        encode_property(&self.session_expiry_interval, pt::SESS_EXPIRY_INT, buf)?;
         encode_property(&self.server_reference, pt::SERVER_REF, buf)?;
         encode_opt_props(
             &self.user_properties,
@@ -246,7 +250,7 @@ mod tests {
     fn disconnect_encode_omits_reason_string_when_it_exceeds_max_packet_size() {
         let disconnect = Disconnect {
             reason_code: DisconnectReasonCode::NotAuthorized,
-            session_expiry_interval_secs: None,
+            session_expiry_interval: None,
             server_reference: None,
             reason_string: Some(ByteString::from_static("too long for budget")),
             user_properties: UserProperties::default(),
@@ -263,7 +267,7 @@ mod tests {
     fn disconnect_encode_omits_user_property_when_it_exceeds_max_packet_size() {
         let disconnect = Disconnect {
             reason_code: DisconnectReasonCode::NotAuthorized,
-            session_expiry_interval_secs: None,
+            session_expiry_interval: None,
             server_reference: None,
             reason_string: None,
             user_properties: vec![(ByteString::from_static("k"), ByteString::from_static("v"))],

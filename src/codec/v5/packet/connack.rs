@@ -1,6 +1,10 @@
-//! MQTT **CONNACK** control packet — variable header and properties.
+//! MQTT CONNACK (§3.2).
 //!
-//! - OASIS MQTT v5.0: §3.2 CONNACK — Connect acknowledgement
+//! Variable header and properties per OASIS MQTT Version 5.0.
+//!
+//! # Errors
+//! Decode rejects reserved Acknowledge flags ([MQTT-3.2.2-1]), duplicate property
+//! identifiers ([MQTT-2.2.2-2]), and trailing bytes after the properties (§2.1.4).
 
 use std::num::NonZeroU16;
 
@@ -18,30 +22,47 @@ use crate::codec::v5::RECEIVE_MAX_DEFAULT;
 use crate::codec::v5::body_encode::WireBodyEncode;
 use crate::codec::v5::{UserProperties, UserProperty, property_type as pt};
 
-/// Connect acknowledgment packet
+/// CONNACK packet body (§3.2).
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ConnectAck {
-    /// enables a Client to establish whether the Client and Server have a consistent view
-    /// about whether there is already stored Session state.
+    /// Session Present flag (§3.2.2.1.1).
     pub session_present: bool,
+    /// Connect Reason Code (§3.2.2.2).
     pub reason_code: ConnectAckReason,
 
-    pub session_expiry_interval_secs: Option<u32>,
+    /// Session Expiry Interval (§3.2.2.3.2).
+    pub session_expiry_interval: Option<u32>,
+    /// Receive Maximum (§3.2.2.3.3); default 65_535 when omitted.
     pub receive_max: NonZeroU16,
+    /// Maximum QoS (§3.2.2.3.4).
     pub max_qos: QoS,
+    /// Maximum Packet Size (§3.2.2.3.6).
     pub max_packet_size: Option<u32>,
+    /// Assigned Client Identifier (§3.2.2.3.7).
     pub assigned_client_id: Option<ByteString>,
+    /// Topic Alias Maximum (§3.2.2.3.8).
     pub topic_alias_max: u16,
+    /// Retain Available (§3.2.2.3.5).
     pub retain_available: bool,
+    /// Wildcard Subscription Available (§3.2.2.3.11).
     pub wildcard_subscription_available: bool,
+    /// Subscription Identifier Available (§3.2.2.3.12).
     pub subscription_identifiers_available: bool,
+    /// Shared Subscription Available (§3.2.2.3.13).
     pub shared_subscription_available: bool,
-    pub server_keepalive_sec: Option<u16>,
+    /// Server Keep Alive (§3.2.2.3.14).
+    pub server_keep_alive: Option<u16>,
+    /// Response Information (§3.2.2.3.15).
     pub response_info: Option<ByteString>,
+    /// Server Reference (§3.2.2.3.16).
     pub server_reference: Option<ByteString>,
+    /// Authentication Method (§3.2.2.3.17).
     pub auth_method: Option<ByteString>,
+    /// Authentication Data (§3.2.2.3.18).
     pub auth_data: Option<Bytes>,
+    /// Reason String (§3.2.2.3.9).
     pub reason_string: Option<ByteString>,
+    /// User Property (§3.2.2.3.10).
     pub user_properties: UserProperties,
 }
 
@@ -50,7 +71,7 @@ impl Default for ConnectAck {
         ConnectAck {
             session_present: false,
             reason_code: ConnectAckReason::Success,
-            session_expiry_interval_secs: None,
+            session_expiry_interval: None,
             receive_max: RECEIVE_MAX_DEFAULT,
             max_qos: QoS::ExactlyOnce,
             max_packet_size: None,
@@ -60,7 +81,7 @@ impl Default for ConnectAck {
             wildcard_subscription_available: true,
             subscription_identifiers_available: true,
             shared_subscription_available: true,
-            server_keepalive_sec: None,
+            server_keep_alive: None,
             response_info: None,
             server_reference: None,
             auth_method: None,
@@ -71,7 +92,7 @@ impl Default for ConnectAck {
     }
 }
 
-/// CONNACK reason codes ([MQTT-3.2.2.3]). Unlisted wire values decode as [`Unknown`](ConnectAckReason::Unknown).
+/// CONNACK reason codes (§3.2.2.2). Unlisted wire values decode as [`Unknown`](ConnectAckReason::Unknown).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectAckReason {
     Success,
@@ -160,7 +181,7 @@ impl From<ConnectAckReason> for u8 {
 }
 
 impl ConnectAckReason {
-    /// Returns a human-readable description of the reason code
+    /// Short English label for logging and diagnostics (not a wire field).
     pub fn reason(self) -> &'static str {
         match self {
             ConnectAckReason::Success => "Connection Accepted",
@@ -184,7 +205,7 @@ impl ConnectAck {
 
         let prop_src = &mut utils::take_properties(src)?;
 
-        let mut session_expiry_interval_secs = None;
+        let mut session_expiry_interval = None;
         let mut receive_max = None;
         let mut max_qos = None;
         let mut retain_available = None;
@@ -203,10 +224,11 @@ impl ConnectAck {
         let mut auth_data = None;
         while prop_src.has_remaining() {
             match prop_src.get_u8() {
-                pt::SESS_EXPIRY_INT => session_expiry_interval_secs.read_value(prop_src)?,
+                pt::SESS_EXPIRY_INT => session_expiry_interval.read_value(prop_src)?,
                 pt::RECEIVE_MAX => receive_max.read_value(prop_src)?,
                 pt::MAX_QOS => {
-                    ensure!(max_qos.is_none(), DecodeError::MalformedPacket("invalid encoding")); // property is set twice while not allowed
+                    // Duplicate property identifier ([MQTT-2.2.2-2]).
+                    ensure!(max_qos.is_none(), DecodeError::MalformedPacket("invalid encoding"));
                     ensure!(prop_src.has_remaining(), DecodeError::InvalidLength);
                     max_qos = Some(prop_src.get_u8().try_into()?);
                 }
@@ -232,7 +254,7 @@ impl ConnectAck {
         Ok(ConnectAck {
             session_present: flags.contains(ConnectAckFlags::SESSION_PRESENT),
             reason_code,
-            session_expiry_interval_secs,
+            session_expiry_interval,
             receive_max: receive_max.unwrap_or(RECEIVE_MAX_DEFAULT),
             max_qos: max_qos.unwrap_or(QoS::ExactlyOnce),
             max_packet_size,
@@ -242,7 +264,7 @@ impl ConnectAck {
             wildcard_subscription_available: wildcard_sub_avail.unwrap_or(true),
             subscription_identifiers_available: sub_ids_avail.unwrap_or(true),
             shared_subscription_available: shared_sub_avail.unwrap_or(true),
-            server_keepalive_sec: server_ka_sec,
+            server_keep_alive: server_ka_sec,
             response_info,
             server_reference,
             auth_method,
@@ -255,9 +277,10 @@ impl ConnectAck {
 
 impl WireBodyEncode for ConnectAck {
     fn encoded_body_len(&self, max_out: u32) -> Result<usize, EncodeError> {
-        const HEADER_LEN: usize = 2; // state flags byte + reason code
+        // Acknowledge Flags + Reason Code (§3.2.2).
+        const HEADER_LEN: usize = 2;
 
-        let mut prop_len = encoded_property_size(&self.session_expiry_interval_secs)
+        let mut prop_len = encoded_property_size(&self.session_expiry_interval)
             + encoded_property_size_default(&self.receive_max, RECEIVE_MAX_DEFAULT)
             + if self.max_qos < QoS::ExactlyOnce { 1 + 1 } else { 0 }
             + encoded_property_size(&self.max_packet_size)
@@ -266,20 +289,22 @@ impl WireBodyEncode for ConnectAck {
             + encoded_property_size_default(&self.wildcard_subscription_available, true)
             + encoded_property_size_default(&self.subscription_identifiers_available, true)
             + encoded_property_size_default(&self.shared_subscription_available, true)
-            + encoded_property_size(&self.server_keepalive_sec)
+            + encoded_property_size(&self.server_keep_alive)
             + encoded_property_size(&self.response_info)
             + encoded_property_size(&self.server_reference)
             + encoded_property_size(&self.auth_method)
             + encoded_property_size(&self.auth_data);
         if self.topic_alias_max > 0 {
-            prop_len += 1 + self.topic_alias_max.encoded_size(); // [property type, value..]
+            // Property identifier + Two Byte Integer value (§2.2.2).
+            prop_len += 1 + self.topic_alias_max.encoded_size();
         }
 
+        // Reason String / User Properties trimmed to fit; reserve ≤4 bytes for Property Length varint.
         let diag_len = encoded_size_opt_props(
             &self.user_properties,
             &self.reason_string,
             reduce_limit(max_out, HEADER_LEN + 4 + prop_len),
-        ); // exclude other props and max of 4 bytes for property length value
+        );
         prop_len += diag_len;
         Ok(HEADER_LEN + var_int_len(prop_len) as usize + prop_len)
     }
@@ -292,7 +317,7 @@ impl WireBodyEncode for ConnectAck {
         let prop_len = var_int_len_from_size(max_out - 2);
         utils::write_variable_length(prop_len, buf)?;
 
-        encode_property(&self.session_expiry_interval_secs, pt::SESS_EXPIRY_INT, buf)?;
+        encode_property(&self.session_expiry_interval, pt::SESS_EXPIRY_INT, buf)?;
         encode_property_default(&self.receive_max, RECEIVE_MAX_DEFAULT, pt::RECEIVE_MAX, buf)?;
         if self.max_qos < QoS::ExactlyOnce {
             buf.put_slice(&[pt::MAX_QOS, self.max_qos.into()]);
@@ -304,7 +329,7 @@ impl WireBodyEncode for ConnectAck {
         encode_property_default(&self.wildcard_subscription_available, true, pt::WILDCARD_SUB_AVAIL, buf)?;
         encode_property_default(&self.subscription_identifiers_available, true, pt::SUB_IDS_AVAIL, buf)?;
         encode_property_default(&self.shared_subscription_available, true, pt::SHARED_SUB_AVAIL, buf)?;
-        encode_property(&self.server_keepalive_sec, pt::SERVER_KA, buf)?;
+        encode_property(&self.server_keep_alive, pt::SERVER_KA, buf)?;
         encode_property(&self.response_info, pt::RESP_INFO, buf)?;
         encode_property(&self.server_reference, pt::SERVER_REF, buf)?;
         encode_property(&self.auth_method, pt::AUTH_METHOD, buf)?;

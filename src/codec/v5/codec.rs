@@ -7,7 +7,7 @@ use crate::codec::properties::var_int_len_u32;
 use crate::codec::types::MAX_PACKET_SIZE;
 use crate::codec::utils::decode_variable_length;
 
-/// Worst-case MQTT fixed-header overhead: 1 type byte + 4-byte Remaining Length varint.
+/// Worst-case fixed-header overhead: 1 type byte + 4-byte Remaining Length varint (§2.1.4).
 const WIRE_HEADER_BUDGET: u32 = 5;
 
 /// Remaining body budget for property trimming given a total wire-size limit.
@@ -24,37 +24,39 @@ fn mqtt_wire_len(body_len: usize) -> u32 {
     1 + var_int_len_u32(body_len as u32) + body_len as u32
 }
 
-/// MQTT v5.0 protocol codec implementing `tokio_util::codec` Decoder/Encoder
+/// MQTT 5.0 `tokio_util::codec` adapter for framing and control-packet encode/decode.
 ///
-/// Handles MQTT v5.0 wire format framing including:
-/// - Fixed header decoding with configurable max inbound packet size
-/// - Variable-length integer parsing
-/// - Configurable max outbound packet size enforcement
-/// - Frame reassembly across multiple network reads (header bytes stay in `src` until complete)
-/// - Negotiation flags tracking (problem info, retain, subscription IDs)
+/// Responsibilities:
+/// - Split inbound bytes on Remaining Length (§2.1.4) with optional max wire size
+/// - Encode outbound [`Packet`] bodies within the negotiated Maximum Packet Size
+/// - Honour CONNECT Request Problem Information ([MQTT-3.1.2-29], §3.1.2.11.7)
+///
+/// Application PUBLISH uses [`crate::codec::encode_publish`] / [`DecodedFrame::Publish`].
 #[derive(Debug, Clone)]
 pub struct V5Codec {
     max_in_size: u32,
     max_out_size: u32,
-    flags: CodecFlags,
+    negotiated: NegotiatedLimits,
 }
 
 bitflags::bitflags! {
+    /// CONNECT-derived encode constraints applied after the peer's CONNECT is decoded.
     #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct CodecFlags: u8 {
-        const NO_PROBLEM_INFO = 0b0000_0001;
-        const NO_RETAIN       = 0b0000_0010;
-        const NO_SUB_IDS      = 0b0000_1000;
+    struct NegotiatedLimits: u8 {
+        /// Strip Reason String / diagnostic properties on subsequent encodes ([MQTT-3.1.2-29]).
+        const STRIP_PROBLEM_INFO = 0b0000_0001;
     }
 }
 
 impl V5Codec {
-    /// Create `V5Codec` instance.
+    /// Creates a codec with independent inbound and outbound wire-size limits.
+    ///
+    /// `0` means unlimited for that direction.
     pub fn new(max_in_size: u32, max_out_size: u32) -> Self {
         V5Codec {
             max_in_size,
             max_out_size,
-            flags: CodecFlags::empty(),
+            negotiated: NegotiatedLimits::empty(),
         }
     }
 
@@ -66,60 +68,32 @@ impl V5Codec {
         Self::new(max_packet_size, max_packet_size)
     }
 
-    /// Max inbound frame size (total wire bytes, including fixed header).
+    /// Maximum inbound frame size in total wire bytes (fixed header included).
     ///
-    /// If max size is set to `0`, size is unlimited.
-    /// By default max size is set to `0`.
+    /// `0` means unlimited.
     pub fn max_inbound_size(&self) -> u32 {
         self.max_in_size
     }
 
-    /// Max outbound frame size (total wire bytes, including fixed header).
+    /// Maximum outbound frame size in total wire bytes (fixed header included).
     ///
-    /// If max size is set to `0`, size is unlimited.
-    /// By default max size is set to `0`.
+    /// `0` means unlimited.
     pub fn max_outbound_size(&self) -> u32 {
         self.max_out_size
     }
 
-    /// Set max inbound frame size (total wire bytes, including fixed header).
+    /// Sets the maximum inbound frame size in total wire bytes.
     ///
-    /// If max size is set to `0`, size is unlimited.
-    /// By default max size is set to `0`.
+    /// `0` means unlimited.
     pub fn set_max_inbound_size(&mut self, size: u32) {
         self.max_in_size = size;
     }
 
-    /// Set max outbound frame size (total wire bytes, including fixed header).
+    /// Sets the maximum outbound frame size in total wire bytes.
     ///
-    /// If max size is set to `0`, size is unlimited.
-    /// By default max size is set to `0`.
+    /// `0` means unlimited.
     pub fn set_max_outbound_size(&mut self, size: u32) {
         self.max_out_size = size;
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn retain_available(&self) -> bool {
-        !self.flags.contains(CodecFlags::NO_RETAIN)
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn sub_ids_available(&self) -> bool {
-        !self.flags.contains(CodecFlags::NO_SUB_IDS)
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn set_retain_available(&mut self, val: bool) {
-        self.flags.set(CodecFlags::NO_RETAIN, !val);
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn set_sub_ids_available(&mut self, val: bool) {
-        self.flags.set(CodecFlags::NO_SUB_IDS, !val);
     }
 
     /// Encode one control [`Packet`] by appending to `buf`.
@@ -130,7 +104,7 @@ impl V5Codec {
         self.encode(packet, buf)
     }
 
-    /// Decode one frame, discarding the consumed byte count from the codec.
+    /// Decode one frame, discarding the consumed Remaining Length from the codec item.
     pub fn decode_frame(&mut self, src: &mut BytesMut) -> Result<Option<DecodedFrame>, DecodeError> {
         self.decode(src).map(|maybe| maybe.map(|(packet, _)| packet))
     }
@@ -172,7 +146,9 @@ impl Decoder for V5Codec {
         let packet = decode_packet(frame.freeze(), first_byte)?;
 
         if let DecodedFrame::Control(Packet::Connect(ref pkt)) = packet {
-            self.flags.set(CodecFlags::NO_PROBLEM_INFO, !pkt.request_problem_info);
+            // [MQTT-3.1.2-29] Request Problem Information = 0 → omit diagnostics on replies.
+            self.negotiated
+                .set(NegotiatedLimits::STRIP_PROBLEM_INFO, !pkt.request_problem_info);
         }
         Ok(Some((packet, remaining_length)))
     }
@@ -182,8 +158,8 @@ impl Encoder<Packet> for V5Codec {
     type Error = EncodeError;
 
     fn encode(&mut self, mut item: Packet, dst: &mut BytesMut) -> Result<(), EncodeError> {
-        // handle [MQTT 3.1.2.11.7]
-        if self.flags.contains(CodecFlags::NO_PROBLEM_INFO) {
+        // [MQTT-3.1.2-29] / §3.1.2.11.7 — strip Reason String and User Properties when requested.
+        if self.negotiated.contains(NegotiatedLimits::STRIP_PROBLEM_INFO) {
             match item {
                 Packet::PublishAck(ref mut pkt) | Packet::PublishReceived(ref mut pkt) => {
                     pkt.properties.clear();
@@ -339,5 +315,22 @@ mod tests {
         let mut codec = V5Codec::new(0, 0);
         let mut buf = BytesMut::from(&[0xC0, 0x80, 0x00][..]);
         assert!(matches!(codec.decode(&mut buf), Err(DecodeError::MalformedPacket(_))));
+    }
+
+    #[test]
+    fn strip_problem_info_clears_puback_diagnostics() {
+        let mut codec = V5Codec::default();
+        codec.negotiated.insert(NegotiatedLimits::STRIP_PROBLEM_INFO);
+
+        let mut buf = BytesMut::new();
+        let ack = Packet::PublishAck(crate::codec::v5::PublishAck {
+            packet_id: NonZeroU16::new(1).unwrap(),
+            reason_code: crate::codec::v5::PublishAckReason::Success,
+            properties: vec![(ByteString::from_static("k"), ByteString::from_static("v"))],
+            reason_string: Some(ByteString::from_static("oops")),
+        });
+        codec.encode(ack, &mut buf).unwrap();
+        // After stripping diagnostics, Success PUBACK is Packet Identifier only (Remaining Length 2).
+        assert_eq!(buf[1], 0x02);
     }
 }

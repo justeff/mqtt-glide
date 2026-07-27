@@ -1,4 +1,4 @@
-//! MQTT fixed header and Remaining Length framing (OASIS MQTT §2.1, §2.4).
+//! MQTT fixed header and Remaining Length framing (OASIS MQTT §2.1; Remaining Length §2.1.4; VBI §1.5.5).
 //!
 //! Owns variable-length integer encode/decode and fixed-header validation helpers used
 //! when splitting or assembling control packets. Does **not** own packet bodies, property

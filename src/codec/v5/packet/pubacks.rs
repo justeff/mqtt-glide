@@ -1,9 +1,9 @@
-//! MQTT **PUBACK**, **PUBREC**, **PUBREL**, and **PUBCOMP** control packets.
+//! MQTT PUBACK (§3.4), PUBREC (§3.5), PUBREL (§3.6), and PUBCOMP (§3.7).
 //!
-//! - OASIS MQTT v5.0: §3.4 PUBACK — Publish acknowledgement
-//! - OASIS MQTT v5.0: §3.5 PUBREC — Publish received (QoS 2 delivery part 1)
-//! - OASIS MQTT v5.0: §3.6 PUBREL — Publish release (QoS 2 delivery part 2)
-//! - OASIS MQTT v5.0: §3.7 PUBCOMP — Publish complete (QoS 2 delivery part 3)
+//! QoS 1/2 acknowledgement packets per OASIS MQTT Version 5.0.
+//!
+//! # Errors
+//! Decode rejects unknown Reason Codes and trailing bytes after the ack body (§2.1.4).
 
 use std::convert::TryFrom;
 use std::num::NonZeroU16;
@@ -20,7 +20,7 @@ use crate::codec::v5::{DisconnectReasonCode, ToReasonCode, UserProperties};
 
 /// Append a minimal Success PUBACK to `buf` without building [`crate::codec::Packet`].
 ///
-/// Client inbound path: Success only — no Reason Code or Properties ([MQTT-3.4.2]).
+/// Client inbound path: Success only — no Reason Code or Properties ([MQTT-3.4.2-1]).
 /// Write-task counterpart to [`crate::codec::encode_publish`]: does not clear `buf`
 /// (safe for batching). Honours `max_packet_size` when non-zero.
 pub(crate) fn encode_publish_ack(
@@ -39,29 +39,30 @@ pub(crate) fn encode_publish_ack(
     Ok(())
 }
 
-const HEADER_LEN: u32 = 2 + 1; // packet id + reason code
+/// Packet Identifier (2) + Reason Code (1).
+const HEADER_LEN: u32 = 2 + 1;
 
-/// PUBACK/PUBREC message content
+/// PUBACK / PUBREC body (§3.4 / §3.5).
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct PublishAck {
-    /// Packet Identifier
+    /// Packet Identifier (§2.2.1).
     pub packet_id: NonZeroU16,
     pub reason_code: PublishAckReason,
     pub properties: UserProperties,
     pub reason_string: Option<ByteString>,
 }
 
-/// PUBREL/PUBCOMP message content
+/// PUBREL / PUBCOMP body (§3.6 / §3.7).
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct PubRelComp {
-    /// Packet Identifier
+    /// Packet Identifier (§2.2.1).
     pub packet_id: NonZeroU16,
     pub reason_code: PubRelCompReason,
     pub properties: UserProperties,
     pub reason_string: Option<ByteString>,
 }
 
-/// PUBACK / PUBREC reason codes
+/// PUBACK / PUBREC Reason Codes (§3.4.2.1 / §3.5.2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PublishAckReason {
@@ -131,7 +132,7 @@ impl ToReasonCode for PublishAckReason {
     }
 }
 
-/// PUBREL / PUBCOMP reason codes
+/// PUBREL / PUBCOMP Reason Codes (§3.6.2.1 / §3.7.2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PubRelCompReason {
@@ -186,7 +187,7 @@ impl PublishAck {
 
     pub(crate) fn decode(src: &mut Bytes) -> Result<Self, DecodeError> {
         let reader = WireReader::new(src);
-        let packet_id = NonZeroU16::decode(reader.into_inner())?; // [MQTT-2.2.1-3]
+        let packet_id = NonZeroU16::decode(reader.into_inner())?; // §2.2.1 — Packet Identifier must be non-zero
 
         let mut reader = WireReader::new(src);
         if reader.remaining() == 0 {
@@ -206,7 +207,8 @@ impl PublishAck {
         }
 
         let (properties, reason_string) = ack_props::decode(reader.into_inner())?;
-        ensure!(src.is_empty(), DecodeError::InvalidLength); // no data should be left in src
+        // No payload after properties (§2.1.4).
+        ensure!(src.is_empty(), DecodeError::InvalidLength);
         Ok(Self {
             packet_id,
             reason_code,
@@ -240,7 +242,7 @@ impl PubRelComp {
 
     pub(crate) fn decode(src: &mut Bytes) -> Result<Self, DecodeError> {
         let reader = WireReader::new(src);
-        let packet_id = NonZeroU16::decode(reader.into_inner())?; // [MQTT-2.2.1-3]
+        let packet_id = NonZeroU16::decode(reader.into_inner())?; // §2.2.1 — Packet Identifier must be non-zero
 
         let mut reader = WireReader::new(src);
         if reader.remaining() == 0 {
@@ -260,7 +262,8 @@ impl PubRelComp {
         }
 
         let (properties, reason_string) = ack_props::decode(reader.into_inner())?;
-        ensure!(src.is_empty(), DecodeError::InvalidLength); // no data should be left in src
+        // No payload after properties (§2.1.4).
+        ensure!(src.is_empty(), DecodeError::InvalidLength);
         Ok(Self {
             packet_id,
             reason_code,
@@ -289,7 +292,8 @@ impl WireBodyEncode for PublishAck {
         if !self.has_ack_properties() {
             return Ok(HEADER_LEN as usize);
         }
-        let prop_len = ack_props::encoded_size(&self.properties, &self.reason_string, max_out - HEADER_LEN - 4); // max_out - HEADER_LEN - len(packet_len.max())
+        // Body budget: Packet Identifier + Reason Code; reserve ≤4 bytes for Property Length varint.
+        let prop_len = ack_props::encoded_size(&self.properties, &self.reason_string, max_out - HEADER_LEN - 4);
         Ok(HEADER_LEN as usize + prop_len)
     }
 
@@ -309,14 +313,16 @@ impl WireBodyEncode for PublishAck {
 
 impl WireBodyEncode for PubRelComp {
     fn encoded_body_len(&self, max_out: u32) -> Result<usize, EncodeError> {
-        const HEADER_LEN: u32 = 2 + 1; // packet id + reason code
+        // Packet Identifier + Reason Code.
+        const HEADER_LEN: u32 = 2 + 1;
         if self.is_minimal_success() {
             return Ok(2);
         }
         if !self.has_ack_properties() {
             return Ok(HEADER_LEN as usize);
         }
-        let prop_len = ack_props::encoded_size(&self.properties, &self.reason_string, max_out - HEADER_LEN - 4); // max_out - HEADER_LEN - prop_len.max()
+        // Body budget: Packet Identifier + Reason Code; reserve ≤4 bytes for Property Length varint.
+        let prop_len = ack_props::encoded_size(&self.properties, &self.reason_string, max_out - HEADER_LEN - 4);
         Ok(HEADER_LEN as usize + prop_len)
     }
 
