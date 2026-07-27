@@ -250,8 +250,8 @@ impl<'w, 'a, T, P> WindowPublishWith<'w, 'a, T, P> {
 
     /// Appends one MQTT User Property to the PUBLISH properties.
     #[inline]
-    pub fn user_property(mut self, key: impl Into<ByteString>, value: impl Into<ByteString>) -> Self {
-        self.properties.user_properties.push((key, value).into());
+    pub fn user_property(mut self, name: impl Into<ByteString>, value: impl Into<ByteString>) -> Self {
+        self.properties.user_properties.push((name, value).into());
         self
     }
 }

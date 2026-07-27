@@ -100,11 +100,20 @@ impl LastWill {
 
 impl Connect {
     /// Sets Client Identifier (§3.1.3.1).
-    pub fn client_id<T>(mut self, client_id: T) -> Self
-    where
-        ByteString: From<T>,
-    {
+    pub fn client_id(mut self, client_id: impl Into<ByteString>) -> Self {
         self.client_id = client_id.into();
+        self
+    }
+
+    /// Sets User Name (§3.1.3.5).
+    pub fn username(mut self, username: impl Into<ByteString>) -> Self {
+        self.username = Some(username.into());
+        self
+    }
+
+    /// Sets Password (§3.1.3.6).
+    pub fn password(mut self, password: impl Into<Bytes>) -> Self {
+        self.password = Some(password.into());
         self
     }
 
@@ -542,5 +551,12 @@ mod tests {
         });
 
         round_trip_connect(&Connect::default().client_id("builder-id").receive_max(10));
+        round_trip_connect(
+            &Connect::default()
+                .client_id("builder-id")
+                .username("mqtt-user")
+                .password("mqtt-pass")
+                .receive_max(10),
+        );
     }
 }

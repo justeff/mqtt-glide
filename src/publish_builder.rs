@@ -179,8 +179,8 @@ impl<'a, T, P> PublishWith<'a, T, P> {
     /// Subsequent [`.properties`](Self::properties) calls replace the whole properties
     /// struct and **drop** user properties accumulated here.
     #[inline]
-    pub fn user_property(mut self, key: impl Into<ByteString>, value: impl Into<ByteString>) -> Self {
-        self.properties.user_properties.push((key, value).into());
+    pub fn user_property(mut self, name: impl Into<ByteString>, value: impl Into<ByteString>) -> Self {
+        self.properties.user_properties.push((name, value).into());
         self
     }
 }

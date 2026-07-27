@@ -127,7 +127,7 @@ client.shutdown().await?;
 
 | Method | Role | Notes |
 |--------|------|-------|
-| **`publish_with()`** | Convenience one-shot | `.send().await` (= `publish`). Type-state topic/payload; default QoS 0. Helpers: `.message_expiry(secs)`, `.user_property(k, v)`. `.properties(...)` replaces the whole struct — call it before those helpers. |
+| **`publish_with()`** | Convenience one-shot | `.send().await` (= `publish`). Type-state topic/payload; default QoS 0. Helpers: `.message_expiry(secs)`, `.user_property(name, value)`. `.properties(...)` replaces the whole struct — call it before those helpers. |
 | **`publish_window(n)`** | Convenience pipeline | Sliding window over `start_publish` (no task per message). `.push()` = one attempt; `.push_retry()` yields on `Backpressure`. Always `.drain()` after the burst. |
 | **`publish_batch(msgs, qos, retain, n)`** | Convenience same-QoS burst | Internal window of capacity `n`; all messages share `qos` / `retain`. Prefer `publish_window` for mixed QoS. |
 | `publish(msg, qos, retain)` | Power one-shot | Ready [`PublishMessage`](src/codec/publish.rs). |

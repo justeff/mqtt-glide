@@ -7,10 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `PublishMessage::new` / `.properties` (`Into` like `PublishWith::payload`)
+- Fluent `PublishProperties` setters: `content_type`, `response_topic`, `message_expiry`, `correlation_data`, `payload_format_indicator` (alongside `user_property`)
+- `Connect::username` / `Connect::password`
+
 ### Changed
 
-- Codec field names aligned with MQTT 5 terminology (breaking API)
-- `UserProperty` is a struct (`name` / `value`) with `From<(K, V)>` (`("name", value).into()`) instead of a `(ByteString, ByteString)` alias (breaking API)
+- Breaking: codec fields renamed to MQTT 5 terms — `session_expiry_interval_secs` → `session_expiry_interval`, `LastWill.message` → `payload`, `is_utf8_payload` → `payload_format_indicator`, `will_delay_interval_sec` → `will_delay_interval`, `server_keepalive_sec` → `server_keep_alive`
+- Breaking: `UserProperty` is a struct (`name` / `value`) with `From<(K, V)>` instead of a `(ByteString, ByteString)` alias
 - Trim crates.io package: exclude `benches/`, `tests/`, `BENCHMARKS.md`, and `CONTRIBUTING.md` (still in git)
 
 ## [0.1.1] - 2026-07-27

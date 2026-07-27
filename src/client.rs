@@ -426,22 +426,12 @@ impl MqttClient {
     /// ```no_run
     /// use std::num::NonZeroUsize;
     ///
-    /// use bytes::Bytes;
-    /// use bytestring::ByteString;
-    /// use mqtt_glide::{PublishMessage, PublishProperties, QoS};
+    /// use mqtt_glide::{PublishMessage, QoS};
     ///
     /// # async fn demo(client: mqtt_glide::MqttClient) -> Result<(), mqtt_glide::AppError> {
     /// let messages = [
-    ///     PublishMessage {
-    ///         topic: ByteString::from_static("out/1"),
-    ///         payload: Bytes::from_static(b"a"),
-    ///         properties: PublishProperties::default(),
-    ///     },
-    ///     PublishMessage {
-    ///         topic: ByteString::from_static("out/2"),
-    ///         payload: Bytes::from_static(b"b"),
-    ///         properties: PublishProperties::default(),
-    ///     },
+    ///     PublishMessage::new("out/1", "a"),
+    ///     PublishMessage::new("out/2", "b"),
     /// ];
     /// client
     ///     .publish_batch(
