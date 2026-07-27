@@ -390,10 +390,7 @@ async fn mosquitto_publish_properties_roundtrip() {
                 payload: Bytes::from_static(b"props-body"),
                 properties: PublishProperties {
                     message_expiry_interval: Some(expiry),
-                    user_properties: vec![
-                        (ByteString::from_static("k1"), ByteString::from_static("v1")),
-                        (ByteString::from_static("ts"), ByteString::from_static("1")),
-                    ],
+                    user_properties: vec![("k1", "v1").into(), ("ts", "1").into()],
                     ..PublishProperties::default()
                 },
             },
@@ -425,7 +422,7 @@ async fn mosquitto_publish_properties_roundtrip() {
             .properties
             .user_properties
             .iter()
-            .any(|(k, v)| k == "k1" && v == "v1"),
+            .any(|p| p.name == "k1" && p.value == "v1"),
         "User Property k1=v1 must round-trip; got {:?}",
         enqueued.properties.user_properties
     );
@@ -434,7 +431,7 @@ async fn mosquitto_publish_properties_roundtrip() {
             .properties
             .user_properties
             .iter()
-            .any(|(k, v)| k == "ts" && v == "1"),
+            .any(|p| p.name == "ts" && p.value == "1"),
         "User Property ts=1 must round-trip; got {:?}",
         enqueued.properties.user_properties
     );

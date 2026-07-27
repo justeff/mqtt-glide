@@ -17,9 +17,39 @@ pub(crate) use self::encode::publish_wire_len;
 pub(crate) use self::packet::property_type;
 pub use self::packet::*;
 
-/// A key-value pair representing a single user property
-pub type UserProperty = (ByteString, ByteString);
-/// A list of user properties for MQTT v5 packets
+/// One MQTT User Property (§2.2.2.2 / UTF-8 String Pair §1.5.7).
+///
+/// Construct with [`From`]: `("name", "value").into()` for any `Into<ByteString>` pair.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UserProperty {
+    /// Name (first field of the UTF-8 String Pair).
+    pub name: ByteString,
+    /// Value (second field of the UTF-8 String Pair).
+    pub value: ByteString,
+}
+
+impl<K, V> From<(K, V)> for UserProperty
+where
+    K: Into<ByteString>,
+    V: Into<ByteString>,
+{
+    #[inline]
+    fn from((name, value): (K, V)) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+}
+
+impl From<UserProperty> for (ByteString, ByteString) {
+    #[inline]
+    fn from(prop: UserProperty) -> Self {
+        (prop.name, prop.value)
+    }
+}
+
+/// List of User Properties on an MQTT v5 packet.
 pub type UserProperties = Vec<UserProperty>;
 
 /// Default maximum receive value (65535) when CONNECT/CONNACK omit Receive Maximum (MQTT v5).

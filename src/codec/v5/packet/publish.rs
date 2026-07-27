@@ -14,7 +14,7 @@ use crate::codec::error::DecodeError;
 use crate::codec::publish::{PublishMessage, PublishPacket, PublishPacketMeta, PublishProperties};
 use crate::codec::types::QoS;
 use crate::codec::utils::{self, Decode, Property};
-use crate::codec::v5::{UserProperties, property_type as pt};
+use crate::codec::v5::{UserProperties, UserProperty, property_type as pt};
 
 /// MQTT v5 PUBLISH wire properties (includes Topic Alias on the wire).
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
@@ -146,7 +146,7 @@ fn parse_publish_properties(src: &mut Bytes) -> Result<Option<PublishWirePropert
                 }
             }
             pt::TOPIC_ALIAS => topic_alias.read_value(prop_src)?,
-            pt::USER => user_props.push(<(ByteString, ByteString)>::decode(prop_src)?),
+            pt::USER => user_props.push(UserProperty::decode(prop_src)?),
             _ => return Err(DecodeError::MalformedPacket("unknown PUBLISH property")),
         }
     }

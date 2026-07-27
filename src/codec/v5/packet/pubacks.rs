@@ -368,7 +368,7 @@ mod tests {
             PublishAck {
                 packet_id: packet_id.try_into().unwrap(),
                 reason_code,
-                properties: properties.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+                properties: properties.into_iter().map(Into::into).collect(),
                 reason_string: reason_string.map(|s| s.into())
             }
         );
@@ -419,7 +419,7 @@ mod tests {
         round_trip_puback(&PublishAck {
             packet_id: NonZeroU16::new(7).unwrap(),
             reason_code: PublishAckReason::NotAuthorized,
-            properties: vec![(ByteString::from_static("k"), ByteString::from_static("v"))],
+            properties: vec![("k", "v").into()],
             reason_string: Some(ByteString::from_static("denied")),
         });
     }
@@ -447,10 +447,7 @@ mod tests {
         let ack = PublishAck {
             packet_id: NonZeroU16::new(2).unwrap(),
             reason_code: PublishAckReason::UnspecifiedError,
-            properties: vec![(
-                ByteString::from_static("k"),
-                ByteString::from_static("value-does-not-fit"),
-            )],
+            properties: vec![("k", "value-does-not-fit").into()],
             reason_string: None,
         };
         let mut buf = BytesMut::new();

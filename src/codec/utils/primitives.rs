@@ -289,6 +289,17 @@ impl Encode for (ByteString, ByteString) {
     }
 }
 
+impl Encode for crate::codec::v5::UserProperty {
+    fn encoded_size(&self) -> usize {
+        self.name.encoded_size() + self.value.encoded_size()
+    }
+
+    fn encode(&self, buf: &mut BytesMut) -> Result<(), EncodeError> {
+        self.name.encode(buf)?;
+        self.value.encode(buf)
+    }
+}
+
 impl Encode for &[u8] {
     fn encoded_size(&self) -> usize {
         2 + self.len()

@@ -398,9 +398,7 @@ mod tests {
                     correlation_data: Some(Bytes::from_static(b"correlationData")),
                     message_expiry_interval: NonZeroU32::new(7),
                     content_type: Some(ByteString::from_static("contentType")),
-                    user_properties: vec![
-                        (ByteString::from_static("name"), ByteString::from_static("value"))
-                    ],
+                    user_properties: vec![("name", "value").into()],
                     payload_format_indicator: Some(true),
                     response_topic: Some(ByteString::from_static("responseTopic")),
                 }),

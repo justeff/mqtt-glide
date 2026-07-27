@@ -100,9 +100,10 @@ pub(super) fn decode_packet(mut src: Bytes, first_byte: u8) -> Result<DecodedFra
 
 impl Decode for UserProperty {
     fn decode(src: &mut Bytes) -> Result<Self, DecodeError> {
-        let key = ByteString::decode(src)?;
-        let val = ByteString::decode(src)?;
-        Ok((key, val))
+        Ok(Self {
+            name: ByteString::decode(src)?,
+            value: ByteString::decode(src)?,
+        })
     }
 }
 

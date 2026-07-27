@@ -148,12 +148,8 @@ fn round_trip_v5_publish(message: PublishMessage, delivery: PublishDelivery) {
 }
 
 fn arb_v5_user_properties() -> impl Strategy<Value = UserProperties> {
-    prop::collection::vec((arb_valid_topic(), arb_valid_topic()), 0..=4).prop_map(|pairs| {
-        pairs
-            .into_iter()
-            .map(|(key, value)| (ByteString::from(key), ByteString::from(value)))
-            .collect()
-    })
+    prop::collection::vec((arb_valid_topic(), arb_valid_topic()), 0..=4)
+        .prop_map(|pairs| pairs.into_iter().map(|(key, value)| (key, value).into()).collect())
 }
 
 fn arb_optional_reason_string() -> impl Strategy<Value = Option<ByteString>> {
@@ -457,7 +453,7 @@ fn arb_v5_publish_with_properties() -> impl Strategy<Value = (PublishMessage, Pu
             .prop_map(|(retain, topic, payload, user_properties, payload_format_indicator)| {
                 let user_properties = user_properties
                     .into_iter()
-                    .map(|(key, value)| (ByteString::from(key), ByteString::from(value)))
+                    .map(|(key, value)| (key, value).into())
                     .collect();
                 (
                     PublishMessage {
@@ -490,7 +486,7 @@ fn arb_v5_publish_with_properties() -> impl Strategy<Value = (PublishMessage, Pu
                 |(dup, retain, topic, packet_id, payload, user_properties, payload_format_indicator)| {
                     let user_properties = user_properties
                         .into_iter()
-                        .map(|(key, value)| (ByteString::from(key), ByteString::from(value)))
+                        .map(|(key, value)| (key, value).into())
                         .collect();
                     (
                         PublishMessage {
@@ -537,7 +533,7 @@ fn arb_v5_subscribe() -> impl Strategy<Value = Subscribe> {
                 .collect();
             let user_properties = user_properties
                 .into_iter()
-                .map(|(key, value)| (ByteString::from(key), ByteString::from(value)))
+                .map(|(key, value)| (key, value).into())
                 .collect();
             Subscribe {
                 packet_id,

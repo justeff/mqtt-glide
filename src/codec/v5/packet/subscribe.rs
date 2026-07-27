@@ -491,7 +491,7 @@ mod tests {
         let pkt = Subscribe {
             packet_id: 12.try_into().unwrap(),
             id: Some(10.try_into().unwrap()),
-            user_properties: vec![("a".into(), "1".into())],
+            user_properties: vec![("a", "1").into()],
             topic_filters: vec![("test".into(), SubscriptionOptions::default())],
         };
 
@@ -503,7 +503,7 @@ mod tests {
 
         let pkt = Unsubscribe {
             packet_id: 12.try_into().unwrap(),
-            user_properties: vec![("a".into(), "1".into())],
+            user_properties: vec![("a", "1").into()],
             topic_filters: vec!["test".into()],
         };
 
@@ -519,7 +519,7 @@ mod tests {
         let pkt = Packet::Subscribe(Subscribe {
             packet_id: 12.try_into().unwrap(),
             id: None,
-            user_properties: vec![("a".into(), "1".into())],
+            user_properties: vec![("a", "1").into()],
             topic_filters: vec![("test".into(), SubscriptionOptions::default())],
         });
         let mut codec = V5Codec::default();
@@ -537,7 +537,7 @@ mod tests {
     fn test_sub_ack() {
         let ack = SubscribeAck {
             packet_id: NonZeroU16::new(1).unwrap(),
-            properties: vec![("prop1".into(), "val1".into()), ("prop2".into(), "val2".into())],
+            properties: vec![("prop1", "val1").into(), ("prop2", "val2").into()],
             reason_string: None,
             status: vec![SubscribeAckReason::GrantedQos0],
         };
@@ -548,7 +548,7 @@ mod tests {
 
         let ack = UnsubscribeAck {
             packet_id: NonZeroU16::new(1).unwrap(),
-            properties: vec![("prop1".into(), "val1".into()), ("prop2".into(), "val2".into())],
+            properties: vec![("prop1", "val1").into(), ("prop2", "val2").into()],
             reason_string: None,
             status: vec![UnsubscribeAckReason::Success],
         };

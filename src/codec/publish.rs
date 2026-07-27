@@ -18,6 +18,7 @@ use bytes::Bytes;
 use bytestring::ByteString;
 
 use crate::codec::types::QoS;
+use crate::codec::v5::UserProperties;
 
 /// Transferable MQTT v5 PUBLISH properties (no Topic Alias, no Subscription Identifiers).
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
@@ -29,7 +30,7 @@ pub struct PublishProperties {
     /// Content Type (§3.3.2.3.9).
     pub content_type: Option<ByteString>,
     /// User Property (§3.3.2.3.7).
-    pub user_properties: Vec<(ByteString, ByteString)>,
+    pub user_properties: UserProperties,
     /// Payload Format Indicator (§3.3.2.3.2); `true` = UTF-8 payload.
     pub payload_format_indicator: bool,
     /// Response Topic (§3.3.2.3.5).
@@ -37,6 +38,14 @@ pub struct PublishProperties {
 }
 
 impl PublishProperties {
+    /// Appends one User Property (`name`/`value` accept any [`Into<ByteString>`]).
+    #[inline]
+    pub fn user_property(mut self, name: impl Into<ByteString>, value: impl Into<ByteString>) -> Self {
+        self.user_properties
+            .push(crate::codec::v5::UserProperty::from((name, value)));
+        self
+    }
+
     /// True when the v5 property block encodes as Property Length zero.
     pub(crate) fn is_wire_empty(&self) -> bool {
         self.correlation_data.is_none()

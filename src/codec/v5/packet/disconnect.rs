@@ -270,7 +270,7 @@ mod tests {
             session_expiry_interval: None,
             server_reference: None,
             reason_string: None,
-            user_properties: vec![(ByteString::from_static("k"), ByteString::from_static("v"))],
+            user_properties: vec![("k", "v").into()],
         };
         let mut buf = BytesMut::new();
         disconnect.encode_body(&mut buf, 2).expect("encode");

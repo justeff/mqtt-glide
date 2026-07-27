@@ -180,7 +180,7 @@ impl<'a, T, P> PublishWith<'a, T, P> {
     /// struct and **drop** user properties accumulated here.
     #[inline]
     pub fn user_property(mut self, key: impl Into<ByteString>, value: impl Into<ByteString>) -> Self {
-        self.properties.user_properties.push((key.into(), value.into()));
+        self.properties.user_properties.push((key, value).into());
         self
     }
 }

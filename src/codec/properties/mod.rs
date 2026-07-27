@@ -45,7 +45,7 @@ pub(crate) fn encode_opt_props(
     mut size: u32,
 ) -> Result<(), EncodeError> {
     for up in user_props.iter() {
-        let prop_len = 1 + up.0.encoded_size() + up.1.encoded_size(); // prop_type.len() + key.len() + val.len()
+        let prop_len = 1 + up.name.encoded_size() + up.value.encoded_size(); // type + name + value
         if prop_len > size as usize {
             return Ok(());
         }
@@ -198,7 +198,7 @@ pub mod ack_props {
             let prop_id = prop_src.get_u8();
             match prop_id {
                 pt::REASON_STRING => reason_string.read_value(prop_src)?,
-                pt::USER => user_props.push(<(ByteString, ByteString)>::decode(prop_src)?),
+                pt::USER => user_props.push(UserProperty::decode(prop_src)?),
                 _ => return Err(DecodeError::MalformedPacket("unknown property or reason code")),
             }
         }

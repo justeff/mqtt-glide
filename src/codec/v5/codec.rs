@@ -326,7 +326,7 @@ mod tests {
         let ack = Packet::PublishAck(crate::codec::v5::PublishAck {
             packet_id: NonZeroU16::new(1).unwrap(),
             reason_code: crate::codec::v5::PublishAckReason::Success,
-            properties: vec![(ByteString::from_static("k"), ByteString::from_static("v"))],
+            properties: vec![("k", "v").into()],
             reason_string: Some(ByteString::from_static("oops")),
         });
         codec.encode(ack, &mut buf).unwrap();
