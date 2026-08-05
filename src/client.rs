@@ -473,7 +473,7 @@ impl MqttClient {
     ///
     /// On timeout the broker may still apply the subscription; a late SUBACK is then
     /// still recorded in the resubscribe registry (the packet id stays allocated until
-    /// the ack, [MQTT-2.2.1-3]). Treat a timeout as "unknown outcome", not as "failed".
+    /// the ack, §2.2.1). Treat a timeout as "unknown outcome", not as "failed".
     pub async fn subscribe(
         &self,
         filters: impl IntoIterator<Item = impl Into<Subscription>>,

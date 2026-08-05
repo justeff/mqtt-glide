@@ -16,12 +16,7 @@ use mqtt_glide::{PublishDelivery, PublishMessage, PublishProperties, QoS, encode
 const ITERS: u32 = 50_000;
 const PAYLOAD_LEN: usize = 256;
 
-fn main() {
-    let message = PublishMessage {
-        topic: ByteString::from_static("bench/topic"),
-        payload: Bytes::from(vec![0u8; PAYLOAD_LEN]),
-        properties: PublishProperties::default(),
-    };
+fn bench_encode(label: &str, message: &PublishMessage) {
     // QoS 1 is the production outbound path; QoS 0 encode cost is indistinguishable here.
     let delivery = PublishDelivery {
         dup: false,
@@ -33,18 +28,39 @@ fn main() {
 
     for _ in 0..1_000 {
         buf.clear();
-        encode_publish(&message, delivery, 0, &mut buf).expect("encode");
+        encode_publish(message, delivery, 0, &mut buf).expect("encode");
     }
 
     let start = Instant::now();
     for _ in 0..ITERS {
         buf.clear();
-        encode_publish(&message, delivery, 0, &mut buf).expect("encode");
+        encode_publish(message, delivery, 0, &mut buf).expect("encode");
     }
     let elapsed = start.elapsed();
     let ns_per = elapsed.as_nanos() / u128::from(ITERS);
     let msg_s = (f64::from(ITERS) / elapsed.as_secs_f64()).round() as u64;
 
+    println!("encode PUBLISH{label}: {ns_per} ns/msg, {msg_s} msg/s (iters={ITERS}, payload={PAYLOAD_LEN} B, QoS 1)");
+}
+
+fn main() {
+    let bare = PublishMessage {
+        topic: ByteString::from_static("bench/topic"),
+        payload: Bytes::from(vec![0u8; PAYLOAD_LEN]),
+        properties: PublishProperties::default(),
+    };
+    // Property-bearing shape: exercises the plan-time property walk (size + UTF-8 checks).
+    let with_props = PublishMessage {
+        topic: ByteString::from_static("bench/topic"),
+        payload: Bytes::from(vec![0u8; PAYLOAD_LEN]),
+        properties: PublishProperties::default()
+            .content_type("text/plain")
+            .response_topic("bench/reply")
+            .user_property("bench", "true")
+            .user_property("region", "eu-central"),
+    };
+
     println!("=== mqtt-glide codec_throughput (no broker) ===");
-    println!("encode PUBLISH: {ns_per} ns/msg, {msg_s} msg/s (iters={ITERS}, payload={PAYLOAD_LEN} B, QoS 1)");
+    bench_encode("", &bare);
+    bench_encode(" (with properties)", &with_props);
 }

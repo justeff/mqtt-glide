@@ -16,14 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Reject CONNACK `Maximum Packet Size` of `0` on decode (§3.2.2.3.6, Protocol Error); it was accepted and, because the codec treats limit `0` as unbounded, silently disabled outbound size enforcement
-- Validate outbound Response Topics before wire bytes: PUBLISH `response_topic` ([MQTT-3.3.2-13/14]) and Will Topic / Will Response Topic at codec encode ([MQTT-3.1.3-11]) reject empty / wildcard / U+0000
-- Enforce [MQTT-1.5.4-2] on encode: outbound UTF-8 strings containing U+0000 are rejected (decode already rejected them). Plan-time checks per packet keep the hot encode path single-pass
+- Validate outbound Response Topics before wire bytes: PUBLISH `response_topic` ([MQTT-3.3.2-13/14], empty via [MQTT-4.7.3-1]) and Will Topic / Will Response Topic at codec encode ([MQTT-3.1.3-11]) reject empty / wildcard / U+0000
+- Enforce [MQTT-1.5.4-2] on the client send paths: CONNECT (including Will properties and `auth_method`) and PUBLISH properties reject U+0000 at plan time, keeping the hot encode loop single-pass; SUBSCRIBE/UNSUBSCRIBE filters were already rejected by write-task validation. Server-shaped packets (CONNACK/SUBACK/DISCONNECT with reason strings) are never emitted by the client and remain decode-side enforced
+- `Packet::encode_wire` rolls back the fixed header when body encoding fails, so a rejected packet leaves no stray header bytes in a batched buffer (same contract as `encode_publish`)
 - Harden ACK property budgeting: no u32 wrap below the header budget, `ack_props::encode` errors on a zero budget instead of a debug-only assert, and the Reason String trim check now mirrors the size path
 - `BrokerUrl` parses bracketed IPv6 literals (`mqtt://[::1]:1883`, `mqtts://[2001:db8::1]`)
 - Inbound decoder is no longer capped by the broker's CONNACK `Maximum Packet Size` — that limit constrains client→server packets only ([MQTT-3.2.2-15]); inbound stays unbounded because the client never advertises its own limit in CONNECT ([MQTT-3.1.2-24])
-- `clean_start = false`: re-SUBSCRIBE after reconnect when the broker reports `session_present = false` instead of silently losing the app's subscriptions; `SessionParams` now exposes `session_present`
-- Auto-resubscribe validates the SUBACK reason-code count against the sent filters ([MQTT-3.9.3-1]); empty or short status lists are protocol violations
-- Command channel stays open while credentials are invalidated on an auth-failure reconnect (invalidation now runs after the channels are replenished)
+- `clean_start = false`: re-SUBSCRIBE after reconnect when the broker reports `session_present = false` instead of silently losing the app's subscriptions; `SessionParams` now exposes `session_present`. A broker claiming Session Present while the client holds no session state is an unrecoverable desync ([MQTT-3.2.2-4]) and stops the driver instead of reconnect-looping
+- Auto-resubscribe validates the SUBACK reason-code count against the sent filters ([MQTT-3.8.4-6]); empty or short status lists are protocol violations
+- Command channel stays open while credentials are invalidated on an auth-failure reconnect (invalidation now runs after the channels are replenished, and also when the backoff is cancelled by shutdown)
 
 ### Changed
 
