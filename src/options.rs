@@ -71,7 +71,9 @@ pub struct ConnectOptions {
     /// `false` asks the broker to resume a stored session. The driver keeps no local
     /// session store (no QoS 1 DUP redelivery); subscriptions are re-issued whenever the
     /// broker answers `session_present = false`, so a lost session is rebuilt rather than
-    /// silently dropped.
+    /// silently dropped. Resume also needs a non-zero [`Self::session_expiry`] — with the
+    /// default (`None` → 0 on the wire) the broker ends the session on disconnect, so
+    /// every reconnect reports `session_present = false`.
     pub clean_start: bool,
     /// Optional **Session Expiry Interval** (omit property when `None`).
     pub session_expiry: Option<Duration>,

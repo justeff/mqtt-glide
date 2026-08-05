@@ -219,6 +219,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | Reconnect / credentials hooks | ✅ | Traits + optional helpers |
 | Enqueue-before-ack + `InboundSink` | ✅ | Product backpressure policy |
 | Cap / Receive Maximum flow control | ✅ | See Cap vs Window above |
+| Inbound Maximum Packet Size | ⚠️ | Unbounded: the client sends no CONNECT Maximum Packet Size, so a rogue broker could force large frame allocations. A client-side cap knob is a planned follow-up |
 | Graceful `shutdown` | ✅ | Budget via `graceful_disconnect_timeout` |
 | Subscription identifiers | ⚠️ | Deferred |
 | Request/response *helper* / CONNECT negotiation | ⚠️ | Properties ✅ (`response_topic` / `correlation_data`); no inbox RPC API; `request_response_info` deferred |

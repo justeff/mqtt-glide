@@ -341,27 +341,44 @@ impl<H: InboundSink> Connection<H> {
         let retain_available = session.retain_available;
         self.inflight.set_publish_capacity(session.server_receive_maximum);
 
+        let pending = match subscriptions::snapshot_for_resubscribe(&self.subscription_registry) {
+            Ok(filters) => filters,
+            Err(outcome) => return self.finish_session(outcome, false).await,
+        };
+
+        // [MQTT-3.2.2-4] the broker claims a stored session we have no local state for.
+        // Reconnecting would hit the same claim, so this stops instead of looping.
+        if !subscriptions::session_resume_consistent(
+            self.options.clean_start,
+            session.session_present,
+            !pending.is_empty(),
+        ) {
+            return self
+                .finish_session(
+                    ConnectionOutcome::Application(AppError::Internal(
+                        "broker reports Session Present but the client holds no session state".into(),
+                    )),
+                    false,
+                )
+                .await;
+        }
+
         // Clean Start discards broker-side state; a broker answering `session_present = false`
         // to a resume attempt proves it holds none — rebuild the subscriptions in both cases.
-        if subscriptions::needs_resubscribe(self.options.clean_start, session.session_present) {
-            let pending = match subscriptions::snapshot_for_resubscribe(&self.subscription_registry) {
-                Ok(filters) => filters,
-                Err(outcome) => return self.finish_session(outcome, false).await,
-            };
-            if !pending.is_empty()
-                && let Err(outcome) = subscriptions::resubscribe_pending(
-                    &mut framed_read,
-                    &mut framed_write,
-                    &mut self.inflight,
-                    pending,
-                    self.options.ack_timeout,
-                    &self.cancel,
-                    &self.channels.handoff,
-                )
-                .await
-            {
-                return self.finish_session(outcome, false).await;
-            }
+        if subscriptions::needs_resubscribe(self.options.clean_start, session.session_present)
+            && !pending.is_empty()
+            && let Err(outcome) = subscriptions::resubscribe_pending(
+                &mut framed_read,
+                &mut framed_write,
+                &mut self.inflight,
+                pending,
+                self.options.ack_timeout,
+                &self.cancel,
+                &self.channels.handoff,
+            )
+            .await
+        {
+            return self.finish_session(outcome, false).await;
         }
 
         // Session cancel is a child of the client reconnect cancel so `MqttClient::shutdown`
@@ -480,8 +497,10 @@ impl<H: InboundSink> Connection<H> {
                     let disposition = self.backoff_then_retry(delay).await;
                     // Invalidate after the channels are replenished (in backoff_then_retry):
                     // app commands must not see a closed command channel while the
-                    // credentials provider is refreshing.
-                    if invalidate_credentials && matches!(disposition, SessionDisposition::Retry) {
+                    // credentials provider is refreshing. Runs on every disposition —
+                    // including a backoff cancelled by shutdown — so a rejected credential
+                    // is never kept cached.
+                    if invalidate_credentials {
                         self.credentials.invalidate().await;
                     }
                     disposition

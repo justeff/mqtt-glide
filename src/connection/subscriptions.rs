@@ -175,10 +175,24 @@ pub(crate) fn needs_resubscribe(clean_start: bool, session_present: bool) -> boo
     clean_start || !session_present
 }
 
+/// Whether the broker's Session Present flag is consistent with local session state.
+///
+/// [MQTT-3.2.2-4]: a client with no Session State must close the connection if the broker
+/// reports Session Present = 1. The subscription registry is the only session state this
+/// client retains (no QoS inflight store), so a resume claim against an empty registry is
+/// a broker/client desync that cannot be repaired by reconnecting.
+pub(crate) fn session_resume_consistent(
+    clean_start: bool,
+    session_present: bool,
+    has_known_subscriptions: bool,
+) -> bool {
+    clean_start || !session_present || has_known_subscriptions
+}
+
 /// Rejects auto-resubscribe when the SUBACK does not grant every filter at QoS 0/1.
 ///
-/// [MQTT-3.9.3-1]: reason code count and order must match the filters we sent; an empty
-/// or short status list is a protocol violation, not an implicit success.
+/// [MQTT-3.8.4-6]: the SUBACK must carry one reason code per sent filter; an empty or
+/// short status list is a protocol violation, not an implicit success.
 fn validate_resubscribe_ack(ack: &SubscribeAck, expected_filters: usize) -> Result<(), ConnectionOutcome> {
     if ack.status.len() != expected_filters {
         return Err(ConnectionOutcome::Protocol(ProtocolError::Violation(
@@ -345,7 +359,7 @@ mod tests {
     }
 
     /// Auto-resubscribe SUBACK must carry one granted reason per sent filter
-    /// ([MQTT-3.9.3-1]); empty or short status lists are protocol violations.
+    /// ([MQTT-3.8.4-6]); empty or short status lists are protocol violations.
     #[rstest]
     #[case::all_granted(vec![SubscribeAckReason::GrantedQos1], 1, true)]
     #[case::empty_status(vec![], 1, false)]
@@ -379,6 +393,25 @@ mod tests {
     #[case::lost_session_rebuilt(false, false, true)]
     fn resubscribe_decision(#[case] clean_start: bool, #[case] session_present: bool, #[case] expected: bool) {
         assert_eq!(needs_resubscribe(clean_start, session_present), expected);
+    }
+
+    /// [MQTT-3.2.2-4] Session Present = 1 against an empty local registry is a desync.
+    #[rstest]
+    #[case::clean_start_always_new(true, true, false, true)]
+    #[case::clean_start_with_state(true, true, true, true)]
+    #[case::resume_with_state(false, true, true, true)]
+    #[case::no_session_claimed(false, false, false, true)]
+    #[case::broker_state_without_local(false, true, false, false)]
+    fn session_resume_consistency(
+        #[case] clean_start: bool,
+        #[case] session_present: bool,
+        #[case] has_known_subscriptions: bool,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            session_resume_consistent(clean_start, session_present, has_known_subscriptions),
+            expected
+        );
     }
 
     /// registry poison must not silently become "no subscriptions".
