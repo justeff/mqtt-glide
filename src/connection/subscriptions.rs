@@ -126,6 +126,7 @@ where
         .alloc_subscribe()
         .map_err(|_| ConnectionOutcome::Protocol(ProtocolError::Violation("resubscribe packet id exhausted".into())))?;
 
+    let filter_count = filters.len();
     let packet = Packet::Subscribe(Subscribe {
         packet_id,
         id: None,
@@ -147,7 +148,7 @@ where
             match result {
                 Ok(Ok(ack)) => {
                     inflight.release_subscribe(packet_id);
-                    validate_resubscribe_ack(&ack)
+                    validate_resubscribe_ack(&ack, filter_count)
                 }
                 Ok(Err(outcome)) => {
                     inflight.release_subscribe(packet_id);
@@ -164,8 +165,26 @@ where
     }
 }
 
-/// Rejects auto-resubscribe when any filter was not granted at QoS 0/1.
-fn validate_resubscribe_ack(ack: &SubscribeAck) -> Result<(), ConnectionOutcome> {
+/// Whether prior filters must be re-issued on a fresh session.
+///
+/// Clean Start discards any broker-side session ([MQTT-3.1.2-4] N/A applies), and a broker
+/// answering `session_present = false` to a resume attempt proves it has no stored
+/// subscriptions — in both cases the app-visible subscriptions only exist again after
+/// re-SUBSCRIBE.
+pub(crate) fn needs_resubscribe(clean_start: bool, session_present: bool) -> bool {
+    clean_start || !session_present
+}
+
+/// Rejects auto-resubscribe when the SUBACK does not grant every filter at QoS 0/1.
+///
+/// [MQTT-3.9.3-1]: reason code count and order must match the filters we sent; an empty
+/// or short status list is a protocol violation, not an implicit success.
+fn validate_resubscribe_ack(ack: &SubscribeAck, expected_filters: usize) -> Result<(), ConnectionOutcome> {
+    if ack.status.len() != expected_filters {
+        return Err(ConnectionOutcome::Protocol(ProtocolError::Violation(
+            "auto-resubscribe SUBACK reason count did not match filters".into(),
+        )));
+    }
     if ack.status.iter().all(|reason| subscribe_reason_granted(*reason)) {
         Ok(())
     } else {
@@ -251,6 +270,8 @@ fn map_resubscribe_send_error(error: crate::codec::EncodeError) -> ConnectionOut
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    use rstest::rstest;
+
     use super::*;
     use crate::codec::QoS;
 
@@ -321,6 +342,43 @@ mod tests {
         );
         registry.remove([ByteString::from_static("active/topic")]);
         assert!(registry.snapshot().is_empty());
+    }
+
+    /// Auto-resubscribe SUBACK must carry one granted reason per sent filter
+    /// ([MQTT-3.9.3-1]); empty or short status lists are protocol violations.
+    #[rstest]
+    #[case::all_granted(vec![SubscribeAckReason::GrantedQos1], 1, true)]
+    #[case::empty_status(vec![], 1, false)]
+    #[case::short_status(vec![SubscribeAckReason::GrantedQos0], 2, false)]
+    #[case::extra_reasons(vec![SubscribeAckReason::GrantedQos0, SubscribeAckReason::GrantedQos1], 1, false)]
+    #[case::not_authorized(vec![SubscribeAckReason::NotAuthorized], 1, false)]
+    fn resubscribe_ack_validation(
+        #[case] status: Vec<SubscribeAckReason>,
+        #[case] expected_filters: usize,
+        #[case] expect_ok: bool,
+    ) {
+        use crate::codec::SubscribeAck;
+        use std::num::NonZeroU16;
+
+        let ack = SubscribeAck {
+            packet_id: NonZeroU16::new(1).unwrap(),
+            properties: Vec::new(),
+            reason_string: None,
+            status,
+        };
+        assert_eq!(validate_resubscribe_ack(&ack, expected_filters).is_ok(), expect_ok);
+    }
+
+    /// `clean_start = false` with `session_present = false` must resubscribe — the broker
+    /// proved it holds no session, so skipping the re-SUBSCRIBE would silently lose the
+    /// app-visible subscriptions.
+    #[rstest]
+    #[case::clean_start_discards(true, false, true)]
+    #[case::clean_start_even_if_present(true, true, true)]
+    #[case::resumed_session_kept(false, true, false)]
+    #[case::lost_session_rebuilt(false, false, true)]
+    fn resubscribe_decision(#[case] clean_start: bool, #[case] session_present: bool, #[case] expected: bool) {
+        assert_eq!(needs_resubscribe(clean_start, session_present), expected);
     }
 
     /// registry poison must not silently become "no subscriptions".

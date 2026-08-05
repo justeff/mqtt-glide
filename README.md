@@ -228,7 +228,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | WebSockets | ❌ | TCP (+ TLS) only |
 | Topic Alias | ❌ | Maximum = 0; inbound alias → protocol error (no alias state across reconnects) |
 | QoS 2 | ❌ | Rejected at the API (no 4-way handshake / store-and-forward) |
-| Persistent sessions / DUP redelivery | ❌ | Clean Start always true; outbound `dup` always false |
+| Persistent sessions / DUP redelivery | ❌ | No local store-and-forward; outbound `dup` always false. `clean_start = false` resumes broker-held sessions and re-subscribes when the broker reports `session_present = false` |
 
 Broker-dependent: Message Expiry *drop after interval* (property round-trip is tested), shared-sub rebalancing under handoff stall, redelivery after unclean disconnect (client guarantees enqueue-before-ack only).
 

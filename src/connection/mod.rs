@@ -121,7 +121,6 @@ impl<H: InboundSink> ConnectionChannels<H> {
 pub struct Connection<H: InboundSink = flume::Sender<crate::codec::PublishMessage>> {
     options: ConnectOptions,
     credentials: SharedCredentials,
-    #[allow(dead_code)] // reconnect-loop field
     reconnect: Arc<dyn ReconnectPolicy>,
     channels: ConnectionChannels<H>,
     cancel: CancellationToken,
@@ -342,7 +341,9 @@ impl<H: InboundSink> Connection<H> {
         let retain_available = session.retain_available;
         self.inflight.set_publish_capacity(session.server_receive_maximum);
 
-        if self.options.clean_start {
+        // Clean Start discards broker-side state; a broker answering `session_present = false`
+        // to a resume attempt proves it holds none — rebuild the subscriptions in both cases.
+        if subscriptions::needs_resubscribe(self.options.clean_start, session.session_present) {
             let pending = match subscriptions::snapshot_for_resubscribe(&self.subscription_registry) {
                 Ok(filters) => filters,
                 Err(outcome) => return self.finish_session(outcome, false).await,
@@ -459,9 +460,8 @@ impl<H: InboundSink> Connection<H> {
         self.state = ConnectionState::Draining;
         self.notify_disconnected(outcome.clone());
 
-        if matches!(&outcome, ConnectionOutcome::Auth(AuthError::NotAuthorized)) && from_active_session {
-            self.credentials.invalidate().await;
-        }
+        let invalidate_credentials =
+            matches!(&outcome, ConnectionOutcome::Auth(AuthError::NotAuthorized)) && from_active_session;
 
         match &outcome {
             ConnectionOutcome::Shutdown(_) | ConnectionOutcome::Application(_) => {
@@ -470,10 +470,22 @@ impl<H: InboundSink> Connection<H> {
             }
             ConnectionOutcome::Auth(_) => match self.reconnect.delay_after(&outcome) {
                 None => {
+                    if invalidate_credentials {
+                        self.credentials.invalidate().await;
+                    }
                     self.state = ConnectionState::Stopped;
                     SessionDisposition::Stop(Err(outcome))
                 }
-                Some(delay) => self.backoff_then_retry(delay).await,
+                Some(delay) => {
+                    let disposition = self.backoff_then_retry(delay).await;
+                    // Invalidate after the channels are replenished (in backoff_then_retry):
+                    // app commands must not see a closed command channel while the
+                    // credentials provider is refreshing.
+                    if invalidate_credentials && matches!(disposition, SessionDisposition::Retry) {
+                        self.credentials.invalidate().await;
+                    }
+                    disposition
+                }
             },
             ConnectionOutcome::Transport(_) | ConnectionOutcome::Protocol(_) => {
                 match self.reconnect.delay_after(&outcome) {
