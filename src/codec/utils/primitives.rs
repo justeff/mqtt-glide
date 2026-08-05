@@ -273,7 +273,11 @@ impl Encode for ByteString {
         self.as_bytes().encoded_size()
     }
 
+    /// MQTT UTF-8 strings MUST NOT encode U+0000 ([MQTT-1.5.4-2]); decode rejects it as well.
     fn encode(&self, buf: &mut BytesMut) -> Result<(), EncodeError> {
+        if self.as_bytes().contains(&0) {
+            return Err(EncodeError::MalformedPacket);
+        }
         self.as_bytes().encode(buf)
     }
 }
@@ -317,6 +321,22 @@ impl Encode for &[u8] {
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    /// [MQTT-1.5.4-2] UTF-8 Encoded Strings MUST NOT encode U+0000 — enforced on encode
+    /// just as `decode_mqtt_utf8_string_rejects_embedded_nul` enforces it on decode.
+    #[test]
+    fn encode_mqtt_utf8_string_rejects_embedded_nul() {
+        let mut buf = BytesMut::from(&b"keep"[..]);
+        let err = ByteString::from_static("a\0b").encode(&mut buf).expect_err("nul");
+        assert!(matches!(err, EncodeError::MalformedPacket));
+        assert_eq!(&buf[..], b"keep", "rejected encode must not write bytes");
+
+        let mut buf = BytesMut::new();
+        ByteString::from_static("clean")
+            .encode(&mut buf)
+            .expect("clean string encodes");
+        assert_eq!(&buf[..], b"\x00\x05clean");
+    }
 
     #[test]
     fn decode_non_empty_topic_rejects_zero_length() {

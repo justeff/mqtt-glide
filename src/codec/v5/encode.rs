@@ -109,6 +109,12 @@ fn publish_wire_plan(
     if message.topic.is_empty() || topic_name_bytes_forbidden(message.topic.as_bytes()) {
         return Err(EncodeError::MalformedPacket);
     }
+    // Response Topic follows Topic Name rules ([MQTT-3.3.2-13/14]).
+    if let Some(response_topic) = message.properties.response_topic.as_ref()
+        && (response_topic.is_empty() || topic_name_bytes_forbidden(response_topic.as_bytes()))
+    {
+        return Err(EncodeError::MalformedPacket);
+    }
     let body = V5PublishBody { message, delivery };
     let body_len = body.encoded_body_len(max_packet_size)? as u32;
     let wire_len = 1 + var_int_len_u32(body_len) + body_len;
@@ -690,6 +696,54 @@ mod tests {
             b"keep",
             "{topic}: rejected encode must not leave a partial PUBLISH frame"
         );
+    }
+
+    /// [MQTT-3.3.2-13/14] Response Topic follows Topic Name rules: non-empty, no wildcards.
+    #[rstest]
+    #[case::empty("")]
+    #[case::plus_wildcard("reply/+")]
+    #[case::hash_wildcard("reply/#")]
+    #[case::embedded_nul("reply\0topic")]
+    fn encode_publish_rejects_invalid_response_topic(#[case] response_topic: &str) {
+        let delivery = PublishDelivery {
+            dup: false,
+            retain: false,
+            qos: QoS::AtMostOnce,
+            packet_id: None,
+        };
+        let message = PublishMessage {
+            topic: ByteString::from_static("req/topic"),
+            payload: Bytes::from_static(b"x"),
+            properties: PublishProperties::default().response_topic(response_topic),
+        };
+        let mut buf = BytesMut::from(&b"keep"[..]);
+        let err = encode_publish(&message, delivery, u32::MAX, &mut buf).expect_err(response_topic);
+        assert!(
+            matches!(err, EncodeError::MalformedPacket),
+            "{response_topic}: expected MalformedPacket, got {err:?}"
+        );
+        assert_eq!(
+            &buf[..],
+            b"keep",
+            "{response_topic}: rejected encode must not leave a partial PUBLISH frame"
+        );
+    }
+
+    #[test]
+    fn encode_publish_accepts_valid_response_topic() {
+        let delivery = PublishDelivery {
+            dup: false,
+            retain: false,
+            qos: QoS::AtMostOnce,
+            packet_id: None,
+        };
+        let message = PublishMessage {
+            topic: ByteString::from_static("req/topic"),
+            payload: Bytes::from_static(b"x"),
+            properties: PublishProperties::default().response_topic("reply/to/me"),
+        };
+        let mut buf = BytesMut::new();
+        encode_publish(&message, delivery, u32::MAX, &mut buf).expect("valid response topic encodes");
     }
 
     #[test]

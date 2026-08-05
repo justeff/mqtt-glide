@@ -233,7 +233,15 @@ impl ConnectAck {
                     max_qos = Some(prop_src.get_u8().try_into()?);
                 }
                 pt::RETAIN_AVAIL => retain_available.read_value(prop_src)?,
-                pt::MAX_PACKET_SIZE => max_packet_size.read_value(prop_src)?,
+                pt::MAX_PACKET_SIZE => {
+                    max_packet_size.read_value(prop_src)?;
+                    // Maximum Packet Size of 0 is a Protocol Error ([MQTT-3.2.2-16]); the codec
+                    // treats limit 0 as "unbounded", so accepting it would silently disable enforcement.
+                    ensure!(
+                        max_packet_size != Some(0),
+                        DecodeError::MalformedPacket("maximum packet size must not be 0")
+                    );
+                }
                 pt::ASSND_CLIENT_ID => assigned_client_id.read_value(prop_src)?,
                 pt::TOPIC_ALIAS_MAX => topic_alias_max.read_value(prop_src)?,
                 pt::REASON_STRING => reason_string.read_value(prop_src)?,
@@ -364,6 +372,22 @@ mod tests {
         let mut src = Bytes::from_static(&[0x00, 0x8D, 0x00]);
         let ack = ConnectAck::decode(&mut src).unwrap();
         assert_eq!(ack.reason_code, ConnectAckReason::Unknown(141));
+    }
+
+    #[test]
+    fn connack_rejects_zero_max_packet_size() {
+        // [MQTT-3.2.2-16] Maximum Packet Size of 0 is a Protocol Error; the codec uses
+        // limit 0 as "unbounded", so accepting it would silently disable size enforcement.
+        let mut src = Bytes::from_static(&[0x00, 0x00, 0x05, 0x27, 0x00, 0x00, 0x00, 0x00]);
+        assert!(matches!(
+            ConnectAck::decode(&mut src),
+            Err(DecodeError::MalformedPacket(_))
+        ));
+
+        // Non-zero still parses.
+        let mut src = Bytes::from_static(&[0x00, 0x00, 0x05, 0x27, 0x00, 0x00, 0x04, 0x00]);
+        let ack = ConnectAck::decode(&mut src).unwrap();
+        assert_eq!(ack.max_packet_size, Some(1024));
     }
 
     #[test]

@@ -462,7 +462,13 @@ impl WireBodyEncode for Connect {
         self.client_id.encode(buf)?;
 
         if let Some(will) = self.will_message.as_ref() {
-            if will.topic.is_empty() {
+            // Will Topic Name rules on encode ([MQTT-3.1.3-11]); decode enforces the same.
+            if will.topic.is_empty() || utils::topic_name_bytes_forbidden(will.topic.as_bytes()) {
+                return Err(EncodeError::MalformedPacket);
+            }
+            if let Some(response_topic) = will.response_topic.as_ref()
+                && (response_topic.is_empty() || utils::topic_name_bytes_forbidden(response_topic.as_bytes()))
+            {
                 return Err(EncodeError::MalformedPacket);
             }
             let prop_len = will.properties_len();
@@ -494,7 +500,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::codec::error::DecodeError;
+    use crate::codec::error::{DecodeError, EncodeError};
 
     /// Builds a CONNECT body: header + `flags` + fixed keep-alive + `properties` + `tail`.
     ///
@@ -573,6 +579,28 @@ mod tests {
         let connect = Connect::decode(&mut src).unwrap();
         assert!(connect.username.is_none());
         assert_eq!(connect.password.as_deref(), Some(b"token".as_ref()));
+    }
+
+    /// [MQTT-3.1.3-11] Will Topic Name rules (and Will Response Topic, §3.1.3.2.6) on encode —
+    /// the client API validates via `validate_will_message`; the codec rejects raw misuse too.
+    #[rstest]
+    #[case::wildcard_will_topic("a/+/b", None)]
+    #[case::hash_will_topic("a/#", None)]
+    #[case::nul_will_topic("a\0b", None)]
+    #[case::wildcard_will_response_topic("ok/topic", Some("reply/#"))]
+    #[case::nul_will_response_topic("ok/topic", Some("reply\0topic"))]
+    fn connect_encode_rejects_invalid_will_topics(#[case] will_topic: &str, #[case] response_topic: Option<&str>) {
+        let mut will = WillMessage::new(will_topic, "payload");
+        will.response_topic = response_topic.map(ByteString::from);
+        let connect = Connect {
+            client_id: ByteString::from_static("id"),
+            will_message: Some(will),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        let body_len = connect.encoded_body_len(u32::MAX).unwrap() as u32;
+        let err = connect.encode_body(&mut buf, body_len).expect_err("invalid will topic");
+        assert!(matches!(err, EncodeError::MalformedPacket));
     }
 
     #[test]
