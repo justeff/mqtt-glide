@@ -202,6 +202,18 @@ impl Packet {
     }
 
     pub(crate) fn encode_wire(&self, buf: &mut BytesMut, body_len: u32) -> Result<(), EncodeError> {
+        // Roll back on failure (same contract as `encode_publish`): the fixed header is
+        // written before the body, so a rejected body must not leave stray header bytes
+        // in a caller-batched buffer.
+        let start_len = buf.len();
+        if let Err(error) = self.encode_wire_inner(buf, body_len) {
+            buf.truncate(start_len);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn encode_wire_inner(&self, buf: &mut BytesMut, body_len: u32) -> Result<(), EncodeError> {
         match self {
             Packet::Connect(connect) => {
                 buf.put_u8(packet_type::CONNECT);

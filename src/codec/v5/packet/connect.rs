@@ -429,6 +429,10 @@ impl WireBodyEncode for Connect {
                 .as_ref()
                 .is_some_and(|username| username.as_bytes().contains(&0))
             || self
+                .auth_method
+                .as_ref()
+                .is_some_and(|method| method.as_bytes().contains(&0))
+            || self
                 .user_properties
                 .iter()
                 .any(|property| property.name.as_bytes().contains(&0) || property.value.as_bytes().contains(&0))
@@ -613,6 +617,25 @@ mod tests {
         assert_eq!(connect.password.as_deref(), Some(b"token".as_ref()));
     }
 
+    /// Routes a CONNECT through the public codec entry point with a pre-seeded buffer:
+    /// rejection must roll back even the fixed header (no stray bytes in batched buffers).
+    fn assert_connect_rejected_via_codec(connect: Connect, case: &str) {
+        use crate::codec::{Packet, V5Codec};
+        use tokio_util::codec::Encoder;
+
+        let mut codec = V5Codec::with_max_packet_size(0);
+        let mut buf = BytesMut::from(&b"keep"[..]);
+        let err = codec
+            .encode(Packet::Connect(Box::new(connect)), &mut buf)
+            .expect_err(case);
+        assert!(matches!(err, EncodeError::MalformedPacket), "{case}: got {err:?}");
+        assert_eq!(
+            &buf[..],
+            b"keep",
+            "{case}: rejected encode must not leave partial bytes"
+        );
+    }
+
     /// [MQTT-3.1.3-11] Will Topic Name rules (and Will Response Topic, §3.1.3.2.6) on encode —
     /// the client API validates via `validate_will_message`; the codec rejects raw misuse too.
     /// [MQTT-1.5.4-2] covers the U+0000 cases.
@@ -625,16 +648,14 @@ mod tests {
     fn connect_encode_rejects_invalid_will_topics(#[case] will_topic: &str, #[case] response_topic: Option<&str>) {
         let mut will = WillMessage::new(will_topic, "payload");
         will.response_topic = response_topic.map(ByteString::from);
-        let connect = Connect {
-            client_id: ByteString::from_static("id"),
-            will_message: Some(will),
-            ..Default::default()
-        };
-        let mut buf = BytesMut::new();
-        let body_len = connect.encoded_body_len(u32::MAX).unwrap() as u32;
-        let err = connect.encode_body(&mut buf, body_len).expect_err("invalid will topic");
-        assert!(matches!(err, EncodeError::MalformedPacket));
-        assert!(buf.is_empty(), "rejected encode must not leave partial bytes");
+        assert_connect_rejected_via_codec(
+            Connect {
+                client_id: ByteString::from_static("id"),
+                will_message: Some(will),
+                ..Default::default()
+            },
+            "invalid will topic",
+        );
     }
 
     /// [MQTT-1.5.4-2] U+0000 in CONNECT UTF-8 fields is rejected before any wire bytes.
@@ -646,6 +667,11 @@ mod tests {
     #[case::username(Connect {
         client_id: ByteString::from_static("id"),
         username: Some(ByteString::from_static("bad\0user")),
+        ..Default::default()
+    })]
+    #[case::auth_method(Connect {
+        client_id: ByteString::from_static("id"),
+        auth_method: Some(ByteString::from_static("SCRAM\0SHA1")),
         ..Default::default()
     })]
     #[case::connect_user_property(Connect {
@@ -664,11 +690,7 @@ mod tests {
         ..Default::default()
     })]
     fn connect_encode_rejects_nul_in_utf8_fields(#[case] connect: Connect) {
-        let mut buf = BytesMut::new();
-        let body_len = connect.encoded_body_len(u32::MAX).unwrap() as u32;
-        let err = connect.encode_body(&mut buf, body_len).expect_err("nul field");
-        assert!(matches!(err, EncodeError::MalformedPacket));
-        assert!(buf.is_empty(), "rejected encode must not leave partial bytes");
+        assert_connect_rejected_via_codec(connect, "nul field");
     }
 
     #[test]
