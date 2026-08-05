@@ -240,8 +240,10 @@ impl SharedCredentials {
 ///
 /// # Drop behavior
 ///
-/// Dropping this handle without waiting does not cancel the already-enqueued PUBLISH.
-/// For QoS 1, the driver-side waiter remains until PUBACK or session teardown, matching
+/// Dropping this handle without waiting means the publish result is discarded. A PUBLISH
+/// still queued on the command channel at that point may be skipped without a packet id
+/// being allocated; once the write task has encoded the frame, the publish proceeds —
+/// for QoS 1 the driver-side waiter remains until PUBACK or session teardown, matching
 /// the behavior of dropping a [`MqttClient::publish`] future while it awaits completion.
 /// The acknowledgement timeout starts only when [`Self::wait`] is polled.
 #[derive(Debug)]
@@ -468,6 +470,10 @@ impl MqttClient {
     ///
     /// Awaits a matching SUBACK until [`ConnectOptions::ack_timeout`] elapses, then
     /// returns [`AppError::SubscribeAckTimeout`].
+    ///
+    /// On timeout the broker may still apply the subscription; a late SUBACK is then
+    /// still recorded in the resubscribe registry (the packet id stays allocated until
+    /// the ack, [MQTT-2.2.1-3]). Treat a timeout as "unknown outcome", not as "failed".
     pub async fn subscribe(
         &self,
         filters: impl IntoIterator<Item = impl Into<Subscription>>,
@@ -494,6 +500,9 @@ impl MqttClient {
     ///
     /// Awaits a matching UNSUBACK until [`ConnectOptions::ack_timeout`] elapses, then
     /// returns [`AppError::UnsubscribeAckTimeout`].
+    ///
+    /// On timeout the broker may still apply the removal; a late UNSUBACK is then still
+    /// recorded in the resubscribe registry. Treat a timeout as "unknown outcome".
     pub async fn unsubscribe(
         &self,
         filters: impl IntoIterator<Item = impl Into<ByteString>>,

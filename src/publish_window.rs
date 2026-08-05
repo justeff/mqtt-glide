@@ -51,8 +51,9 @@ use crate::publish_builder::{PayloadSet, PayloadUnset, TopicSet, TopicUnset};
 /// Keeps at most `capacity` [`PublishCompletion`]s open. [`Self::push`] / [`Self::push_retry`]
 /// wait on the oldest completion when full, then enqueue. After the burst, call [`Self::drain`].
 ///
-/// Dropping without [`Self::drain`] does not cancel already-enqueued publishes (same as
-/// dropping [`PublishCompletion`] without [`PublishCompletion::wait`](crate::PublishCompletion::wait)).
+/// Dropping without [`Self::drain`] discards the open completions (same as dropping
+/// [`PublishCompletion`] without [`PublishCompletion::wait`](crate::PublishCompletion::wait)):
+/// publishes the write task has already encoded proceed, still-queued ones may be skipped.
 #[derive(Debug)]
 pub struct PublishWindow<'a> {
     client: &'a MqttClient,
