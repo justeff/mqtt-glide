@@ -12,7 +12,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use bytestring::ByteString;
 
 use crate::codec::error::{DecodeError, EncodeError};
-use crate::codec::properties::ack_props;
+use crate::codec::properties::{ack_props, reduce_limit};
 use crate::codec::types::packet_type;
 use crate::codec::utils::{Decode, Encode, MINIMAL_PACKET_ID_ACK_WIRE_LEN, WireReader, encode_minimal_packet_id_ack};
 use crate::codec::v5::body_encode::WireBodyEncode;
@@ -293,7 +293,11 @@ impl WireBodyEncode for PublishAck {
             return Ok(HEADER_LEN as usize);
         }
         // Body budget: Packet Identifier + Reason Code; reserve ≤4 bytes for Property Length varint.
-        let prop_len = ack_props::encoded_size(&self.properties, &self.reason_string, max_out - HEADER_LEN - 4);
+        let prop_len = ack_props::encoded_size(
+            &self.properties,
+            &self.reason_string,
+            reduce_limit(max_out, (HEADER_LEN + 4) as usize),
+        );
         Ok(HEADER_LEN as usize + prop_len)
     }
 
@@ -306,7 +310,12 @@ impl WireBodyEncode for PublishAck {
         if !self.has_ack_properties() {
             return Ok(());
         }
-        ack_props::encode(&self.properties, &self.reason_string, buf, max_out - HEADER_LEN)?;
+        ack_props::encode(
+            &self.properties,
+            &self.reason_string,
+            buf,
+            reduce_limit(max_out, HEADER_LEN as usize),
+        )?;
         Ok(())
     }
 }
@@ -322,7 +331,11 @@ impl WireBodyEncode for PubRelComp {
             return Ok(HEADER_LEN as usize);
         }
         // Body budget: Packet Identifier + Reason Code; reserve ≤4 bytes for Property Length varint.
-        let prop_len = ack_props::encoded_size(&self.properties, &self.reason_string, max_out - HEADER_LEN - 4);
+        let prop_len = ack_props::encoded_size(
+            &self.properties,
+            &self.reason_string,
+            reduce_limit(max_out, (HEADER_LEN + 4) as usize),
+        );
         Ok(HEADER_LEN as usize + prop_len)
     }
 
@@ -335,7 +348,7 @@ impl WireBodyEncode for PubRelComp {
         if !self.has_ack_properties() {
             return Ok(());
         }
-        ack_props::encode(&self.properties, &self.reason_string, buf, max_out - 3)?;
+        ack_props::encode(&self.properties, &self.reason_string, buf, reduce_limit(max_out, 3))?;
         Ok(())
     }
 }
@@ -457,5 +470,21 @@ mod tests {
             &[0x00, 0x02, 0x80, 0x00],
             "User Property must be omitted when it would exceed the PUBACK body budget"
         );
+    }
+
+    /// Budgets below the Packet Identifier + Reason Code header must not wrap the u32
+    /// subtraction into a huge trim limit (defensive; the encode orchestration always
+    /// passes the computed body length).
+    #[test]
+    fn puback_encode_body_below_header_budget_errors_instead_of_wrapping() {
+        let ack = PublishAck {
+            packet_id: NonZeroU16::new(1).unwrap(),
+            reason_code: PublishAckReason::NotAuthorized,
+            properties: Vec::new(),
+            reason_string: Some(ByteString::from_static("reason")),
+        };
+        let mut buf = BytesMut::new();
+        let err = ack.encode_body(&mut buf, 1).expect_err("budget below header");
+        assert!(matches!(err, EncodeError::OverMaxPacketSize { .. }));
     }
 }
