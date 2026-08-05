@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Will Message (LWT) on CONNECT: `ClientBuilder` / `ConnectOptions` `.will(topic, payload)` (+ `.will_qos` / `.will_retain`)
 - Fluent codec helpers: `PublishMessage::new` / `.properties`, `PublishProperties` setters, `Connect::username` / `password`
+- `BrokerUrlError::InvalidHost` for malformed bracketed IPv6 hosts
+
+### Fixed
+
+- Reject CONNACK `Maximum Packet Size` of `0` on decode ([MQTT-3.2.2-16]); it was accepted and, because the codec treats limit `0` as unbounded, silently disabled outbound size enforcement
+- Validate outbound Response Topics before wire bytes: PUBLISH `response_topic` ([MQTT-3.3.2-13/14]) and Will Topic / Will Response Topic at codec encode ([MQTT-3.1.3-11]) reject empty / wildcard / U+0000
+- Enforce [MQTT-1.5.4-2] on encode: outbound UTF-8 strings containing U+0000 are rejected (decode already rejected them)
+- Harden ACK property budgeting: no u32 wrap below the header budget, `ack_props::encode` errors on a zero budget instead of a debug-only assert, and the Reason String trim check now mirrors the size path
+- `BrokerUrl` parses bracketed IPv6 literals (`mqtt://[::1]:1883`, `mqtts://[2001:db8::1]`)
 
 ### Changed
 
