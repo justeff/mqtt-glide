@@ -4,7 +4,7 @@
 //! Publish: QoS 0 fire-and-forget; QoS 1 awaits PUBACK.
 //! Prefer [`MqttClient::publish_with`] for the fluent builder, [`MqttClient::publish_window`] for
 //! pipelined sliding-window publish, or [`MqttClient::publish`] with a ready
-//! [`PublishMessage`](crate::PublishMessage).
+//! [`PublishMessage`].
 //!
 //! For a higher-level entry point that applies defaults and connects (spawns the driver), see
 //! [`ClientBuilder`].
@@ -361,7 +361,7 @@ impl MqttClient {
     /// required before [`.send`](PublishWith::send) / `.await` (type-state). See [`PublishWith`].
     ///
     /// Prefer [`.send()`](PublishWith::send).await; bare `.await` boxes via
-    /// [`IntoFuture`](std::future::IntoFuture).
+    /// [`IntoFuture`].
     ///
     /// # Examples
     ///

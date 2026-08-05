@@ -1,4 +1,4 @@
-//! Ergonomic [`ClientBuilder`] over [`connect_with_shared`].
+//! Ergonomic [`ClientBuilder`] over the `connect_with_shared` driver entry.
 //!
 //! # Publish sink (type-state)
 //!

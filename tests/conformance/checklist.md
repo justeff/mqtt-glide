@@ -8,7 +8,7 @@ Hard, testable client **MUST**s: status + test. Scope / deviations → [`README.
 | `pending` | In scope; not yet proven                                          |
 | `N/A`     | Out of scope — short reason (see README feature matrix if needed) |
 
-Generated from Appendix B client/shared MUST rows. Tests attach under Phase B.
+Rows are the client/shared MUSTs from the MQTT 5.0 specification (Appendix B); each `pass` row names the test(s) that prove it.
 
 ## MUST (in scope)
 
@@ -106,7 +106,7 @@ Generated from Appendix B client/shared MUST rows. Tests attach under Phase B.
 
 ## N/A (out of scope)
 
-Populate with concrete `[MQTT-…]` IDs when extracted. Do not restate README policy tables here.
+Client/shared MUSTs this client deliberately does not implement, with a short reason (product framing: README feature matrix).
 
 | ID              | Reason                                                                   |
 |-----------------|--------------------------------------------------------------------------|

@@ -1,7 +1,7 @@
 //! Sliding-window outbound publish helper ([`PublishWindow`]).
 //!
 //! Wraps [`MqttClient::start_publish`](crate::MqttClient::start_publish) +
-//! [`PublishCompletion`](crate::PublishCompletion) without spawning a task per message.
+//! [`PublishCompletion`] without spawning a task per message.
 //! Prefer [`PublishWindow::publish_with`] for fluent topic/payload; call
 //! [`PublishWindow::drain`] after the burst. For a uniform QoS/retain burst, see
 //! [`MqttClient::publish_batch`](crate::MqttClient::publish_batch).
