@@ -20,14 +20,29 @@ struct V5PublishBody<'a> {
     delivery: PublishDelivery,
 }
 
-fn canonical_props_len(props: &PublishProperties) -> usize {
+/// Summed property wire size. Rejects U+0000 in the UTF-8 property strings
+/// ([MQTT-1.5.4-2]) within the same plan-time walk over the properties — the hot
+/// no-properties path never calls this (see `is_wire_empty`).
+fn canonical_props_len(props: &PublishProperties) -> Result<usize, EncodeError> {
+    if let Some(content_type) = props.content_type.as_ref()
+        && content_type.as_bytes().contains(&0)
+    {
+        return Err(EncodeError::MalformedPacket);
+    }
+    let mut user_props_len = 0;
+    for property in &props.user_properties {
+        if property.name.as_bytes().contains(&0) || property.value.as_bytes().contains(&0) {
+            return Err(EncodeError::MalformedPacket);
+        }
+        user_props_len += 1 + property.encoded_size(); // prop type byte + name + value
+    }
     let prop_len = encoded_property_size(&props.correlation_data)
         + encoded_property_size(&props.message_expiry_interval)
         + encoded_property_size(&props.content_type)
         + encoded_property_size_default(&props.payload_format_indicator, false)
         + encoded_property_size(&props.response_topic)
-        + props.user_properties.encoded_size();
-    prop_len + var_int_len(prop_len) as usize
+        + user_props_len;
+    Ok(prop_len + var_int_len(prop_len) as usize)
 }
 
 fn encode_canonical_props(props: &PublishProperties, buf: &mut BytesMut, max_out: u32) -> Result<(), EncodeError> {
@@ -47,7 +62,7 @@ impl WireBodyEncode for V5PublishBody<'_> {
         let property_size = if self.message.properties.is_wire_empty() {
             1
         } else {
-            canonical_props_len(&self.message.properties)
+            canonical_props_len(&self.message.properties)?
         };
         Ok(self.message.topic.encoded_size() + packet_id_size + property_size + self.message.payload.len())
     }
@@ -109,7 +124,10 @@ fn publish_wire_plan(
     if message.topic.is_empty() || topic_name_bytes_forbidden(message.topic.as_bytes()) {
         return Err(EncodeError::MalformedPacket);
     }
-    // Response Topic follows Topic Name rules ([MQTT-3.3.2-13/14]).
+    // Response Topic follows Topic Name rules ([MQTT-3.3.2-13/14]) — same single pass
+    // family as the topic check above (NUL included via topic_name_bytes_forbidden).
+    // U+0000 in the remaining UTF-8 properties is rejected inside `canonical_props_len`
+    // ([MQTT-1.5.4-2]), within its existing plan-time walk over the properties.
     if let Some(response_topic) = message.properties.response_topic.as_ref()
         && (response_topic.is_empty() || topic_name_bytes_forbidden(response_topic.as_bytes()))
     {
@@ -744,6 +762,34 @@ mod tests {
         };
         let mut buf = BytesMut::new();
         encode_publish(&message, delivery, u32::MAX, &mut buf).expect("valid response topic encodes");
+    }
+
+    /// [MQTT-1.5.4-2] U+0000 in publish UTF-8 properties is rejected at plan time,
+    /// before any wire bytes.
+    #[rstest]
+    #[case::content_type(PublishProperties::default().content_type("text/\0plain"))]
+    #[case::user_property_name(PublishProperties::default().user_property("k\0", "v"))]
+    #[case::user_property_value(PublishProperties::default().user_property("k", "v\0"))]
+    fn encode_publish_rejects_nul_in_utf8_properties(#[case] properties: PublishProperties) {
+        let delivery = PublishDelivery {
+            dup: false,
+            retain: false,
+            qos: QoS::AtMostOnce,
+            packet_id: None,
+        };
+        let message = PublishMessage {
+            topic: ByteString::from_static("topic/a"),
+            payload: Bytes::from_static(b"x"),
+            properties,
+        };
+        let mut buf = BytesMut::from(&b"keep"[..]);
+        let err = encode_publish(&message, delivery, u32::MAX, &mut buf).expect_err("nul property");
+        assert!(matches!(err, EncodeError::MalformedPacket), "got {err:?}");
+        assert_eq!(
+            &buf[..],
+            b"keep",
+            "rejected encode must not leave a partial PUBLISH frame"
+        );
     }
 
     #[test]

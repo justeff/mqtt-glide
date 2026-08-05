@@ -235,8 +235,9 @@ impl ConnectAck {
                 pt::RETAIN_AVAIL => retain_available.read_value(prop_src)?,
                 pt::MAX_PACKET_SIZE => {
                     max_packet_size.read_value(prop_src)?;
-                    // Maximum Packet Size of 0 is a Protocol Error ([MQTT-3.2.2-16]); the codec
-                    // treats limit 0 as "unbounded", so accepting it would silently disable enforcement.
+                    // §3.2.2.3.6: Maximum Packet Size of 0 is a Protocol Error (no Appendix-B
+                    // ID); the codec treats limit 0 as "unbounded", so accepting it would
+                    // silently disable enforcement.
                     ensure!(
                         max_packet_size != Some(0),
                         DecodeError::MalformedPacket("maximum packet size must not be 0")
@@ -376,7 +377,7 @@ mod tests {
 
     #[test]
     fn connack_rejects_zero_max_packet_size() {
-        // [MQTT-3.2.2-16] Maximum Packet Size of 0 is a Protocol Error; the codec uses
+        // §3.2.2.3.6: Maximum Packet Size of 0 is a Protocol Error; the codec uses
         // limit 0 as "unbounded", so accepting it would silently disable size enforcement.
         let mut src = Bytes::from_static(&[0x00, 0x00, 0x05, 0x27, 0x00, 0x00, 0x00, 0x00]);
         assert!(matches!(
