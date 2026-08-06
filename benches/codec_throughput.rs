@@ -81,6 +81,14 @@ fn bench_decode(label: &str, template: &Bytes) {
     let mut buf = BytesMut::with_capacity(template.len() * 2);
     let fills = ITERS / FRAMES_PER_FILL;
 
+    // Validate framing once outside the timed loop so the assert does not skew results.
+    buf.extend_from_slice(template);
+    for _ in 0..FRAMES_PER_FILL {
+        let frame = codec.decode_frame(&mut buf).expect("decode").expect("frame");
+        black_box(&frame);
+    }
+    assert!(buf.is_empty(), "template must split into whole frames");
+
     let mut run = |fills: u32| {
         for _ in 0..fills {
             buf.extend_from_slice(template);
@@ -88,7 +96,6 @@ fn bench_decode(label: &str, template: &Bytes) {
                 let frame = codec.decode_frame(&mut buf).expect("decode").expect("frame");
                 black_box(&frame);
             }
-            assert!(buf.is_empty(), "template must split into whole frames");
         }
     };
 
