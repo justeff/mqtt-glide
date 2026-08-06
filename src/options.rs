@@ -72,8 +72,8 @@ pub struct ConnectOptions {
     /// keeps no local QoS 1 DUP store; subscriptions are re-issued whenever the broker
     /// answers `session_present = false`. Resume also needs a non-zero [`Self::session_expiry`]
     /// — with the default (`None` → 0 on the wire) the broker ends the session on disconnect.
-    /// Cross-process resume requires a stable [`ClientId`]; [`ClientId::from_prefix`] always
-    /// mints a fresh UUID.
+    /// Cross-process resume requires a stable [`ClientId`] (via [`ClientId::try_new`]).
+    /// [`ClientId::from_prefix`] always mints a fresh UUID.
     pub clean_start: bool,
     /// Optional **Session Expiry Interval** (omit property when `None`).
     pub session_expiry: Option<Duration>,
@@ -151,6 +151,9 @@ impl ConnectOptions {
     }
 
     /// Sets the MQTT client identifier sent in CONNECT.
+    ///
+    /// Use [`ClientId::try_new`] for a stable ID across process restarts, or
+    /// [`ClientId::from_prefix`] for a fresh random ID.
     pub fn client_id(mut self, client_id: ClientId) -> Self {
         self.client_id = Some(client_id);
         self

@@ -47,7 +47,7 @@ use crate::connection::{LifecycleHook, NoopLifecycle, SessionParams, SessionPhas
 use crate::error::{AppError, ConnectError, ConnectionOutcome, TransportError};
 use crate::inbound_sink::{InboundSink, OnInboundSink};
 use crate::options::ConnectOptions;
-use crate::util::{BrokerUrl, BrokerUrlError, ClientId};
+use crate::util::{BrokerUrl, BrokerUrlError, ClientId, ClientIdError};
 
 /// Marker: handoff not configured — [`ClientBuilder::connect`] is unavailable.
 #[doc(hidden)]
@@ -79,7 +79,7 @@ struct BuilderConfig {
 /// - reconnect: [`NoReconnect`]
 /// - lifecycle: [`crate::NoopLifecycle`]
 /// - credentials: [`AnonymousCredentials`] (CONNECT without username/password)
-/// - `client_id`: [`ClientId::from_prefix`]`("mqtt5")` when `options.client_id` is `None`
+/// - `client_id`: [`ClientId::from_prefix`]`("glide")` when `options.client_id` is `None`
 /// - `wait_connected`: `true` (await [`SessionPhase::Connected`] after [`Self::connect`])
 ///
 /// Low-level [`crate::connect`] remains available for full control.
@@ -178,6 +178,21 @@ impl<H> ClientBuilder<H> {
         self
     }
 
+    /// Sets the MQTT client identifier sent in CONNECT.
+    ///
+    /// Pass a stable string (for example `"sensors-edge-01"`) when you need session resume
+    /// across process restarts. Validation matches [`ClientId::try_new`]. When unset,
+    /// [`ClientId::from_prefix`]`("glide")` is minted at connect time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientIdError`] when `id` is empty, longer than 65535 UTF-8 bytes, or
+    /// contains U+0000.
+    pub fn client_id(mut self, id: impl AsRef<str>) -> Result<Self, ClientIdError> {
+        self.config.options = self.config.options.client_id(ClientId::try_new(id)?);
+        Ok(self)
+    }
+
     /// Sets the Will Message for CONNECT (§3.1.2.5).
     ///
     /// Builds [`WillMessage`](crate::WillMessage) internally (QoS 0, retain `false` by default).
@@ -255,7 +270,7 @@ async fn finish_connect<S: InboundSink>(
     } = config;
 
     if options.client_id.is_none() {
-        options = options.client_id(ClientId::from_prefix("mqtt5"));
+        options = options.client_id(ClientId::from_prefix("glide"));
     }
 
     let connect_timeout = options.connect_timeout;
@@ -360,7 +375,7 @@ mod tests {
     use crate::error::ConnectionOutcome;
     use crate::util::BrokerUrl;
 
-    /// Builder defaults: anonymous creds, NoReconnect, NoopLifecycle, wait_connected, mqtt5 client id.
+    /// Builder defaults: anonymous creds, NoReconnect, NoopLifecycle, wait_connected, glide client id.
     #[tokio::test]
     async fn builder_applies_defaults_and_connects() {
         let observed_client_id = Arc::new(Mutex::new(None));
@@ -384,7 +399,37 @@ mod tests {
             .expect("connect");
 
         let id = observed_client_id.lock().await.clone().expect("CONNECT seen");
-        assert!(id.starts_with("mqtt5-"), "default client_id prefix mqtt5, got {id}");
+        assert!(id.starts_with("glide-"), "default client_id prefix glide, got {id}");
+
+        client.shutdown().await.expect("shutdown");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// Explicit stable client ID is sent on CONNECT unchanged.
+    #[tokio::test]
+    async fn builder_client_id_sends_stable_id() {
+        let observed_client_id = Arc::new(Mutex::new(None));
+        let observed = Arc::clone(&observed_client_id);
+        let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+            if let Some(Ok((DecodedFrame::Control(Packet::Connect(connect)), _))) = framed_read.next().await {
+                *observed.lock().await = Some(connect.client_id.to_string());
+                let _ = framed_write.send(Packet::ConnectAck(Box::default())).await;
+                while framed_read.next().await.is_some() {}
+            }
+        })
+        .await;
+
+        let client = ClientBuilder::new(format!("mqtt://127.0.0.1:{port}"))
+            .expect("url")
+            .client_id("stable-edge-01")
+            .expect("valid id")
+            .discard_inbound()
+            .connect()
+            .await
+            .expect("connect");
+
+        let id = observed_client_id.lock().await.clone().expect("CONNECT seen");
+        assert_eq!(id, "stable-edge-01");
 
         client.shutdown().await.expect("shutdown");
         tokio::time::sleep(Duration::from_millis(50)).await;

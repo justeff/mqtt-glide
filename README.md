@@ -30,45 +30,53 @@ mqtt-glide = { version = "0.1", default-features = false, features = ["tls-rustl
 Connect, publish once, shut down. No event loop to drive:
 
 ```rust,no_run
-use mqtt_glide::{ClientBuilder, QoS};
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use mqtt_glide::{ClientBuilder, QoS};
 
-let client = ClientBuilder::new("mqtt://127.0.0.1:1883")?
-    .discard_inbound()
-    .connect()
-    .await?;
+    let client = ClientBuilder::new("mqtt://127.0.0.1:1883")?
+        .discard_inbound()
+        .connect()
+        .await?;
 
-client
-    .publish_with()
-    .topic("sensors/room1/temp")
-    .payload("22.5")
-    .qos(QoS::AtLeastOnce)
-    .send()
-    .await?;
+    client
+        .publish_with()
+        .topic("sensors/room1/temp")
+        .payload("22.5")
+        .qos(QoS::AtLeastOnce)
+        .send()
+        .await?;
 
-client.shutdown().await?;
+    client.shutdown().await?;
+    Ok(())
+}
 ```
 
 Receiving is the mirror image: hand the client a channel sender, then read the receiver wherever you like.
 
 ```rust,no_run
-use mqtt_glide::{ClientBuilder, PublishMessage, QoS};
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use mqtt_glide::{ClientBuilder, PublishMessage, QoS};
 
-let (tx, mut rx) = tokio::sync::mpsc::channel::<PublishMessage>(1024);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<PublishMessage>(1024);
 
-let client = ClientBuilder::new("mqtt://127.0.0.1:1883")?
-    .inbound_sink(tx)
-    .connect()
-    .await?;
+    let client = ClientBuilder::new("mqtt://127.0.0.1:1883")?
+        .inbound_sink(tx)
+        .connect()
+        .await?;
 
-client.subscribe([("sensors/+/temp", QoS::AtLeastOnce)]).await?;
+    client.subscribe([("sensors/+/temp", QoS::AtLeastOnce)]).await?;
 
-// For QoS 1, PUBACK goes out after this channel accepted the message,
-// not when it was decoded off the socket.
-while let Some(msg) = rx.recv().await {
-    println!("{}: {} bytes", msg.topic, msg.payload.len());
+    // For QoS 1, PUBACK goes out after this channel accepted the message,
+    // not when it was decoded off the socket.
+    while let Some(msg) = rx.recv().await {
+        println!("{}: {} bytes", msg.topic, msg.payload.len());
+    }
+
+    client.shutdown().await?;
+    Ok(())
 }
-
-client.shutdown().await?;
 ```
 
 If the channel is full, the read task waits and the broker stops sending. That is backpressure working, not a stall. Nothing in your code has to be polled for the connection to stay alive.
@@ -86,24 +94,28 @@ If the channel is full, the read task waits and the broker stops sending. That i
 
 Step 3 after step 2 is the whole point, and the rest of this document calls it **enqueue-before-ack**. A client that acks at step 1 tells the broker "delivered" while the message still only exists inside the client. If the process dies there, the broker has already moved on. Here the broker keeps ownership until your queue has the message. The guarantee ends there: once the handoff succeeded, the message belongs to your application, and what happens to it afterwards is your responsibility.
 
-**One handoff instead of two queues.** Decoded messages go directly into your `InboundSink`: a `flume` or `tokio::sync::mpsc` sender, an inline handler, or your own implementation. There is no library-owned inbound queue in front of it to size, drain, or reason about.
+### One handoff instead of two queues
 
-**A slow consumer costs throughput, not the session.** Read and write run as separate tasks on a split socket. While the read task waits on a full sink, the write task keeps sending `PINGREQ`, and the keep-alive watchdog knows the difference between "the broker is gone" and "we are busy". A backed-up consumer does not get you disconnected. It is not free: outbound `PUBACK`s wait until the sink accepts, and inbound frames (including `PINGRESP`) sit unread in the socket buffer while the read task is blocked; `receive_maximum` bounds how far behind it can fall.
+Decoded messages go directly into your `InboundSink`: a `flume` or `tokio::sync::mpsc` sender, an inline handler, or your own implementation. There is no library-owned inbound queue in front of it to size, drain, or reason about.
+
+### A slow consumer costs throughput, not the session
+
+Read and write run as separate tasks on a split socket. While the read task waits on a full sink, the write task keeps sending `PINGREQ`, and the keep-alive watchdog knows the difference between "the broker is gone" and "we are busy". A backed-up consumer does not get you disconnected. It is not free: outbound `PUBACK`s wait until the sink accepts, and inbound frames (including `PINGRESP`) sit unread in the socket buffer while the read task is blocked; `receive_maximum` bounds how far behind it can fall.
 
 | Concern | Approach |
 |---------|----------|
 | App API | Cloneable `MqttClient` (no polling) |
-| I/O | Separate **read** and **write** tasks on a split socket |
+| I/O | Separate read and write tasks on a split socket |
 | Inbound | Injectable `InboundSink` (e.g. `flume` / `tokio::mpsc`) |
-| QoS 1 ingress | **Enqueue-before-ack:** `PUBACK` only after the sink accepts |
+| QoS 1 ingress | enqueue-before-ack: `PUBACK` only after the sink accepts |
 | Keep-alive under load | Write keeps sending `PINGREQ` while read waits on a full sink; liveness treats that stall as self-induced |
 | Shutdown | Graceful `DISCONNECT` + join |
 
 ## Design goals
 
-- **Clean drain:** graceful shutdown without reaching into crate internals, and no "acked but not forwarded" window.
-- **Spec-backed:** client **MUST**s from [OASIS MQTT 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html) are tracked in [`tests/conformance/checklist.md`](tests/conformance/checklist.md).
-- **Auth stays outside:** a `CredentialsProvider` hook is the whole story. No OAuth or token manager lives in this crate.
+- Clean drain: graceful shutdown without reaching into crate internals, and no "acked but not forwarded" window.
+- Spec-backed: client **MUST**s from [OASIS MQTT 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html) are tracked in [`tests/conformance/checklist.md`](tests/conformance/checklist.md).
+- Auth stays outside: a `CredentialsProvider` hook is the whole story. No OAuth or token manager lives in this crate.
 
 Non-goals are deliberate rather than unfinished; the [feature matrix](#feature-matrix) lists them.
 
@@ -111,11 +123,17 @@ Non-goals are deliberate rather than unfinished; the [feature matrix](#feature-m
 
 Three things change in your code.
 
-**No `eventloop.poll()`.** In a polled client the event loop is yours to drive: connection progress, keep-alive, and incoming publishes all happen as a side effect of your poll call. Here `connect()` spawns the driver and it owns the socket; your code only keeps `MqttClient` handles, which are cheap to clone.
+### No `eventloop.poll()`
 
-**One queue instead of two.** A polled loop hands you notifications that you forward into your own channel: two queues, two capacities, two places to get backpressure wrong. You pass your channel in at connect time instead, and the driver writes into it.
+In a polled client the event loop is yours to drive: connection progress, keep-alive, and incoming publishes all happen as a side effect of your poll call. Here `connect()` spawns the driver and it owns the socket; your code only keeps `MqttClient` handles, which are cheap to clone.
 
-**Backpressure is a policy, not an accident.** When a full application queue blocks the same loop that sends `PINGREQ`, a slow consumer can end the session. With read and write split, a slow consumer slows down reading only.
+### One queue instead of two
+
+A polled loop hands you notifications that you forward into your own channel: two queues, two capacities, two places to get backpressure wrong. You pass your channel in at connect time instead, and the driver writes into it.
+
+### Backpressure is a policy, not an accident
+
+When a full application queue blocks the same loop that sends `PINGREQ`, a slow consumer can end the session. With read and write split, a slow consumer slows down reading only.
 
 | In rumqttc | Here |
 |------------|------|
@@ -125,15 +143,17 @@ Three things change in your code.
 | Connection state inferred from polled events | `LifecycleHook`, or the `SessionPhase` watch from the low-level `connect` |
 | `publish(..)` resolves when the request is queued for the event loop | `publish(..)` resolves when the frame is encoded into the write buffer (QoS 0; not necessarily flushed) or when `PUBACK` arrives (QoS 1) |
 
-**What it costs.** No MQTT 3.1.1, no QoS 2, no WebSockets, and Topic Alias are out of scope, not pending. If you need any of those, rumqttc remains the better fit. There is no local store-and-forward, so redelivery after an unclean disconnect is entirely the broker's job, and resuming a session across process restarts needs a stable client ID that this crate does not expose yet. rumqttc is also the far more widely deployed crate; this one is 0.1.x, and the API can still move.
+### What it costs
+
+No MQTT 3.1.1, no QoS 2, no WebSockets, and Topic Alias are out of scope, not pending. If you need any of those, rumqttc remains the better fit. There is no local store-and-forward, so redelivery after an unclean disconnect is entirely the broker's job. Cross-process session resume needs a stable client ID (`.client_id("…")?` or `ClientId::try_new`) plus `clean_start(false)` and a non-zero `session_expiry`. rumqttc is also the far more widely deployed crate; this one is 0.1.x, and the API can still move.
 
 ## Architecture
 
 `connect()` gives you a handle and starts one driver over a single socket:
 
-1. **`MqttClient`:** a cheap cloneable handle. It sends commands and does no socket I/O.
-2. **Write task:** encodes `PUBLISH` / `SUBSCRIBE` / acks / `PINGREQ`, and puts inbound `PUBACK`s ahead of your publishes.
-3. **Read task:** decodes frames, answers control packets itself, and passes application `PUBLISH` to your sink. Reconnect and credential refresh happen here, not in your code.
+1. `MqttClient`: a cheap cloneable handle. It sends commands and does no socket I/O.
+2. Write task: encodes `PUBLISH` / `SUBSCRIBE` / acks / `PINGREQ`, and puts inbound `PUBACK`s ahead of your publishes.
+3. Read task: decodes frames, answers control packets itself, and passes application `PUBLISH` to your sink. Reconnect and credential refresh happen here, not in your code.
 
 ```text
                  +---------------------------+
@@ -156,25 +176,33 @@ Three things change in your code.
                   one TCP/TLS socket (split)
 ```
 
-**Why split read and write?** A stalled handoff must not freeze keep-alive. The read task can sit on a sink push while the write task keeps sending `PINGREQ` and your publishes. A full sink still delays outbound `PUBACK`s (they wait on sink acceptance), and inbound frames sit unread in the socket buffer; the inbound receive window bounds how far that can grow, and control frames that were already decoded are handled before the next handoff wait.
+Why split read and write? A stalled handoff must not freeze keep-alive. The read task can sit on a sink push while the write task keeps sending `PINGREQ` and your publishes. A full sink still delays outbound `PUBACK`s (they wait on sink acceptance), and inbound frames sit unread in the socket buffer; the inbound receive window bounds how far that can grow, and control frames that were already decoded are handled before the next handoff wait.
 
 ## Defaults worth changing before production
 
 The builder defaults are chosen for a predictable first run, not for a long-lived service. Four of them will surprise you:
 
-**No reconnect.** The default policy is `NoReconnect`: one connect attempt, and a dropped connection stays dropped. Pass `.reconnect(StandardReconnectPolicy::new(delay, max_auth_backoff))` or your own `ReconnectPolicy` if the process should outlive a broker restart.
+### No reconnect
 
-**A new client ID every process.** Without an explicit `client_id`, the builder mints a fresh UUID (`ClientId::from_prefix("mqtt5")`). That ID is reused for reconnects inside the same process, but `ClientId` only mints random values today. A stable ID you could persist across restarts is not exposed yet, so broker-side session resume across process boundaries is not available.
+The default policy is `NoReconnect`: one connect attempt, and a dropped connection stays dropped. Pass `.reconnect(StandardReconnectPolicy::new(delay, max_auth_backoff))` or your own `ReconnectPolicy` if the process should outlive a broker restart.
 
-**No session.** `clean_start` is `true` and `session_expiry` is unset (property omitted; MQTT default 0 s), so the broker drops your subscriptions and anything queued for you as soon as the connection ends. Resuming within the process needs `clean_start(false)` **plus** a non-zero `session_expiry`; re-subscribe whenever CONNACK reports `session_present = false`.
+### A new client ID every process (by default)
 
-**Capacities sized for a few connections, not a pipeline.** `command_channel_capacity` and `receive_maximum` are both `32`. See [Flow control](#flow-control).
+Without an explicit `client_id`, the builder mints a fresh UUID (`ClientId::from_prefix("glide")`). That ID is reused for reconnects inside the same process. For broker-side session resume across restarts, set a stable ID with `.client_id("my-service")?` (or `ConnectOptions::client_id(ClientId::try_new(...))`) together with `clean_start(false)` and a non-zero `session_expiry`.
+
+### No session
+
+`clean_start` is `true` and `session_expiry` is unset (property omitted; MQTT default 0 s), so the broker drops your subscriptions and anything queued for you as soon as the connection ends. Resuming within the process needs `clean_start(false)` plus a non-zero `session_expiry`; re-subscribe whenever CONNACK reports `session_present = false`.
+
+### Capacities sized for a few connections, not a pipeline
+
+`command_channel_capacity` and `receive_maximum` are both `32`. See [Flow control](#flow-control).
 
 | Setting | Default | Change it when |
 |---------|--------:|----------------|
 | reconnect policy | `NoReconnect` | the process must outlive a broker restart |
-| `client_id` | random UUID | not useful for cross-process resume yet (no stable ID API) |
-| `clean_start` / `session_expiry` | `true` / unset | you need in-process session resume across reconnects |
+| `client_id` | random UUID | you need session resume across restarts (`.client_id("…")?`) |
+| `clean_start` / `session_expiry` | `true` / unset | same (needs the stable `client_id` too) |
 | `command_channel_capacity` | `32` | you keep more than ~32 publishes in flight |
 | `receive_maximum` | `32` | inbound QoS 1 rate is high and workers are fast |
 | `keep_alive` | 60 s | your broker or NAT expects otherwise |
@@ -189,11 +217,17 @@ See [`ConnectOptions`](https://docs.rs/mqtt-glide/latest/mqtt_glide/options/stru
 
 Three limits, easy to confuse, only two of them yours to set.
 
-**Command channel capacity** (`ConnectOptions::command_channel_capacity`, default `32`): how many commands may queue up for the write task. Full means `publish` returns `AppError::Backpressure` rather than blocking, so set it to at least the number of publishes you keep in flight.
+### Command channel capacity
 
-**Receive Maximum** (`ConnectOptions::receive_maximum`, default `32`): how many inbound QoS 1 messages the broker may leave unacknowledged with this client. This is the knob that bounds memory when your sink is slow.
+`ConnectOptions::command_channel_capacity`, default `32`: how many commands may queue up for the write task. Full means `publish` returns `AppError::Backpressure` rather than blocking, so set it to at least the number of publishes you keep in flight.
 
-**Outbound inflight** is not yours: the broker's Receive Maximum from `CONNACK` decides how many of your QoS 1 publishes can await `PUBACK` at once.
+### Receive Maximum
+
+`ConnectOptions::receive_maximum`, default `32`: how many inbound QoS 1 messages the broker may leave unacknowledged with this client. This is the knob that bounds memory when your sink is slow.
+
+### Outbound inflight
+
+Not yours: the broker's Receive Maximum from `CONNACK` decides how many of your QoS 1 publishes can await `PUBACK` at once.
 
 How many publishes you have in flight is an application decision, not a library option. That is what [`publish_window`](https://docs.rs/mqtt-glide/latest/mqtt_glide/publish_window/struct.PublishWindow.html) gives you.
 
@@ -203,13 +237,13 @@ Do not confuse `DEFAULT_RECEIVE_MAXIMUM` (`32`, on `ConnectOptions`) with the co
 |------|-------------|
 | Outbound pipeline / many concurrent `publish` | `command_channel_capacity` ≥ your in-flight count; prefer [`publish_window`](https://docs.rs/mqtt-glide/latest/mqtt_glide/publish_window/struct.PublishWindow.html) (or your own window over `start_publish`) |
 | Inbound QoS 1 under load | Larger `receive_maximum`; keep the `InboundSink` draining (a full sink stalls decode and delays `PUBACK`) |
-| Comparing against another client | Same receive window and request capacity as the peer; measure **pipelined** or **concurrent** QoS 1, not serial round-trips |
+| Comparing against another client | Same receive window and request capacity as the peer; measure pipelined or concurrent QoS 1, not serial round-trips |
 
 ## API reference
 
 The tables below are the lookup surface: which call to reach for, what it guarantees, and which defaults apply. Full signatures live on [docs.rs](https://docs.rs/mqtt-glide).
 
-**Prefer convenience** (zero extra cost vs. the primitives underneath):
+Prefer convenience (zero extra cost vs. the primitives underneath):
 
 | Goal | API |
 |------|-----|
@@ -218,17 +252,17 @@ The tables below are the lookup surface: which call to reach for, what it guaran
 | Many publishes in flight | [`publish_window`](https://docs.rs/mqtt-glide/latest/mqtt_glide/publish_window/struct.PublishWindow.html) → `.push_retry().await` … `.drain().await` |
 | Same-QoS burst | [`publish_batch`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.publish_batch) → one call (`push_retry` + `drain` under the hood) |
 | Receive + workers | `.inbound_sink(flume/mpsc)` + your `recv` loop |
-| Tiny sync inbound work | `.on_inbound(\|msg\| …)` (runs on the **read task**; keep it short) |
+| Tiny sync inbound work | `.on_inbound(\|msg\| …)` (runs on the read task; keep it short) |
 
-**Power** (same semantics, more control): [`connect`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/fn.connect.html), custom [`InboundSink`](https://docs.rs/mqtt-glide/latest/mqtt_glide/inbound_sink/trait.InboundSink.html), [`publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.publish) / [`start_publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.start_publish) + [`PublishCompletion`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.PublishCompletion.html).
+Power (same semantics, more control): [`connect`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/fn.connect.html), custom [`InboundSink`](https://docs.rs/mqtt-glide/latest/mqtt_glide/inbound_sink/trait.InboundSink.html), [`publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.publish) / [`start_publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.start_publish) + [`PublishCompletion`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.PublishCompletion.html).
 
 ### Publish paths
 
 | Method | Role | Notes |
 |--------|------|-------|
-| **`publish_with()`** | Convenience one-shot | `.send().await` (= `publish`). Type-state topic/payload; default QoS 0. Helpers: `.message_expiry(secs)`, `.user_property(name, value)`. `.properties(...)` replaces the whole struct; call it before those helpers. |
-| **`publish_window(n)`** | Convenience pipeline | Sliding window over `start_publish` (no task per message). `.push()` = one attempt; `.push_retry()` yields on `Backpressure`. Always `.drain()` after the burst. |
-| **`publish_batch(msgs, qos, retain, n)`** | Convenience same-QoS burst | Internal window of capacity `n`; all messages share `qos` / `retain`. Prefer `publish_window` for mixed QoS. |
+| `publish_with()` | Convenience one-shot | `.send().await` (= `publish`). Type-state topic/payload; default QoS 0. Helpers: `.message_expiry(secs)`, `.user_property(name, value)`. `.properties(...)` replaces the whole struct; call it before those helpers. |
+| `publish_window(n)` | Convenience pipeline | Sliding window over `start_publish` (no task per message). `.push()` = one attempt; `.push_retry()` yields on `Backpressure`. Always `.drain()` after the burst. |
+| `publish_batch(msgs, qos, retain, n)` | Convenience same-QoS burst | Internal window of capacity `n`; all messages share `qos` / `retain`. Prefer `publish_window` for mixed QoS. |
 | `publish(msg, qos, retain)` | Power one-shot | Ready [`PublishMessage`](https://docs.rs/mqtt-glide/latest/mqtt_glide/codec/publish/struct.PublishMessage.html). |
 | `start_publish` + `PublishCompletion` | Power pipeline | Custom windowing / wait order. Full command channel → `AppError::Backpressure`. |
 
@@ -238,9 +272,9 @@ QoS 2 is rejected (`AppError::InvalidRequest`). Packet ID / `dup` are assigned b
 
 | API | When |
 |-----|------|
-| **`.inbound_sink(tx)`** | Normal apps: queue to workers (enqueue-before-ack) |
-| **`.on_inbound(handler)`** | Inline on the read task: counters, filters, metrics, tiny sync work. **Not** for heavy processing (stalls decode/keepalive) |
-| **`.discard_inbound()`** | Outbound-only / ignore inbound |
+| `.inbound_sink(tx)` | Normal apps: queue to workers (enqueue-before-ack) |
+| `.on_inbound(handler)` | Inline on the read task: counters, filters, metrics, tiny sync work. Not for heavy processing (stalls decode/keepalive) |
+| `.discard_inbound()` | Outbound-only / ignore inbound |
 | Custom `InboundSink` | Special buffers, existing systems |
 
 ### Subscribe, unsubscribe, shutdown
@@ -285,12 +319,12 @@ Broader flows live under [`examples/`](examples/) and are the better starting po
 | `graceful_disconnect_timeout` | 2 s | Caps read-join + inbound `PUBACK` flush + `DISCONNECT` on `shutdown` |
 | Packet IDs | n/a | Reserved until matching ACK or session teardown (no reap-on-cancel) |
 | Inbound QoS 1 `PUBACK` | n/a | Only after successful `InboundSink` push; custom `send` **MUST** be cancel-safe |
-| Readiness | n/a | `ClientBuilder::connect` waits for the first `Connected` (`wait_connected`, default `true`); the low-level `connect` returns a `SessionPhase` watch instead. Use the hook **or** the watch for side effects, not both |
+| Readiness | n/a | `ClientBuilder::connect` waits for the first `Connected` (`wait_connected`, default `true`); the low-level `connect` returns a `SessionPhase` watch instead. Use the hook or the watch for side effects, not both |
 | `CredentialsProvider::invalidate` | no-op | `CONNECT`-level `NotAuthorized` only (never `SUBACK` ACL) |
 
-**`StandardReconnectPolicy::mark_live()`:** call once the session is fully ready (typically after subscriptions succeed). The next transport failure then retries immediately (`Duration::ZERO`) once, before falling back to the configured delay. Auth failures use the normal delay, then `max_auth_backoff` after a streak (`DEFAULT_AUTH_FAILURE_THRESHOLD`). Credential cache clearing is `CredentialsProvider::invalidate`, not this policy.
+`StandardReconnectPolicy::mark_live()`: call once the session is fully ready (typically after subscriptions succeed). The next transport failure then retries immediately (`Duration::ZERO`) once, before falling back to the configured delay. Auth failures use the normal delay, then `max_auth_backoff` after a streak (`DEFAULT_AUTH_FAILURE_THRESHOLD`). Credential cache clearing is `CredentialsProvider::invalidate`, not this policy.
 
-**Custom `InboundSink` cancel safety:** built-ins (`flume`, `tokio::mpsc`, `OnInboundSink`) are fine. If you implement `InboundSink`, dropping `send()` before `Ok(())` **MUST** mean the message was **not** accepted by your consumer. On shutdown the driver may drop a pending send and will withhold `PUBACK` in that case. `.on_inbound` runs on the connection read task; keep the handler short or use a channel sink.
+Custom `InboundSink` cancel safety: built-ins (`flume`, `tokio::mpsc`, `OnInboundSink`) are fine. If you implement `InboundSink`, dropping `send()` before `Ok(())` **MUST** mean the message was not accepted by your consumer. On shutdown the driver may drop a pending send and will withhold `PUBACK` in that case. `.on_inbound` runs on the connection read task; keep the handler short or use a channel sink.
 
 Spec **SHOULD**s this client adopts: `CONNACK` within `connect_timeout`; `PINGRESP` watchdog (~1× Keep Alive) with handoff-stall exemption.
 
@@ -320,7 +354,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | WebSockets | ❌ | TCP (+ TLS) only |
 | Topic Alias | ❌ | Maximum = 0; inbound alias → protocol error (no alias state across reconnects) |
 | QoS 2 | ❌ | Rejected at the API (no 4-way handshake / store-and-forward) |
-| Persistent sessions / DUP redelivery | ❌ | No local store-and-forward; outbound `dup` always false. `clean_start = false` resumes a broker session **within this process** across reconnects (re-SUBSCRIBE when `session_present = false`). `ClientId::from_prefix` always mints a fresh UUID, so cross-process resume needs a stable ID API (not exposed yet) |
+| Persistent sessions / DUP redelivery | ❌ | No local store-and-forward; outbound `dup` always false. `clean_start = false` resumes a broker session across reconnects when the same client ID is reused (re-SUBSCRIBE when `session_present = false`). Builder: `.client_id("…")?`; options: `ClientId::try_new`. `ClientId::from_prefix` always mints a fresh UUID |
 
 Broker-dependent: Message Expiry *drop after interval* (property round-trip is tested), shared-sub rebalancing under handoff stall, redelivery after unclean disconnect (client guarantees enqueue-before-ack only).
 
@@ -328,7 +362,7 @@ Broker-dependent: Message Expiry *drop after interval* (property round-trip is t
 
 All results and the reading guide: [`BENCHMARKS.md`](BENCHMARKS.md). How to run them yourself: [`benches/README.md`](benches/README.md).
 
-Highlights at **256 B** (load: msg/s · CPU ns/msg; latency: p50/p99 µs), measured against Mosquitto `2.1.2-alpine` as a median of 100 runs on an Apple M1 Max.
+Highlights at 256 B (load: msg/s · CPU ns/msg; latency: p50/p99 µs), measured against Mosquitto `2.1.2-alpine` as a median of 100 runs on an Apple M1 Max.
 
 | Scenario | glide | rumqttc | mqtt5 |
 |----------|------:|--------:|------:|
@@ -338,7 +372,7 @@ Highlights at **256 B** (load: msg/s · CPU ns/msg; latency: p50/p99 µs), m
 | Ingress serial QoS 1 `after_enqueue` | **312** / **488** | 314 / 846 | n/a |
 | Outbound serial latency QoS 1 | 250 / **400** | 254 / 482 | **250** / 437 |
 
-Compare only inside one cell: same scenario, QoS, payload, ack policy, and broker. glide's ingress QoS 1 rows use `after_enqueue` and are not comparable to a peer's auto-ack `before` row. For a cutover estimate, use **QoS 1** with the pipelined or concurrent rows. Outbound QoS 0 exists on the mock broker only, and mock numbers are a client-side ceiling rather than a broker claim. Wire-only `encode_publish` costs about 27 ns/msg (`codec_throughput`).
+Compare only inside one cell: same scenario, QoS, payload, ack policy, and broker. glide's ingress QoS 1 rows use `after_enqueue` and are not comparable to a peer's auto-ack `before` row. For a cutover estimate, use QoS 1 with the pipelined or concurrent rows. Outbound QoS 0 exists on the mock broker only, and mock numbers are a client-side ceiling rather than a broker claim. Wire-only `encode_publish` costs about 27 ns/msg (`codec_throughput`).
 
 Throughput knobs live under [Flow control](#flow-control); the `MQTT_COMPARE_*` variables configure the bench harness and have no effect on the library.
 

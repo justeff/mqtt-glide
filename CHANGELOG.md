@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Default builder client ID prefix is `glide-` (was `mqtt5-`) to avoid looking like LabOverWire `mqtt5` in broker logs
+- `ClientId::try_new` / `FromStr` / `TryFrom` for stable Client Identifiers (plus `ClientIdError`); `ClientBuilder::client_id` takes `impl AsRef<str>` and returns `Result`
 - Will Message (LWT) on CONNECT: `ClientBuilder` / `ConnectOptions` `.will(topic, payload)` (+ `.will_qos` / `.will_retain`)
 - Fluent codec helpers: `PublishMessage::new` / `.properties`, `PublishProperties` setters, `Connect::username` / `password`
 - `BrokerUrlError::InvalidHost` for malformed bracketed IPv6 hosts (breaking: enum is now `#[non_exhaustive]`)
