@@ -1,8 +1,48 @@
 # mqtt-glide
 
+[![crates.io](https://img.shields.io/crates/v/mqtt-glide.svg)](https://crates.io/crates/mqtt-glide)
+[![docs.rs](https://docs.rs/mqtt-glide/badge.svg)](https://docs.rs/mqtt-glide)
+[![license: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 Tokio MQTT **5** client: duplex API, injectable inbound handoff, and flow control without an app-side event loop.
 
 MUST tracker: [`tests/conformance/checklist.md`](tests/conformance/checklist.md) · Protocol: [OASIS MQTT 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)
+
+## Quickstart
+
+```toml
+[dependencies]
+mqtt-glide = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+flume = "0.12"   # optional; any InboundSink works
+```
+
+Connect, publish once, shut down — no event loop to drive:
+
+```rust,no_run
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+use mqtt_glide::{ClientBuilder, QoS};
+
+let client = ClientBuilder::new("mqtt://127.0.0.1:1883")?
+    .discard_inbound()
+    .connect()
+    .await?;
+
+client
+    .publish_with()
+    .topic("sensors/room1/temp")
+    .payload("22.5")
+    .qos(QoS::AtLeastOnce)
+    .send()
+    .await?;
+
+client.shutdown().await?;
+# Ok(())
+# }
+```
+
+`connect()` spawns the connection driver; the cloneable `MqttClient` handle is all your code keeps. Receiving works the same way — pick an inbound handoff (channel or inline handler) and consume messages in your own tasks. Runnable flows live under [`examples/`](examples/); the tables below are the reference for knobs and semantics.
 
 ## Design goals
 
@@ -71,14 +111,7 @@ Do not confuse `DEFAULT_RECEIVE_MAXIMUM` (`32`, `ConnectOptions`) with codec `RE
 
 ## Installation
 
-```toml
-[dependencies]
-mqtt-glide = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
-flume = "0.12"   # optional; any InboundSink works
-```
-
-TLS: enable **exactly one** of `tls-rustls-aws-lc` (default) or `tls-rustls-ring`. Prefer pinning in dependents (`default-features = false, features = […]`). The client uses `ClientConfig::builder_with_provider` and does not rely on process-global rustls defaults. Do not enable both features and do not use `--all-features`.
+Base dependencies are shown in the [Quickstart](#quickstart). TLS: enable **exactly one** of `tls-rustls-aws-lc` (default) or `tls-rustls-ring`. Prefer pinning in dependents (`default-features = false, features = […]`). The client uses `ClientConfig::builder_with_provider` and does not rely on process-global rustls defaults. Do not enable both features and do not use `--all-features`.
 
 ```toml
 mqtt-glide = { version = "0.1", default-features = false, features = ["tls-rustls-ring"] }
@@ -103,25 +136,6 @@ cargo test --no-default-features --features tls-rustls-ring --lib
 | Tiny sync inbound work | `.on_inbound(\|msg\| …)` (runs on the **read task** — keep it short) |
 
 **Power** (same semantics, more control): [`connect`](src/client.rs), custom [`InboundSink`](src/inbound_sink.rs), [`publish`](src/client.rs) / [`start_publish`](src/client.rs) + [`PublishCompletion`](src/client.rs).
-
-```rust
-use mqtt_glide::{ClientBuilder, QoS};
-
-let client = ClientBuilder::new("mqtt://127.0.0.1:1883")?
-    .discard_inbound()
-    .connect()
-    .await?;
-
-client
-    .publish_with()
-    .topic("sensors/room1/temp")
-    .payload("22.5")
-    .qos(QoS::AtLeastOnce)
-    .send()
-    .await?;
-
-client.shutdown().await?;
-```
 
 ### Publish paths
 
@@ -203,7 +217,7 @@ cargo run --example hooks
 
 **Custom `InboundSink` cancel safety:** built-ins (`flume`, `tokio::mpsc`, `OnInboundSink`) are fine. If you implement `InboundSink`, dropping `send()` before `Ok(())` **MUST** mean the message was **not** accepted by your consumer. On shutdown the driver may drop a pending send and will withhold `PUBACK` in that case. `.on_inbound` runs on the connection read task — keep the handler short or use a channel sink.
 
-Adopted chapter **SHOULD**s: `CONNACK` within `connect_timeout`; `PINGRESP` watchdog (~1× Keep Alive) with handoff-stall exemption.
+Spec **SHOULD**s this client adopts: `CONNACK` within `connect_timeout`; `PINGRESP` watchdog (~1× Keep Alive) with handoff-stall exemption.
 
 ## Feature matrix
 
@@ -219,6 +233,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | Reconnect / credentials hooks | ✅ | Traits + optional helpers |
 | Enqueue-before-ack + `InboundSink` | ✅ | Product backpressure policy |
 | Cap / Receive Maximum flow control | ✅ | See Cap vs Window above |
+| Inbound Maximum Packet Size | ⚠️ | Unbounded: the client sends no CONNECT Maximum Packet Size, so a rogue broker could force large frame allocations. A client-side cap knob is a planned follow-up |
 | Graceful `shutdown` | ✅ | Budget via `graceful_disconnect_timeout` |
 | Subscription identifiers | ⚠️ | Deferred |
 | Request/response *helper* / CONNECT negotiation | ⚠️ | Properties ✅ (`response_topic` / `correlation_data`); no inbox RPC API; `request_response_info` deferred |
@@ -228,7 +243,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | WebSockets | ❌ | TCP (+ TLS) only |
 | Topic Alias | ❌ | Maximum = 0; inbound alias → protocol error (no alias state across reconnects) |
 | QoS 2 | ❌ | Rejected at the API (no 4-way handshake / store-and-forward) |
-| Persistent sessions / DUP redelivery | ❌ | Clean Start always true; outbound `dup` always false |
+| Persistent sessions / DUP redelivery | ❌ | No local store-and-forward; outbound `dup` always false. `clean_start = false` resumes a broker session **within this process** across reconnects (re-SUBSCRIBE when `session_present = false`). `ClientId::from_prefix` always mints a fresh UUID, so cross-process resume needs a stable ID API (not exposed yet) |
 
 Broker-dependent: Message Expiry *drop after interval* (property round-trip is tested), shared-sub rebalancing under handoff stall, redelivery after unclean disconnect (client guarantees enqueue-before-ack only).
 

@@ -67,6 +67,6 @@ mod tests {
     fn ready_drain_tracks_max_io_batch_floor() {
         // max(128, MAX_IO_BATCH * 2) with MAX_IO_BATCH = 64.
         assert_eq!(MAX_READY_DRAIN, 128);
-        assert!(MAX_READY_DRAIN >= MAX_IO_BATCH);
+        const { assert!(MAX_READY_DRAIN >= MAX_IO_BATCH) };
     }
 }

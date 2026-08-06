@@ -67,6 +67,13 @@ pub struct ConnectOptions {
     /// Client **Receive Maximum** (inbound QoS-1 pipelining window).
     pub receive_maximum: NonZeroU16,
     /// MQTT v5 **Clean Start** flag.
+    ///
+    /// `false` asks the broker to resume a stored session **for this process**. The driver
+    /// keeps no local QoS 1 DUP store; subscriptions are re-issued whenever the broker
+    /// answers `session_present = false`. Resume also needs a non-zero [`Self::session_expiry`]
+    /// — with the default (`None` → 0 on the wire) the broker ends the session on disconnect.
+    /// Cross-process resume requires a stable [`ClientId`]; [`ClientId::from_prefix`] always
+    /// mints a fresh UUID.
     pub clean_start: bool,
     /// Optional **Session Expiry Interval** (omit property when `None`).
     pub session_expiry: Option<Duration>,

@@ -370,7 +370,7 @@ async fn inbound_publish_clears_keepalive_watchdog_without_pingresp() {
     .await
     {
         Err(_) => {}
-        Ok(Ok(guard)) => panic!("expected session to stay Connected; got {:?}", &*guard),
+        Ok(Ok(guard)) => panic!("expected session to stay Connected; got {:?}", *guard),
         Ok(Err(_)) => panic!("phase watch closed while connection should stay alive"),
     }
 
@@ -459,7 +459,7 @@ async fn server_keep_alive_from_connack_drives_pingreq_interval() {
     .await
     {
         Err(_) => {}
-        Ok(Ok(guard)) => panic!("expected session to stay Connected; got {:?}", &*guard),
+        Ok(Ok(guard)) => panic!("expected session to stay Connected; got {:?}", *guard),
         Ok(Err(_)) => panic!("phase watch closed while connection should stay alive"),
     }
 

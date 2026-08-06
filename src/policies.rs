@@ -9,7 +9,7 @@
 //! This policy **only** returns delays. Token / password invalidation is owned by
 //! [`CredentialsProvider::invalidate`](crate::CredentialsProvider::invalidate),
 //! which the driver invokes on CONNECT-level
-//! [`ConnectionOutcome::Auth`](crate::ConnectionOutcome::Auth).
+//! [`ConnectionOutcome::Auth`].
 //!
 //! Subscription-level `NotAuthorized` (ACL mismatch) is not a connection outcome.
 //! Apps that treat ACL failures like auth for backoff can call

@@ -66,5 +66,10 @@ pub use util::{
     validate_share_name,
 };
 
+// Compile README code samples as doctests (`cargo test --doc`).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme_doctests {}
+
 // Re-export TLS decision hook for callers / structure tests.
 pub use connection::resolve_tls_mode;
