@@ -175,19 +175,30 @@ pub(crate) fn needs_resubscribe(clean_start: bool, session_present: bool) -> boo
     clean_start || !session_present
 }
 
+/// Process-local resume affinity for [MQTT-3.2.2-4] Session Present checks.
+///
+/// Independent of subscription count: an unsubscribe-all leaves a valid empty session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionAffinity {
+    /// No resumeable session established in this process yet.
+    None,
+    /// This process has established a resumeable session (`clean_start = false` past CONNACK).
+    Held,
+}
+
 /// Whether the broker's Session Present flag is consistent with local session state.
 ///
 /// - [MQTT-3.2.2-2]: Clean Start = 1 requires Session Present = 0. A `1` is a broker bug;
 ///   reconnecting with Clean Start again will not help, so the driver must stop.
 /// - [MQTT-3.2.2-4]: a client with no Session State must close when Session Present = 1.
-///   `has_local_session` tracks whether this process has already established a resumeable
+///   [`SessionAffinity`] tracks whether this process has already established a resumeable
 ///   session (`clean_start = false` past CONNACK), not whether the subscription registry is
 ///   non-empty — an unsubscribe-all leaves a valid empty session.
-pub(crate) fn session_resume_consistent(clean_start: bool, session_present: bool, has_local_session: bool) -> bool {
+pub(crate) fn session_resume_consistent(clean_start: bool, session_present: bool, affinity: SessionAffinity) -> bool {
     if clean_start {
         return !session_present;
     }
-    !session_present || has_local_session
+    !session_present || affinity == SessionAffinity::Held
 }
 
 /// Rejects auto-resubscribe when the SUBACK does not grant every filter at QoS 0/1.
@@ -398,21 +409,21 @@ mod tests {
 
     /// Session Present consistency: Clean Start forbids Present=1; resume requires local affinity.
     #[rstest]
-    #[case::clean_start_rejects_present(true, true, false, false)]
-    #[case::clean_start_rejects_present_even_with_affinity(true, true, true, false)]
-    #[case::clean_start_ok(true, false, false, true)]
-    #[case::resume_with_affinity(false, true, true, true)]
-    #[case::resume_empty_registry_with_affinity(false, true, true, true)]
-    #[case::no_session_claimed(false, false, false, true)]
-    #[case::broker_state_without_local(false, true, false, false)]
+    #[case::clean_start_rejects_present(true, true, SessionAffinity::None, false)]
+    #[case::clean_start_rejects_present_even_with_affinity(true, true, SessionAffinity::Held, false)]
+    #[case::clean_start_ok(true, false, SessionAffinity::None, true)]
+    #[case::resume_with_affinity(false, true, SessionAffinity::Held, true)]
+    #[case::resume_empty_registry_with_affinity(false, true, SessionAffinity::Held, true)]
+    #[case::no_session_claimed(false, false, SessionAffinity::None, true)]
+    #[case::broker_state_without_local(false, true, SessionAffinity::None, false)]
     fn session_resume_consistency(
         #[case] clean_start: bool,
         #[case] session_present: bool,
-        #[case] has_local_session: bool,
+        #[case] affinity: SessionAffinity,
         #[case] expected: bool,
     ) {
         assert_eq!(
-            session_resume_consistent(clean_start, session_present, has_local_session),
+            session_resume_consistent(clean_start, session_present, affinity),
             expected
         );
     }

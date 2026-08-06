@@ -136,7 +136,7 @@ pub struct Connection<H: InboundSink = flume::Sender<crate::codec::PublishMessag
     subscription_registry: std::sync::Arc<std::sync::RwLock<SubscriptionRegistry>>,
     /// Whether this process has established a resumeable MQTT session (`clean_start = false`
     /// past a successful CONNACK). Used for [MQTT-3.2.2-4]; independent of subscription count.
-    local_session_state: bool,
+    session_affinity: subscriptions::SessionAffinity,
 }
 
 impl<H: InboundSink> std::fmt::Debug for Connection<H> {
@@ -171,7 +171,7 @@ impl<H: InboundSink> Connection<H> {
             state: ConnectionState::Stopped,
             inflight,
             subscription_registry: std::sync::Arc::new(std::sync::RwLock::new(SubscriptionRegistry::default())),
-            local_session_state: false,
+            session_affinity: subscriptions::SessionAffinity::None,
         }
     }
 
@@ -355,7 +355,7 @@ impl<H: InboundSink> Connection<H> {
         if !subscriptions::session_resume_consistent(
             self.options.clean_start,
             session.session_present,
-            self.local_session_state,
+            self.session_affinity,
         ) {
             let message = if self.options.clean_start {
                 "broker set Session Present = 1 after Clean Start = 1 ([MQTT-3.2.2-2])"
@@ -371,7 +371,11 @@ impl<H: InboundSink> Connection<H> {
         }
         // Affinity follows Clean Start: a clean session clears it; a resume path marks us as
         // holding local session state even when the subscription registry is empty.
-        self.local_session_state = !self.options.clean_start;
+        self.session_affinity = if self.options.clean_start {
+            subscriptions::SessionAffinity::None
+        } else {
+            subscriptions::SessionAffinity::Held
+        };
 
         // Clean Start discards broker-side state; a broker answering `session_present = false`
         // to a resume attempt proves it holds none — rebuild the subscriptions in both cases.
