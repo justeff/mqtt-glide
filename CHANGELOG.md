@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Breaking: remove unused `AppError::NotImplemented` (test stub exits map to `AppError::Internal`)
 - perf(codec): Topic Name validation (`NUL`/`+`/`#`) scans with SIMD `memchr3` for topics ≥ 32 bytes on encode and decode (~20–25 % faster PUBLISH encode/decode with long topics; short topics keep the branch-free loop), and the Remaining Length minimality check ([MQTT-1.5.5-1]) is a single last-byte test instead of a recomputed width — wire behavior is unchanged
 - `codec_throughput` bench now also measures the decode path (PUBLISH shapes + minimal PUBACK) and property-block encode
 - Breaking: codec fields renamed to MQTT 5 terms — `session_expiry_interval_secs` → `session_expiry_interval`, will `message` → `payload`, `is_utf8_payload` → `payload_format_indicator`, `will_delay_interval_sec` → `will_delay_interval`, `server_keepalive_sec` → `server_keep_alive`

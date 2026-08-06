@@ -81,7 +81,7 @@ async fn read_task_exit_cancels_write_and_joins() {
     let result = run.await.expect("join run task");
     assert!(matches!(
         result,
-        Err(ConnectionOutcome::Application(AppError::NotImplemented))
+        Err(ConnectionOutcome::Application(AppError::Internal(_)))
     ));
 }
 
@@ -95,7 +95,7 @@ async fn write_task_exit_cancels_read_and_joins() {
     let result = run.await.expect("join run task");
     assert!(matches!(
         result,
-        Err(ConnectionOutcome::Application(AppError::NotImplemented))
+        Err(ConnectionOutcome::Application(AppError::Internal(_)))
     ));
 }
 

@@ -76,9 +76,6 @@ pub enum AppError {
     /// [`ConnectionOutcome::Application`] so reconnect policies do not loop.
     #[error("{0}")]
     SessionPresentInconsistent(String),
-    /// Driver or API surface not yet implemented.
-    #[error("not yet implemented")]
-    NotImplemented,
     /// SUBSCRIBE was sent but no matching SUBACK arrived before the deadline.
     #[error("subscribe acknowledgement timed out after {0:?}")]
     SubscribeAckTimeout(Duration),

@@ -613,7 +613,9 @@ impl<H: InboundSink> Connection<H> {
         match result {
             Ok(ReadOutcome::Cancelled) => ConnectionOutcome::Shutdown(ShutdownError::Cancelled),
             #[cfg(test)]
-            Ok(ReadOutcome::StubExit) => ConnectionOutcome::Application(AppError::NotImplemented),
+            Ok(ReadOutcome::StubExit) => {
+                ConnectionOutcome::Application(AppError::Internal("test stub read exit".into()))
+            }
             Ok(ReadOutcome::InboundSinkClosed) => ConnectionOutcome::Application(AppError::InboundSinkClosed),
             Ok(ReadOutcome::PeerClosed) => {
                 ConnectionOutcome::Transport(TransportError::Connection("peer closed".into()))
@@ -630,7 +632,9 @@ impl<H: InboundSink> Connection<H> {
             Ok(WriteOutcome::Cancelled) => ConnectionOutcome::Shutdown(ShutdownError::Cancelled),
             Ok(WriteOutcome::Shutdown) => ConnectionOutcome::Shutdown(ShutdownError::Requested),
             #[cfg(test)]
-            Ok(WriteOutcome::StubExit) => ConnectionOutcome::Application(AppError::NotImplemented),
+            Ok(WriteOutcome::StubExit) => {
+                ConnectionOutcome::Application(AppError::Internal("test stub write exit".into()))
+            }
             Ok(WriteOutcome::CommandChannelClosed) => ConnectionOutcome::Application(AppError::CommandChannelClosed),
             Ok(WriteOutcome::ControlChannelClosed) => ConnectionOutcome::Application(AppError::CommandChannelClosed),
             Ok(WriteOutcome::Transport(error)) => ConnectionOutcome::Transport(error),
