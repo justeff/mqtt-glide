@@ -18,8 +18,7 @@ Image: `eclipse-mosquitto:2.1.2-alpine` (anonymous + reject-connect configs).
 | `mosquitto_handoff_full_keep_alive_no_spurious_reconnect` | Full handoff stall; connection stays up past keep-alive window (no spurious reconnect). Wire PINGREQ scheduling is covered by the unit keep-alive enforcer test |
 | `mosquitto_resubscribes_after_reconnect` | After reconnect, prior subscriptions deliver without re-subscribe |
 | `mosquitto_session_phase_updates_app_state_without_eventloop_poll` | App health driven solely by `SessionPhase` watch |
-| `mosquitto_shutdown_pubacks_before_disconnect` | Incoming QoS1 → flume → shutdown → clean disconnect (no redelivery of already-acked payload). Wire order PUBACK-before-DISCONNECT is covered by unit tests |
-| `mosquitto_handoff_survives_shutdown` | Handoff message remains receivable after `shutdown()` |
+| `mosquitto_handoff_survives_shutdown` | Handoff message remains receivable after `shutdown()`. Wire order PUBACK-before-DISCONNECT is covered by unit tests |
 | `mosquitto_two_parallel_connections_isolated_handoff_and_phase` | Two parallel `Connection`s: isolated handoffs via unique probe publishes; B’s phase stays Connected after A shutdown |
 
 Requires a Docker-compatible API (Podman works when `DOCKER_HOST` points at the machine).

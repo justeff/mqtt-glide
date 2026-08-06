@@ -93,11 +93,12 @@ jobs:
       - name: check ring TLS
         run: cargo check --lib --no-default-features --features tls-rustls-ring
 
-  # Informational until the next crates.io release absorbs intentional Unreleased breakages.
+  # Default features only: `tls-rustls-aws-lc` and `tls-rustls-ring` are mutually exclusive,
+  # so the action's all-features heuristic cannot document the crate.
+  # Release type is inferred from the version bump (0.1 → 0.2 = Cargo's 0.x "major").
   semver-checks:
     name: cargo-semver-checks
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -105,3 +106,5 @@ jobs:
         with:
           key: semver
       - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: default-features

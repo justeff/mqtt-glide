@@ -75,9 +75,8 @@ impl ClientId {
     /// (programmer error: prefixes are expected to be short static labels).
     pub fn from_prefix(prefix: &str) -> Self {
         let id = format!("{prefix}-{}", Uuid::new_v4().simple());
-        Self::try_new(&id).unwrap_or_else(|err| {
-            panic!("ClientId::from_prefix produced an invalid client ID ({err}): {id:?}")
-        })
+        Self::try_new(&id)
+            .unwrap_or_else(|err| panic!("ClientId::from_prefix produced an invalid client ID ({err}): {id:?}"))
     }
 
     /// Returns the wire-format client ID string.

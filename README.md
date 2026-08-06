@@ -14,7 +14,7 @@ MQTT 5 only, QoS 0 and 1, TCP and TLS. No MQTT 3.1.1, no QoS 2, no WebSockets, `
 
 ```toml
 [dependencies]
-mqtt-glide = "0.1"
+mqtt-glide = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 flume = "0.12"   # optional; any InboundSink works
 ```
@@ -22,7 +22,7 @@ flume = "0.12"   # optional; any InboundSink works
 TLS goes through rustls. Enable **exactly one** crypto provider: `tls-rustls-aws-lc` (default) or `tls-rustls-ring`. Prefer pinning the choice in dependents. The client builds its `ClientConfig` with `builder_with_provider` and does not rely on a process-global rustls default, so enabling both features (or `--all-features`) is rejected.
 
 ```toml
-mqtt-glide = { version = "0.1", default-features = false, features = ["tls-rustls-ring"] }
+mqtt-glide = { version = "0.2", default-features = false, features = ["tls-rustls-ring"] }
 ```
 
 ## Quickstart
@@ -145,7 +145,7 @@ When a full application queue blocks the same loop that sends `PINGREQ`, a slow 
 
 ### What it costs
 
-No MQTT 3.1.1, no QoS 2, no WebSockets, and Topic Alias are out of scope, not pending. If you need any of those, rumqttc remains the better fit. There is no local store-and-forward, so redelivery after an unclean disconnect is entirely the broker's job. Cross-process session resume needs a stable client ID (`.client_id("…")?` or `ClientId::try_new`) plus `clean_start(false)` and a non-zero `session_expiry`. rumqttc is also the far more widely deployed crate; this one is 0.1.x, and the API can still move.
+No MQTT 3.1.1, no QoS 2, no WebSockets, and Topic Alias are out of scope, not pending. If you need any of those, rumqttc remains the better fit. There is no local store-and-forward, so redelivery after an unclean disconnect is entirely the broker's job. Cross-process session resume needs a stable client ID (`.client_id("…")?` or `ClientId::try_new`) plus `clean_start(false)` and a non-zero `session_expiry`. rumqttc is also the far more widely deployed crate; this one is 0.2.x, and the API can still move.
 
 ## Architecture
 

@@ -477,19 +477,22 @@ mod tests {
         );
     }
 
-    /// Budgets below the Packet Identifier + Reason Code header must not wrap the u32
-    /// subtraction into a huge trim limit (defensive; the encode orchestration always
-    /// passes the computed body length).
+    /// `encoded_body_len` must use saturating budget math: a tiny `max_out` must not wrap
+    /// `max_out - header` into a huge trim limit. The encode orchestration then rejects on
+    /// wire size; it never passes such a budget into `encode_body`.
     #[test]
-    fn puback_encode_body_below_header_budget_errors_instead_of_wrapping() {
+    fn puback_encoded_body_len_below_header_budget_does_not_wrap() {
         let ack = PublishAck {
             packet_id: NonZeroU16::new(1).unwrap(),
             reason_code: PublishAckReason::NotAuthorized,
             properties: Vec::new(),
             reason_string: Some(ByteString::from_static("reason")),
         };
-        let mut buf = BytesMut::new();
-        let err = ack.encode_body(&mut buf, 1).expect_err("budget below header");
-        assert!(matches!(err, EncodeError::OverMaxPacketSize { .. }));
+        let len = ack.encoded_body_len(1).expect("len");
+        assert_eq!(
+            len,
+            HEADER_LEN as usize + 1,
+            "expect header + empty property length only, not a wrapped huge size"
+        );
     }
 }

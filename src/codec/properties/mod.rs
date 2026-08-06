@@ -129,6 +129,8 @@ pub(crate) fn var_int_len_u32(val: u32) -> u32 {
 
 /// Calculates `len` from `var_int_len(len) + len` value.
 pub(crate) fn var_int_len_from_size(val: u32) -> u32 {
+    // Callers pass a non-zero `var_int_len(len) + len` sum (typically an encoded body length).
+    debug_assert!(val > 0);
     let over_size = var_int_len_u32(val);
     let res = val - over_size + 1;
     val - var_int_len_u32(res)
@@ -180,6 +182,7 @@ pub mod ack_props {
     ) -> Result<(), EncodeError> {
         // Callers only pass `size` after `encoded_body_len` / the outer max-packet check;
         // ACK paths never invoke this with a zero remaining budget.
+        debug_assert!(size > 0);
         if size == 1 {
             // empty properties
             buf.put_u8(0);
