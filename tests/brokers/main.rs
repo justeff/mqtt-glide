@@ -3,6 +3,9 @@
 //! Mosquitto integration: CONNECT/CONNACK, disconnect, auth failure, shared subscribe,
 //! QoS1, keep-alive / reconnect / SessionPhase, User Properties, Message Expiry, shutdown.
 //! parallel Connection smoke.
+//!
+//! When Docker is unavailable, Mosquitto helpers return `None` and each test early-returns
+//! (see `skipping brokers test: docker unavailable`) instead of panicking.
 
 mod helpers;
 
@@ -110,7 +113,9 @@ async fn join_run_after_shutdown(run: tokio::task::JoinHandle<Result<(), Connect
 /// Successful CONNECT/CONNACK against Mosquitto, then disconnect via shutdown.
 #[tokio::test]
 async fn mosquitto_connect_connack_and_disconnect() {
-    let (_container, port) = start_mosquitto().await;
+    let Some((_container, port)) = start_mosquitto().await else {
+        return;
+    };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("connect-ok"));
     let (tx, _rx) = flume::bounded::<PublishMessage>(8);
@@ -147,7 +152,9 @@ async fn mosquitto_connect_connack_and_disconnect() {
 /// Single attempt (NoReconnect) — no silent reconnect loop.
 #[tokio::test]
 async fn mosquitto_not_authorized_invalidates_credentials() {
-    let (_container, port) = start_mosquitto_reject_connect().await;
+    let Some((_container, port)) = start_mosquitto_reject_connect().await else {
+        return;
+    };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("connect-auth"));
     let invalidations = Arc::new(AtomicUsize::new(0));
@@ -220,7 +227,9 @@ async fn mosquitto_not_authorized_invalidates_credentials() {
 /// Shared filter `$share/{group}/{topic}` against Mosquitto: SUBACK success + inbound PUBLISH to handoff.
 #[tokio::test]
 async fn mosquitto_shared_subscription_delivers_to_handoff() {
-    let (_container, port) = start_mosquitto().await;
+    let Some((_container, port)) = start_mosquitto().await else {
+        return;
+    };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("share-sub"));
     let (tx, rx) = flume::bounded::<PublishMessage>(8);
@@ -286,7 +295,9 @@ async fn mosquitto_qos1_publish_awaits_puback() {
     use bytestring::ByteString;
     use mqtt_glide::PublishMessage;
 
-    let (_container, port) = start_mosquitto().await;
+    let Some((_container, port)) = start_mosquitto().await else {
+        return;
+    };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("qos1"));
     let (tx, _rx) = flume::bounded::<PublishMessage>(8);
@@ -342,7 +353,9 @@ async fn mosquitto_publish_properties_roundtrip() {
     use bytestring::ByteString;
     use mqtt_glide::{PublishMessage, PublishProperties};
 
-    let (_container, port) = start_mosquitto().await;
+    let Some((_container, port)) = start_mosquitto().await else {
+        return;
+    };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("props"));
     let (tx, rx) = flume::bounded::<PublishMessage>(8);
@@ -445,7 +458,9 @@ async fn mosquitto_publish_properties_roundtrip() {
 /// AC1: Broker kill / TCP reset → reconnect per policy → Connected again.
 #[tokio::test]
 async fn mosquitto_broker_kill_reconnects_and_emits_connected() {
-    let (container, port) = start_mosquitto().await;
+    let Some((container, port)) = start_mosquitto().await else {
+        return;
+    };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url)
         .client_id(ClientId::from_prefix("reconnect-kill"))
@@ -491,7 +506,9 @@ async fn mosquitto_broker_kill_reconnects_and_emits_connected() {
     );
 
     // Restart on the same host port so the policy-driven reconnect can succeed.
-    let _broker = start_mosquitto_on_port(port).await;
+    let Some(_broker) = start_mosquitto_on_port(port).await else {
+        return;
+    };
 
     let second = wait_for_phase(&mut phase, Duration::from_secs(20), |e| {
         matches!(
@@ -524,7 +541,9 @@ async fn mosquitto_broker_kill_reconnects_and_emits_connected() {
 /// AC2: Auth fail → Stopped + invalidate; policy returns None for Auth → no endless reconnect.
 #[tokio::test]
 async fn mosquitto_auth_fail_stops_without_endless_reconnect() {
-    let (_container, port) = start_mosquitto_reject_connect().await;
+    let Some((_container, port)) = start_mosquitto_reject_connect().await else {
+        return;
+    };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("reconnect-auth"));
 
@@ -616,7 +635,9 @@ async fn mosquitto_auth_fail_stops_without_endless_reconnect() {
 /// This Mosquitto case covers broker-facing survival under a full handoff.
 #[tokio::test]
 async fn mosquitto_handoff_full_keep_alive_no_spurious_reconnect() {
-    let (_container, port) = start_mosquitto().await;
+    let Some((_container, port)) = start_mosquitto().await else {
+        return;
+    };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     // Short keep-alive so Mosquitto would drop us within a few seconds without PINGs.
     let keep_alive = Duration::from_secs(2);
@@ -719,7 +740,9 @@ async fn mosquitto_handoff_full_keep_alive_no_spurious_reconnect() {
 /// AC4: After reconnect, prior subscriptions are active again (message arrives without re-subscribe).
 #[tokio::test]
 async fn mosquitto_resubscribes_after_reconnect() {
-    let (container, port) = start_mosquitto().await;
+    let Some((container, port)) = start_mosquitto().await else {
+        return;
+    };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url)
         .client_id(ClientId::from_prefix("resub"))
@@ -767,7 +790,9 @@ async fn mosquitto_resubscribes_after_reconnect() {
     })
     .await;
 
-    let _broker = start_mosquitto_on_port(port).await;
+    let Some(_broker) = start_mosquitto_on_port(port).await else {
+        return;
+    };
     wait_for_phase(&mut phase, Duration::from_secs(20), |e| {
         matches!(
             e,
@@ -804,7 +829,9 @@ async fn mosquitto_session_phase_updates_app_state_without_eventloop_poll() {
         Online,
     }
 
-    let (container, port) = start_mosquitto().await;
+    let Some((container, port)) = start_mosquitto().await else {
+        return;
+    };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url)
         .client_id(ClientId::from_prefix("phase"))
@@ -842,7 +869,9 @@ async fn mosquitto_session_phase_updates_app_state_without_eventloop_poll() {
     }
     assert_eq!(health, AppHealth::Offline);
 
-    let _broker = start_mosquitto_on_port(port).await;
+    let Some(_broker) = start_mosquitto_on_port(port).await else {
+        return;
+    };
     let reconnected = wait_for_phase(&mut phase, Duration::from_secs(20), |e| {
         matches!(
             e,
@@ -875,7 +904,9 @@ async fn mosquitto_shutdown_pubacks_before_disconnect() {
 
     use bytes::Bytes;
 
-    let (_container, port) = start_mosquitto().await;
+    let Some((_container, port)) = start_mosquitto().await else {
+        return;
+    };
     let client_id = ClientId::from_prefix("shutdown-drain");
     let topic = "shutdown/qos1";
     let payload = b"acked-before-disconnect";
@@ -976,7 +1007,9 @@ async fn mosquitto_shutdown_pubacks_before_disconnect() {
 /// handoff message remains receivable after `shutdown()` (Mosquitto path).
 #[tokio::test]
 async fn mosquitto_handoff_survives_shutdown() {
-    let (_container, port) = start_mosquitto().await;
+    let Some((_container, port)) = start_mosquitto().await else {
+        return;
+    };
     let topic = "handoff/survive";
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("handoff"));
@@ -1018,7 +1051,9 @@ async fn mosquitto_handoff_survives_shutdown() {
 /// no global state; each receives only its own subscribed topic/message.
 #[tokio::test]
 async fn mosquitto_two_parallel_connections_isolated_handoff_and_phase() {
-    let (_container, port) = start_mosquitto().await;
+    let Some((_container, port)) = start_mosquitto().await else {
+        return;
+    };
     let url_a = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let url_b = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
 

@@ -1,7 +1,14 @@
 //! Shared Mosquitto container helpers for mqtt-glide broker tests.
 //!
 //! eclipse-mosquitto `2.1.2-alpine`, anonymous + reject-connect configs.
+//!
+//! When Docker is unavailable, [`start_mosquitto`] / [`start_mosquitto_reject_connect`] /
+//! [`start_mosquitto_on_port`] return `None` after printing
+//! `skipping brokers test: docker unavailable` so integration tests can early-return
+//! instead of panicking.
 
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -29,6 +36,30 @@ const CONF_NO_AUTH: &str = "listener 1883\nallow_anonymous true\n";
 /// no password file configured → every CONNECT results in ConnAck(NotAuthorized).
 const CONF_REJECT_CONNECT: &str = "listener 1883\nallow_anonymous false\n";
 
+/// Whether a Docker-compatible CLI answers `docker info` (cached for the process).
+///
+/// Podman works when the `docker` CLI is available and `DOCKER_HOST` points at the engine.
+pub fn docker_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Command::new("docker")
+            .args(["info"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+fn skip_without_docker() -> bool {
+    if docker_available() {
+        return false;
+    }
+    eprintln!("skipping brokers test: docker unavailable");
+    true
+}
+
 fn mosquitto_image(conf: &'static str) -> ContainerRequest<GenericImage> {
     GenericImage::new("eclipse-mosquitto", "2.1.2-alpine")
         .with_wait_for(WaitFor::message_on_stderr("mosquitto version"))
@@ -39,40 +70,57 @@ fn mosquitto_image(conf: &'static str) -> ContainerRequest<GenericImage> {
 
 /// Starts a Mosquitto container with anonymous access and returns the container
 /// and the mapped host port.
-pub async fn start_mosquitto() -> (ContainerAsync<GenericImage>, u16) {
+///
+/// Returns `None` (after a skip message) when Docker is unavailable.
+pub async fn start_mosquitto() -> Option<(ContainerAsync<GenericImage>, u16)> {
+    if skip_without_docker() {
+        return None;
+    }
     let container = mosquitto_image(CONF_NO_AUTH)
         .start()
         .await
         .expect("failed to start Mosquitto container");
 
     let port = container.get_host_port_ipv4(1883).await.expect("mapped mosquitto port");
-    (container, port)
+    Some((container, port))
 }
 
 /// Starts a Mosquitto container that rejects all CONNECT attempts with
 /// `ConnAck(NotAuthorized)`. Used to test auth-failure handling.
-pub async fn start_mosquitto_reject_connect() -> (ContainerAsync<GenericImage>, u16) {
+///
+/// Returns `None` (after a skip message) when Docker is unavailable.
+pub async fn start_mosquitto_reject_connect() -> Option<(ContainerAsync<GenericImage>, u16)> {
+    if skip_without_docker() {
+        return None;
+    }
     let container = mosquitto_image(CONF_REJECT_CONNECT)
         .start()
         .await
         .expect("failed to start Mosquitto container (reject-connect)");
 
     let port = container.get_host_port_ipv4(1883).await.expect("mapped mosquitto port");
-    (container, port)
+    Some((container, port))
 }
 
 /// Starts Mosquitto mapped to a fixed host port (reconnect tests after stop/drop).
 ///
 /// After the previous container releases the port, the reconnect loop can find the
 /// broker again on the same host port.
-pub async fn start_mosquitto_on_port(port: u16) -> ContainerAsync<GenericImage> {
+///
+/// Returns `None` (after a skip message) when Docker is unavailable.
+pub async fn start_mosquitto_on_port(port: u16) -> Option<ContainerAsync<GenericImage>> {
+    if skip_without_docker() {
+        return None;
+    }
     use testcontainers::core::ContainerPort;
 
-    mosquitto_image(CONF_NO_AUTH)
-        .with_mapped_port(port, ContainerPort::Tcp(1883))
-        .start()
-        .await
-        .expect("failed to start Mosquitto container on fixed port")
+    Some(
+        mosquitto_image(CONF_NO_AUTH)
+            .with_mapped_port(port, ContainerPort::Tcp(1883))
+            .start()
+            .await
+            .expect("failed to start Mosquitto container on fixed port"),
+    )
 }
 
 /// Second MQTT 5 session: CONNECT + QoS 0 PUBLISH + DISCONNECT (no client crate publish API yet).

@@ -23,6 +23,7 @@ Image: `eclipse-mosquitto:2.1.2-alpine` (anonymous + reject-connect configs).
 | `mosquitto_two_parallel_connections_isolated_handoff_and_phase` | Two parallel `Connection`s: isolated handoffs via unique probe publishes; B’s phase stays Connected after A shutdown |
 
 Requires a Docker-compatible API (Podman works when `DOCKER_HOST` points at the machine).
+Without Docker, Mosquitto tests skip cleanly (`skipping brokers test: docker unavailable`) instead of panicking.
 
 ```shell
 cargo test --test brokers
