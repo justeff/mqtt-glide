@@ -1,13 +1,13 @@
 //! Connect options: broker URL, client ID, keep-alive, receive maximum, TLS trust.
 
-use std::num::{NonZeroU16, NonZeroUsize};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use nonzero_ext::nonzero;
 
-use crate::codec::{QoS, WillMessage};
+use crate::codec::{DEFAULT_MAX_PACKET_SIZE, QoS, WillMessage};
 use crate::util::{BrokerUrl, ClientId};
 
 /// Default capacity of the bounded application command/data path to the write task.
@@ -106,6 +106,10 @@ pub struct ConnectOptions {
     /// CONNACK Maximum QoS / Retain Available apply to later PUBLISH, not to this CONNECT field
     /// (the Will is already on the wire before CONNACK).
     pub will_message: Option<WillMessage>,
+    /// Client **Maximum Packet Size** advertised in CONNECT and enforced on the inbound decoder
+    /// ([MQTT-3.1.2-24]). Default: [`DEFAULT_MAX_PACKET_SIZE`] (1 MiB). Broker CONNACK limits
+    /// still apply only to outbound encode.
+    pub max_packet_size: NonZeroU32,
     /// Optional counter incremented when the write task feeds an inbound QoS-1 PUBACK.
     ///
     /// Bench / diagnostic hook only (`None` in production). Does not change enqueue-before-ack semantics.
@@ -134,6 +138,7 @@ impl ConnectOptions {
             command_channel_capacity: NonZeroUsize::new(COMMAND_CHANNEL_CAPACITY)
                 .expect("COMMAND_CHANNEL_CAPACITY is non-zero"),
             will_message: None,
+            max_packet_size: NonZeroU32::new(DEFAULT_MAX_PACKET_SIZE).expect("DEFAULT_MAX_PACKET_SIZE non-zero"),
             bench_inbound_publish_ack_counter: None,
         }
     }
@@ -162,6 +167,14 @@ impl ConnectOptions {
     /// Default: [`DEFAULT_RECEIVE_MAXIMUM`] (32).
     pub fn receive_maximum(mut self, receive_maximum: NonZeroU16) -> Self {
         self.receive_maximum = receive_maximum;
+        self
+    }
+
+    /// Sets the client **Maximum Packet Size** advertised in CONNECT / enforced inbound.
+    ///
+    /// Default: [`DEFAULT_MAX_PACKET_SIZE`] (1 MiB).
+    pub fn max_packet_size(mut self, max_packet_size: NonZeroU32) -> Self {
+        self.max_packet_size = max_packet_size;
         self
     }
 

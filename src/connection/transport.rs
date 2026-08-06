@@ -35,7 +35,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (read_codec, write_codec) = distinct_v5_codecs_for_framed_halves();
+    let (read_codec, write_codec) = distinct_v5_codecs_for_framed_halves(options.max_packet_size.get());
     let mut framed_read = FramedRead::new(read_half, read_codec);
     let mut framed_write = FramedWrite::new(write_half, write_codec);
 
@@ -69,8 +69,7 @@ where
 /// Applies the broker Maximum Packet Size from CONNACK to the **outbound** encoder only.
 ///
 /// The broker's limit constrains client→server packets ([MQTT-3.2.2-15]). Inbound stays
-/// unbounded: this client never advertises its own Maximum Packet Size in CONNECT, so the
-/// broker has no client-side limit to respect ([MQTT-3.1.2-24]).
+/// at the client Maximum Packet Size advertised in CONNECT ([MQTT-3.1.2-24]).
 fn apply_session_limits_to_codecs<W>(framed_write: &mut FramedWrite<W, V5Codec>, session: &SessionParams) {
     if let Some(max_packet_size) = session.max_packet_size {
         framed_write.encoder_mut().set_max_outbound_size(max_packet_size);
@@ -434,8 +433,8 @@ mod tests {
         let session = apply_connack(Duration::from_secs(60), &ack).expect("success");
         apply_session_limits_to_codecs(&mut framed_write, &session);
 
-        // Outbound capped ([MQTT-3.2.2-15]); inbound stays unbounded — the client never
-        // advertises its own Maximum Packet Size in CONNECT ([MQTT-3.1.2-24]).
+        // Outbound capped by broker CONNACK ([MQTT-3.2.2-15]); this unit test starts with
+        // unbounded inbound — production framed halves use ConnectOptions::max_packet_size.
         assert_eq!(framed_write.encoder().max_outbound_size(), 1024);
         assert_eq!(framed_read.decoder().max_inbound_size(), 0);
     }

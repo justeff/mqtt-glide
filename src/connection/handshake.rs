@@ -77,6 +77,7 @@ pub(crate) fn build_connect(options: &ConnectOptions, client_id: &str, credentia
         keep_alive,
         session_expiry_interval: session_expiry_secs(options.session_expiry),
         receive_max: Some(options.receive_maximum),
+        max_packet_size: Some(options.max_packet_size),
         topic_alias_max: 0,
         client_id: ByteString::from(client_id),
         username,
@@ -181,11 +182,11 @@ pub(crate) fn resolve_client_id_str(options: &ConnectOptions) -> String {
 
 /// Builds the distinct [`crate::V5Codec`] instances for each `Framed` half after
 /// `TcpStream::into_split()` — never a shared `Arc`.
-pub(crate) fn distinct_v5_codecs_for_framed_halves() -> (crate::V5Codec, crate::V5Codec) {
-    (
-        crate::V5Codec::with_max_packet_size(0),
-        crate::V5Codec::with_max_packet_size(0),
-    )
+///
+/// `inbound_max` is the client Maximum Packet Size from CONNECT (0 = unlimited).
+/// The write half starts with unlimited outbound until CONNACK applies the broker limit.
+pub(crate) fn distinct_v5_codecs_for_framed_halves(inbound_max: u32) -> (crate::V5Codec, crate::V5Codec) {
+    (crate::V5Codec::new(inbound_max, 0), crate::V5Codec::new(0, 0))
 }
 
 /// Auth path: invalidate credentials on broker rejection only.
@@ -298,6 +299,11 @@ mod tests {
         assert_eq!(
             packet.topic_alias_max, 0,
             "Topic Alias Maximum must be 0 (product policy)"
+        );
+        assert_eq!(
+            packet.max_packet_size,
+            Some(options.max_packet_size),
+            "CONNECT must advertise client Maximum Packet Size"
         );
         assert!(packet.will_message.is_none(), "default ConnectOptions has no Will");
     }
