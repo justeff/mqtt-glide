@@ -4,6 +4,10 @@
 //! binary (`tests/connection.rs`, `tests/brokers/main.rs`) since Cargo builds
 //! every file under `tests/` as an independent binary and does not share
 //! modules across them automatically.
+//!
+//! Not every helper is used by every binary; allow unused items so `-D warnings`
+//! stays green when Mosquitto brokers tests omit the PeerBroker path.
+#![allow(dead_code)]
 
 use std::future::Future;
 use std::num::NonZeroU16;
@@ -144,6 +148,16 @@ impl PeerSession {
             .send(Packet::Disconnect(Disconnect::new(reason)))
             .await
             .expect("peer send DISCONNECT");
+    }
+
+    /// Expect a client DISCONNECT with `reason` (before EOF).
+    pub async fn expect_disconnect(&mut self, reason: DisconnectReasonCode) {
+        match self.read.next().await {
+            Some(Ok((DecodedFrame::Control(Packet::Disconnect(disconnect)), _))) => {
+                assert_eq!(disconnect.reason_code, reason, "peer expected DISCONNECT {reason:?}");
+            }
+            other => panic!("peer expected DISCONNECT {reason:?}, got {other:?}"),
+        }
     }
 
     /// Expect SUBSCRIBE and reply with Granted QoS 0 for every filter.

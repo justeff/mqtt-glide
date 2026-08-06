@@ -250,6 +250,7 @@ async fn auth_failure_reconnect_replenishes_channel_before_invalidate() {
 }
 
 /// [MQTT-3.2.2-2]: Clean Start = 1 with Session Present = 1 stops the driver (no reconnect loop).
+/// Peer observes Protocol Error DISCONNECT before TCP close.
 #[tokio::test]
 async fn clean_start_session_present_stops_without_reconnect() {
     let (port, peer) = spawn_peer_broker(|broker| async move {
@@ -261,6 +262,7 @@ async fn clean_start_session_present_stops_without_reconnect() {
                 ..Default::default()
             })
             .await;
+        session.expect_disconnect(DisconnectReasonCode::ProtocolError).await;
         assert!(
             !broker.try_accept_within(Duration::from_millis(150)).await,
             "must not reconnect after Session Present desync"

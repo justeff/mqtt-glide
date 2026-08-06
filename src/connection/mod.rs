@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use futures_util::SinkExt;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
@@ -26,8 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use self::write::WriteOutcome;
 use crate::client::{ReconnectPolicy, SharedCredentials};
-use crate::codec::DisconnectReasonCode;
-use crate::codec::V5Codec;
+use crate::codec::{Disconnect, DisconnectReasonCode, Packet, V5Codec};
 use crate::error::{AppError, AuthError, ConnectionOutcome, ProtocolError, ShutdownError, TransportError};
 use crate::inbound_sink::InboundSink;
 use crate::options::ConnectOptions;
@@ -351,7 +351,8 @@ impl<H: InboundSink> Connection<H> {
         };
 
         // Session Present must match Clean Start / local session affinity. Reconnecting into
-        // the same claim would loop, so this stops (Application → no retry).
+        // the same claim would loop, so this stops (Application → no retry). Prefer a
+        // Protocol Error DISCONNECT before dropping TCP when the write half is still open.
         if !subscriptions::session_resume_consistent(
             self.options.clean_start,
             session.session_present,
@@ -362,6 +363,9 @@ impl<H: InboundSink> Connection<H> {
             } else {
                 "broker reports Session Present but the client holds no session state ([MQTT-3.2.2-4])"
             };
+            let _ = framed_write
+                .send(Packet::Disconnect(Disconnect::new(DisconnectReasonCode::ProtocolError)))
+                .await;
             return self
                 .finish_session(
                     ConnectionOutcome::Application(AppError::SessionPresentInconsistent(message.into())),
