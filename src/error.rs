@@ -69,6 +69,13 @@ pub enum AppError {
     /// not for tokio task join failures.
     #[error("internal error: {0}")]
     Internal(String),
+    /// Broker `Session Present` is inconsistent with local session affinity.
+    ///
+    /// Used for [MQTT-3.2.2-2] (Clean Start = 1 but Present = 1) and [MQTT-3.2.2-4]
+    /// (Present = 1 without process-local resume affinity). Surfaces as
+    /// [`ConnectionOutcome::Application`] so reconnect policies do not loop.
+    #[error("{0}")]
+    SessionPresentInconsistent(String),
     /// Driver or API surface not yet implemented.
     #[error("not yet implemented")]
     NotImplemented,

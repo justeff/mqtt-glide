@@ -126,6 +126,7 @@ where
         .alloc_subscribe()
         .map_err(|_| ConnectionOutcome::Protocol(ProtocolError::Violation("resubscribe packet id exhausted".into())))?;
 
+    let filter_count = filters.len();
     let packet = Packet::Subscribe(Subscribe {
         packet_id,
         id: None,
@@ -147,7 +148,7 @@ where
             match result {
                 Ok(Ok(ack)) => {
                     inflight.release_subscribe(packet_id);
-                    validate_resubscribe_ack(&ack)
+                    validate_resubscribe_ack(&ack, filter_count)
                 }
                 Ok(Err(outcome)) => {
                     inflight.release_subscribe(packet_id);
@@ -164,8 +165,41 @@ where
     }
 }
 
-/// Rejects auto-resubscribe when any filter was not granted at QoS 0/1.
-fn validate_resubscribe_ack(ack: &SubscribeAck) -> Result<(), ConnectionOutcome> {
+/// Whether prior filters must be re-issued on a fresh session.
+///
+/// Clean Start discards any broker-side session ([MQTT-3.1.2-4] N/A applies), and a broker
+/// answering `session_present = false` to a resume attempt proves it has no stored
+/// subscriptions — in both cases the app-visible subscriptions only exist again after
+/// re-SUBSCRIBE.
+pub(crate) fn needs_resubscribe(clean_start: bool, session_present: bool) -> bool {
+    clean_start || !session_present
+}
+
+/// Whether the broker's Session Present flag is consistent with local session state.
+///
+/// - [MQTT-3.2.2-2]: Clean Start = 1 requires Session Present = 0. A `1` is a broker bug;
+///   reconnecting with Clean Start again will not help, so the driver must stop.
+/// - [MQTT-3.2.2-4]: a client with no Session State must close when Session Present = 1.
+///   `has_local_session` tracks whether this process has already established a resumeable
+///   session (`clean_start = false` past CONNACK), not whether the subscription registry is
+///   non-empty — an unsubscribe-all leaves a valid empty session.
+pub(crate) fn session_resume_consistent(clean_start: bool, session_present: bool, has_local_session: bool) -> bool {
+    if clean_start {
+        return !session_present;
+    }
+    !session_present || has_local_session
+}
+
+/// Rejects auto-resubscribe when the SUBACK does not grant every filter at QoS 0/1.
+///
+/// [MQTT-3.8.4-6]: the SUBACK must carry one reason code per sent filter; an empty or
+/// short status list is a protocol violation, not an implicit success.
+fn validate_resubscribe_ack(ack: &SubscribeAck, expected_filters: usize) -> Result<(), ConnectionOutcome> {
+    if ack.status.len() != expected_filters {
+        return Err(ConnectionOutcome::Protocol(ProtocolError::Violation(
+            "auto-resubscribe SUBACK reason count did not match filters".into(),
+        )));
+    }
     if ack.status.iter().all(|reason| subscribe_reason_granted(*reason)) {
         Ok(())
     } else {
@@ -251,6 +285,8 @@ fn map_resubscribe_send_error(error: crate::codec::EncodeError) -> ConnectionOut
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    use rstest::rstest;
+
     use super::*;
     use crate::codec::QoS;
 
@@ -321,6 +357,64 @@ mod tests {
         );
         registry.remove([ByteString::from_static("active/topic")]);
         assert!(registry.snapshot().is_empty());
+    }
+
+    /// Auto-resubscribe SUBACK must carry one granted reason per sent filter
+    /// ([MQTT-3.8.4-6]); empty or short status lists are protocol violations.
+    #[rstest]
+    #[case::all_granted(vec![SubscribeAckReason::GrantedQos1], 1, true)]
+    #[case::empty_status(vec![], 1, false)]
+    #[case::short_status(vec![SubscribeAckReason::GrantedQos0], 2, false)]
+    #[case::extra_reasons(vec![SubscribeAckReason::GrantedQos0, SubscribeAckReason::GrantedQos1], 1, false)]
+    #[case::not_authorized(vec![SubscribeAckReason::NotAuthorized], 1, false)]
+    fn resubscribe_ack_validation(
+        #[case] status: Vec<SubscribeAckReason>,
+        #[case] expected_filters: usize,
+        #[case] expect_ok: bool,
+    ) {
+        use crate::codec::SubscribeAck;
+        use std::num::NonZeroU16;
+
+        let ack = SubscribeAck {
+            packet_id: NonZeroU16::new(1).unwrap(),
+            properties: Vec::new(),
+            reason_string: None,
+            status,
+        };
+        assert_eq!(validate_resubscribe_ack(&ack, expected_filters).is_ok(), expect_ok);
+    }
+
+    /// `clean_start = false` with `session_present = false` must resubscribe — the broker
+    /// proved it holds no session, so skipping the re-SUBSCRIBE would silently lose the
+    /// app-visible subscriptions.
+    #[rstest]
+    #[case::clean_start_discards(true, false, true)]
+    #[case::clean_start_even_if_present(true, true, true)]
+    #[case::resumed_session_kept(false, true, false)]
+    #[case::lost_session_rebuilt(false, false, true)]
+    fn resubscribe_decision(#[case] clean_start: bool, #[case] session_present: bool, #[case] expected: bool) {
+        assert_eq!(needs_resubscribe(clean_start, session_present), expected);
+    }
+
+    /// Session Present consistency: Clean Start forbids Present=1; resume requires local affinity.
+    #[rstest]
+    #[case::clean_start_rejects_present(true, true, false, false)]
+    #[case::clean_start_rejects_present_even_with_affinity(true, true, true, false)]
+    #[case::clean_start_ok(true, false, false, true)]
+    #[case::resume_with_affinity(false, true, true, true)]
+    #[case::resume_empty_registry_with_affinity(false, true, true, true)]
+    #[case::no_session_claimed(false, false, false, true)]
+    #[case::broker_state_without_local(false, true, false, false)]
+    fn session_resume_consistency(
+        #[case] clean_start: bool,
+        #[case] session_present: bool,
+        #[case] has_local_session: bool,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            session_resume_consistent(clean_start, session_present, has_local_session),
+            expected
+        );
     }
 
     /// registry poison must not silently become "no subscriptions".

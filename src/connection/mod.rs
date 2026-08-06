@@ -121,7 +121,6 @@ impl<H: InboundSink> ConnectionChannels<H> {
 pub struct Connection<H: InboundSink = flume::Sender<crate::codec::PublishMessage>> {
     options: ConnectOptions,
     credentials: SharedCredentials,
-    #[allow(dead_code)] // reconnect-loop field
     reconnect: Arc<dyn ReconnectPolicy>,
     channels: ConnectionChannels<H>,
     cancel: CancellationToken,
@@ -135,6 +134,9 @@ pub struct Connection<H: InboundSink = flume::Sender<crate::codec::PublishMessag
     inflight: packet_id::InflightPots,
     /// Topic filters to restore after Clean Start reconnect.
     subscription_registry: std::sync::Arc<std::sync::RwLock<SubscriptionRegistry>>,
+    /// Whether this process has established a resumeable MQTT session (`clean_start = false`
+    /// past a successful CONNACK). Used for [MQTT-3.2.2-4]; independent of subscription count.
+    local_session_state: bool,
 }
 
 impl<H: InboundSink> std::fmt::Debug for Connection<H> {
@@ -169,6 +171,7 @@ impl<H: InboundSink> Connection<H> {
             state: ConnectionState::Stopped,
             inflight,
             subscription_registry: std::sync::Arc::new(std::sync::RwLock::new(SubscriptionRegistry::default())),
+            local_session_state: false,
         }
     }
 
@@ -342,25 +345,50 @@ impl<H: InboundSink> Connection<H> {
         let retain_available = session.retain_available;
         self.inflight.set_publish_capacity(session.server_receive_maximum);
 
-        if self.options.clean_start {
-            let pending = match subscriptions::snapshot_for_resubscribe(&self.subscription_registry) {
-                Ok(filters) => filters,
-                Err(outcome) => return self.finish_session(outcome, false).await,
+        let pending = match subscriptions::snapshot_for_resubscribe(&self.subscription_registry) {
+            Ok(filters) => filters,
+            Err(outcome) => return self.finish_session(outcome, false).await,
+        };
+
+        // Session Present must match Clean Start / local session affinity. Reconnecting into
+        // the same claim would loop, so this stops (Application → no retry).
+        if !subscriptions::session_resume_consistent(
+            self.options.clean_start,
+            session.session_present,
+            self.local_session_state,
+        ) {
+            let message = if self.options.clean_start {
+                "broker set Session Present = 1 after Clean Start = 1 ([MQTT-3.2.2-2])"
+            } else {
+                "broker reports Session Present but the client holds no session state ([MQTT-3.2.2-4])"
             };
-            if !pending.is_empty()
-                && let Err(outcome) = subscriptions::resubscribe_pending(
-                    &mut framed_read,
-                    &mut framed_write,
-                    &mut self.inflight,
-                    pending,
-                    self.options.ack_timeout,
-                    &self.cancel,
-                    &self.channels.handoff,
+            return self
+                .finish_session(
+                    ConnectionOutcome::Application(AppError::SessionPresentInconsistent(message.into())),
+                    false,
                 )
-                .await
-            {
-                return self.finish_session(outcome, false).await;
-            }
+                .await;
+        }
+        // Affinity follows Clean Start: a clean session clears it; a resume path marks us as
+        // holding local session state even when the subscription registry is empty.
+        self.local_session_state = !self.options.clean_start;
+
+        // Clean Start discards broker-side state; a broker answering `session_present = false`
+        // to a resume attempt proves it holds none — rebuild the subscriptions in both cases.
+        if subscriptions::needs_resubscribe(self.options.clean_start, session.session_present)
+            && !pending.is_empty()
+            && let Err(outcome) = subscriptions::resubscribe_pending(
+                &mut framed_read,
+                &mut framed_write,
+                &mut self.inflight,
+                pending,
+                self.options.ack_timeout,
+                &self.cancel,
+                &self.channels.handoff,
+            )
+            .await
+        {
+            return self.finish_session(outcome, false).await;
         }
 
         // Session cancel is a child of the client reconnect cancel so `MqttClient::shutdown`
@@ -459,9 +487,8 @@ impl<H: InboundSink> Connection<H> {
         self.state = ConnectionState::Draining;
         self.notify_disconnected(outcome.clone());
 
-        if matches!(&outcome, ConnectionOutcome::Auth(AuthError::NotAuthorized)) && from_active_session {
-            self.credentials.invalidate().await;
-        }
+        let invalidate_credentials =
+            matches!(&outcome, ConnectionOutcome::Auth(AuthError::NotAuthorized)) && from_active_session;
 
         match &outcome {
             ConnectionOutcome::Shutdown(_) | ConnectionOutcome::Application(_) => {
@@ -470,10 +497,24 @@ impl<H: InboundSink> Connection<H> {
             }
             ConnectionOutcome::Auth(_) => match self.reconnect.delay_after(&outcome) {
                 None => {
+                    if invalidate_credentials {
+                        self.credentials.invalidate().await;
+                    }
                     self.state = ConnectionState::Stopped;
                     SessionDisposition::Stop(Err(outcome))
                 }
-                Some(delay) => self.backoff_then_retry(delay).await,
+                Some(delay) => {
+                    let disposition = self.backoff_then_retry(delay).await;
+                    // Invalidate after the channels are replenished (in backoff_then_retry):
+                    // app commands must not see a closed command channel while the
+                    // credentials provider is refreshing. Runs on every disposition —
+                    // including a backoff cancelled by shutdown — so a rejected credential
+                    // is never kept cached.
+                    if invalidate_credentials {
+                        self.credentials.invalidate().await;
+                    }
+                    disposition
+                }
             },
             ConnectionOutcome::Transport(_) | ConnectionOutcome::Protocol(_) => {
                 match self.reconnect.delay_after(&outcome) {
