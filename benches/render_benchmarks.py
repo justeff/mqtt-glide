@@ -334,7 +334,7 @@ def render_generated(mosq: dict, mock: dict) -> str:
             "## Refresh",
             "",
             "```shell",
-            "# Mosquitto baseline (Podman or Docker)",
+            "# Mosquitto baseline (Podman or Docker) — default SCENARIOS includes outbound_concurrent",
             "MQTT_COMPARE_QOS=0,1 \\",
             "MQTT_COMPARE_PAYLOADS=64,256,1024,4096 \\",
             "MQTT_COMPARE_RUNS=100 \\",
@@ -353,7 +353,10 @@ def render_generated(mosq: dict, mock: dict) -> str:
             "python3 benches/render_benchmarks.py",
             "```",
             "",
-            "Then sync the README highlight table if the Mosquitto 256 B story changes.",
+            "This baseline's concurrent rows were measured into `outbound-concurrent-mosquitto-100/` / "
+            "`outbound-concurrent-mock-100/` and merged by hand; a full refresh into `full-*` "
+            "(with default scenarios) is enough next time. Then sync the README highlight table if "
+            "the Mosquitto 256\u202fB story changes.",
             "",
             MARKER_END,
             "",

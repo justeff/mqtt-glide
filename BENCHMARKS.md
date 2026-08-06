@@ -1,11 +1,54 @@
 # Benchmarks
 
-Absolute multi-client results for **mqtt-glide**, **rumqttc-next**, and LabOverWire **mqtt5**.
-Compare clients only within the same cell (scenario × QoS × payload × ack policy × broker).
+Absolute numbers for mqtt-glide, rumqttc-next, and LabOverWire mqtt5 against the same broker, same payloads, same harness. Nothing here is a paired A/B: every number is measured on its own and only means something together with the conditions it was measured under.
 
-How to run: [`benches/README.md`](benches/README.md).
+mqtt-glide is the only client here that can ack after your queue accepted the message; sustained QoS 1 throughput and CPU per message vary by scenario. Read [How to read this page](#how-to-read-this-page) before quoting any single number.
 
-## Host
+## How to read this page
+
+Every number is one cell: one client, one scenario, one QoS, one payload size, one ack policy, one broker. Cells are only comparable to cells that differ in the client column. "glide does 101 179 msg/s" on its own says nothing. The same client does 3 932 msg/s two sections down, because that row waits for a broker round trip per message.
+
+### Scenarios
+
+Every table belongs to one of six:
+
+| Scenario | What it measures |
+|----------|------------------|
+| Ingress load (`ingress_load`) | A burst published at the client under test, measured as decode → bounded app queue → drain |
+| Ingress serial latency (`ingress_serial`) | One message at a time: publisher send until the subscriber pulls it off the app queue |
+| Outbound serial (`outbound_serial`) | One task, `publish().await`, then the next. The cost of idiomatic one-at-a-time publishing |
+| Outbound pipelined (`outbound_pipelined`) | One feeder keeping a window of 64 in flight through each client's idiomatic pipeline |
+| Outbound concurrent (`outbound_concurrent`) | 64 tasks sharing one session, each awaiting its own `publish` (HTTP-style fan-out) |
+| Outbound serial latency (`outbound_serial_latency`) | Per-message stopwatch on the outbound path (QoS 1 on Mosquitto ends at PUBACK) |
+
+### Units
+
+Load cells are `msg/s · CPU ns/msg` (`getrusage` of the bench process; ingress load excludes the publisher child). Latency cells are `p50 / p99 µs`. Bold marks the best msg/s and the lowest CPU in a load row, or the lowest p50 and p99 in a latency row, among clients with `status: ok`. Ties are all bold.
+
+### Ack policies
+
+Apply to ingress QoS 1 only and decide *when* PUBACK is sent relative to the app-queue handoff. Both policies still go through the queue.
+
+| Policy | Meaning | Who can do it |
+|--------|---------|---------------|
+| `after_enqueue` | PUBACK after the app queue accepted the message | mqtt-glide (only mode), rumqttc via `manual_acks` |
+| `before` | PUBACK on decode, before the app sees the message | rumqttc auto-ack, mqtt5 (inherent) |
+
+Cross-policy cells (glide `after_enqueue` against mqtt5 or rumqttc `before`) are not cutover-fair.
+
+### `n/a` reasons
+
+Mark a capability gap or an intentional harness skip, never a failed run:
+
+| Marker | Meaning |
+|--------|---------|
+| `n/a (no_manual_ack)` | mqtt5 has no enqueue-before-ack API |
+| `n/a (no_auto_ack)` | mqtt-glide does not expose auto-ack; use `after_enqueue` for glide ingress QoS 1 |
+| `n/a (qos0_no_wire_counter)` | Mosquitto outbound QoS 0 has no wire counter, so the harness skips it (see Mock) |
+
+## Setup
+
+### Host
 
 | | |
 |--|--|
@@ -14,86 +57,87 @@ How to run: [`benches/README.md`](benches/README.md).
 | Memory | 32 GB |
 | OS | macOS 26.5.2 |
 
-## Matrix (this baseline)
+### Matrix for this baseline
 
 | Knob | Value |
 |------|--------|
-| Runs | median-of **100** |
-| Load burst | 5 000 messages, window / concurrency **64** |
+| Runs | median-of 100 |
+| Load burst | 5 000 messages, window / concurrency 64 |
 | Payloads | 64 / 256 / 1 024 / 4 096 bytes |
 | QoS | 0 and 1 |
 | Clients | `glide`, `rumqttc`, `mqtt5` |
-| mqtt-glide (this baseline) | **0.1.0** (not every release is re-benched) |
-| Peer crates (locked) | `rumqttc-next` **0.33.3**, LabOverWire `mqtt5` **0.37.2** |
+| mqtt-glide (this baseline) | 0.1.0 (not every release is re-benched) |
+| Peer crates (locked) | `rumqttc-next` 0.33.3, LabOverWire `mqtt5` 0.37.2 |
 | Ack (ingress QoS 1 only) | `after_enqueue`, `before` |
 | Source dirs | `target/mqtt_compare/full-mosquitto-100/`, `full-mock-100/`; concurrent: `outbound-concurrent-mosquitto-100/`, `outbound-concurrent-mock-100/` |
-| Outbound QoS 0 | **Mock only** (wire `WAIT`); Mosquitto → `n/a` (`qos0_no_wire_counter`) including latency |
+| Outbound QoS 0 | Mock only (wire `WAIT`); Mosquitto → `n/a` (`qos0_no_wire_counter`) including latency |
 | Outbound QoS 1 | Mosquitto + mock (PUBACK / wire) |
 
-**Mosquitto** is the published baseline (eclipse-mosquitto `2.1.2-alpine`, bench-tuned).
-**Mock** is a ceiling / attribution broker (out-of-process, multi-thread, Arc fanout, inbound PUBLISH counter) — not a production broker claim.
+Mosquitto is the published baseline (eclipse-mosquitto `2.1.2-alpine`, bench-tuned).
+Mock is a ceiling / attribution broker (out-of-process, multi-thread, Arc fanout, inbound PUBLISH counter), not a production broker claim.
 
-### Reading the tables
+## Fairness rules
 
-- **Bold** in a row: best msg/s and lowest CPU (load), or lowest p50 and p99 (latency), among clients with `status: ok` (ties all bold).
-- Load cells: **msg/s · CPU ns/msg** (`getrusage` of the bench process; ingress load excludes the publisher child).
-- Latency cells: **p50 / p99 µs**.
-- `n/a (no_manual_ack)` — mqtt5 has no enqueue-before-ack API.
-- `n/a (no_auto_ack)` — mqtt-glide does not expose auto-ack; use `after_enqueue` for glide ingress QoS 1.
-- `n/a (qos0_no_wire_counter)` — harness skip for Mosquitto outbound QoS 0 (not rendered in Mosquitto tables; see Mock).
+These are the constraints that make the numbers comparable at all. Read them before quoting a row.
 
-Cross-policy cells (glide `after_enqueue` vs mqtt5/rumqttc `before`) are **not** cutover-fair.
+### Ingress is always the handoff use case
 
-### Caveats
+Takeaway: there is no "process it inline" number on this page.
 
-#### Ingress is always the handoff use case
-
-All **ingress** cells (load + serial latency, QoS 0 and 1) measure **decode → app queue (flume) → drain**, not “handle the message inline in a decode/callback path.”
+All ingress cells (load + serial latency, QoS 0 and 1) measure decode → app queue (flume) → drain, not “handle the message inline in a decode/callback path.”
 
 - The harness always enqueues a handoff record and later `recv`s it (`recv_touch` / barrier on handoffs or PUBACKs).
 - That matches mqtt-glide’s product model (`InboundSink` accept). Peers are adapted to the same shape so cutover compares stay fair.
-- There is **no** bench cell for “I got a PUBLISH and processed it directly without an app queue.”
-- QoS 1 `after_enqueue` / `before` only changes **when PUBACK is sent** relative to that handoff — both still use the queue.
+- There is no bench cell for “I got a PUBLISH and processed it directly without an app queue.”
+- QoS 1 `after_enqueue` / `before` only changes when PUBACK is sent relative to that handoff; both still use the queue.
 
-#### Outbound load: wire counter (mock) vs Mosquitto
+### Outbound load: wire counter (mock) vs Mosquitto
 
-On **`MQTT_COMPARE_BROKER=mock`**, outbound serial/pipelined/concurrent wall time ends when the mock stats port answers `WAIT N` with `RECEIVED <count>` (inbound PUBLISH frames decoded). `TIMEOUT <count>` or a count ≠ N fails the cell. Early `publish().await` completion cannot finish the cell early.
+Takeaway: outbound throughput is measured at the wire, and on Mosquitto that only works for QoS 1.
 
-On **Mosquitto**, all **outbound QoS 0** cells (serial / pipelined / concurrent load + serial latency) are **`n/a` (`qos0_no_wire_counter`)**. Prefer **QoS 1** for Mosquitto cutover outbound (PUBACK ≈ broker saw the message). Fair QoS 0 wire attribution lives on the mock.
+On `MQTT_COMPARE_BROKER=mock`, outbound serial/pipelined/concurrent wall time ends when the mock stats port answers `WAIT N` with `RECEIVED <count>` (inbound PUBLISH frames decoded). `TIMEOUT <count>` or a count ≠ N fails the cell. Early `publish().await` completion cannot finish the cell early.
 
-#### Outbound feed shapes (serial vs pipelined vs concurrent)
+On Mosquitto, all outbound QoS 0 cells (serial / pipelined / concurrent load + serial latency) are `n/a` (`qos0_no_wire_counter`). Prefer QoS 1 for Mosquitto cutover outbound (PUBACK ≈ broker saw the message). Fair QoS 0 wire attribution lives on the mock.
+
+### Outbound feed shapes (serial vs pipelined vs concurrent)
+
+Takeaway: the wall clock is fair across clients, but a serial `publish().await` does not mean the same thing in each of them.
 
 | Scenario | Feeder model | Per-message API |
 |----------|--------------|-----------------|
-| **outbound_serial** | One task | `publish().await` then next |
-| **outbound_pipelined** | One feeder, window 64 | Client-idiomatic pipeline (`publish_window` / rumqttc notices / mqtt5 spawns) |
-| **outbound_concurrent** | 64 harness tasks, shared session | Only `publish().await` / `publish_serial` (HTTP-style fan-out) |
+| `outbound_serial` | One task | `publish().await` then next |
+| `outbound_pipelined` | One feeder, window 64 | Client-idiomatic pipeline (`publish_window` / rumqttc notices / mqtt5 spawns) |
+| `outbound_concurrent` | 64 harness tasks, shared session | Only `publish().await` / `publish_serial` (HTTP-style fan-out) |
 
-Mock outbound **load** ends on the same wire barrier (`WAIT N`), but clients still **feed** the burst differently when the harness calls idiomatic serial `publish().await` (Mock QoS 0 only — Mosquitto outbound QoS 0 is skipped):
+Mock outbound load ends on the same wire barrier (`WAIT N`), but clients still feed the burst differently when the harness calls idiomatic serial `publish().await` (Mock QoS 0 only; Mosquitto outbound QoS 0 is skipped):
 
 | Client | What each serial `publish().await` does (QoS 0) | Encode / invalid-topic errors on that call? |
 |--------|--------------------------------------------------|-----------------------------------------------|
-| **mqtt-glide** | Waits until the write task has encoded into the connection write buffer (oneshot). | **Yes** (returned on the completion / `publish` result). |
-| **rumqttc-next** | Accepts the request onto the EventLoop channel only; encode/write happen later in the event loop (often batched). | **No** on that `await` — mainly channel full / early topic checks; later failures surface via the event loop. |
-| **mqtt5** | Encodes and `write_packet` / TCP write on the calling task, then returns. | **Yes** (on that call). |
+| mqtt-glide | Waits until the write task has encoded into the connection write buffer (oneshot). | Yes (returned on the completion / `publish` result). |
+| rumqttc-next | Accepts the request onto the EventLoop channel only; encode/write happen later in the event loop (often batched). | No on that `await` (mainly channel full / early topic checks; later failures surface via the event loop). |
+| mqtt5 | Encodes and `write_packet` / TCP write on the calling task, then returns. | Yes (on that call). |
 
-With `WAIT N`, rumqttc **cannot** finish the cell early by enqueue-only awaits — wall msg/s is wire-complete for all three (and on Mock serial QoS 0, glide typically leads msg/s). What still differs is **what each `publish().await` guarantees** (write/completion vs channel accept) and thus CPU/shape of the feeder. Prefer **outbound pipelined**, **outbound concurrent**, and **QoS 1** for “sustained publish throughput with visible per-message completion.” Serial remains useful as “cost of idiomatic one-at-a-time `publish().await`.” Concurrent keeps that same await API but overlaps many callers (fair across clients: harness spawn is identical).
+With `WAIT N`, rumqttc cannot finish the cell early by enqueue-only awaits; wall msg/s is wire-complete for all three (and on Mock serial QoS 0, glide typically leads msg/s). What still differs is what each `publish().await` guarantees (write/completion vs channel accept) and thus CPU/shape of the feeder. Prefer outbound pipelined, outbound concurrent, and QoS 1 for “sustained publish throughput with visible per-message completion.” Serial remains useful as “cost of idiomatic one-at-a-time `publish().await`.” Concurrent keeps that same await API but overlaps many callers (fair across clients: harness spawn is identical).
 
-#### Latency stopwatches
+### Latency stopwatches
+
+Takeaway: each latency row stops at a different barrier, so check which one before comparing them to each other.
 
 | Cell | Barrier |
 |------|---------|
-| **Ingress serial** (QoS 0/1) | Publisher send → subscriber flume handoff `recv` (same app-queue path as ingress load) |
-| **Outbound serial latency QoS 1** (Mosquitto) | `publish().await` until PUBACK |
-| **Outbound serial latency** (mock, QoS 0/1) | Start → `publish` → mock `WAIT 1` / `RECEIVED` (broker decoded the frame) |
+| Ingress serial (QoS 0/1) | Publisher send → subscriber flume handoff `recv` (same app-queue path as ingress load) |
+| Outbound serial latency QoS 1 (Mosquitto) | `publish().await` until PUBACK |
+| Outbound serial latency (mock, QoS 0/1) | Start → `publish` → mock `WAIT 1` / `RECEIVED` (broker decoded the frame) |
 
-Do not treat Mosquitto outbound QoS 0 latency as missing coverage — it is intentionally skipped. Mock outbound QoS 0 latency is wire-complete, not API-queue latency.
+Do not treat Mosquitto outbound QoS 0 latency as missing coverage; it is intentionally skipped. Mock outbound QoS 0 latency is wire-complete, not API-queue latency.
 
-#### Other
+### Where the numbers are bounded by something other than the client
 
-- **Outbound serial QoS 1** is largely Mosquitto RTT-bound (~4 k msg/s ≈ 250 µs round-trip). msg/s parity is expected; CPU gaps while blocked on PUBACK are parking/overhead, not wire encode.
-- **Outbound serial / pipelined / concurrent QoS 0** on mock is wire-complete (`WAIT N`); absolute rates still depend on client enqueue/write efficiency and (for serial) per-call await semantics above.
-- Keep Mosquitto **outbound QoS 1** load (serial + pipelined + concurrent): that remains the cutover throughput / RTT story. Only QoS 0 outbound is dropped there.
+Takeaway: serial QoS 1 is a broker round-trip measurement; do not read client differences into it.
+
+- Outbound serial QoS 1 is largely Mosquitto RTT-bound (~4 k msg/s ≈ 250 µs round-trip). msg/s parity is expected; CPU gaps while blocked on PUBACK are parking/overhead, not wire encode.
+- Outbound serial / pipelined / concurrent QoS 0 on mock is wire-complete (`WAIT N`); absolute rates still depend on client enqueue/write efficiency and (for serial) per-call await semantics above.
+- Keep Mosquitto outbound QoS 1 load (serial + pipelined + concurrent): that remains the cutover throughput / RTT story. Only QoS 0 outbound is dropped there.
 
 <!-- benchmarks:generated:start -->
 
@@ -403,3 +447,9 @@ python3 benches/render_benchmarks.py
 This baseline’s concurrent rows were measured into `outbound-concurrent-mosquitto-100/` / `outbound-concurrent-mock-100/` and merged by hand; a full refresh into `full-*` (with default scenarios) is enough next time. Then sync the README highlight table if the Mosquitto 256 B story changes.
 
 <!-- benchmarks:generated:end -->
+
+## Reproducing
+
+Everything above the generated tables describes *what* was measured; [`benches/README.md`](benches/README.md) describes *how* to run it.
+
+It covers the env knobs (`MQTT_COMPARE_*`), the broker backends, the fairness constraints baked into the harness, and the JSONL output that `python3 benches/render_benchmarks.py` turns back into the tables on this page.

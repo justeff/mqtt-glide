@@ -1,7 +1,11 @@
 # mqtt-glide benchmarks
 
-Published numbers live in [`BENCHMARKS.md`](../BENCHMARKS.md). This file is **how to run** the harness (fairness, env knobs, caps).
-Rebuild published tables from JSONL with `python3 benches/render_benchmarks.py` (bolds best msg/s / lowest CPU / lowest latency per row).
+The two benchmark documents split like this:
+
+- [`BENCHMARKS.md`](../BENCHMARKS.md) — the published numbers, what each scenario measures, and the fairness rules for reading them.
+- **This file** — how to run the harness yourself: env knobs, broker backends, client caps, and the fairness constraints it enforces.
+
+Rebuild the published tables from JSONL with `python3 benches/render_benchmarks.py` (bolds best msg/s / lowest CPU / lowest latency per row).
 
 ## Host baseline (documented numbers)
 
@@ -35,7 +39,7 @@ Each JSONL line is one cell (`status: ok` or `n/a` with `reason`).
 
 | Value | Crate | Baseline version |
 |-------|--------|------------------|
-| `glide` | mqtt-glide (this crate) | **0.1.1** (`CARGO_PKG_VERSION`; not every release is re-benched) |
+| `glide` | mqtt-glide (this crate) | **0.1.0** (not every release is re-benched) |
 | `rumqttc` | `rumqttc-next` | **0.33.3** (pinned; do not bump to 0.34+ without a full re-bench) |
 | `mqtt5` | LabOverWire `mqtt5` | **0.37.2** (pinned) |
 
