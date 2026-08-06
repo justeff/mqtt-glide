@@ -417,6 +417,48 @@ impl WireBodyEncode for Connect {
     }
 
     fn encode_body(&self, buf: &mut BytesMut, _max_out: u32) -> Result<(), EncodeError> {
+        // Validate before any wire bytes. CONNECT is encoded once per session, so these
+        // passes are not on a hot path.
+        //
+        // Client ID / User Name / Will properties are UTF-8 strings: no U+0000 on the
+        // wire ([MQTT-1.5.4-2]). Will Topic + Will Response Topic follow Topic Name rules
+        // ([MQTT-3.1.3-11], §3.1.3.2.6); decode enforces the same.
+        if utils::contains_nul(self.client_id.as_bytes())
+            || self
+                .username
+                .as_ref()
+                .is_some_and(|username| utils::contains_nul(username.as_bytes()))
+            || self
+                .auth_method
+                .as_ref()
+                .is_some_and(|method| utils::contains_nul(method.as_bytes()))
+            || self.user_properties.iter().any(|property| {
+                utils::contains_nul(property.name.as_bytes()) || utils::contains_nul(property.value.as_bytes())
+            })
+        {
+            return Err(EncodeError::MalformedPacket);
+        }
+        if let Some(will) = self.will_message.as_ref() {
+            if will.topic.is_empty() || utils::topic_name_bytes_forbidden(will.topic.as_bytes()) {
+                return Err(EncodeError::MalformedPacket);
+            }
+            if let Some(response_topic) = will.response_topic.as_ref()
+                && (response_topic.is_empty() || utils::topic_name_bytes_forbidden(response_topic.as_bytes()))
+            {
+                return Err(EncodeError::MalformedPacket);
+            }
+            if let Some(content_type) = will.content_type.as_ref()
+                && utils::contains_nul(content_type.as_bytes())
+            {
+                return Err(EncodeError::MalformedPacket);
+            }
+            if will.user_properties.iter().any(|property| {
+                utils::contains_nul(property.name.as_bytes()) || utils::contains_nul(property.value.as_bytes())
+            }) {
+                return Err(EncodeError::MalformedPacket);
+            }
+        }
+
         b"MQTT".as_ref().encode(buf)?;
 
         let mut flags = ConnectFlags::empty();
@@ -462,9 +504,6 @@ impl WireBodyEncode for Connect {
         self.client_id.encode(buf)?;
 
         if let Some(will) = self.will_message.as_ref() {
-            if will.topic.is_empty() {
-                return Err(EncodeError::MalformedPacket);
-            }
             let prop_len = will.properties_len();
             utils::write_variable_length(prop_len as u32, buf)?; // safe: whole message size is checked for max already
 
@@ -494,7 +533,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::codec::error::DecodeError;
+    use crate::codec::error::{DecodeError, EncodeError};
 
     /// Builds a CONNECT body: header + `flags` + fixed keep-alive + `properties` + `tail`.
     ///
@@ -573,6 +612,82 @@ mod tests {
         let connect = Connect::decode(&mut src).unwrap();
         assert!(connect.username.is_none());
         assert_eq!(connect.password.as_deref(), Some(b"token".as_ref()));
+    }
+
+    /// Routes a CONNECT through the public codec entry point with a pre-seeded buffer:
+    /// rejection must roll back even the fixed header (no stray bytes in batched buffers).
+    fn assert_connect_rejected_via_codec(connect: Connect, case: &str) {
+        use crate::codec::{Packet, V5Codec};
+        use tokio_util::codec::Encoder;
+
+        let mut codec = V5Codec::with_max_packet_size(0);
+        let mut buf = BytesMut::from(&b"keep"[..]);
+        let err = codec
+            .encode(Packet::Connect(Box::new(connect)), &mut buf)
+            .expect_err(case);
+        assert!(matches!(err, EncodeError::MalformedPacket), "{case}: got {err:?}");
+        assert_eq!(
+            &buf[..],
+            b"keep",
+            "{case}: rejected encode must not leave partial bytes"
+        );
+    }
+
+    /// [MQTT-3.1.3-11] Will Topic Name rules (and Will Response Topic, §3.1.3.2.6) on encode —
+    /// the client API validates via `validate_will_message`; the codec rejects raw misuse too.
+    /// [MQTT-1.5.4-2] covers the U+0000 cases.
+    #[rstest]
+    #[case::wildcard_will_topic("a/+/b", None)]
+    #[case::hash_will_topic("a/#", None)]
+    #[case::nul_will_topic("a\0b", None)]
+    #[case::wildcard_will_response_topic("ok/topic", Some("reply/#"))]
+    #[case::nul_will_response_topic("ok/topic", Some("reply\0topic"))]
+    fn connect_encode_rejects_invalid_will_topics(#[case] will_topic: &str, #[case] response_topic: Option<&str>) {
+        let mut will = WillMessage::new(will_topic, "payload");
+        will.response_topic = response_topic.map(ByteString::from);
+        assert_connect_rejected_via_codec(
+            Connect {
+                client_id: ByteString::from_static("id"),
+                will_message: Some(will),
+                ..Default::default()
+            },
+            "invalid will topic",
+        );
+    }
+
+    /// [MQTT-1.5.4-2] U+0000 in CONNECT UTF-8 fields is rejected before any wire bytes.
+    #[rstest]
+    #[case::client_id(Connect {
+        client_id: ByteString::from_static("bad\0id"),
+        ..Default::default()
+    })]
+    #[case::username(Connect {
+        client_id: ByteString::from_static("id"),
+        username: Some(ByteString::from_static("bad\0user")),
+        ..Default::default()
+    })]
+    #[case::auth_method(Connect {
+        client_id: ByteString::from_static("id"),
+        auth_method: Some(ByteString::from_static("SCRAM\0SHA1")),
+        ..Default::default()
+    })]
+    #[case::connect_user_property(Connect {
+        client_id: ByteString::from_static("id"),
+        user_properties: vec![UserProperty::from(("k\0", "v"))],
+        ..Default::default()
+    })]
+    #[case::will_content_type(Connect {
+        client_id: ByteString::from_static("id"),
+        will_message: Some(WillMessage::new("will/topic", "payload").content_type("text/\0plain")),
+        ..Default::default()
+    })]
+    #[case::will_user_property(Connect {
+        client_id: ByteString::from_static("id"),
+        will_message: Some(WillMessage::new("will/topic", "payload").user_property("k", "v\0")),
+        ..Default::default()
+    })]
+    fn connect_encode_rejects_nul_in_utf8_fields(#[case] connect: Connect) {
+        assert_connect_rejected_via_codec(connect, "nul field");
     }
 
     #[test]

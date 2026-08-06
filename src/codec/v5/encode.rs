@@ -11,7 +11,10 @@ use crate::codec::properties::{
 use crate::codec::publish::{PublishDelivery, PublishMessage, PublishProperties};
 use crate::codec::types::QoS;
 use crate::codec::types::packet_type;
-use crate::codec::utils::{Encode, encode_minimal_packet_id_ack, topic_name_bytes_forbidden, write_variable_length};
+use crate::codec::utils::{
+    Encode, MAX_VARIABLE_LENGTH, contains_nul, encode_minimal_packet_id_ack, topic_name_bytes_forbidden,
+    write_variable_length,
+};
 use crate::codec::v5::property_type as pt;
 
 /// Borrowed v5 PUBLISH body — avoids cloning topic/payload/properties for outbound encode.
@@ -20,14 +23,29 @@ struct V5PublishBody<'a> {
     delivery: PublishDelivery,
 }
 
-fn canonical_props_len(props: &PublishProperties) -> usize {
+/// Summed property wire size. Rejects U+0000 in the UTF-8 property strings
+/// ([MQTT-1.5.4-2]) within the same plan-time walk over the properties — the hot
+/// no-properties path never calls this (see `is_wire_empty`).
+fn canonical_props_len(props: &PublishProperties) -> Result<usize, EncodeError> {
+    if let Some(content_type) = props.content_type.as_ref()
+        && contains_nul(content_type.as_bytes())
+    {
+        return Err(EncodeError::MalformedPacket);
+    }
+    let mut user_props_len = 0;
+    for property in &props.user_properties {
+        if contains_nul(property.name.as_bytes()) || contains_nul(property.value.as_bytes()) {
+            return Err(EncodeError::MalformedPacket);
+        }
+        user_props_len += 1 + property.encoded_size(); // prop type byte + name + value
+    }
     let prop_len = encoded_property_size(&props.correlation_data)
         + encoded_property_size(&props.message_expiry_interval)
         + encoded_property_size(&props.content_type)
         + encoded_property_size_default(&props.payload_format_indicator, false)
         + encoded_property_size(&props.response_topic)
-        + props.user_properties.encoded_size();
-    prop_len + var_int_len(prop_len) as usize
+        + user_props_len;
+    Ok(prop_len + var_int_len(prop_len) as usize)
 }
 
 fn encode_canonical_props(props: &PublishProperties, buf: &mut BytesMut, max_out: u32) -> Result<(), EncodeError> {
@@ -47,7 +65,7 @@ impl WireBodyEncode for V5PublishBody<'_> {
         let property_size = if self.message.properties.is_wire_empty() {
             1
         } else {
-            canonical_props_len(&self.message.properties)
+            canonical_props_len(&self.message.properties)?
         };
         Ok(self.message.topic.encoded_size() + packet_id_size + property_size + self.message.payload.len())
     }
@@ -109,8 +127,23 @@ fn publish_wire_plan(
     if message.topic.is_empty() || topic_name_bytes_forbidden(message.topic.as_bytes()) {
         return Err(EncodeError::MalformedPacket);
     }
+    // Response Topic follows Topic Name rules ([MQTT-3.3.2-13/14]) — same single pass
+    // family as the topic check above (NUL included via topic_name_bytes_forbidden).
+    // U+0000 in the remaining UTF-8 properties is rejected inside `canonical_props_len`
+    // ([MQTT-1.5.4-2]), within its existing plan-time walk over the properties.
+    if let Some(response_topic) = message.properties.response_topic.as_ref()
+        && (response_topic.is_empty() || topic_name_bytes_forbidden(response_topic.as_bytes()))
+    {
+        return Err(EncodeError::MalformedPacket);
+    }
     let body = V5PublishBody { message, delivery };
-    let body_len = body.encoded_body_len(max_packet_size)? as u32;
+    let body_len = body.encoded_body_len(max_packet_size)?;
+    // Bodies beyond the Remaining Length ceiling (§2.1.4) cannot be framed at all;
+    // reject before the u32 cast below can truncate (e.g. multi-GiB payloads).
+    if body_len > MAX_VARIABLE_LENGTH as usize {
+        return Err(EncodeError::InvalidLength);
+    }
+    let body_len = body_len as u32;
     let wire_len = 1 + var_int_len_u32(body_len) + body_len;
     if max_packet_size != 0 && wire_len > max_packet_size {
         return Err(EncodeError::OverMaxPacketSize {
@@ -178,6 +211,18 @@ impl Packet {
     }
 
     pub(crate) fn encode_wire(&self, buf: &mut BytesMut, body_len: u32) -> Result<(), EncodeError> {
+        // Roll back on failure (same contract as `encode_publish`): the fixed header is
+        // written before the body, so a rejected body must not leave stray header bytes
+        // in a caller-batched buffer.
+        let start_len = buf.len();
+        if let Err(error) = self.encode_wire_inner(buf, body_len) {
+            buf.truncate(start_len);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn encode_wire_inner(&self, buf: &mut BytesMut, body_len: u32) -> Result<(), EncodeError> {
         match self {
             Packet::Connect(connect) => {
                 buf.put_u8(packet_type::CONNECT);
@@ -690,6 +735,105 @@ mod tests {
             b"keep",
             "{topic}: rejected encode must not leave a partial PUBLISH frame"
         );
+    }
+
+    /// [MQTT-3.3.2-13/14] Response Topic follows Topic Name rules: non-empty, no wildcards.
+    #[rstest]
+    #[case::empty("")]
+    #[case::plus_wildcard("reply/+")]
+    #[case::hash_wildcard("reply/#")]
+    #[case::embedded_nul("reply\0topic")]
+    fn encode_publish_rejects_invalid_response_topic(#[case] response_topic: &str) {
+        let delivery = PublishDelivery {
+            dup: false,
+            retain: false,
+            qos: QoS::AtMostOnce,
+            packet_id: None,
+        };
+        let message = PublishMessage {
+            topic: ByteString::from_static("req/topic"),
+            payload: Bytes::from_static(b"x"),
+            properties: PublishProperties::default().response_topic(response_topic),
+        };
+        let mut buf = BytesMut::from(&b"keep"[..]);
+        let err = encode_publish(&message, delivery, u32::MAX, &mut buf).expect_err(response_topic);
+        assert!(
+            matches!(err, EncodeError::MalformedPacket),
+            "{response_topic}: expected MalformedPacket, got {err:?}"
+        );
+        assert_eq!(
+            &buf[..],
+            b"keep",
+            "{response_topic}: rejected encode must not leave a partial PUBLISH frame"
+        );
+    }
+
+    #[test]
+    fn encode_publish_accepts_valid_response_topic() {
+        let delivery = PublishDelivery {
+            dup: false,
+            retain: false,
+            qos: QoS::AtMostOnce,
+            packet_id: None,
+        };
+        let message = PublishMessage {
+            topic: ByteString::from_static("req/topic"),
+            payload: Bytes::from_static(b"x"),
+            properties: PublishProperties::default().response_topic("reply/to/me"),
+        };
+        let mut buf = BytesMut::new();
+        encode_publish(&message, delivery, u32::MAX, &mut buf).expect("valid response topic encodes");
+    }
+
+    /// [MQTT-1.5.4-2] U+0000 in publish UTF-8 properties is rejected at plan time,
+    /// before any wire bytes.
+    #[rstest]
+    #[case::content_type(PublishProperties::default().content_type("text/\0plain"))]
+    #[case::user_property_name(PublishProperties::default().user_property("k\0", "v"))]
+    #[case::user_property_value(PublishProperties::default().user_property("k", "v\0"))]
+    fn encode_publish_rejects_nul_in_utf8_properties(#[case] properties: PublishProperties) {
+        let delivery = PublishDelivery {
+            dup: false,
+            retain: false,
+            qos: QoS::AtMostOnce,
+            packet_id: None,
+        };
+        let message = PublishMessage {
+            topic: ByteString::from_static("topic/a"),
+            payload: Bytes::from_static(b"x"),
+            properties,
+        };
+        let mut buf = BytesMut::from(&b"keep"[..]);
+        let err = encode_publish(&message, delivery, u32::MAX, &mut buf).expect_err("nul property");
+        assert!(matches!(err, EncodeError::MalformedPacket), "got {err:?}");
+        assert_eq!(
+            &buf[..],
+            b"keep",
+            "rejected encode must not leave a partial PUBLISH frame"
+        );
+    }
+
+    /// Bodies beyond the Remaining Length ceiling (§2.1.4) cannot be framed; the plan
+    /// rejects them before the u32 cast could truncate (multi-GiB payloads with an
+    /// unlimited max packet size would otherwise produce a corrupt Remaining Length).
+    #[test]
+    fn encode_publish_rejects_body_beyond_remaining_length_ceiling() {
+        // `vec![0; n]` is lazily zero-mapped; the rejected encode never touches the pages.
+        let message = PublishMessage {
+            topic: ByteString::from_static("t"),
+            payload: Bytes::from(vec![0u8; crate::codec::utils::MAX_VARIABLE_LENGTH as usize]),
+            properties: PublishProperties::default(),
+        };
+        let delivery = PublishDelivery {
+            dup: false,
+            retain: false,
+            qos: QoS::AtMostOnce,
+            packet_id: None,
+        };
+        let mut buf = BytesMut::from(&b"keep"[..]);
+        let err = encode_publish(&message, delivery, 0, &mut buf).expect_err("oversize body");
+        assert!(matches!(err, EncodeError::InvalidLength), "got {err:?}");
+        assert_eq!(&buf[..], b"keep", "rejected encode must not leave a partial frame");
     }
 
     #[test]

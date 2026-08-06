@@ -97,8 +97,14 @@ MQTT_COMPARE_CLIENTS=glide,rumqttc MQTT_COMPARE_ACK=after_enqueue MQTT_COMPARE_R
 
 ## codec_throughput
 
-No-broker microbench for outbound wire attribution: `encode_publish`
-(including topic validation). Indicative numbers live in [`BENCHMARKS.md`](../BENCHMARKS.md) / README highlights.
+No-broker microbench for wire attribution on both codec directions:
+
+- **encode** `encode_publish` (including topic validation) — short topic, 71 B topic, and property-block shapes
+- **decode** `V5Codec::decode_frame` — PUBLISH (same three shapes) and minimal PUBACK; decode rows include the per-fill buffer refill memcpy (same shape as a socket read into the codec buffer)
+
+Indicative numbers live in [`BENCHMARKS.md`](../BENCHMARKS.md) / README highlights. Single-digit-ns
+deltas between builds can be code-layout artifacts; verify suspected regressions with
+`-C llvm-args=-align-all-functions=6` on both sides before attributing them to a change.
 
 ```shell
 cargo bench --bench codec_throughput

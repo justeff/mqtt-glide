@@ -63,29 +63,17 @@ pub(crate) fn decode_variable_length(src: &[u8]) -> Result<Option<(u32, usize)>,
     }
 }
 
-/// Minimum on-wire byte count for a decoded Variable Byte Integer value. [MQTT-1.5.5-1]
-#[inline]
-fn minimal_variable_length_bytes(value: u32) -> usize {
-    if value <= 127 {
-        1
-    } else if value <= 16_383 {
-        2
-    } else if value <= 2_097_151 {
-        3
-    } else {
-        4
-    }
-}
-
 /// Decodes variable-length integer from buffer
 ///
 /// # MQTT Spec
 /// Variable length integers use up to 4 bytes with continuation bits
 /// Max value: 268,435,455 (0xFFFFFF7F)
+///
+/// Minimality ([MQTT-1.5.5-1]): an encoding is non-minimal iff its final byte
+/// contributes no bits — i.e. a multi-byte encoding whose last byte is `0x00`.
 #[inline]
 #[allow(clippy::cast_lossless)]
 pub(crate) fn decode_variable_length_cursor<B: Buf>(src: &mut B) -> Result<u32, DecodeError> {
-    let start = src.remaining();
     let mut shift: u32 = 0;
     let mut len: u32 = 0;
     loop {
@@ -94,11 +82,10 @@ pub(crate) fn decode_variable_length_cursor<B: Buf>(src: &mut B) -> Result<u32, 
             DecodeError::MalformedPacket("truncated variable byte integer")
         );
         let val = src.get_u8();
-        len += ((val & 0b0111_1111) as u32) << shift;
+        len |= ((val & 0b0111_1111) as u32) << shift;
         if val & 0b1000_0000 == 0 {
-            let consumed = start - src.remaining();
             ensure!(
-                consumed == minimal_variable_length_bytes(len),
+                val != 0 || shift == 0,
                 DecodeError::MalformedPacket("non-minimal variable byte integer")
             );
             return Ok(len);

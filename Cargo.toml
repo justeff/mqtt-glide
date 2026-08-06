@@ -47,6 +47,9 @@ bytes = "1.12"
 bytestring = "1.5"
 flume = "0.12"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# SIMD byte scans (NUL / wildcard rejection) on the codec hot path. Safe API;
+# runtime-dispatched SSE2/AVX2 (x86_64) / NEON (aarch64) internally.
+memchr = "2.7"
 nonzero_ext = "0.3"
 secrecy = "0.10"
 thiserror = "2.0"

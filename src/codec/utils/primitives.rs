@@ -78,6 +78,22 @@ impl Decode for Bytes {
     }
 }
 
+/// Topic-scan crossover length: below this, the simple (auto-vectorized) loop beats
+/// the `memchr` crate's runtime-dispatched SIMD kernels, whose call + setup overhead
+/// dominates short slices (typical topic names). Measured on x86_64 AVX2; see
+/// `benches/codec_throughput.rs`.
+const SIMD_SCAN_MIN_LEN: usize = 32;
+
+/// True when the bytes contain a `0x00` octet (U+0000 in UTF-8). [MQTT-1.5.4-2]
+///
+/// Plain `contains` on purpose: core lowers it to a SWAR memchr that wins for the
+/// short strings dominating property/identifier fields, without the code-size cost
+/// a `memchr`-crate dual path adds at every call site (measured slower here).
+#[inline]
+pub(crate) fn contains_nul(bytes: &[u8]) -> bool {
+    bytes.contains(&0)
+}
+
 /// MQTT UTF-8 strings must be well-formed UTF-8 and MUST NOT encode U+0000. [MQTT-1.5.4-1], [MQTT-1.5.4-2]
 ///
 /// Zero-copy: after validation, wraps the frame [`Bytes`] via [`ByteString::try_from`]
@@ -85,7 +101,7 @@ impl Decode for Bytes {
 #[inline]
 pub(crate) fn decode_mqtt_utf8_string(bytes: Bytes) -> Result<ByteString, DecodeError> {
     // U+0000 is a single 0x00 byte in UTF-8 — reject before wrapping.
-    if bytes.as_ref().contains(&0) {
+    if contains_nul(bytes.as_ref()) {
         return Err(DecodeError::MalformedPacket("MQTT UTF-8 string contains U+0000"));
     }
     ByteString::try_from(bytes).map_err(|_| DecodeError::MalformedPacket("invalid UTF-8 string"))
@@ -98,9 +114,22 @@ impl Decode for ByteString {
 }
 
 /// True when Topic Name bytes contain a forbidden octet: `NUL`, `+`, or `#`.
+///
+/// Long topics scan via SIMD `memchr3` (SSE2/AVX2 or NEON at runtime); short ones
+/// use a plain loop (see [`SIMD_SCAN_MIN_LEN`]). The long path stays outlined so
+/// hot callers only inline the short loop.
 #[inline]
 pub(crate) fn topic_name_bytes_forbidden(bytes: &[u8]) -> bool {
-    bytes.iter().any(|&b| matches!(b, 0 | b'+' | b'#'))
+    if bytes.len() < SIMD_SCAN_MIN_LEN {
+        bytes.iter().any(|&b| matches!(b, 0 | b'+' | b'#'))
+    } else {
+        topic_name_bytes_forbidden_simd(bytes)
+    }
+}
+
+#[inline(never)]
+fn topic_name_bytes_forbidden_simd(bytes: &[u8]) -> bool {
+    memchr::memchr3(0, b'+', b'#', bytes).is_some()
 }
 
 /// True when Topic Filter bytes violate `NUL` ([MQTT-4.7.3-2]) or `+`/`#` placement ([MQTT-4.7.1-1/2]).
@@ -273,6 +302,9 @@ impl Encode for ByteString {
         self.as_bytes().encoded_size()
     }
 
+    /// No U+0000 check here on purpose ([MQTT-1.5.4-2] is enforced at plan time per
+    /// packet — `publish_wire_plan`, `Connect::encode_body`): the per-message encode
+    /// path stays single-pass over each string.
     fn encode(&self, buf: &mut BytesMut) -> Result<(), EncodeError> {
         self.as_bytes().encode(buf)
     }

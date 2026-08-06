@@ -5,7 +5,7 @@ use super::{DecodedFrame, Packet, decode::decode_packet};
 use crate::codec::error::{DecodeError, EncodeError};
 use crate::codec::properties::var_int_len_u32;
 use crate::codec::types::MAX_PACKET_SIZE;
-use crate::codec::utils::decode_variable_length;
+use crate::codec::utils::{MAX_VARIABLE_LENGTH, decode_variable_length};
 
 /// Worst-case fixed-header overhead: 1 type byte + 4-byte Remaining Length varint (§2.1.4).
 const WIRE_HEADER_BUDGET: u32 = 5;
@@ -194,6 +194,11 @@ impl Encoder<Packet> for V5Codec {
         let wire_limit = self.max_out_size;
         let body_budget = outbound_body_budget(wire_limit);
         let body_len = item.encoded_body_len(body_budget)?;
+        // Bodies beyond the Remaining Length ceiling (§2.1.4) cannot be framed at all;
+        // reject before `mqtt_wire_len` / `encode_wire` can truncate the u32 cast.
+        if body_len > MAX_VARIABLE_LENGTH as usize {
+            return Err(EncodeError::InvalidLength);
+        }
         if wire_limit != 0 {
             let wire_size = mqtt_wire_len(body_len);
             if wire_size > wire_limit {
@@ -301,6 +306,25 @@ mod tests {
 
         let mut codec = V5Codec::new(0, wire_len);
         codec.encode(ack, &mut BytesMut::new()).expect("minimal PUBACK fits");
+    }
+
+    /// Control bodies beyond the Remaining Length ceiling (§2.1.4) are rejected before
+    /// any header byte is written; previously `write_variable_length` failed only after
+    /// the packet type byte, leaving a partial frame in the write buffer.
+    #[test]
+    fn encode_control_rejects_body_beyond_remaining_length_ceiling() {
+        use bytes::Bytes;
+        // `vec![0; n]` is lazily zero-mapped; the rejected encode never touches the pages.
+        let connect = Packet::Connect(Box::new(Connect {
+            client_id: ByteString::from_static("id"),
+            password: Some(Bytes::from(vec![0u8; MAX_VARIABLE_LENGTH as usize])),
+            ..Default::default()
+        }));
+        let mut codec = V5Codec::default();
+        let mut buf = BytesMut::new();
+        let err = codec.encode(connect, &mut buf).expect_err("oversize body");
+        assert!(matches!(err, EncodeError::InvalidLength), "got {err:?}");
+        assert!(buf.is_empty(), "rejected encode must not leave partial bytes");
     }
 
     #[test]

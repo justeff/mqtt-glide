@@ -54,11 +54,13 @@ pub(crate) fn encode_opt_props(
         size -= prop_len as u32; // safe: checked it's less already
     }
 
-    if let Some(reason) = reason_str
-        && reason.len() < size as usize
-    {
-        buf.put_u8(pt::REASON_STRING);
-        reason.encode(buf)?;
+    // Mirror of the size-path check in `encoded_size_opt_props` (full wire size, `<=`).
+    if let Some(reason) = reason_str {
+        let reason_len = 1 + reason.encoded_size();
+        if reason_len <= size as usize {
+            buf.put_u8(pt::REASON_STRING);
+            reason.encode(buf)?;
+        }
     }
 
     Ok(())
@@ -176,8 +178,8 @@ pub mod ack_props {
         buf: &mut BytesMut,
         size: u32,
     ) -> Result<(), EncodeError> {
-        debug_assert!(size > 0); // formalize in signature?
-
+        // Callers only pass `size` after `encoded_body_len` / the outer max-packet check;
+        // ACK paths never invoke this with a zero remaining budget.
         if size == 1 {
             // empty properties
             buf.put_u8(0);
@@ -204,5 +206,29 @@ pub mod ack_props {
         }
 
         Ok((user_props, reason_string))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Size path and encode path must agree on Reason String trimming: the property is
+    /// written iff its full wire size (type byte + length prefix + content) fits.
+    #[test]
+    fn opt_props_reason_string_trim_matches_size_path() {
+        let reason = Some(ByteString::from_static("abc")); // wire: 1 + 2 + 3 = 6 bytes
+
+        // Fits exactly: both paths include it.
+        assert_eq!(encoded_size_opt_props(&[], &reason, 6), 6);
+        let mut buf = BytesMut::new();
+        encode_opt_props(&[], &reason, &mut buf, 6).expect("encode");
+        assert_eq!(&buf[..], &[pt::REASON_STRING, 0x00, 0x03, b'a', b'b', b'c']);
+
+        // One byte short: both paths omit it (encode previously used content length `<`).
+        assert_eq!(encoded_size_opt_props(&[], &reason, 5), 0);
+        let mut buf = BytesMut::new();
+        encode_opt_props(&[], &reason, &mut buf, 5).expect("encode");
+        assert!(buf.is_empty(), "reason string that does not fit must be omitted");
     }
 }

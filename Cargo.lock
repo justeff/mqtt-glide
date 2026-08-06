@@ -1310,6 +1310,7 @@ dependencies = [
  "flume",
  "futures-util",
  "libc",
+ "memchr",
  "mqtt5",
  "nonzero_ext",
  "proptest",
