@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: aws-lc (default)
+            args: ""
+          - name: ring
+            args: --no-default-features --features tls-rustls-ring
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-${{ matrix.name }}
+      - name: clippy (${{ matrix.name }})
+        run: cargo clippy --all-targets ${{ matrix.args }} -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: aws-lc (default)
+            args: ""
+          - name: ring
+            args: --no-default-features --features tls-rustls-ring
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.name }}
+      - name: lib (${{ matrix.name }})
+        run: cargo test --lib ${{ matrix.args }}
+      - name: connection (${{ matrix.name }})
+        run: cargo test --test connection ${{ matrix.args }}
+      - name: brokers (${{ matrix.name }})
+        run: cargo test --test brokers ${{ matrix.args }}
+
+  doc:
+    name: doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: doc
+      - name: cargo doc
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: check default TLS
+        run: cargo check --lib
+      - name: check ring TLS
+        run: cargo check --lib --no-default-features --features tls-rustls-ring
+
+  # Informational until the next crates.io release absorbs intentional Unreleased breakages.
+  semver-checks:
+    name: cargo-semver-checks
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: semver
+      - uses: obi1kenobi/cargo-semver-checks-action@v2

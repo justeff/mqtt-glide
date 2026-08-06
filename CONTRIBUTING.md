@@ -5,23 +5,34 @@ Thanks for contributing to **mqtt-glide**.
 ## Development
 
 ```shell
-cargo test --lib
-cargo clippy -- -D warnings
 cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --lib
+cargo doc --no-deps
 ```
+
+`RUSTDOCFLAGS='-D warnings' cargo doc --no-deps` matches CI.
 
 TLS features are mutually exclusive. To verify both providers:
 
 ```shell
 cargo test --lib
 cargo test --no-default-features --features tls-rustls-ring --lib
+cargo clippy --all-targets --no-default-features --features tls-rustls-ring -- -D warnings
 ```
 
-Broker integration tests need Docker or Podman:
+Broker integration tests need Docker or Podman (skipped cleanly when unavailable):
 
 ```shell
 cargo test --test brokers
 cargo test --test connection
+```
+
+MSRV is `rust-version` in `Cargo.toml` (currently 1.88). GitHub Actions runs the same checks on push/PR (see `.github/workflows/ci.yml`). Optional local API-surface check against the last crates.io release:
+
+```shell
+cargo install cargo-semver-checks --locked
+cargo semver-checks
 ```
 
 Public API and product scope: [`README.md`](README.md). MUST tracker: [`tests/conformance/checklist.md`](tests/conformance/checklist.md).
