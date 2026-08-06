@@ -5,7 +5,7 @@
 pub enum ConnectionState {
     /// A connect attempt is in progress.
     Connecting,
-    /// Session is active after a successful (stub) connect.
+    /// Session is active after a successful connect.
     Connected,
     /// Graceful shutdown in progress.
     Draining,

@@ -59,21 +59,20 @@ where
     let ack = read_connack(&mut framed_read, deadline, options.connect_timeout).await?;
     match apply_connack(options.keep_alive, &ack) {
         Ok(session) => {
-            apply_session_limits_to_codecs(&mut framed_read, &mut framed_write, &session);
+            apply_session_limits_to_codecs(&mut framed_write, &session);
             Ok((framed_read, framed_write, session))
         }
         Err(outcome) => Err(on_auth_failure(credentials, outcome).await),
     }
 }
 
-/// Applies broker Maximum Packet Size from CONNACK onto both framed codecs (0 = unlimited).
-fn apply_session_limits_to_codecs<R, W>(
-    framed_read: &mut FramedRead<R, V5Codec>,
-    framed_write: &mut FramedWrite<W, V5Codec>,
-    session: &SessionParams,
-) {
+/// Applies the broker Maximum Packet Size from CONNACK to the **outbound** encoder only.
+///
+/// The broker's limit constrains client→server packets ([MQTT-3.2.2-15]). Inbound stays
+/// unbounded: this client never advertises its own Maximum Packet Size in CONNECT, so the
+/// broker has no client-side limit to respect ([MQTT-3.1.2-24]).
+fn apply_session_limits_to_codecs<W>(framed_write: &mut FramedWrite<W, V5Codec>, session: &SessionParams) {
     if let Some(max_packet_size) = session.max_packet_size {
-        framed_read.decoder_mut().set_max_inbound_size(max_packet_size);
         framed_write.encoder_mut().set_max_outbound_size(max_packet_size);
     }
 }
@@ -425,7 +424,7 @@ mod tests {
         let _server = accept.await.expect("join accept");
 
         let (read_half, write_half) = client.into_split();
-        let mut framed_read = FramedRead::new(read_half, V5Codec::with_max_packet_size(0));
+        let framed_read = FramedRead::new(read_half, V5Codec::with_max_packet_size(0));
         let mut framed_write = FramedWrite::new(write_half, V5Codec::with_max_packet_size(0));
 
         let ack = ConnectAck {
@@ -433,9 +432,11 @@ mod tests {
             ..Default::default()
         };
         let session = apply_connack(Duration::from_secs(60), &ack).expect("success");
-        apply_session_limits_to_codecs(&mut framed_read, &mut framed_write, &session);
+        apply_session_limits_to_codecs(&mut framed_write, &session);
 
-        assert_eq!(framed_read.decoder().max_inbound_size(), 1024);
+        // Outbound capped ([MQTT-3.2.2-15]); inbound stays unbounded — the client never
+        // advertises its own Maximum Packet Size in CONNECT ([MQTT-3.1.2-24]).
         assert_eq!(framed_write.encoder().max_outbound_size(), 1024);
+        assert_eq!(framed_read.decoder().max_inbound_size(), 0);
     }
 }

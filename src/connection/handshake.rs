@@ -29,6 +29,9 @@ pub struct SessionParams {
     pub retain_available: bool,
     /// Server Receive Maximum from CONNACK (outbound QoS-1 window).
     pub server_receive_maximum: NonZeroU16,
+    /// Session Present flag from CONNACK (§3.2.2.1.1): `true` when the broker resumed a
+    /// stored session. Drives resubscribe for `clean_start = false` connections.
+    pub session_present: bool,
 }
 
 /// Whether the connector must negotiate TLS with system roots.
@@ -135,6 +138,7 @@ pub(crate) fn apply_connack(client_keep_alive: Duration, ack: &ConnectAck) -> Re
         max_qos: ack.max_qos,
         retain_available: ack.retain_available,
         server_receive_maximum: ack.receive_max,
+        session_present: ack.session_present,
     })
 }
 

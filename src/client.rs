@@ -4,7 +4,7 @@
 //! Publish: QoS 0 fire-and-forget; QoS 1 awaits PUBACK.
 //! Prefer [`MqttClient::publish_with`] for the fluent builder, [`MqttClient::publish_window`] for
 //! pipelined sliding-window publish, or [`MqttClient::publish`] with a ready
-//! [`PublishMessage`](crate::PublishMessage).
+//! [`PublishMessage`].
 //!
 //! For a higher-level entry point that applies defaults and connects (spawns the driver), see
 //! [`ClientBuilder`].
@@ -240,8 +240,10 @@ impl SharedCredentials {
 ///
 /// # Drop behavior
 ///
-/// Dropping this handle without waiting does not cancel the already-enqueued PUBLISH.
-/// For QoS 1, the driver-side waiter remains until PUBACK or session teardown, matching
+/// Dropping this handle without waiting means the publish result is discarded. A PUBLISH
+/// still queued on the command channel at that point may be skipped without a packet id
+/// being allocated; once the write task has encoded the frame, the publish proceeds —
+/// for QoS 1 the driver-side waiter remains until PUBACK or session teardown, matching
 /// the behavior of dropping a [`MqttClient::publish`] future while it awaits completion.
 /// The acknowledgement timeout starts only when [`Self::wait`] is polled.
 #[derive(Debug)]
@@ -361,7 +363,7 @@ impl MqttClient {
     /// required before [`.send`](PublishWith::send) / `.await` (type-state). See [`PublishWith`].
     ///
     /// Prefer [`.send()`](PublishWith::send).await; bare `.await` boxes via
-    /// [`IntoFuture`](std::future::IntoFuture).
+    /// [`IntoFuture`].
     ///
     /// # Examples
     ///
@@ -468,6 +470,10 @@ impl MqttClient {
     ///
     /// Awaits a matching SUBACK until [`ConnectOptions::ack_timeout`] elapses, then
     /// returns [`AppError::SubscribeAckTimeout`].
+    ///
+    /// On timeout the broker may still apply the subscription; a late SUBACK is then
+    /// still recorded in the resubscribe registry (the packet id stays allocated until
+    /// the ack, §2.2.1). Treat a timeout as "unknown outcome", not as "failed".
     pub async fn subscribe(
         &self,
         filters: impl IntoIterator<Item = impl Into<Subscription>>,
@@ -494,6 +500,9 @@ impl MqttClient {
     ///
     /// Awaits a matching UNSUBACK until [`ConnectOptions::ack_timeout`] elapses, then
     /// returns [`AppError::UnsubscribeAckTimeout`].
+    ///
+    /// On timeout the broker may still apply the removal; a late UNSUBACK is then still
+    /// recorded in the resubscribe registry. Treat a timeout as "unknown outcome".
     pub async fn unsubscribe(
         &self,
         filters: impl IntoIterator<Item = impl Into<ByteString>>,
@@ -627,6 +636,18 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
     if inbound.is_closed() {
         return Err(ConnectError::Application(AppError::InboundSinkClosed));
     }
+    // [MQTT-3.1.3-7]: Clean Start = 0 with a Zero-length ClientID is a Protocol Error.
+    if !options.clean_start {
+        let empty_id = options
+            .client_id
+            .as_ref()
+            .is_none_or(|client_id| client_id.as_str().is_empty());
+        if empty_id {
+            return Err(ConnectError::Application(AppError::InvalidRequest(
+                "clean_start = false requires a non-empty client_id ([MQTT-3.1.3-7])".into(),
+            )));
+        }
+    }
     if let Some(will) = options.will_message.as_ref() {
         crate::connection::validate_will_message(will)?;
     }
@@ -736,6 +757,16 @@ mod tests {
         let (tx, _rx) = flume::bounded(1);
         let err = connect(options, AnonymousCredentials, NoReconnect, tx, NoopLifecycle)
             .expect_err("wildcard will topic must fail before dial");
+        assert!(matches!(err, ConnectError::Application(AppError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn connect_rejects_clean_start_false_without_client_id() {
+        let url = BrokerUrl::parse("mqtt://127.0.0.1:9").expect("url");
+        let options = ConnectOptions::new(url).clean_start(false);
+        let (tx, _rx) = flume::bounded(1);
+        let err = connect(options, AnonymousCredentials, NoReconnect, tx, NoopLifecycle)
+            .expect_err("empty client id with clean_start=false");
         assert!(matches!(err, ConnectError::Application(AppError::InvalidRequest(_))));
     }
 
