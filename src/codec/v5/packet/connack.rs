@@ -95,28 +95,51 @@ impl Default for ConnectAck {
 /// CONNACK reason codes (§3.2.2.2). Unlisted wire values decode as [`Unknown`](ConnectAckReason::Unknown).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectAckReason {
+    /// 0x00: the connection is accepted.
     Success,
+    /// 0x80: the broker does not say why it refused.
     UnspecifiedError,
+    /// 0x81: the CONNECT could not be parsed.
     MalformedPacket,
+    /// 0x82: the CONNECT violated the protocol.
     ProtocolError,
+    /// 0x83: valid CONNECT, refused by the broker implementation.
     ImplementationSpecificError,
+    /// 0x84: the broker does not support the requested MQTT version.
     UnsupportedProtocolVersion,
+    /// 0x85: the Client Identifier is valid UTF-8 but not accepted by the broker.
     ClientIdentifierNotValid,
+    /// 0x86: the user name or password is not accepted.
     BadUserNameOrPassword,
+    /// 0x87: the client is not authorized to connect.
     NotAuthorized,
+    /// 0x88: the MQTT service is not available.
     ServerUnavailable,
+    /// 0x89: the broker is busy; try again later.
     ServerBusy,
+    /// 0x8A: the client is banned.
     Banned,
+    /// 0x8C: the Authentication Method is not supported or does not match the one in use.
     BadAuthenticationMethod,
+    /// 0x90: the Will Topic Name is well formed but not accepted.
     TopicNameInvalid,
+    /// 0x95: the CONNECT exceeds the broker's maximum packet size.
     PacketTooLarge,
+    /// 0x97: an implementation or administrative limit was exceeded.
     QuotaExceeded,
+    /// 0x99: the Will payload does not match its Payload Format Indicator.
     PayloadFormatInvalid,
+    /// 0x9A: the broker does not support retained messages, but Will Retain was set.
     RetainNotSupported,
+    /// 0x9B: the broker does not support the Will QoS.
     QosNotSupported,
+    /// 0x9C: connect to another broker (see the Server Reference).
     UseAnotherServer,
+    /// 0x9D: the broker has moved for good (see the Server Reference).
     ServerMoved,
+    /// 0x9F: the connection rate limit was exceeded.
     ConnectionRateExceeded,
+    /// A reason code this client does not know, as received.
     Unknown(u8),
 }
 

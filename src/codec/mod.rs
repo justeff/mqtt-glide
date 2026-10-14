@@ -2,8 +2,9 @@
 //!
 //! # Free functions vs methods
 //!
-//! Decode/encode that a type owns use associated methods (`Connect::decode`,
-//! `PublishPacket::decode`, `V5Codec::encode_packet` / `V5Codec::decode_frame`).
+//! Control packets go through [`V5Codec`]: `V5Codec::encode_packet` for a [`Packet`] and
+//! `V5Codec::decode_frame` for any inbound frame (the per-packet `decode` functions are
+//! crate-private).
 //!
 //! [`encode_publish`] and [`ensure_publish_wire_fits`] stay free: the hot-path
 //! inputs are [`PublishMessage`] + [`PublishDelivery`] + a buffer (or size check),
@@ -18,6 +19,8 @@ pub mod publish;
 pub mod types;
 pub mod v5;
 
+/// Default Maximum Packet Size (1 MiB) the client advertises in CONNECT and enforces on inbound
+/// packets; see `ConnectOptions::max_packet_size`.
 pub const DEFAULT_MAX_PACKET_SIZE: u32 = 1024 * 1024;
 
 pub use error::{DecodeError, EncodeError};

@@ -20,15 +20,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = ClientBuilder::new(&broker)?.inbound_sink(tx).connect().await?;
 
     let filter = "demo/glide/subscribe";
-    let reasons = client
+    let response = client
         .subscribe([
             // Tuple form still works; Subscription adds No Local / retain options.
             Subscription::new(filter, QoS::AtLeastOnce).retain_as_published(true),
             Subscription::new("demo/glide/cmd", QoS::AtLeastOnce).no_local(true),
         ])
         .await?;
-    // Per-filter SUBACK reason codes — never collapsed to a bool.
-    println!("SUBACK: {reasons:?}");
+    // Per-filter SUBACK reason codes (the response also carries the broker's Reason String and
+    // User Properties) — never collapsed to a bool.
+    println!("SUBACK: {:?}", response.as_slice());
 
     // Self-publish so the example works without an external publisher.
     client.publish(filter, "ping").qos(QoS::AtLeastOnce).send().await?;

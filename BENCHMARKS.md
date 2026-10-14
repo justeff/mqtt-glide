@@ -139,6 +139,21 @@ Facts read off the tables below, on this host and pinning only.
 - `outbound_rate`: all clients keep up with 10k and 50k msg/s offered; the differences are CPU/msg and the tail (p99.9), not throughput.
 - Ingress load on Mosquitto is about 153-155k msg/s for every client, which is the broker/publisher pace, not a client limit.
 
+## Cost of the `stats` feature
+
+The `stats` feature counts events on the connection tasks (see [Metrics](README.md#metrics) in the README). To see what that costs, the same code was run with the feature off and on, interleaved, 3 rounds each. Only glide was run: tuned Mosquitto for the outbound cells, the mock broker for ingress. Hardware, pinning and payload are as described under [Setup](#setup).
+
+| Cell | off msg/s | on msg/s | Δ | off ns/msg | on ns/msg | Δ |
+|---|---:|---:|---:|---:|---:|---:|
+| `ingress_load`, QoS 0 | 373.6k | 374.4k | +0.2% | 2292 | 2366 | +3.2% |
+| `ingress_load`, QoS 1 `after_enqueue` | 232.7k | 233.8k | +0.5% | 2241 | 2262 | +0.9% |
+| `outbound_concurrent`, 512 callers, QoS 1 | 328.0k | 331.6k | +1.1% | 3200 | 3230 | +0.9% |
+| `outbound_concurrent`, 64 callers, QoS 1 | 313.0k | 311.7k | -0.4% | 3312 | 3365 | +1.6% |
+| `outbound_concurrent`, 8 callers, QoS 1 | 170.0k | 169.8k | -0.1% | 4200 | 4246 | +1.1% |
+| `outbound_pipelined`, QoS 1 | 305.7k | 318.8k | +4.3% | 3639 | 3582 | -1.6% |
+
+`ns/msg` is client CPU time per message. Throughput is unchanged: the differences go both ways, and the largest (+4.3%, pipelined, in favour of the feature being on) is not a speedup the counters can cause. CPU per message is within about 2% in every cell but one (`ingress_load` at QoS 0, +3.2%), mostly slightly higher with the feature on. The spread from round to round is of the same size, so these runs cannot resolve a cost smaller than that.
+
 <!-- benchmarks:generated:start -->
 
 ## Headline: QoS 1, 256 B, tuned Mosquitto

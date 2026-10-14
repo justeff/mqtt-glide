@@ -20,8 +20,8 @@ pub struct ClientId(String);
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum ClientIdError {
-    /// Empty Client Identifier. Use `ConnectOptions::client_id(None)` (or leave unset) when
-    /// the broker should assign an ID under `clean_start = true` ([MQTT-3.1.3-6]).
+    /// Empty Client Identifier. Leave `client_id` unset when the broker should
+    /// assign an ID under `clean_start = true` ([MQTT-3.1.3-6]).
     #[error("client ID must not be empty")]
     Empty,
     /// Client Identifier longer than 65535 UTF-8 bytes (MQTT UTF-8 string limit).

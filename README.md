@@ -161,13 +161,19 @@ When a full application queue blocks the same loop that sends `PINGREQ`, a slow 
 
 No MQTT 3.1.1 and no QoS 2: both are out of scope, not pending. If you need either, rumqttc remains the better fit. Unacknowledged QoS 1 publishes are kept in memory only: they are resent after a reconnect into a resumed session (see [No session](#no-session)), but not after a process restart. Cross-process session resume needs a stable client ID (`.client_id("…")?` or `ClientId::try_new`) plus `clean_start(false)` and a non-zero `session_expiry`. rumqttc is also the far more widely deployed crate; this one is 0.2.x, and the API can still move.
 
+## Upgrading from 0.2
+
+The biggest changes: a new publish API (`client.publish(topic, payload).qos(..)`, and an owned `Publish` for `send`), inbound messages delivered as `InboundMessage` (with `retain`, `dup` and `qos`), the non-blocking enqueue renamed to `try_start_publish` while `start_publish` now waits for room, and `#[non_exhaustive]` on most public enums and response types, so a `match` on them needs a wildcard arm. The [CHANGELOG](CHANGELOG.md#unreleased) has a migration table from the old calls to the new ones.
+
 ## Architecture
 
 `connect()` gives you a handle and starts one driver over a single socket:
 
 1. `MqttClient`: a cheap cloneable handle. It sends commands and does no socket I/O.
 2. Write task: encodes `PUBLISH` / `SUBSCRIBE` / acks / `PINGREQ`, and puts inbound `PUBACK`s ahead of your publishes.
-3. Read task: decodes frames, answers control packets itself, and passes application `PUBLISH` to your sink. Reconnect and credential refresh happen here, not in your code.
+3. Read task: decodes frames, answers control packets itself, and passes application `PUBLISH` to your sink.
+
+The driver around these tasks (`Connection::run`) owns reconnects and credential refresh; neither is your code's job.
 
 ```text
                  +---------------------------+
@@ -202,11 +208,13 @@ The default policy is `NoReconnect`: one connect attempt, and a dropped connecti
 
 ### A new client ID every process (by default)
 
-Without an explicit `client_id`, the builder mints a fresh UUID (`ClientId::from_prefix("glide")`). That ID is reused for reconnects inside the same process. For broker-side session resume across restarts, set a stable ID with `.client_id("my-service")?` (or `ConnectOptions::client_id(ClientId::try_new(...))`) together with `clean_start(false)` and a non-zero `session_expiry`.
+Without an explicit `client_id`, the builder mints a fresh UUID (`ClientId::from_prefix("glide")`). That ID is reused for reconnects inside the same process. For broker-side session resume across restarts, set a stable ID with `.client_id("my-service")?` (or `.client_id(ClientId::try_new("my-service")?)` on `ConnectOptions`) together with `clean_start(false)` and a non-zero `session_expiry`.
 
 ### No session
 
-`clean_start` is `true` and `session_expiry` is unset (property omitted; MQTT default 0 s), so the broker drops your subscriptions and anything queued for you as soon as the connection ends. Resuming within the process needs `clean_start(false)` plus a non-zero `session_expiry`; re-subscribe whenever CONNACK reports `session_present = false`.
+`clean_start` is `true` and `session_expiry` is unset (property omitted; MQTT default 0 s), so the broker drops your subscriptions and anything queued for you as soon as the connection ends. Resuming a session needs `clean_start(false)` plus a non-zero `session_expiry`; re-subscribe whenever CONNACK reports `session_present = false`.
+
+A service restarted with `clean_start(false)`, the same client ID and an unexpired session resumes the session the broker kept for it, and receives what was queued meanwhile. The broker keeps that session's subscriptions as well, including ones the new version no longer wants. A service that changes its subscriptions between versions should unsubscribe the old filters, or connect once with Clean Start to discard the session.
 
 What happens to your publishes when the connection drops and the client reconnects:
 
@@ -236,7 +244,31 @@ A caller that stops waiting earlier (its `ack_timeout` ran out during a long rec
 | `max_packet_size` (inbound) | 1 MiB | you accept larger payloads |
 | `wait_connected` | `true` | you want `connect()` to return before CONNACK |
 
-See [`ConnectOptions`](https://docs.rs/mqtt-glide/latest/mqtt_glide/options/struct.ConnectOptions.html) for the full set.
+On `ClientBuilder` itself only `reconnect`, `client_id` (a string), `credentials`, `lifecycle`, the Will setters and `wait_connected` exist. Every other setting in the table, and the other opt-ins such as `follow_server_redirects` and `http_proxy`, is a field of [`ConnectOptions`](https://docs.rs/mqtt-glide/latest/mqtt_glide/options/struct.ConnectOptions.html) (which lists the full set; `wait_connected` is not among them). Set them through [`ClientBuilder::options`](https://docs.rs/mqtt-glide/latest/mqtt_glide/builder/struct.ClientBuilder.html#method.options), or start from `ClientBuilder::from_options`:
+
+```rust,no_run
+# async fn demo() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+use std::time::Duration;
+
+use mqtt_glide::ClientBuilder;
+
+let client = ClientBuilder::new("mqtt://127.0.0.1:1883")?
+    .client_id("my-service")?
+    .options(|options| {
+        options
+            .clean_start(false)
+            .session_expiry(Some(Duration::from_secs(3600)))
+            .fail_fast_when_disconnected(true)
+            .topic_alias_maximum(16)
+            .follow_server_redirects(true)
+    })
+    .discard_inbound()
+    .connect()
+    .await?;
+# client.shutdown().await?;
+# Ok(())
+# }
+```
 
 ## Flow control
 
@@ -421,7 +453,7 @@ With the `stats` feature, `client.stats()` returns what the connection has done 
 - **Inbound:** publishes per QoS, duplicates, how often and how long the inbound sink was full.
 - **Bytes** in each direction.
 
-The crate does not choose a metrics system for you. Read the snapshot on each scrape (a few dozen atomic loads) and hand the numbers to Prometheus, OpenTelemetry or a log line. Without the feature the counting is compiled out. With it on, each counted event is a plain atomic store on the task that owns the counter; in the [benchmarks](BENCHMARKS.md) that cost about 1% CPU per message and no throughput.
+The crate does not choose a metrics system for you. Read the snapshot on each scrape (a few dozen atomic loads) and hand the numbers to Prometheus, OpenTelemetry or a log line. Without the feature the counting is compiled out. With it on, each counted event is a plain atomic store on the task that owns the counter; in an interleaved on/off comparison, throughput did not change and CPU per message stayed within about 2% in all but one of six cells, at the size of the run-to-run spread ([Cost of the `stats` feature](BENCHMARKS.md#cost-of-the-stats-feature)).
 
 ```toml
 mqtt-glide = { version = "0.3", features = ["stats"] }
@@ -469,7 +501,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | WebSockets | ✅ opt-in | `websocket` feature: `ws://host[:port]/path` / `wss://…` (subprotocol `mqtt`, binary frames, §6). `wss` uses the same rustls setup as `mqtts`. Without the feature such URLs fail to parse |
 | Topic Alias | ✅ opt-in | Inbound: `topic_alias_maximum(n)`, resolved before delivery. Outbound: `outbound_topic_aliases(n)`, capped by the broker's maximum, LRU rebinding. Per connection, reset on reconnect |
 | QoS 2 | ❌ | Rejected at the API (no 4-way handshake / store-and-forward) |
-| Persistent sessions / DUP redelivery | ✅ in process | Resumed sessions resend unacknowledged QoS 1 with `DUP` and original ids ([MQTT-4.4.0-1]); state is in memory, not persisted across restarts. Needs a stable client ID (`.client_id("…")?` / `ClientId::try_new`; `ClientId::from_prefix` always mints a fresh UUID), `clean_start(false)` and a non-zero `session_expiry` |
+| Persistent sessions / DUP redelivery | ✅ in process | Resumed sessions resend unacknowledged QoS 1 with `DUP` and original ids ([MQTT-4.4.0-1]); state is in memory, not persisted across restarts. Needs a stable client ID (`.client_id("…")?` / `ClientId::try_new`; `ClientId::from_prefix` always mints a fresh UUID), `clean_start(false)` and a non-zero `session_expiry`. A restarted process resumes the broker's session (queued messages arrive, old subscriptions stay); the old process's unacknowledged publishes are gone |
 
 Broker-dependent: Message Expiry *drop after interval* (property round-trip is tested), shared-sub rebalancing under handoff stall, redelivery after unclean disconnect (client guarantees enqueue-before-ack only).
 
@@ -485,7 +517,7 @@ Headline at 256 B, QoS 1, tuned Mosquitto `2.1.2-alpine`, median of 5 runs, 50 0
 | 512 callers sharing one client | **316 591** · **3 430** | 220 438 · 4 540 | 215 616 · 6 810 |
 | Pipelined, window 64 | **298 327** · **3 691** | 216 274 · 4 527 | 180 156 · 8 513 |
 
-These are absolute numbers on one host and broker setup, not paired comparisons. Against a stock-limit Mosquitto (Receive Maximum 20) glide and mqtt5 lose throughput at high concurrency, and peers lead some cells (for example idle QoS 0 outbound latency and QoS 0 ingress load on the mock broker, and mqtt5's idle QoS 1 latency on tuned Mosquitto). rumqttc is pinned to 0.33.3 because 0.34.0 scans its whole outgoing table on every flush; against a broker without a Receive Maximum that table has 65 535 slots and throughput falls to a few thousand msg/s. Per-publish p50/p99/p99.9 latency, a task-per-message burst, fixed-rate load, ingress, and the pinning and fairness details are in [`BENCHMARKS.md`](BENCHMARKS.md). Wire-only `encode_publish` costs about 27 ns/msg (`codec_throughput`).
+These are absolute numbers on one host and broker setup, not paired comparisons. Against a stock-limit Mosquitto (Receive Maximum 20) glide and mqtt5 lose throughput at high concurrency, and peers lead some cells (for example idle QoS 0 outbound latency and QoS 0 ingress load on the mock broker, and mqtt5's idle QoS 1 latency on tuned Mosquitto). rumqttc is pinned to 0.33.3 because 0.34.0 scans its whole outgoing table on every flush; against a broker without a Receive Maximum that table has 65 535 slots and throughput falls to a few thousand msg/s. Per-publish p50/p99/p99.9 latency, a task-per-message burst, fixed-rate load, ingress, and the pinning and fairness details are in [`BENCHMARKS.md`](BENCHMARKS.md). The wire codec alone, without broker or client, is measured by `cargo bench --bench codec_throughput` ([`benches/README.md`](benches/README.md)).
 
 Throughput knobs live under [Flow control](#flow-control); the `MQTT_COMPARE_*` variables configure the bench harness and have no effect on the library.
 

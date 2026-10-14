@@ -38,35 +38,65 @@ pub trait ToReasonCode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DisconnectReasonCode {
+    /// Close the connection normally; the Will Message is not published.
     NormalDisconnection = 0,
+    /// Close the connection, but publish the Will Message.
     DisconnectWithWillMessage = 4,
+    /// The sender does not say why.
     UnspecifiedError = 128,
+    /// The received packet could not be parsed.
     MalformedPacket = 129,
+    /// The received packet was valid but violated the protocol.
     ProtocolError = 130,
+    /// Valid packet, refused by the implementation.
     ImplementationSpecificError = 131,
+    /// The request is not authorized.
     NotAuthorized = 135,
+    /// The broker is busy; try again later.
     ServerBusy = 137,
+    /// The broker is shutting down.
     ServerShuttingDown = 139,
+    /// The Authentication Method is not supported or does not match the one in use.
     BadAuthenticationMethod = 140,
+    /// No packet arrived within 1.5 times the Keep Alive.
     KeepAliveTimeout = 141,
+    /// Another connection with the same Client Identifier took over the session.
     SessionTakenOver = 142,
+    /// A Topic Filter is well formed but not accepted.
     TopicFilterInvalid = 143,
+    /// A Topic Name is well formed but not accepted.
     TopicNameInvalid = 144,
+    /// The peer sent more unacknowledged QoS 1 publishes than Receive Maximum allows.
     ReceiveMaximumExceeded = 147,
+    /// A Topic Alias is not valid (zero, or above the Topic Alias Maximum).
     TopicAliasInvalid = 148,
+    /// The packet exceeds the maximum packet size.
     PacketTooLarge = 149,
+    /// The message rate is too high.
     MessageRateTooHigh = 150,
+    /// An implementation or administrative limit was exceeded.
     QuotaExceeded = 151,
+    /// The connection is closed by administrative action.
     AdministrativeAction = 152,
+    /// The payload does not match its Payload Format Indicator.
     PayloadFormatInvalid = 153,
+    /// The broker does not support retained messages.
     RetainNotSupported = 154,
+    /// The broker does not support the requested QoS.
     QosNotSupported = 155,
+    /// Connect to another broker (see the Server Reference).
     UseAnotherServer = 156,
+    /// The broker has moved for good (see the Server Reference).
     ServerMoved = 157,
+    /// The broker does not support shared subscriptions.
     SharedSubscriptionNotSupported = 158,
+    /// The connection rate limit was exceeded.
     ConnectionRateExceeded = 159,
+    /// The maximum connection time authorized for this connection was exceeded.
     MaximumConnectTime = 160,
+    /// The broker does not support Subscription Identifiers.
     SubscriptionIdentifiersNotSupported = 161,
+    /// The broker does not support wildcard subscriptions.
     WildcardSubscriptionsNotSupported = 162,
 }
 

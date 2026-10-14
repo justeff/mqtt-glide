@@ -15,7 +15,9 @@ use crate::util::{BrokerUrl, ClientId, HttpProxy};
 /// App → write-task admission queue (not PUBACK inflight). Sized for typical
 /// single-flight / low-concurrency callers. Raise explicitly when keeping many
 /// concurrent `publish().await` (or queued commands) in flight — otherwise the
-/// queue fills and callers see [`crate::AppError::Backpressure`].
+/// queue fills: awaited calls wait up to [`ConnectOptions::ack_timeout`] for room
+/// and then fail with [`crate::AppError::Backpressure`], while
+/// [`crate::MqttClient::try_start_publish`] fails at once.
 ///
 /// Used as [`ConnectOptions::command_channel_capacity`] when not overridden.
 pub const COMMAND_CHANNEL_CAPACITY: usize = 32;
@@ -297,7 +299,12 @@ impl ConnectOptions {
         self
     }
 
-    /// Sets the graceful-disconnect flush budget (default: [`DEFAULT_GRACEFUL_DISCONNECT_TIMEOUT`]).
+    /// Sets the budget for the [`crate::MqttClient::shutdown`] drain (default:
+    /// [`DEFAULT_GRACEFUL_DISCONNECT_TIMEOUT`]).
+    ///
+    /// The drain sends the queued commands, waits for the `PUBACK`s of outbound QoS 1
+    /// publishes, then sends `DISCONNECT`; what is still unacknowledged when the budget
+    /// runs out fails with [`crate::AppError::ConnectionLost`].
     pub fn graceful_disconnect_timeout(mut self, graceful_disconnect_timeout: Duration) -> Self {
         self.graceful_disconnect_timeout = graceful_disconnect_timeout;
         self

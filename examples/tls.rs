@@ -1,7 +1,8 @@
 //! TLS connect via `mqtts://` (rustls + OS trust store / [`TlsConfig::SystemRoots`](mqtt_glide::TlsConfig::SystemRoots)).
 //!
-//! Raise `connect_timeout` for slower TLS dials; `ack_timeout` is shown at the default (5s) and
-//! covers PUBACK / SUBACK / UNSUBACK only — not app-level channel waits.
+//! Raise `connect_timeout` for slower TLS dials; `ack_timeout` is shown at the default (5s). It
+//! bounds the wait for PUBACK / SUBACK / UNSUBACK and for room in the command channel, not
+//! waits on your own channels.
 //!
 //! The broker certificate **MUST** chain to the OS trust store. A local Mosquitto with a
 //! self-signed (or private-CA) cert will fail unless that CA is trusted by the OS. On

@@ -20,6 +20,13 @@
 //! Downstream crates should pin explicitly, e.g.
 //! `mqtt-glide = { ..., default-features = false, features = ["tls-rustls-aws-lc"] }`.
 //!
+//! # Other features
+//!
+//! - `websocket`: `ws://` / `wss://` broker URLs (MQTT over WebSocket).
+//! - `testing`: the in-process `testing::TestBroker` and `testing::FaultProxy` for tests of
+//!   applications; meant for `[dev-dependencies]`.
+//! - `stats`: `MqttClient::stats` returns counters of what the connection did.
+//!
 //! Crate overview: see the [repository README](https://github.com/justeff/mqtt-glide).
 //! Spec coverage: `CONFORMANCE.md` in the repository.
 

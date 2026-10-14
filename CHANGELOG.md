@@ -28,17 +28,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `shutdown()` drains before it disconnects, bounded by `graceful_disconnect_timeout`: commands already queued are sent, outbound QoS 1 publishes get their `PUBACK`s instead of failing at once, and the read task keeps delivering and acknowledging inbound messages meanwhile, so they are no longer dropped with the socket buffer. Only what is still unacknowledged when the budget runs out fails with `AppError::ConnectionLost`. Every command issued after `shutdown()` fails with the new `AppError::ShuttingDown`
 - `AppError` is `#[non_exhaustive]`, and so are `SessionPhase`, `ConnectionOutcome`, `ConnectError`, `AuthError`, `TransportError`, `ProtocolError`, `ShutdownError`, `ShareNameError`, `TlsConfig`, `DecodeError`, `EncodeError`, `PublishRejection`, `SubscribeResponse` and `UnsubscribeResponse`: a `match` on them needs a wildcard arm, and the structs are only built by the client. New variants and fields are then no longer breaking changes
 - `ConnectOptions` can no longer be written as a struct literal (it gained a private field when the bench-only `bench_inbound_publish_ack_counter` hook left the public API); build it with `ConnectOptions::new(url)` and its setters
+- `PublishPacket` gained the public field `subscription_ids`, so a struct literal needs it
 - `InboundSinkClosed` and `InboundTrySendError` implement `Display` and `std::error::Error`; `ClientBuilder` and `OnInboundSink` implement `Debug`
 
 - Removed from the public API: `Connection::state` / `Connection::generation` (`run` consumes the `Connection`, so they could only ever report the initial state) together with the `ConnectionState` / `Generation` re-exports, and the test-only `TlsMode` / `resolve_tls_mode`. Observe the session through `SessionPhase`, a `LifecycleHook` or `MqttClient::is_connected`
 
 - Wire-level codec items are no longer re-exported at the crate root: `Connect`, `ConnectAck`, `Disconnect`, `Packet`, `DecodedFrame`, `V5Codec`, `PublishPacket`, `PublishPacketMeta`, `PublishDelivery`, `PublishAck`, `Subscribe`, `SubscribeAck`, `Unsubscribe`, `UnsubscribeAck`, `DecodeError`, `EncodeError`, `RECEIVE_MAX_DEFAULT`, `encode_publish`, `ensure_publish_wire_fits`. Import them from `mqtt_glide::codec`. Message, option and reason-code types stay at the root
 
-- Inbound messages are delivered as the new `InboundMessage` (topic, payload, properties plus `retain`, `dup`, `qos`) instead of `PublishMessage`, so applications can tell retained messages from live ones and see redeliveries. `InboundSink`, `on_inbound` and the inbound channel types change accordingly (`flume::Sender<InboundMessage>`, `tokio::sync::mpsc::Sender<InboundMessage>`); field access (`msg.topic`, `msg.payload`) is unchanged. `Publish::from(InboundMessage)` republishes one
+- Inbound messages are delivered as the new `InboundMessage` (topic, payload, properties plus `retain`, `dup`, `qos`) instead of `PublishMessage`, so applications can tell retained messages from live ones and see redeliveries. `InboundSink`, `on_inbound` and the inbound channel types change accordingly (`flume::Sender<InboundMessage>`, `tokio::sync::mpsc::Sender<InboundMessage>`); field access (`msg.topic`, `msg.payload`) is unchanged. `Publish::from(InboundMessage)` republishes one. `InboundSink::try_send` / `send` take an `InboundMessage`, `InboundTrySendError::{Full, Closed}` carry one, and the default type parameter of `Connection<H>` is `flume::Sender<InboundMessage>`
 
 - Requests that were waiting when the connection broke (QoS 1 publishes in flight or parked, subscribe / unsubscribe awaiting their ack) now always fail with `AppError::ConnectionLost`. Before, a write-side failure reported `SendFailed` and a read-side one `ConnectionLost` for the same situation, depending on which side noticed first. `SendFailed` remains for the one command whose own write failed
 
-- Broker diagnostics are passed through instead of dropped: `AppError::PublishRejected` now carries a `PublishRejection` (PUBACK reason code, Reason String, User Properties) instead of a formatted string; `subscribe` / `unsubscribe` return `SubscribeResponse` / `UnsubscribeResponse` (per-filter reason codes plus Reason String and User Properties; they deref to the reason list, compare equal to a `Vec` of reasons and offer `as_slice`, so most callers compile unchanged); the Reason String and Server Reference of a broker DISCONNECT and the Reason String of a refused CONNACK appear in the connection outcome
+- Broker diagnostics are passed through instead of dropped: `AppError::PublishRejected` now carries a `Box<PublishRejection>` (PUBACK reason code, Reason String, User Properties) instead of a formatted string, so a pattern match derefs the box; `subscribe` / `unsubscribe` return `SubscribeResponse` / `UnsubscribeResponse` (per-filter reason codes plus Reason String and User Properties; they deref to the reason list, compare equal to a `Vec` of reasons and offer `as_slice`, so most callers compile unchanged); the Reason String and Server Reference of a broker DISCONNECT and the Reason String of a refused CONNACK appear in the connection outcome
+
+### Changed
+
+- Raised the declared minimum versions of `secrecy` (0.10.1), `thiserror` (2.0.7), `rustls` (0.23.5) and `tracing` (0.1.6) to what actually builds; the old `rustls` floor also admitted releases with a known infinite-loop bug. `tokio-util` no longer needs its `rt` feature. Nothing is capped, so dependents still get newer compatible releases
 
 ### Added
 
@@ -53,7 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `MqttClient::session_phase`: the session-phase watch, now also reachable for clients made with `ClientBuilder` (which only returns the `MqttClient`)
 - `MqttClient::is_connected` and `ConnectOptions::fail_fast_when_disconnected`: with it, publish / subscribe / unsubscribe fail at once with the new `AppError::NotConnected` while no connection is up, instead of queueing for the next connection (the default, still bounded by `ack_timeout`)
 - `Publish` setters for Content Type, Response Topic and Correlation Data; read accessors (`topic`, `payload`, `qos_level`, `is_retained`, `publish_properties`, `into_parts`)
-- `PublishBuilder::start` (enqueue without waiting) and `PublishBuilder::into_publish`
+- `PublishBuilder::start` (enqueue, waiting for room in the command channel), `PublishBuilder::try_start` (without waiting) and `PublishBuilder::into_publish`
+- `InboundMessage::into_message`: topic, payload and properties as a `PublishMessage`
 
 ### Fixed
 
@@ -79,7 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fluent codec helpers: `PublishMessage::new` / `.properties`, `PublishProperties` setters, `Connect::username` / `password`
 - `BrokerUrlError::InvalidHost` for malformed bracketed IPv6 hosts (breaking: enum is now `#[non_exhaustive]`)
 - `AppError::SessionPresentInconsistent` when CONNACK Session Present disagrees with Clean Start / process-local session affinity
-- `ConnectOptions::max_packet_size` (default [`DEFAULT_MAX_PACKET_SIZE`] = 1 MiB) advertised on CONNECT and enforced on the inbound decoder
+- `ConnectOptions::max_packet_size` (default `DEFAULT_MAX_PACKET_SIZE` = 1 MiB) advertised on CONNECT and enforced on the inbound decoder
 
 ### Fixed
 
@@ -90,7 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Packet::encode_wire` rolls back the fixed header when body encoding fails, so a rejected packet leaves no stray header bytes in a batched buffer (same contract as `encode_publish`)
 - Harden ACK property budgeting: no u32 wrap below the header budget, and the Reason String trim check now mirrors the size path
 - `BrokerUrl` parses bracketed IPv6 literals (`mqtt://[::1]:1883`, `mqtts://[2001:db8::1]`)
-- Inbound decoder is no longer capped by the broker's CONNACK `Maximum Packet Size`; that limit constrains client→server packets only ([MQTT-3.2.2-15]). The client advertises its own limit in CONNECT ([MQTT-3.1.2-24]) via `ConnectOptions::max_packet_size` (default [`DEFAULT_MAX_PACKET_SIZE`] = 1 MiB) and enforces it on the inbound decoder
+- Inbound decoder is no longer capped by the broker's CONNACK `Maximum Packet Size`; that limit constrains client→server packets only ([MQTT-3.2.2-15]). The client advertises its own limit in CONNECT ([MQTT-3.1.2-24]) via `ConnectOptions::max_packet_size` (default `DEFAULT_MAX_PACKET_SIZE` = 1 MiB) and enforces it on the inbound decoder
 - Session Present consistency: stop (no reconnect loop) when Clean Start = 1 but Session Present = 1 ([MQTT-3.2.2-2]), or when a resume CONNECT gets Session Present = 1 while this process has no local session affinity ([MQTT-3.2.2-4]); affinity is process-local and independent of an empty subscription registry after unsubscribe-all. `clean_start = false` with `session_present = false` re-SUBSCRIBEs; `SessionParams` exposes `session_present`
 - Auto-resubscribe validates the SUBACK reason-code count against the sent filters ([MQTT-3.8.4-6]); empty or short status lists are protocol violations
 - Command channel stays open while credentials are invalidated on an auth-failure reconnect (invalidation now runs after the channels are replenished, and also when the backoff is cancelled by shutdown)

@@ -1,8 +1,9 @@
 //! Pipelined QoS 1 publish via [`mqtt_glide::PublishWindow`].
 //!
-//! Prefer this when topics/QoS vary or you need per-message fluent builders.
-//! For a same-QoS/retain burst of ready [`PublishMessage`]s, see `publish_batch` in
-//! [`publish.rs`](publish.rs) — less flexible, less boilerplate.
+//! Prefer this when messages are produced over time (a loop, a stream, other work in between)
+//! or the loop needs to react to an error before the burst is over. When you already hold all
+//! the messages, `publish_batch` in [`publish.rs`](publish.rs) is the shorter form: it runs the
+//! same window, and each message carries its own QoS and retain flag in both cases.
 //!
 //! ```shell
 //! MQTT_GLIDE_BROKER=mqtt://127.0.0.1:1883 cargo run --example pipeline

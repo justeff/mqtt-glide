@@ -4,29 +4,60 @@ Thanks for contributing to **mqtt-glide**.
 
 ## Development
 
+These are the checks CI runs (see `.github/workflows/ci.yml`). Never use `--all-features`: the two TLS features are mutually exclusive.
+
 ```shell
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --lib
-cargo doc --no-deps
+cargo clippy --all-targets --features testing -- -D warnings
+cargo clippy --all-targets --features testing,stats,__bench -- -D warnings
+cargo test --lib --features testing,stats
+RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --features websocket,testing,stats
 ```
 
-`RUSTDOCFLAGS='-D warnings' cargo doc --no-deps` matches CI.
+`__bench` is an internal feature for the comparison bench; it is not part of the public API.
 
-TLS features are mutually exclusive. To verify both providers:
+CI repeats clippy and the tests for the second TLS provider and for WebSocket. Locally, for example:
 
 ```shell
-cargo test --lib
-cargo test --no-default-features --features tls-rustls-ring --lib
-cargo clippy --all-targets --no-default-features --features tls-rustls-ring -- -D warnings
+cargo test --lib --no-default-features --features testing,stats,tls-rustls-ring
+cargo clippy --all-targets --no-default-features --features testing,tls-rustls-ring -- -D warnings
+cargo test --lib --features testing,stats,websocket
 ```
 
-Broker integration tests need Docker or Podman (skipped cleanly when unavailable):
+### Integration tests
+
+These need no Docker:
+
+```shell
+cargo test --test connection --test redirect --test proxy --test codec_proptest
+cargo test --test testing --features testing
+cargo test --test stats --features testing,stats
+```
+
+- `connection`, `redirect`, `proxy`: the client against in-process mock brokers and proxies.
+- `codec_proptest`: property tests of the codec.
+- `testing`: the `testing` helpers (`TestBroker`, `FaultProxy`).
+- `stats`: the `stats` counters.
+
+These need Docker or Podman (the tests return early when neither is available):
 
 ```shell
 cargo test --test brokers
-cargo test --test connection
+cargo test --test faults --features testing,stats
 ```
+
+- `brokers`: real brokers (Mosquitto, HiveMQ) in containers; see `tests/brokers/README.md`.
+- `faults`: a real Mosquitto behind `testing::FaultProxy`; needs the `testing` feature.
+
+### Benchmarks
+
+`benches/mqtt_compare.rs` compares mqtt-glide with other clients and needs the internal `__bench` feature:
+
+```shell
+cargo bench --features __bench --bench mqtt_compare
+```
+
+`cargo bench --bench codec_throughput` measures the codec alone. How to run and pin them: [`benches/README.md`](benches/README.md).
 
 MSRV is `rust-version` in `Cargo.toml` (currently 1.88). GitHub Actions runs the same checks on push/PR (see `.github/workflows/ci.yml`). Optional local API-surface check against the last crates.io release:
 
