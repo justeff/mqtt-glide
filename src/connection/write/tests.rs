@@ -313,6 +313,24 @@ fn validate_subscribe_request_rejects_no_local_on_shared_filter() {
     assert!(matches!(err, AppError::InvalidRequest(_)));
 }
 
+/// QoS 2 subscriptions would let the broker deliver QoS 2 PUBLISHes, which the read task
+/// treats as a protocol violation (disconnect, then the registry resubscribes → loop).
+#[test]
+fn validate_subscribe_request_rejects_qos2() {
+    let filters = [
+        (ByteString::from_static("ok/t"), SubscriptionOptions::default()),
+        (
+            ByteString::from_static("q2/t"),
+            SubscriptionOptions {
+                qos: QoS::ExactlyOnce,
+                ..SubscriptionOptions::default()
+            },
+        ),
+    ];
+    let err = validate_subscribe_request(&filters).expect_err("QoS 2 subscription must fail");
+    assert!(matches!(err, AppError::InvalidRequest(_)));
+}
+
 /// [MQTT-4.7.3-1] Topic Filters MUST be at least one character long (subscribe + unsubscribe).
 #[rstest]
 #[case::subscribe(FilterOp::Subscribe)]

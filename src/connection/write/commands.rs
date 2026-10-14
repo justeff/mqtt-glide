@@ -422,6 +422,13 @@ pub(super) fn validate_subscribe_request(filters: &[(ByteString, SubscriptionOpt
                 "topic filter does not meet MQTT topic filter rules".into(),
             ));
         }
+        // The broker delivers at most the granted subscription QoS; inbound QoS 2 is not
+        // supported and would kill the session on the first matching message.
+        if options.qos == QoS::ExactlyOnce {
+            return Err(AppError::InvalidRequest(
+                "QoS 2 subscriptions are not supported (use QoS 0 or 1)".into(),
+            ));
+        }
         if is_shared_subscription_filter(filter) {
             validate_shared_subscription_filter(filter)?;
             if options.no_local {

@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - QoS 1 publishes beyond the broker's CONNACK Receive Maximum now wait for a free slot (FIFO, sent as `PUBACK`s arrive) instead of failing with `AppError::Backpressure("publish inflight at capacity")`. A `publish_window` / `publish_batch` wider than the broker window (e.g. 64 against a default mosquitto, which allows 20) used to fail in `drain()`. SUBSCRIBE / UNSUBSCRIBE still pass parked publishes; a parked publish whose caller gave up (ack timeout / drop) is never sent
+- `subscribe` rejects QoS 2 filters with `AppError::InvalidRequest` before any wire bytes. Inbound QoS 2 is not supported, so a granted QoS 2 subscription disconnected the session on the first matching message, and the resubscribe registry restored it after every reconnect (disconnect loop)
 
 ## [0.2.0] - 2026-08-06
 
