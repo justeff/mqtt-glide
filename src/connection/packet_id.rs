@@ -11,10 +11,40 @@
 //! `slots.len()` live in a small [`HashSet`]. Growing the table migrates any
 //! overlapping `subscribe_high` entries into slots so that invariant stays exact.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::num::NonZeroU16;
 
 use crate::error::AppError;
+
+/// Map keyed by Packet Identifier, for the per-packet waiter tables on the write path.
+pub(crate) type PacketIdMap<V> = HashMap<NonZeroU16, V, BuildHasherDefault<PacketIdHasher>>;
+
+/// Hasher for Packet Identifier keys: small integers this client allocates itself, so the
+/// default SipHash's flooding resistance buys nothing and costs a lookup per PUBACK. A
+/// Fibonacci multiply is a bijection on the low bits (bucket index) and spreads the ids over
+/// the high bits the table's probe tags use.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct PacketIdHasher(u64);
+
+impl Hasher for PacketIdHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write_u16(&mut self, id: u16) {
+        self.0 = u64::from(id).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    /// Only reached if a key type hashes as bytes; never for `NonZeroU16`.
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(byte)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+}
 
 /// Occupancy of one packet-id slot in `1..=publish_capacity` (and retained larger tables).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

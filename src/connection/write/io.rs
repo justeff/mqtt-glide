@@ -18,7 +18,7 @@ use crate::codec::{
 use crate::connection::packet_id::InflightPots;
 use crate::connection::subscriptions::SubscriptionRegistry;
 use crate::connection::{
-    ClientCommand, CommandReceiver, ControlMessage, ControlReceiver, Generation, effective_io_batch,
+    ClientCommand, CommandReceiver, ControlMessage, ControlReceiver, Generation, StopSignal, effective_io_batch,
 };
 use crate::error::{AppError, ProtocolError, TransportError};
 
@@ -33,7 +33,7 @@ use super::{
 pub(super) enum FlushAbort<'a> {
     /// Hot path: race flush with session cancel and app `shutdown_notify`.
     Hot {
-        cancel: &'a CancellationToken,
+        cancel: &'a StopSignal,
         shutdown_notify: &'a CancellationToken,
     },
     /// Graceful DISCONNECT path: do not race already-cancelled tokens; caller bounds with timeout.
@@ -51,7 +51,7 @@ pub(super) struct GracefulDisconnectCtx<'a> {
     pub(super) publish_limits: BrokerPublishLimits,
     pub(super) subscription_registry: &'a Arc<RwLock<SubscriptionRegistry>>,
     pub(super) generation: Generation,
-    pub(super) read_stop: &'a CancellationToken,
+    pub(super) read_stop: &'a StopSignal,
 }
 
 /// Graceful shutdown, bounded by `flush_budget`:
@@ -453,11 +453,14 @@ where
             cancel,
             shutdown_notify,
         } => {
+            // Flush first: it is almost always ready at once, and then the token futures are
+            // never polled (polling one locks the token's mutex). A flush stuck on a full
+            // socket still loses to cancel / shutdown.
             tokio::select! {
                 biased;
+                result = framed.flush() => result.map_err(map_encode_error),
                 _ = shutdown_notify.cancelled() => Err(WriteOutcome::Shutdown),
                 _ = cancel.cancelled() => Err(WriteOutcome::Cancelled),
-                result = framed.flush() => result.map_err(map_encode_error),
             }
         }
         FlushAbort::Graceful => framed.flush().await.map_err(map_encode_error),

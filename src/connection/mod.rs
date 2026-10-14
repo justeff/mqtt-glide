@@ -8,6 +8,7 @@ pub(crate) mod packet_id;
 pub(crate) mod read;
 pub(crate) mod session_policy;
 mod state;
+mod stop;
 pub(crate) mod subscriptions;
 pub(crate) mod topic_alias;
 mod transport;
@@ -48,6 +49,7 @@ pub(crate) use io_batch::effective_io_batch;
 pub use lifecycle::{LifecycleHook, NoopLifecycle, SessionPhase};
 pub(crate) use session_policy::{inbound_publish_policy, validate_publish_against_broker_limits};
 pub(crate) use state::{ConnectionState, Generation};
+pub(crate) use stop::StopSignal;
 pub(crate) use subscriptions::SubscriptionRegistry;
 
 use self::read::ReadOutcome;
@@ -458,14 +460,13 @@ impl<H: InboundSink> Connection<H> {
             return self.finish_session(outcome, false).await;
         }
 
-        // The session is not a child of the driver cancel: `MqttClient::shutdown` cancels that
-        // too, but an active session must stay up to drain. The write task sees
-        // `shutdown_notify`, drains (bounded by the graceful budget) and only then stops the
-        // read task via `read_stop`; the supervisor cancels the rest.
-        let session_cancel = CancellationToken::new();
-        let read_cancel = session_cancel.child_token();
-        let write_cancel = session_cancel.child_token();
-        let read_stop = CancellationToken::new();
+        // Not tied to the driver cancel: `MqttClient::shutdown` cancels that too, but an
+        // active session must stay up to drain. The write task sees `shutdown_notify`, drains
+        // (bounded by the graceful budget) and only then stops the read task via `read_stop`;
+        // the supervisor cancels the rest.
+        let read_cancel = StopSignal::new();
+        let write_cancel = StopSignal::new();
+        let read_stop = StopSignal::new();
 
         let control_tx = self.channels.control_tx.clone();
         let handoff = self.channels.handoff.clone();
@@ -552,8 +553,6 @@ impl<H: InboundSink> Connection<H> {
         ));
 
         let outcome = Self::supervise_tasks(read_handle, write_handle, read_cancel, write_cancel).await;
-        // Drop session token so any lingering child work observes cancel.
-        drop(session_cancel);
         self.finish_session(outcome, true).await
     }
 
@@ -642,8 +641,8 @@ impl<H: InboundSink> Connection<H> {
     async fn supervise_tasks(
         read_handle: JoinHandle<ReadOutcome>,
         write_handle: JoinHandle<WriteOutcome>,
-        read_cancel: CancellationToken,
-        write_cancel: CancellationToken,
+        read_cancel: StopSignal,
+        write_cancel: StopSignal,
     ) -> ConnectionOutcome {
         tokio::pin!(read_handle);
         tokio::pin!(write_handle);

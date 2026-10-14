@@ -12,7 +12,7 @@ mod keepalive;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -27,11 +27,11 @@ use tokio_util::sync::CancellationToken;
 use bytestring::ByteString;
 
 use crate::codec::{Disconnect, DisconnectReasonCode, Packet, PublishMessage, QoS, SubscriptionOptions, V5Codec};
-use crate::connection::packet_id::InflightPots;
+use crate::connection::packet_id::{InflightPots, PacketIdMap};
 use crate::connection::subscriptions::SubscriptionRegistry;
 use crate::connection::{
-    ClientCommand, CommandReceiver, ControlMessage, ControlReceiver, Generation, PublishReply, SubscribeReply,
-    UnsubscribeReply,
+    ClientCommand, CommandReceiver, ControlMessage, ControlReceiver, Generation, PublishReply, StopSignal,
+    SubscribeReply, UnsubscribeReply,
 };
 use crate::error::{ProtocolError, TransportError};
 
@@ -102,8 +102,8 @@ pub(crate) enum WriteOutcome {
 
 /// Outstanding subscribe/unsubscribe waiters keyed by Packet Identifier.
 pub(super) struct SubUnsubWaiters {
-    pub(super) subscribe: HashMap<NonZeroU16, PendingSubscribe>,
-    pub(super) unsubscribe: HashMap<NonZeroU16, PendingUnsubscribe>,
+    pub(super) subscribe: PacketIdMap<PendingSubscribe>,
+    pub(super) unsubscribe: PacketIdMap<PendingUnsubscribe>,
 }
 
 pub(super) struct PendingSubscribe {
@@ -121,8 +121,8 @@ pub(super) struct PendingUnsubscribe {
 impl SubUnsubWaiters {
     fn new() -> Self {
         Self {
-            subscribe: HashMap::new(),
-            unsubscribe: HashMap::new(),
+            subscribe: PacketIdMap::default(),
+            unsubscribe: PacketIdMap::default(),
         }
     }
 }
@@ -145,7 +145,7 @@ impl SubUnsubWaiters {
 /// connection loss can hand it to the next connection for resending.
 #[derive(Debug, Default)]
 pub(crate) struct PublishWaiters {
-    pub(super) by_id: HashMap<NonZeroU16, InflightPublish>,
+    pub(super) by_id: PacketIdMap<InflightPublish>,
     pub(super) parked: VecDeque<PendingOutboundPublish>,
     pub(super) carry: Option<SessionCarry>,
     /// Keep each in-flight message for a resend (resumable session).
@@ -361,7 +361,7 @@ pub(crate) struct WriteSession {
     /// Shared subscription registry for app subscribe/unsubscribe updates.
     pub subscription_registry: Arc<RwLock<SubscriptionRegistry>>,
     /// Session cancel (peer close / supervisor).
-    pub cancel: CancellationToken,
+    pub cancel: StopSignal,
     /// App graceful-shutdown notify — selected before [`Self::cancel`].
     pub shutdown_notify: CancellationToken,
     /// Budget for pending inbound PUBACK + DISCONNECT flush ([`crate::DEFAULT_GRACEFUL_DISCONNECT_TIMEOUT`]).
@@ -381,7 +381,7 @@ pub(crate) struct WriteSession {
     /// Hand-over to the next connection ([`SessionCarry`]); `None` only in unit tests.
     pub session_carry: Option<SessionCarry>,
     /// Stops the paired read task; cancelled by graceful shutdown after the outbound drain.
-    pub read_stop: CancellationToken,
+    pub read_stop: StopSignal,
     /// Outbound Topic Aliases to use on this connection (already capped by the broker).
     pub outbound_topic_aliases: u16,
     /// CONNACK Subscription Identifiers Available.
@@ -471,6 +471,12 @@ where
         .await;
     }
 
+    // Created once, not per iteration: each fresh `cancelled()` future registers with (and on
+    // drop deregisters from) the token under its mutex.
+    let shutdown_wait = shutdown_notify.cancelled();
+    let cancel_wait = cancel.cancelled();
+    tokio::pin!(shutdown_wait, cancel_wait);
+
     loop {
         // A PUBACK handled in the previous iteration may have freed window slots.
         if !publish_waiters.parked.is_empty() && inflight.has_publish_capacity() {
@@ -510,7 +516,7 @@ where
             biased;
             // App shutdown / session cancel before ping so the watchdog cannot turn a graceful
             // teardown into `PINGRESP timed out` while read has already stopped marking activity.
-            _ = shutdown_notify.cancelled() => {
+            () = &mut shutdown_wait => {
                 return graceful_disconnect(
                     &mut framed,
                     GracefulDisconnectCtx {
@@ -529,7 +535,7 @@ where
                 )
                 .await;
             }
-            _ = cancel.cancelled() => {
+            () = &mut cancel_wait => {
                 // Peer close / supervisor cancel: outstanding QoS1 waiters must not hang
                 // on connection loss.
                 return finish_write_outcome(

@@ -8,10 +8,9 @@ use futures_util::{FutureExt, StreamExt};
 use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 use tokio_util::codec::FramedRead;
-use tokio_util::sync::CancellationToken;
 
 use crate::codec::{DecodeError, DecodedFrame, InboundMessage, Packet, PublishPacket, V5Codec};
-use crate::connection::{ControlMessage, Generation, effective_io_batch, inbound_publish_policy};
+use crate::connection::{ControlMessage, Generation, StopSignal, effective_io_batch, inbound_publish_policy};
 use crate::error::{ProtocolError, TransportError};
 use crate::inbound_sink::{InboundSink, InboundTrySendError};
 
@@ -39,10 +38,10 @@ pub(crate) enum ReadOutcome {
 #[derive(Debug, Clone)]
 pub(crate) struct ReadSession {
     /// Session cancel (peer close / supervisor).
-    pub cancel: CancellationToken,
+    pub cancel: StopSignal,
     /// Graceful stop: cancelled by the write task once a shutdown drain is done; cuts off
     /// further `framed.next()`.
-    pub stop: CancellationToken,
+    pub stop: StopSignal,
     /// Connection generation for stale PUBACK discard.
     pub generation: Generation,
     /// Client Receive Maximum from CONNECT (adaptive buffered-frame burst).
@@ -116,6 +115,11 @@ where
     let inbound_activity = session.inbound_activity;
     let mut topic_aliases = session.topic_aliases;
     let response_router = session.response_router;
+    // Created once, not per iteration (see the write task): fresh `cancelled()` futures
+    // register with the token under its mutex.
+    let cancel_wait = cancel.cancelled();
+    let stop_wait = shutdown_notify.cancelled();
+    tokio::pin!(cancel_wait, stop_wait);
 
     loop {
         // Do not put `#[cfg(test)]` on a `tokio::select!` arm — the macro rejects it.
@@ -126,8 +130,8 @@ where
 
         tokio::select! {
             // Session cancel or graceful-shutdown notify — stop consuming the read half.
-            _ = cancel.cancelled() => return ReadOutcome::Cancelled,
-            _ = shutdown_notify.cancelled() => return ReadOutcome::Cancelled,
+            () = &mut cancel_wait => return ReadOutcome::Cancelled,
+            () = &mut stop_wait => return ReadOutcome::Cancelled,
             msg = stub_exit => {
                 #[cfg(test)]
                 {
@@ -200,8 +204,8 @@ async fn handle_inbound_publish<H: InboundSink>(
     response_router: &crate::request::ResponseRouter,
     handoff: &H,
     control_tx: &mpsc::Sender<ControlMessage>,
-    cancel: &CancellationToken,
-    shutdown_notify: &CancellationToken,
+    cancel: &StopSignal,
+    shutdown_notify: &StopSignal,
     handoff_stalled: &AtomicBool,
     inbound_activity: &AtomicBool,
 ) -> Option<ReadOutcome> {
@@ -278,8 +282,8 @@ impl Drop for HandoffStallGuard<'_> {
 async fn accept_publish_preferring_completed_push<H: InboundSink>(
     handoff: &H,
     message: InboundMessage,
-    cancel: &CancellationToken,
-    shutdown_notify: &CancellationToken,
+    cancel: &StopSignal,
+    shutdown_notify: &StopSignal,
     handoff_stalled: &AtomicBool,
     inbound_activity: &AtomicBool,
 ) -> PublishAccept {
@@ -378,9 +382,8 @@ mod tests {
     use bytes::Bytes;
     use bytestring::ByteString;
     use std::sync::atomic::AtomicBool;
-    use tokio_util::sync::CancellationToken;
 
-    use super::{PublishAccept, accept_publish_preferring_completed_push};
+    use super::{PublishAccept, StopSignal, accept_publish_preferring_completed_push};
     use crate::codec::{InboundMessage, QoS};
 
     fn sample_publish(payload: &'static [u8]) -> InboundMessage {
@@ -400,8 +403,8 @@ mod tests {
     #[tokio::test]
     async fn completed_handoff_wins_over_precancelled_shutdown_notify() {
         let (tx, rx) = flume::bounded::<InboundMessage>(1);
-        let cancel = CancellationToken::new();
-        let shutdown_notify = CancellationToken::new();
+        let cancel = StopSignal::new();
+        let shutdown_notify = StopSignal::new();
         shutdown_notify.cancel();
         let stalled = AtomicBool::new(false);
         let activity = AtomicBool::new(false);
@@ -427,8 +430,8 @@ mod tests {
     async fn cutoff_wins_while_handoff_send_is_pending() {
         let (tx, _rx) = flume::bounded::<InboundMessage>(1);
         tx.try_send(sample_publish(b"fill")).expect("fill");
-        let cancel = CancellationToken::new();
-        let shutdown_notify = CancellationToken::new();
+        let cancel = StopSignal::new();
+        let shutdown_notify = StopSignal::new();
         let stalled = std::sync::Arc::new(AtomicBool::new(false));
         let activity = std::sync::Arc::new(AtomicBool::new(false));
 
@@ -471,8 +474,8 @@ mod tests {
     async fn stalled_accept_sets_inbound_activity_catchup_grace() {
         let (tx, rx) = flume::bounded::<InboundMessage>(1);
         tx.try_send(sample_publish(b"fill")).expect("fill");
-        let cancel = CancellationToken::new();
-        let shutdown_notify = CancellationToken::new();
+        let cancel = StopSignal::new();
+        let shutdown_notify = StopSignal::new();
         let stalled = std::sync::Arc::new(AtomicBool::new(false));
         let activity = std::sync::Arc::new(AtomicBool::new(false));
 

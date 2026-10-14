@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 struct WriteTaskHandle {
     control_tx: mpsc::Sender<ControlMessage>,
     command_tx: mpsc::Sender<ClientCommand>,
-    cancel: CancellationToken,
+    cancel: StopSignal,
     subscription_registry: Arc<RwLock<SubscriptionRegistry>>,
     join: JoinHandle<WriteOutcome>,
     /// Kept alive so `stub_exit_rx.recv()` does not resolve early (biased select in unit tests).
@@ -72,7 +72,7 @@ where
     let (control_tx, control_rx) = mpsc::channel(8);
     let (command_tx, command_rx) = mpsc::channel(8);
     let (stub_tx, stub_rx) = mpsc::channel(1);
-    let cancel = CancellationToken::new();
+    let cancel = StopSignal::new();
     let (read_done_tx, read_done_rx) = oneshot::channel();
     let _ = read_done_tx.send(());
     let subscription_registry = Arc::new(RwLock::new(SubscriptionRegistry::default()));
@@ -96,7 +96,7 @@ where
             inbound_activity: Arc::new(AtomicBool::new(false)),
             bench_inbound_publish_ack_counter: None,
             session_carry: None,
-            read_stop: CancellationToken::new(),
+            read_stop: StopSignal::new(),
             outbound_topic_aliases: 0,
             subscription_identifiers_available: true,
         },
@@ -246,8 +246,8 @@ fn app_error_from_write_outcome_mapping() {
 #[tokio::test]
 async fn fail_waiters_for_outcome_maps_transport_not_command_channel_closed() {
     let mut waiters = SubUnsubWaiters {
-        subscribe: HashMap::new(),
-        unsubscribe: HashMap::new(),
+        subscribe: PacketIdMap::default(),
+        unsubscribe: PacketIdMap::default(),
     };
     let mut publish_waiters = PublishWaiters::new();
     let mut inflight = InflightPots::new(nonzero!(4u16));
@@ -275,8 +275,8 @@ async fn fail_waiters_for_outcome_maps_transport_not_command_channel_closed() {
 #[tokio::test]
 async fn graceful_shutdown_fail_all_waiters_uses_connection_lost() {
     let mut waiters = SubUnsubWaiters {
-        subscribe: HashMap::new(),
-        unsubscribe: HashMap::new(),
+        subscribe: PacketIdMap::default(),
+        unsubscribe: PacketIdMap::default(),
     };
     let mut publish_waiters = PublishWaiters::new();
     let mut inflight = InflightPots::new(nonzero!(4u16));

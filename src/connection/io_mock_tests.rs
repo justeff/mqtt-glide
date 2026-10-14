@@ -31,7 +31,7 @@ use crate::connection::packet_id::InflightPots;
 use crate::connection::read::{ReadDoneSignal, ReadOutcome, ReadSession};
 use crate::connection::subscriptions::SubscriptionRegistry;
 use crate::connection::write::{WriteOutcome, WriteSession};
-use crate::connection::{ControlMessage, Generation};
+use crate::connection::{ControlMessage, Generation, StopSignal};
 use crate::error::{ProtocolError, TransportError};
 
 /// Encoded QoS0 PUBLISH used as a multi-byte frame for split / reset tests.
@@ -53,7 +53,7 @@ fn sample_qos0_publish_wire() -> Bytes {
 }
 
 struct ReadTaskHandle {
-    cancel: CancellationToken,
+    cancel: StopSignal,
     inbound_activity: Arc<AtomicBool>,
     handoff_stalled: Arc<AtomicBool>,
     handoff_rx: flume::Receiver<InboundMessage>,
@@ -75,7 +75,7 @@ where
     let (control_tx, _control_rx) = mpsc::channel(8);
     let (stub_tx, stub_rx) = mpsc::channel(1);
     let (handoff_tx, handoff_rx) = flume::bounded(handoff_cap);
-    let cancel = CancellationToken::new();
+    let cancel = StopSignal::new();
     let (read_done_tx, _read_done_rx) = oneshot::channel();
     let inbound_activity = Arc::new(AtomicBool::new(false));
     let handoff_stalled = Arc::new(AtomicBool::new(false));
@@ -83,7 +83,7 @@ where
     let join = tokio::spawn(crate::connection::read::run(
         ReadSession {
             cancel: cancel.clone(),
-            stop: CancellationToken::new(),
+            stop: StopSignal::new(),
             topic_aliases: crate::connection::topic_alias::InboundTopicAliases::new(0),
             response_router: Arc::default(),
             generation: Generation(1),
@@ -110,7 +110,7 @@ where
 
 struct WriteTaskHandle {
     control_tx: mpsc::Sender<ControlMessage>,
-    cancel: CancellationToken,
+    cancel: StopSignal,
     shutdown_notify: CancellationToken,
     join: JoinHandle<WriteOutcome>,
     _stub_tx: mpsc::Sender<()>,
@@ -124,7 +124,7 @@ where
     let (control_tx, control_rx) = mpsc::channel(8);
     let (command_tx, command_rx) = mpsc::channel(8);
     let (stub_tx, stub_rx) = mpsc::channel(1);
-    let cancel = CancellationToken::new();
+    let cancel = StopSignal::new();
     let shutdown_notify = CancellationToken::new();
     let (read_done_tx, read_done_rx) = oneshot::channel();
     let _ = read_done_tx.send(());
@@ -148,7 +148,7 @@ where
             inbound_activity: Arc::new(AtomicBool::new(false)),
             bench_inbound_publish_ack_counter: None,
             session_carry: None,
-            read_stop: CancellationToken::new(),
+            read_stop: StopSignal::new(),
             outbound_topic_aliases: 0,
             subscription_identifiers_available: true,
         },
