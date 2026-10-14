@@ -367,7 +367,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | Cap / Receive Maximum flow control | ✅ | See [Flow control](#flow-control) |
 | Inbound Maximum Packet Size | ✅ | CONNECT advertises [`DEFAULT_MAX_PACKET_SIZE`](https://docs.rs/mqtt-glide/latest/mqtt_glide/codec/constant.DEFAULT_MAX_PACKET_SIZE.html) (1 MiB) by default; override via `ConnectOptions::max_packet_size`. Broker CONNACK limit applies outbound only |
 | Graceful `shutdown` | ✅ | Budget via `graceful_disconnect_timeout` |
-| Subscription identifiers | ⚠️ | Deferred |
+| Subscription identifiers | ✅ | `subscribe_with_id(id, filters)`; inbound `InboundMessage::subscription_ids`; kept across resubscribe; refused when CONNACK says unsupported |
 | Request/response *helper* / CONNECT negotiation | ⚠️ | Properties ✅ (`response_topic` / `correlation_data`); no inbox RPC API; `request_response_info` deferred |
 | Will message (`CONNECT`) | ✅ | `.will(topic, payload)` (+ `.will_qos` / `.will_retain`); QoS 0\|1; power: `WillMessage` |
 | Optional `SO_SNDBUF` / `SO_RCVBUF` | ⚠️ | OS defaults today |

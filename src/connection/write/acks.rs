@@ -76,7 +76,7 @@ pub(super) fn complete_subscribe_ack(
     };
     inflight.release_subscribe(packet_id);
     if let Ok(mut registry) = subscription_registry.write() {
-        apply_subscribe_ack_to_registry(&mut registry, &pending.filters, &ack.status);
+        apply_subscribe_ack_to_registry(&mut registry, &pending.filters, pending.id, &ack.status);
     }
     let _ = pending.reply.send(Ok(crate::ack::SubscribeResponse {
         reasons: ack.status,

@@ -1,7 +1,7 @@
 //! Per-connection subscription registry and Clean Start resubscribe.
 
 use std::collections::HashMap;
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroU32};
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -24,14 +24,28 @@ use crate::inbound_sink::InboundSink;
 /// Active topic filters + options remembered across reconnects (lives on [`super::Connection`]).
 #[derive(Debug, Default)]
 pub(crate) struct SubscriptionRegistry {
-    entries: HashMap<ByteString, SubscriptionOptions>,
+    /// Filter → options + the Subscription Identifier it was subscribed with.
+    entries: HashMap<ByteString, (SubscriptionOptions, Option<NonZeroU32>)>,
 }
 
+/// Filters sharing one Subscription Identifier: re-issued as one SUBSCRIBE.
+pub(crate) type ResubscribeGroup = (Option<NonZeroU32>, Vec<(ByteString, SubscriptionOptions)>);
+
 impl SubscriptionRegistry {
-    /// Registers or replaces filters granted by the broker.
+    /// Registers or replaces filters granted by the broker (no Subscription Identifier).
+    #[cfg(test)]
     pub(crate) fn upsert(&mut self, filters: impl IntoIterator<Item = (ByteString, SubscriptionOptions)>) {
+        self.upsert_with_id(filters, None);
+    }
+
+    /// Registers or replaces filters granted by the broker for a SUBSCRIBE with `id`.
+    pub(crate) fn upsert_with_id(
+        &mut self,
+        filters: impl IntoIterator<Item = (ByteString, SubscriptionOptions)>,
+        id: Option<NonZeroU32>,
+    ) {
         for (filter, options) in filters {
-            self.entries.insert(filter, options);
+            self.entries.insert(filter, (options, id));
         }
     }
 
@@ -42,12 +56,26 @@ impl SubscriptionRegistry {
         }
     }
 
-    /// Snapshot for Clean Start resubscribe after reconnect.
+    /// Flat snapshot (filter + options), for tests.
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Vec<(ByteString, SubscriptionOptions)> {
         self.entries
             .iter()
-            .map(|(filter, options)| (filter.clone(), *options))
+            .map(|(filter, (options, _))| (filter.clone(), *options))
             .collect()
+    }
+
+    /// Snapshot grouped by Subscription Identifier (one SUBSCRIBE per identifier, since the
+    /// identifier is a property of the whole packet).
+    pub(crate) fn snapshot_grouped(&self) -> Vec<ResubscribeGroup> {
+        let mut groups: Vec<ResubscribeGroup> = Vec::new();
+        for (filter, (options, id)) in &self.entries {
+            match groups.iter_mut().find(|(group_id, _)| group_id == id) {
+                Some((_, filters)) => filters.push((filter.clone(), *options)),
+                None => groups.push((*id, vec![(filter.clone(), *options)])),
+            }
+        }
+        groups
     }
 }
 
@@ -66,10 +94,10 @@ pub(crate) fn subscribe_reason_granted(reason: SubscribeAckReason) -> bool {
 /// RwLock poison must surface as an error — never as an empty subscription list.
 pub(crate) fn snapshot_for_resubscribe(
     registry: &RwLock<SubscriptionRegistry>,
-) -> Result<Vec<(ByteString, SubscriptionOptions)>, ConnectionOutcome> {
+) -> Result<Vec<ResubscribeGroup>, ConnectionOutcome> {
     registry
         .read()
-        .map(|guard| guard.snapshot())
+        .map(|guard| guard.snapshot_grouped())
         .map_err(|_| ConnectionOutcome::Application(AppError::Internal("subscription registry lock poisoned".into())))
 }
 
@@ -77,11 +105,12 @@ pub(crate) fn snapshot_for_resubscribe(
 pub(crate) fn apply_subscribe_ack_to_registry(
     registry: &mut SubscriptionRegistry,
     filters: &[(ByteString, SubscriptionOptions)],
+    id: Option<NonZeroU32>,
     reasons: &[SubscribeAckReason],
 ) {
     for ((filter, options), reason) in filters.iter().zip(reasons.iter()) {
         if subscribe_reason_granted(*reason) {
-            registry.upsert([(filter.clone(), *options)]);
+            registry.upsert_with_id([(filter.clone(), *options)], id);
         }
     }
 }
@@ -109,7 +138,51 @@ pub(crate) async fn resubscribe_pending<H: InboundSink, R, W>(
     framed_read: &mut FramedRead<R, V5Codec>,
     framed_write: &mut FramedWrite<W, V5Codec>,
     inflight: &mut InflightPots,
+    groups: Vec<ResubscribeGroup>,
+    deadline: Duration,
+    cancel: &CancellationToken,
+    inbound: ResubscribeInbound<'_, H>,
+) -> Result<(), ConnectionOutcome>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    for (id, filters) in groups {
+        // A broker that stopped offering identifiers must not get one ([MQTT-3.8.2-1]);
+        // the subscription itself still matters more than the routing hint.
+        let id = match id {
+            Some(_) if !inbound.subscription_identifiers_available => {
+                tracing::warn!("broker no longer supports Subscription Identifiers; restoring without");
+                None
+            }
+            id => id,
+        };
+        resubscribe_group(
+            framed_read,
+            framed_write,
+            inflight,
+            filters,
+            id,
+            deadline,
+            cancel,
+            ResubscribeInbound {
+                handoff: inbound.handoff,
+                topic_aliases: &mut *inbound.topic_aliases,
+                subscription_identifiers_available: inbound.subscription_identifiers_available,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resubscribe_group<H: InboundSink, R, W>(
+    framed_read: &mut FramedRead<R, V5Codec>,
+    framed_write: &mut FramedWrite<W, V5Codec>,
+    inflight: &mut InflightPots,
     filters: Vec<(ByteString, SubscriptionOptions)>,
+    id: Option<NonZeroU32>,
     deadline: Duration,
     cancel: &CancellationToken,
     inbound: ResubscribeInbound<'_, H>,
@@ -129,7 +202,7 @@ where
     let filter_count = filters.len();
     let packet = Packet::Subscribe(Subscribe {
         packet_id,
-        id: None,
+        id,
         user_properties: Vec::new(),
         topic_filters: filters,
     });
@@ -170,6 +243,8 @@ where
 pub(crate) struct ResubscribeInbound<'a, H> {
     pub(crate) handoff: &'a H,
     pub(crate) topic_aliases: &'a mut super::topic_alias::InboundTopicAliases,
+    /// CONNACK Subscription Identifiers Available.
+    pub(crate) subscription_identifiers_available: bool,
 }
 
 /// Whether prior filters must be re-issued on a fresh session.
@@ -339,6 +414,7 @@ mod tests {
                 (ByteString::from_static("ok"), opts),
                 (ByteString::from_static("denied"), opts),
             ],
+            None,
             &[SubscribeAckReason::GrantedQos1, SubscribeAckReason::NotAuthorized],
         );
         let snap = registry.snapshot();

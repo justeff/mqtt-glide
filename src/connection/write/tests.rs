@@ -98,6 +98,7 @@ where
             session_carry: None,
             read_stop: CancellationToken::new(),
             outbound_topic_aliases: 0,
+            subscription_identifiers_available: true,
         },
         InflightPots::new(overrides.inflight_capacity),
         read_done_rx,
@@ -157,6 +158,7 @@ async fn timed_out_subscribe_keeps_waiter_until_suback() {
     harness
         .command_tx
         .try_send(ClientCommand::Subscribe {
+            id: None,
             filters: vec![(ByteString::from_static("t/late"), SubscriptionOptions::default())],
             reply: reply_tx,
         })

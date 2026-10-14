@@ -302,6 +302,7 @@ mod tests {
                     packet_id: Some(packet_id(0x4321)),
                 },
                 wire_topic_alias: None,
+                subscription_ids: Vec::new(),
             }),
         );
 
@@ -320,6 +321,7 @@ mod tests {
                     packet_id: None,
                 },
                 wire_topic_alias: None,
+                subscription_ids: Vec::new(),
             }),
         );
 

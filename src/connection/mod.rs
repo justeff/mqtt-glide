@@ -380,6 +380,7 @@ impl<H: InboundSink> Connection<H> {
     {
         self.generation = self.generation.next();
         let keep_alive = session.keep_alive;
+        let subscription_identifiers_available = session.subscription_identifiers_available;
         // Topic Aliases are per network connection ([MQTT-3.3.2-7]): fresh maps every time.
         let mut inbound_topic_aliases = topic_alias::InboundTopicAliases::new(self.options.topic_alias_maximum);
         let outbound_topic_aliases = self
@@ -446,6 +447,7 @@ impl<H: InboundSink> Connection<H> {
                 subscriptions::ResubscribeInbound {
                     handoff: &self.channels.handoff,
                     topic_aliases: &mut inbound_topic_aliases,
+                    subscription_identifiers_available,
                 },
             )
             .await
@@ -539,6 +541,7 @@ impl<H: InboundSink> Connection<H> {
                 session_carry: Some(Arc::clone(&self.session_carry)),
                 read_stop,
                 outbound_topic_aliases,
+                subscription_identifiers_available,
             },
             inflight,
             read_done_rx,

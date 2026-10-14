@@ -135,6 +135,7 @@ fn round_trip_v5_publish(message: PublishMessage, delivery: PublishDelivery) {
             packet_id: delivery.packet_id,
         },
         wire_topic_alias: None,
+        subscription_ids: Vec::new(),
     });
     let mut codec = V5Codec::with_max_packet_size(DEFAULT_MAX_PACKET_SIZE);
     let mut wire = BytesMut::new();

@@ -563,6 +563,48 @@ impl MqttClient {
         &self,
         filters: impl IntoIterator<Item = impl Into<Subscription>>,
     ) -> Result<crate::ack::SubscribeResponse, AppError> {
+        self.subscribe_inner(filters, None).await
+    }
+
+    /// Like [`Self::subscribe`], tagging the subscriptions with Subscription Identifier `id`
+    /// (§3.8.2.1.2): every inbound message they match carries `id` in
+    /// [`InboundMessage::subscription_ids`](crate::InboundMessage::subscription_ids), so an
+    /// application can route by subscription instead of re-matching topics. One identifier
+    /// covers all `filters` of the call. The identifier survives reconnects (restored
+    /// subscriptions keep it).
+    ///
+    /// `id` must be in `1..=268_435_455`; a broker that announced no support for
+    /// identifiers (CONNACK) makes this fail with [`AppError::InvalidRequest`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use mqtt_glide::QoS;
+    ///
+    /// # async fn demo(client: mqtt_glide::MqttClient) -> Result<(), mqtt_glide::AppError> {
+    /// const ALERTS: u32 = 1;
+    /// client.subscribe_with_id(ALERTS, [("site/+/alarm", QoS::AtLeastOnce)]).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn subscribe_with_id(
+        &self,
+        id: u32,
+        filters: impl IntoIterator<Item = impl Into<Subscription>>,
+    ) -> Result<crate::ack::SubscribeResponse, AppError> {
+        /// Largest Variable Byte Integer (§1.5.5), the identifier's wire type.
+        const MAX_SUBSCRIPTION_ID: u32 = 268_435_455;
+        let id = std::num::NonZeroU32::new(id)
+            .filter(|id| id.get() <= MAX_SUBSCRIPTION_ID)
+            .ok_or_else(|| AppError::InvalidRequest(format!("Subscription Identifier {id} not in 1..=268435455")))?;
+        self.subscribe_inner(filters, Some(id)).await
+    }
+
+    async fn subscribe_inner(
+        &self,
+        filters: impl IntoIterator<Item = impl Into<Subscription>>,
+        id: Option<std::num::NonZeroU32>,
+    ) -> Result<crate::ack::SubscribeResponse, AppError> {
         let filters: Vec<_> = filters
             .into_iter()
             .map(|sub| {
@@ -573,6 +615,7 @@ impl MqttClient {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.send_command(ClientCommand::Subscribe {
             filters,
+            id,
             reply: reply_tx,
         })
         .await?;
@@ -3002,5 +3045,217 @@ mod tests {
             message.contains("maintenance") && message.contains("mqtt2.example.com"),
             "DISCONNECT diagnostics in the outcome: {message}"
         );
+    }
+
+    // --- Subscription Identifiers ---
+
+    /// Raw PUBLISH (QoS 0) carrying Subscription Identifiers, as a broker sends it
+    /// (the client's own encoder never writes them, [MQTT-3.3.4-6]).
+    fn raw_publish_with_subscription_ids(topic: &str, payload: &[u8], ids: &[u8]) -> Vec<u8> {
+        let mut properties = Vec::new();
+        for id in ids {
+            properties.extend_from_slice(&[0x0B, *id]); // Subscription Identifier, 1-byte varint
+        }
+        let mut body = Vec::new();
+        body.extend_from_slice(&u16::try_from(topic.len()).expect("short topic").to_be_bytes());
+        body.extend_from_slice(topic.as_bytes());
+        body.push(u8::try_from(properties.len()).expect("short properties"));
+        body.extend_from_slice(&properties);
+        body.extend_from_slice(payload);
+        let mut frame = vec![0x30, u8::try_from(body.len()).expect("short body")];
+        frame.extend_from_slice(&body);
+        frame
+    }
+
+    #[tokio::test]
+    async fn subscription_ids_go_out_and_come_back() {
+        let seen_id = Arc::new(tokio::sync::Mutex::new(None));
+        let seen = Arc::clone(&seen_id);
+        let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+            if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+                return;
+            }
+            while let Some(Ok((frame, _))) = framed_read.next().await {
+                if let DecodedFrame::Control(Packet::Subscribe(sub)) = frame {
+                    *seen.lock().await = sub.id;
+                    let _ = framed_write
+                        .send(Packet::SubscribeAck(SubscribeAck {
+                            packet_id: sub.packet_id,
+                            properties: Vec::new(),
+                            reason_string: None,
+                            status: vec![SubscribeAckReason::GrantedQos0],
+                        }))
+                        .await;
+                    let frame = raw_publish_with_subscription_ids("plant/1/alarm", b"hot", &[7, 9]);
+                    let _ = tokio::io::AsyncWriteExt::write_all(framed_write.get_mut(), &frame).await;
+                }
+            }
+        })
+        .await;
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let (tx, rx) = flume::bounded::<InboundMessage>(4);
+        let (client, connection, mut phase) = connect(
+            ConnectOptions::new(url),
+            static_test_credentials(),
+            NoReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        client
+            .subscribe_with_id(7, [("plant/+/alarm", QoS::AtMostOnce)])
+            .await
+            .expect("subscribe with id");
+        assert_eq!(
+            *seen_id.lock().await,
+            std::num::NonZeroU32::new(7),
+            "SUBSCRIBE carries the id"
+        );
+        let message = timeout(Duration::from_secs(2), rx.recv_async())
+            .await
+            .expect("delivery")
+            .expect("open");
+        let ids: Vec<u32> = message.subscription_ids.iter().map(|id| id.get()).collect();
+        assert_eq!(ids, [7, 9], "every matching subscription's id, in wire order");
+
+        for bad in [0, 268_435_456] {
+            let err = client
+                .subscribe_with_id(bad, [("x/#", QoS::AtMostOnce)])
+                .await
+                .expect_err("out-of-range id");
+            assert!(matches!(err, AppError::InvalidRequest(_)), "{bad}: {err:?}");
+        }
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
+
+    /// A broker announcing no Subscription Identifier support gets none: the call fails
+    /// instead of risking a protocol error, plain subscribes still work.
+    #[tokio::test]
+    async fn subscription_ids_refused_when_broker_lacks_support() {
+        let port = spawn_broker_once(|mut framed_read, mut framed_write| async move {
+            let mut ack = ConnectAck::default();
+            ack.subscription_identifiers_available = false;
+            if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
+                return;
+            }
+            while let Some(Ok((frame, _))) = framed_read.next().await {
+                if let DecodedFrame::Control(Packet::Subscribe(sub)) = frame {
+                    assert_eq!(sub.id, None, "no id may reach this broker");
+                    let _ = framed_write
+                        .send(Packet::SubscribeAck(SubscribeAck {
+                            packet_id: sub.packet_id,
+                            properties: Vec::new(),
+                            reason_string: None,
+                            status: vec![SubscribeAckReason::GrantedQos0],
+                        }))
+                        .await;
+                }
+            }
+        })
+        .await;
+        let (client, connection, mut phase) = connect_test_client(port).await;
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let err = client
+            .subscribe_with_id(3, [("a/#", QoS::AtMostOnce)])
+            .await
+            .expect_err("unsupported");
+        assert!(matches!(err, AppError::InvalidRequest(_)), "{err:?}");
+        client
+            .subscribe([("a/#", QoS::AtMostOnce)])
+            .await
+            .expect("plain subscribe still works");
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
+
+    /// Restored subscriptions keep their identifier: after a reconnect into a fresh session
+    /// the driver re-issues one SUBSCRIBE per identifier.
+    #[tokio::test]
+    async fn subscription_ids_survive_resubscribe() {
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::<(usize, Option<u32>, Vec<String>)>::new()));
+        let seen_broker = Arc::clone(&seen);
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port = crate::connection::test_support::spawn_broker_loop(move |mut framed_read, mut framed_write| {
+            let seen = Arc::clone(&seen_broker);
+            let connections = Arc::clone(&connections);
+            async move {
+                let index = connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+                    return;
+                }
+                let mut subscribes = 0;
+                while let Some(Ok((frame, _))) = framed_read.next().await {
+                    if let DecodedFrame::Control(Packet::Subscribe(sub)) = frame {
+                        let filters = sub.topic_filters.iter().map(|(f, _)| f.to_string()).collect();
+                        seen.lock().await.push((index, sub.id.map(|id| id.get()), filters));
+                        let _ = framed_write
+                            .send(Packet::SubscribeAck(SubscribeAck {
+                                packet_id: sub.packet_id,
+                                properties: Vec::new(),
+                                reason_string: None,
+                                status: vec![SubscribeAckReason::GrantedQos0; sub.topic_filters.len()],
+                            }))
+                            .await;
+                        subscribes += 1;
+                        if index == 0 && subscribes == 3 {
+                            return; // drop the first connection once everything is subscribed
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+        let (client, connection, mut phase) = connect(
+            ConnectOptions::new(url),
+            static_test_credentials(),
+            ImmediateReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        client
+            .subscribe_with_id(1, [("a/#", QoS::AtMostOnce)])
+            .await
+            .expect("id 1");
+        client
+            .subscribe_with_id(2, [("b/#", QoS::AtMostOnce)])
+            .await
+            .expect("id 2");
+        client.subscribe([("c/#", QoS::AtMostOnce)]).await.expect("no id");
+
+        let restored = timeout(Duration::from_secs(3), async {
+            loop {
+                let restored: Vec<_> = seen.lock().await.iter().filter(|s| s.0 == 1).cloned().collect();
+                if restored.len() == 3 {
+                    return restored;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("three resubscribes on the second connection");
+        let mut by_id: Vec<(Option<u32>, Vec<String>)> = restored.into_iter().map(|(_, id, f)| (id, f)).collect();
+        by_id.sort();
+        assert_eq!(
+            by_id,
+            [
+                (None, vec!["c/#".to_owned()]),
+                (Some(1), vec!["a/#".to_owned()]),
+                (Some(2), vec!["b/#".to_owned()]),
+            ]
+        );
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
     }
 }

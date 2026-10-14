@@ -149,6 +149,7 @@ where
             session_carry: None,
             read_stop: CancellationToken::new(),
             outbound_topic_aliases: 0,
+            subscription_identifiers_available: true,
         },
         InflightPots::new(NonZeroU16::new(4).expect("nz")),
         read_done_rx,

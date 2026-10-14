@@ -1234,3 +1234,75 @@ async fn mosquitto_broker_created_topic_aliases_resolve() {
     join_run_after_shutdown(pub_run).await;
     join_run_after_shutdown(sub_run).await;
 }
+
+/// Subscription Identifiers end to end: two overlapping subscriptions with different ids;
+/// the message arrives tagged with both (one copy carrying both ids, or one copy per
+/// subscription, both are allowed by the spec).
+#[tokio::test]
+async fn mosquitto_subscription_identifiers_tag_deliveries() {
+    let Some((_container, port)) = start_mosquitto().await else {
+        return;
+    };
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let (tx, inbound) = flume::bounded::<InboundMessage>(16);
+    let (client, connection, mut phase) = connect(
+        ConnectOptions::new(url),
+        static_credentials(),
+        NoReconnect,
+        tx,
+        NoopLifecycle,
+    )
+    .expect("connect");
+    let run = tokio::spawn(connection.run());
+    wait_for_phase(&mut phase, Duration::from_secs(10), |p| {
+        matches!(p, SessionPhase::Connected { .. })
+    })
+    .await;
+
+    client
+        .subscribe_with_id(11, [("subid/#", QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe id 11");
+    client
+        .subscribe_with_id(22, [("subid/+/alarm", QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe id 22");
+    client
+        .publish("subid/boiler/alarm", "hot")
+        .qos(QoS::AtLeastOnce)
+        .await
+        .expect("publish");
+    client
+        .publish("subid/boiler/temp", "80")
+        .qos(QoS::AtLeastOnce)
+        .await
+        .expect("publish");
+
+    let mut alarm_ids = std::collections::BTreeSet::new();
+    let mut temp_ids = std::collections::BTreeSet::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+        let Ok(Ok(message)) = timeout(left, inbound.recv_async()).await else {
+            break;
+        };
+        let target = if message.topic.ends_with("alarm") {
+            &mut alarm_ids
+        } else {
+            &mut temp_ids
+        };
+        target.extend(message.subscription_ids.iter().map(|id| id.get()));
+    }
+    assert_eq!(
+        alarm_ids.into_iter().collect::<Vec<_>>(),
+        [11, 22],
+        "matches both subscriptions"
+    );
+    assert_eq!(
+        temp_ids.into_iter().collect::<Vec<_>>(),
+        [11],
+        "matches only the wildcard"
+    );
+
+    client.shutdown().await.expect("shutdown");
+    join_run_after_shutdown(run).await;
+}

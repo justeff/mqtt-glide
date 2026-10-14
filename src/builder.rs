@@ -704,6 +704,7 @@ mod tests {
             qos: QoS::AtMostOnce,
             retain: false,
             dup: false,
+            subscription_ids: Vec::new(),
         };
         for _ in 0..7 {
             assert!(tx.try_send(stub()).is_ok());

@@ -85,6 +85,7 @@ mod tests {
                 packet_id: None,
             },
             wire_topic_alias: alias,
+            subscription_ids: Vec::new(),
         }
     }
 

@@ -109,6 +109,8 @@ pub(super) struct SubUnsubWaiters {
 pub(super) struct PendingSubscribe {
     pub(super) reply: SubscribeReply,
     pub(super) filters: Vec<(ByteString, SubscriptionOptions)>,
+    /// Subscription Identifier the SUBSCRIBE carried (kept in the registry for resubscribe).
+    pub(super) id: Option<std::num::NonZeroU32>,
 }
 
 pub(super) struct PendingUnsubscribe {
@@ -382,6 +384,8 @@ pub(crate) struct WriteSession {
     pub read_stop: CancellationToken,
     /// Outbound Topic Aliases to use on this connection (already capped by the broker).
     pub outbound_topic_aliases: u16,
+    /// CONNACK Subscription Identifiers Available.
+    pub subscription_identifiers_available: bool,
 }
 
 /// Runs the write task until cancelled, shut down, or signalled to exit.
@@ -422,6 +426,7 @@ where
     let inbound_activity = session.inbound_activity;
     let inbound_publish_ack_counter = session.bench_inbound_publish_ack_counter;
     let read_stop = session.read_stop;
+    let subscription_identifiers_available = session.subscription_identifiers_available;
     let mut awaiting_pingresp = false;
     let generation = session.generation;
     let receive_maximum = session.receive_maximum;
@@ -920,6 +925,7 @@ where
                         publish_limits,
                         receive_maximum,
                         flush_abort,
+                        subscription_identifiers_available,
                     },
                     true, // primary recv path coalesces ready PUBLISHes
                 )

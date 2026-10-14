@@ -148,6 +148,7 @@ mod tests {
                 packet_id: None,
             },
             wire_topic_alias: alias.and_then(NonZeroU16::new),
+            subscription_ids: Vec::new(),
         }
     }
 

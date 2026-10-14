@@ -129,6 +129,8 @@ pub(crate) enum ClientCommand {
     Subscribe {
         /// Topic filters and per-filter options.
         filters: Vec<(ByteString, SubscriptionOptions)>,
+        /// Subscription Identifier for the whole SUBSCRIBE (§3.8.2.1.2).
+        id: Option<std::num::NonZeroU32>,
         /// Oneshot completed with per-filter SUBACK reason codes (or a typed error).
         reply: SubscribeReply,
     },

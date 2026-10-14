@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Subscription Identifiers: `MqttClient::subscribe_with_id(id, filters)` tags subscriptions, inbound messages report every matching id in `InboundMessage::subscription_ids` (also `PublishPacket::subscription_ids`), and restored subscriptions keep their id across reconnects. `SessionParams::subscription_identifiers_available`; a broker without support gets `AppError::InvalidRequest` instead of a protocol error
 - MQTT over WebSocket behind the optional `websocket` feature: `ws://` / `wss://` broker URLs (`BrokerUrl::websocket_path`), `mqtt` subprotocol, binary frames per §6, `wss` on the client's own rustls configuration. Without the feature such URLs fail with `BrokerUrlError::WebSocketUnsupported`
 - Topic Aliases, opt-in: `ConnectOptions::topic_alias_maximum` accepts aliases from the broker (resolved before delivery), `ConnectOptions::outbound_topic_aliases` uses them when publishing (capped by the broker's CONNACK maximum, least recently used topic rebound when full, reset on every new connection). `SessionParams::server_topic_alias_maximum`; codec: `encode_publish_with_alias` / `OutboundTopicAlias`
 - `MqttClient::session_phase`: the session-phase watch, now also reachable for clients made with `ClientBuilder` (which only returns the `MqttClient`)

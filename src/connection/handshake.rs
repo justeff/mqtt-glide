@@ -31,6 +31,8 @@ pub struct SessionParams {
     pub server_receive_maximum: NonZeroU16,
     /// Server Topic Alias Maximum from CONNACK (0 = the broker accepts no aliases).
     pub server_topic_alias_maximum: u16,
+    /// Subscription Identifiers Available from CONNACK (`true` when the property is absent).
+    pub subscription_identifiers_available: bool,
     /// Session Present flag from CONNACK (§3.2.2.1.1): `true` when the broker resumed a
     /// stored session. Drives resubscribe for `clean_start = false` connections.
     pub session_present: bool,
@@ -142,6 +144,7 @@ pub(crate) fn apply_connack(client_keep_alive: Duration, ack: &ConnectAck) -> Re
         retain_available: ack.retain_available,
         server_receive_maximum: ack.receive_max,
         server_topic_alias_maximum: ack.topic_alias_max,
+        subscription_identifiers_available: ack.subscription_identifiers_available,
         session_present: ack.session_present,
     })
 }

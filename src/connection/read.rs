@@ -382,6 +382,7 @@ mod tests {
             qos: QoS::AtMostOnce,
             retain: false,
             dup: false,
+            subscription_ids: Vec::new(),
         }
     }
 

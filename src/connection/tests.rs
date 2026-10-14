@@ -53,6 +53,7 @@ async fn handoff_channel_survives_read_sender_drop() {
         qos: QoS::AtMostOnce,
         retain: false,
         dup: false,
+        subscription_ids: Vec::new(),
     };
     anchor.send_async(msg).await.expect("send after read drop");
     let got = rx.recv_async().await.expect("recv after read drop");
@@ -129,6 +130,7 @@ async fn write_can_progress_while_handoff_stalls() {
             qos: QoS::AtMostOnce,
             retain: false,
             dup: false,
+            subscription_ids: Vec::new(),
         }
     }
 
@@ -203,6 +205,7 @@ async fn keep_alive_survives_handoff_stall_without_spurious_reconnect() {
             qos: QoS::AtMostOnce,
             retain: false,
             dup: false,
+            subscription_ids: Vec::new(),
         })
         .await
         .expect("pre-fill handoff");

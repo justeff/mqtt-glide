@@ -39,6 +39,8 @@ where
     pub(super) publish_limits: BrokerPublishLimits,
     pub(super) receive_maximum: NonZeroU16,
     pub(super) flush_abort: FlushAbort<'a>,
+    /// CONNACK Subscription Identifiers Available.
+    pub(super) subscription_identifiers_available: bool,
 }
 
 /// Result of [`dispatch_client_command`].
@@ -154,6 +156,7 @@ where
                     PendingSubscribe {
                         reply,
                         filters: Vec::new(),
+                        id: None,
                     },
                 );
             }
@@ -173,8 +176,21 @@ where
             }
             Ok(CommandDispatch::Continue)
         }
-        ClientCommand::Subscribe { filters, reply } => {
-            handle_subscribe(ctx.framed, ctx.inflight, ctx.waiters, filters, reply, ctx.flush_abort).await?;
+        ClientCommand::Subscribe { filters, id, reply } => {
+            if id.is_some() && !ctx.subscription_identifiers_available {
+                let _ = reply.send(Err(AppError::InvalidRequest(
+                    "broker does not support Subscription Identifiers (CONNACK)".into(),
+                )));
+                return Ok(CommandDispatch::Continue);
+            }
+            handle_subscribe(
+                ctx.framed,
+                ctx.inflight,
+                ctx.waiters,
+                SubscribeRequest { filters, id, reply },
+                ctx.flush_abort,
+            )
+            .await?;
             Ok(CommandDispatch::Continue)
         }
         ClientCommand::Unsubscribe { filters, reply } => {
@@ -409,17 +425,24 @@ where
     flush_writes(framed, flush_abort).await
 }
 
+/// One application SUBSCRIBE as handed to [`handle_subscribe`].
+pub(super) struct SubscribeRequest {
+    pub(super) filters: Vec<(ByteString, SubscriptionOptions)>,
+    pub(super) id: Option<std::num::NonZeroU32>,
+    pub(super) reply: SubscribeReply,
+}
+
 pub(super) async fn handle_subscribe<W>(
     framed: &mut FramedWrite<W, V5Codec>,
     inflight: &mut InflightPots,
     waiters: &mut SubUnsubWaiters,
-    filters: Vec<(ByteString, SubscriptionOptions)>,
-    reply: SubscribeReply,
+    request: SubscribeRequest,
     flush_abort: FlushAbort<'_>,
 ) -> Result<(), WriteOutcome>
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let SubscribeRequest { filters, id, reply } = request;
     if reply.is_closed() {
         return Ok(());
     }
@@ -441,12 +464,13 @@ where
         PendingSubscribe {
             reply,
             filters: filters.clone(),
+            id,
         },
     );
 
     let packet = Packet::Subscribe(Subscribe {
         packet_id,
-        id: None,
+        id,
         user_properties: Vec::new(),
         topic_filters: filters,
     });

@@ -54,7 +54,8 @@ impl PublishPacket {
             return Err(DecodeError::MalformedPacket("empty topic without topic alias"));
         }
         let payload = src;
-        let props = properties.unwrap_or_default();
+        let mut props = properties.unwrap_or_default();
+        let subscription_ids = std::mem::take(&mut props.subscription_ids);
 
         Ok(PublishPacket {
             message: PublishMessage {
@@ -76,6 +77,7 @@ impl PublishPacket {
                 packet_id,
             },
             wire_topic_alias,
+            subscription_ids,
         })
     }
 }
@@ -130,6 +132,7 @@ fn parse_publish_properties(src: &mut Bytes) -> Result<Option<PublishWirePropert
     let mut response_topic = None;
     let mut payload_format_indicator = None;
     let mut user_props = Vec::new();
+    let mut subscription_ids = Vec::new();
 
     while prop_src.has_remaining() {
         match prop_src.get_u8() {
@@ -139,10 +142,12 @@ fn parse_publish_properties(src: &mut Bytes) -> Result<Option<PublishWirePropert
             pt::RESP_TOPIC => response_topic.read_value(prop_src)?,
             pt::CORR_DATA => correlation_data.read_value(prop_src)?,
             pt::SUB_ID => {
-                // Deferred: consume and discard (including illegal 0 from lenient peers).
+                // One per matching subscription that carried an identifier (§3.3.2.3.8).
+                // An illegal 0 from a lenient peer is skipped rather than failing the packet.
                 let id = utils::decode_variable_length_cursor(prop_src)?;
-                if id == 0 {
-                    tracing::debug!("ignoring inbound PUBLISH Subscription Identifier 0");
+                match NonZeroU32::new(id) {
+                    Some(id) => subscription_ids.push(id),
+                    None => tracing::debug!("ignoring inbound PUBLISH Subscription Identifier 0"),
                 }
             }
             pt::TOPIC_ALIAS => topic_alias.read_value(prop_src)?,
@@ -156,7 +161,7 @@ fn parse_publish_properties(src: &mut Bytes) -> Result<Option<PublishWirePropert
         topic_alias,
         content_type,
         correlation_data,
-        subscription_ids: Vec::new(),
+        subscription_ids,
         response_topic,
         payload_format_indicator: payload_format_indicator.unwrap_or(false),
         user_properties: user_props,

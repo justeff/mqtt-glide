@@ -167,6 +167,11 @@ pub struct InboundMessage {
     pub retain: bool,
     /// DUP flag: the broker may have delivered this message before (QoS 1 redelivery).
     pub dup: bool,
+    /// Subscription Identifiers of every subscription (made with
+    /// [`MqttClient::subscribe_with_id`](crate::MqttClient::subscribe_with_id)) this message
+    /// matched; empty when none carried one. Lets an application route by subscription
+    /// instead of re-matching topics.
+    pub subscription_ids: Vec<std::num::NonZeroU32>,
 }
 
 impl InboundMessage {
@@ -196,6 +201,7 @@ impl From<PublishPacket> for InboundMessage {
             qos: packet.meta.qos,
             retain: packet.meta.retain,
             dup: packet.meta.dup,
+            subscription_ids: packet.subscription_ids,
         }
     }
 }
@@ -209,6 +215,7 @@ impl std::fmt::Debug for InboundMessage {
             .field("qos", &self.qos)
             .field("retain", &self.retain)
             .field("dup", &self.dup)
+            .field("subscription_ids", &self.subscription_ids)
             .finish()
     }
 }
@@ -229,6 +236,8 @@ pub struct PublishPacket {
     pub meta: PublishPacketMeta,
     /// Decoded v5 Topic Alias — connection-local wire state, not part of [`PublishProperties`].
     pub wire_topic_alias: Option<NonZeroU16>,
+    /// Subscription Identifiers the broker attached (inbound only, §3.3.2.3.8).
+    pub subscription_ids: Vec<std::num::NonZeroU32>,
 }
 
 impl PublishPacket {
