@@ -10,8 +10,8 @@ use bytes::Bytes;
 use bytestring::ByteString;
 use mqtt_glide::{
     AuthError, BrokerUrl, ClientId as GlideClientId, ConnectOptions, ConnectionOutcome, CredentialsProvider,
-    MqttClient, NoopLifecycle, Publish, PublishMessage, PublishProperties, QoS, ReconnectPolicy, SessionParams,
-    SessionPhase, connect,
+    InboundMessage, MqttClient, NoopLifecycle, Publish, PublishMessage, PublishProperties, QoS, ReconnectPolicy,
+    SessionParams, SessionPhase, connect,
 };
 use secrecy::SecretString;
 use tokio::task::JoinHandle;
@@ -71,7 +71,7 @@ impl BenchClient for GlideClient {
 }
 
 struct GlideIngress {
-    handoff_rx: flume::Receiver<PublishMessage>,
+    handoff_rx: flume::Receiver<InboundMessage>,
     handed_off: Arc<AtomicUsize>,
     acked: Arc<AtomicUsize>,
     qos: BenchQos,

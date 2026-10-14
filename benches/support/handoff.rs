@@ -1,11 +1,11 @@
 //! Shared handoff payload helpers for fair peer ↔ mqtt-glide comparison.
 //!
 //! Peer crates build a [`BenchHandoff`] before flume (owned topic/payload/user-props).
-//! mqtt-glide pushes production [`PublishMessage`] — consumers must only *touch* that value,
+//! mqtt-glide pushes production [`InboundMessage`] — consumers must only *touch* that value,
 //! not re-convert it into [`BenchHandoff`] (that would add extra post-handoff work only on glide).
 
 use bytes::Bytes;
-use mqtt_glide::PublishMessage;
+use mqtt_glide::InboundMessage;
 use rumqttc::mqttbytes::v5::Publish as RumqttcPublish;
 
 /// Application-facing handoff record built on peer bench paths.
@@ -51,8 +51,8 @@ impl BenchHandoff {
     }
 }
 
-/// Touches mqtt-glide [`PublishMessage`] fields without re-encoding (fair vs [`BenchHandoff::touch`]).
-pub fn touch_publish(message: &PublishMessage) {
+/// Touches mqtt-glide [`InboundMessage`] fields without re-encoding (fair vs [`BenchHandoff::touch`]).
+pub fn touch_publish(message: &InboundMessage) {
     std::hint::black_box(message.topic.len());
     std::hint::black_box(message.payload.len());
     std::hint::black_box(message.properties.user_properties.len());

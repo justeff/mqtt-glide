@@ -807,8 +807,8 @@ mod tests {
 
     use super::*;
     use crate::codec::{
-        ConnectAck, DecodedFrame, Packet, PublishAck, PublishMessage, PublishProperties, QoS, SubscribeAck,
-        SubscribeAckReason, UnsubscribeAck, UnsubscribeAckReason,
+        ConnectAck, DecodedFrame, InboundMessage, Packet, PublishAck, PublishMessage, PublishProperties, QoS,
+        SubscribeAck, SubscribeAckReason, UnsubscribeAck, UnsubscribeAckReason,
     };
     use crate::connection::test_support::{
         NoReconnect, accept_connect_send_connack, accept_connect_send_connack_with, await_connected, spawn_broker_once,
@@ -882,7 +882,7 @@ mod tests {
     async fn connect_test_client(port: u16) -> (MqttClient, Connection, watch::Receiver<SessionPhase>) {
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
         let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring")
     }
 
@@ -1146,7 +1146,7 @@ mod tests {
         let options = ConnectOptions::new(url)
             .receive_maximum(NonZeroU16::new(8).expect("nz"))
             .ack_timeout(Duration::from_millis(50));
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) =
             connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -1584,7 +1584,7 @@ mod tests {
     async fn publish_returns_backpressure_when_command_queue_full() {
         let url = BrokerUrl::parse("mqtt://localhost").expect("valid url");
         let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, _connection, _phase) = connect(
             options,
             static_test_credentials(),
@@ -1615,7 +1615,7 @@ mod tests {
         let options = ConnectOptions::new(url)
             .receive_maximum(NonZeroU16::new(8).expect("nz"))
             .command_channel_capacity(NonZeroUsize::new(CUSTOM_CAPACITY).expect("nz"));
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, _connection, _phase) = connect(
             options,
             static_test_credentials(),
@@ -1666,7 +1666,7 @@ mod tests {
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
         // Client CONNECT Receive Maximum is large; CONNACK server window must win for outbound.
         let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(64).expect("nz"));
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) =
             connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -1728,7 +1728,7 @@ mod tests {
 
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
         let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(64).expect("nz"));
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) =
             connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -1811,7 +1811,7 @@ mod tests {
         let options = ConnectOptions::new(url)
             .receive_maximum(NonZeroU16::new(64).expect("nz"))
             .ack_timeout(Duration::from_secs(2));
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) =
             connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -2106,7 +2106,7 @@ mod tests {
 
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
         let options = ConnectOptions::new(url).graceful_disconnect_timeout(Duration::from_millis(100));
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) =
             connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -2208,7 +2208,7 @@ mod tests {
     async fn unacked_qos1_is_resent_with_dup_on_session_resume() {
         let seen: SeenPublishes = Arc::default();
         let port = spawn_resume_broker(Arc::clone(&seen), true).await;
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) = connect(
             resumable_options(port),
             static_test_credentials(),
@@ -2256,7 +2256,7 @@ mod tests {
     async fn unacked_qos1_fails_when_broker_lost_the_session() {
         let seen: SeenPublishes = Arc::default();
         let port = spawn_resume_broker(Arc::clone(&seen), false).await;
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) = connect(
             resumable_options(port),
             static_test_credentials(),
@@ -2297,7 +2297,7 @@ mod tests {
         let seen: SeenPublishes = Arc::default();
         let port = spawn_resume_broker(Arc::clone(&seen), false).await;
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) = connect(
             ConnectOptions::new(url),
             static_test_credentials(),
@@ -2435,7 +2435,7 @@ mod tests {
         let events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let port = spawn_drain_broker(100, Duration::from_millis(20), false, Arc::clone(&events)).await;
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let (tx, rx) = flume::bounded::<PublishMessage>(256);
+        let (tx, rx) = flume::bounded::<InboundMessage>(256);
         let (client, connection, mut phase) = connect(
             ConnectOptions::new(url),
             static_test_credentials(),
@@ -2498,7 +2498,7 @@ mod tests {
         let port = spawn_drain_broker(0, Duration::ZERO, true, Arc::clone(&events)).await;
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
         let options = ConnectOptions::new(url).graceful_disconnect_timeout(Duration::from_millis(200));
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) =
             connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
         let run = tokio::spawn(connection.run());
@@ -2565,7 +2565,7 @@ mod tests {
 
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
         let options = ConnectOptions::new(url).command_channel_capacity(NonZeroUsize::new(64).expect("nz"));
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) = connect(
             options,
             static_test_credentials(),
@@ -2643,7 +2643,7 @@ mod tests {
 
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
         let options = ConnectOptions::new(url).fail_fast_when_disconnected(true);
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) =
             connect(options, static_test_credentials(), SlowReconnect, tx, NoopLifecycle).expect("connect wiring");
         assert!(!client.is_connected(), "not connected before the driver runs");
@@ -2682,7 +2682,7 @@ mod tests {
     async fn default_queues_while_disconnected() {
         let url = BrokerUrl::parse("mqtt://127.0.0.1:9").expect("valid url");
         let options = ConnectOptions::new(url).ack_timeout(Duration::from_millis(50));
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, _connection, _phase) =
             connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
         assert!(!client.is_connected());
@@ -2709,7 +2709,7 @@ mod tests {
             .command_channel_capacity(NonZeroUsize::new(1).expect("nz"))
             .ack_timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(10));
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, _phase) =
             connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
         let run = tokio::spawn(connection.run());
@@ -2731,5 +2731,68 @@ mod tests {
             .expect("join");
         assert!(matches!(result, Err(AppError::ShuttingDown)), "got {result:?}");
         let _ = timeout(Duration::from_secs(2), run).await;
+    }
+
+    /// The inbound sink sees the delivery flags: retained vs live, DUP, delivered QoS.
+    #[tokio::test]
+    async fn inbound_message_carries_retain_dup_and_qos() {
+        let port = spawn_broker_once(|mut framed_read, mut framed_write| async move {
+            if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+                return;
+            }
+            let mut wire = bytes::BytesMut::new();
+            let retained = PublishMessage::new("status/dev1", "online");
+            let delivery = crate::codec::PublishDelivery {
+                dup: true,
+                retain: true,
+                qos: QoS::AtLeastOnce,
+                packet_id: Some(NonZeroU16::new(7).expect("nz")),
+            };
+            crate::codec::encode_publish(&retained, delivery, crate::codec::DEFAULT_MAX_PACKET_SIZE, &mut wire)
+                .expect("encode retained");
+            let live = PublishMessage::new("status/dev1", "offline");
+            let delivery = crate::codec::PublishDelivery {
+                dup: false,
+                retain: false,
+                qos: QoS::AtMostOnce,
+                packet_id: None,
+            };
+            crate::codec::encode_publish(&live, delivery, crate::codec::DEFAULT_MAX_PACKET_SIZE, &mut wire)
+                .expect("encode live");
+            let _ = tokio::io::AsyncWriteExt::write_all(framed_write.get_mut(), &wire).await;
+            while framed_read.next().await.is_some() {}
+        })
+        .await;
+
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let (tx, rx) = flume::bounded::<InboundMessage>(4);
+        let (client, connection, mut phase) = connect(
+            ConnectOptions::new(url),
+            static_test_credentials(),
+            NoReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let first = timeout(Duration::from_secs(2), rx.recv_async())
+            .await
+            .expect("first")
+            .expect("open");
+        assert_eq!(&*first.payload, b"online");
+        assert!(first.retain && first.dup);
+        assert_eq!(first.qos, QoS::AtLeastOnce);
+        let second = timeout(Duration::from_secs(2), rx.recv_async())
+            .await
+            .expect("second")
+            .expect("open");
+        assert_eq!(&*second.payload, b"offline");
+        assert!(!second.retain && !second.dup);
+        assert_eq!(second.qos, QoS::AtMostOnce);
+
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
     }
 }

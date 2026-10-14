@@ -32,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Wire-level codec items are no longer re-exported at the crate root: `Connect`, `ConnectAck`, `Disconnect`, `Packet`, `DecodedFrame`, `V5Codec`, `PublishPacket`, `PublishPacketMeta`, `PublishDelivery`, `PublishAck`, `Subscribe`, `SubscribeAck`, `Unsubscribe`, `UnsubscribeAck`, `DecodeError`, `EncodeError`, `RECEIVE_MAX_DEFAULT`, `encode_publish`, `ensure_publish_wire_fits`. Import them from `mqtt_glide::codec`. Message, option and reason-code types stay at the root
 
+- Inbound messages are delivered as the new `InboundMessage` (topic, payload, properties plus `retain`, `dup`, `qos`) instead of `PublishMessage`, so applications can tell retained messages from live ones and see redeliveries. `InboundSink`, `on_inbound` and the inbound channel types change accordingly (`flume::Sender<InboundMessage>`, `tokio::sync::mpsc::Sender<InboundMessage>`); field access (`msg.topic`, `msg.payload`) is unchanged. `Publish::from(InboundMessage)` republishes one
+
 ### Added
 
 - `MqttClient::is_connected` and `ConnectOptions::fail_fast_when_disconnected`: with it, publish / subscribe / unsubscribe fail at once with the new `AppError::NotConnected` while no connection is up, instead of queueing for the next connection (the default, still bounded by `ack_timeout`)

@@ -1,6 +1,6 @@
 //! Injectable inbound PUBLISH sink (enqueue-before-ack).
 //!
-//! The read task delivers each inbound [`PublishMessage`] through a [`InboundSink`]
+//! The read task delivers each inbound [`InboundMessage`] through a [`InboundSink`]
 //! **before** QoS 1 PUBACK. Built-ins: [`flume::Sender`], [`tokio::sync::mpsc::Sender`],
 //! and [`OnInboundSink`] (inline handler via [`crate::ClientBuilder::on_inbound`]).
 //!
@@ -15,7 +15,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use crate::codec::PublishMessage;
+use crate::codec::InboundMessage;
 
 /// The publish-sink consumer is gone; further pushes fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,12 +30,12 @@ pub struct InboundSinkClosed;
 #[allow(clippy::result_large_err)] // message must round-trip by value on Full/Closed
 pub enum InboundTrySendError {
     /// Channel is at capacity; message is returned for a blocking [`InboundSink::send`].
-    Full(PublishMessage),
+    Full(InboundMessage),
     /// No receivers remain; message is returned.
-    Closed(PublishMessage),
+    Closed(InboundMessage),
 }
 
-/// Injectable sink for inbound [`PublishMessage`] delivery.
+/// Injectable sink for inbound [`InboundMessage`] delivery.
 ///
 /// Implementors **MUST** be cheap to [`Clone`] so the connection driver can keep an
 /// anchor handle across read-task respawn without closing the channel.
@@ -48,23 +48,23 @@ pub trait InboundSink: Clone + Send + Sync + 'static {
 
     /// Non-blocking push. On [`InboundTrySendError::Full`], call [`Self::send`].
     #[allow(clippy::result_large_err)] // see [`InboundTrySendError`]
-    fn try_send(&self, message: PublishMessage) -> Result<(), InboundTrySendError>;
+    fn try_send(&self, message: InboundMessage) -> Result<(), InboundTrySendError>;
 
     /// Async push with backpressure until capacity is available or the sink closes.
     ///
     /// Returns a [`Send`] future so the read task can run on a multi-thread runtime.
     /// See cancel safety in the [module docs](self).
-    fn send(&self, message: PublishMessage) -> impl Future<Output = Result<(), InboundSinkClosed>> + Send;
+    fn send(&self, message: InboundMessage) -> impl Future<Output = Result<(), InboundSinkClosed>> + Send;
 }
 
-impl InboundSink for flume::Sender<PublishMessage> {
+impl InboundSink for flume::Sender<InboundMessage> {
     #[inline]
     fn is_closed(&self) -> bool {
         self.is_disconnected()
     }
 
     #[inline]
-    fn try_send(&self, message: PublishMessage) -> Result<(), InboundTrySendError> {
+    fn try_send(&self, message: InboundMessage) -> Result<(), InboundTrySendError> {
         match flume::Sender::try_send(self, message) {
             Ok(()) => Ok(()),
             Err(flume::TrySendError::Full(message)) => Err(InboundTrySendError::Full(message)),
@@ -72,20 +72,20 @@ impl InboundSink for flume::Sender<PublishMessage> {
         }
     }
 
-    fn send(&self, message: PublishMessage) -> impl Future<Output = Result<(), InboundSinkClosed>> + Send {
+    fn send(&self, message: InboundMessage) -> impl Future<Output = Result<(), InboundSinkClosed>> + Send {
         let sender = self.clone();
         async move { sender.send_async(message).await.map_err(|_| InboundSinkClosed) }
     }
 }
 
-impl InboundSink for tokio::sync::mpsc::Sender<PublishMessage> {
+impl InboundSink for tokio::sync::mpsc::Sender<InboundMessage> {
     #[inline]
     fn is_closed(&self) -> bool {
         tokio::sync::mpsc::Sender::is_closed(self)
     }
 
     #[inline]
-    fn try_send(&self, message: PublishMessage) -> Result<(), InboundTrySendError> {
+    fn try_send(&self, message: InboundMessage) -> Result<(), InboundTrySendError> {
         match tokio::sync::mpsc::Sender::try_send(self, message) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(message)) => Err(InboundTrySendError::Full(message)),
@@ -93,7 +93,7 @@ impl InboundSink for tokio::sync::mpsc::Sender<PublishMessage> {
         }
     }
 
-    fn send(&self, message: PublishMessage) -> impl Future<Output = Result<(), InboundSinkClosed>> + Send {
+    fn send(&self, message: InboundMessage) -> impl Future<Output = Result<(), InboundSinkClosed>> + Send {
         let sender = self.clone();
         async move {
             tokio::sync::mpsc::Sender::send(&sender, message)
@@ -121,7 +121,7 @@ pub struct OnInboundSink<F> {
 
 impl<F> OnInboundSink<F>
 where
-    F: Fn(PublishMessage) + Send + Sync + 'static,
+    F: Fn(InboundMessage) + Send + Sync + 'static,
 {
     /// Wraps `handler` for use as a [`InboundSink`].
     pub fn new(handler: F) -> Self {
@@ -141,7 +141,7 @@ impl<F> Clone for OnInboundSink<F> {
 
 impl<F> InboundSink for OnInboundSink<F>
 where
-    F: Fn(PublishMessage) + Send + Sync + 'static,
+    F: Fn(InboundMessage) + Send + Sync + 'static,
 {
     #[inline]
     fn is_closed(&self) -> bool {
@@ -149,12 +149,12 @@ where
     }
 
     #[inline]
-    fn try_send(&self, message: PublishMessage) -> Result<(), InboundTrySendError> {
+    fn try_send(&self, message: InboundMessage) -> Result<(), InboundTrySendError> {
         (self.handler)(message);
         Ok(())
     }
 
-    fn send(&self, message: PublishMessage) -> impl Future<Output = Result<(), InboundSinkClosed>> + Send {
+    fn send(&self, message: InboundMessage) -> impl Future<Output = Result<(), InboundSinkClosed>> + Send {
         let handler = Arc::clone(&self.handler);
         async move {
             handler(message);
@@ -169,18 +169,22 @@ mod tests {
     use bytestring::ByteString;
 
     use super::*;
+    use crate::codec::QoS;
 
-    fn sample(payload: &'static [u8]) -> PublishMessage {
-        PublishMessage {
+    fn sample(payload: &'static [u8]) -> InboundMessage {
+        InboundMessage {
             topic: ByteString::from("t"),
             payload: Bytes::from_static(payload),
             properties: Default::default(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            dup: false,
         }
     }
 
     #[test]
     fn flume_try_send_full_and_closed() {
-        let (tx, rx) = flume::bounded::<PublishMessage>(1);
+        let (tx, rx) = flume::bounded::<InboundMessage>(1);
         tx.try_send(sample(b"a")).expect("fill");
         match InboundSink::try_send(&tx, sample(b"b")) {
             Err(InboundTrySendError::Full(_)) => {}
@@ -196,7 +200,7 @@ mod tests {
 
     #[tokio::test]
     async fn flume_send_awaits_capacity() {
-        let (tx, rx) = flume::bounded::<PublishMessage>(1);
+        let (tx, rx) = flume::bounded::<InboundMessage>(1);
         InboundSink::try_send(&tx, sample(b"fill")).expect("fill");
         let push = tokio::spawn({
             let tx = tx.clone();
@@ -210,7 +214,7 @@ mod tests {
 
     #[test]
     fn mpsc_try_send_full_and_closed() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<PublishMessage>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<InboundMessage>(1);
         tx.try_send(sample(b"a")).expect("fill");
         match InboundSink::try_send(&tx, sample(b"b")) {
             Err(InboundTrySendError::Full(_)) => {}
@@ -226,7 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn mpsc_send_awaits_capacity() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<PublishMessage>(1);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundMessage>(1);
         InboundSink::try_send(&tx, sample(b"fill")).expect("fill");
         let push = tokio::spawn({
             let tx = tx.clone();
@@ -245,7 +249,7 @@ mod tests {
         let seen = Arc::new(AtomicUsize::new(0));
         let sink = OnInboundSink::new({
             let seen = Arc::clone(&seen);
-            move |msg: PublishMessage| {
+            move |msg: InboundMessage| {
                 assert_eq!(&*msg.payload, b"inline");
                 seen.fetch_add(1, Ordering::SeqCst);
             }
@@ -262,7 +266,7 @@ mod tests {
         let seen = Arc::new(AtomicUsize::new(0));
         let sink = OnInboundSink::new({
             let seen = Arc::clone(&seen);
-            move |_msg: PublishMessage| {
+            move |_msg: InboundMessage| {
                 seen.fetch_add(1, Ordering::SeqCst);
             }
         });

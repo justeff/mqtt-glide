@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use mqtt_glide::{ClientBuilder, PublishMessage, QoS};
+use mqtt_glide::{ClientBuilder, InboundMessage, QoS};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = ClientBuilder::new(&broker)?
         .on_inbound({
             let seen = Arc::clone(&seen);
-            move |msg: PublishMessage| {
+            move |msg: InboundMessage| {
                 // Read-task: no await, no heavy work.
                 seen.fetch_add(1, Ordering::Relaxed);
                 println!("{} => {} bytes", msg.topic, msg.payload.len());

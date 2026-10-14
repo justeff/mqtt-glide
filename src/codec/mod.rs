@@ -21,7 +21,9 @@ pub mod v5;
 pub const DEFAULT_MAX_PACKET_SIZE: u32 = 1024 * 1024;
 
 pub use error::{DecodeError, EncodeError};
-pub use publish::{PublishDelivery, PublishMessage, PublishPacket, PublishPacketMeta, PublishProperties};
+pub use publish::{
+    InboundMessage, PublishDelivery, PublishMessage, PublishPacket, PublishPacketMeta, PublishProperties,
+};
 pub use types::QoS;
 
 pub(crate) use utils::topic_filter_bytes_invalid;

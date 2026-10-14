@@ -18,9 +18,9 @@ use std::time::Duration;
 
 use common::{CountingInvalidate, NoReconnect, static_credentials, wait_for_phase};
 use mqtt_glide::{
-    AuthError, BrokerUrl, ClientId, ConnectOptions, ConnectionOutcome, CredentialsProvider, NoopLifecycle, Publish,
-    PublishMessage, QoS, ReconnectPolicy, SessionParams, SessionPhase, SubscribeAckReason, Subscription, connect,
-    shared_filter,
+    AuthError, BrokerUrl, ClientId, ConnectOptions, ConnectionOutcome, CredentialsProvider, InboundMessage,
+    NoopLifecycle, Publish, QoS, ReconnectPolicy, SessionParams, SessionPhase, SubscribeAckReason, Subscription,
+    connect, shared_filter,
 };
 use secrecy::SecretString;
 use tokio::time::timeout;
@@ -118,7 +118,7 @@ async fn mosquitto_connect_connack_and_disconnect() {
     };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("connect-ok"));
-    let (tx, _rx) = flume::bounded::<PublishMessage>(8);
+    let (tx, _rx) = flume::bounded::<InboundMessage>(8);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -161,7 +161,7 @@ async fn mosquitto_not_authorized_invalidates_credentials() {
     let creds = CountingInvalidate {
         invalidations: Arc::clone(&invalidations),
     };
-    let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
     let (_client, connection, mut phase) =
         connect(options, creds, NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -232,7 +232,7 @@ async fn mosquitto_shared_subscription_delivers_to_handoff() {
     };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("share-sub"));
-    let (tx, rx) = flume::bounded::<PublishMessage>(8);
+    let (tx, rx) = flume::bounded::<InboundMessage>(8);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -292,14 +292,14 @@ async fn mosquitto_shared_subscription_delivers_to_handoff() {
 #[tokio::test]
 async fn mosquitto_qos1_publish_awaits_puback() {
     use bytes::Bytes;
-    use mqtt_glide::PublishMessage;
+    use mqtt_glide::InboundMessage;
 
     let Some((_container, port)) = start_mosquitto().await else {
         return;
     };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("qos1"));
-    let (tx, _rx) = flume::bounded::<PublishMessage>(8);
+    let (tx, _rx) = flume::bounded::<InboundMessage>(8);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -341,14 +341,14 @@ async fn mosquitto_qos1_publish_awaits_puback() {
 async fn mosquitto_qos1_window_wider_than_receive_maximum() {
     use std::num::NonZeroUsize;
 
-    use mqtt_glide::PublishMessage;
+    use mqtt_glide::InboundMessage;
 
     let Some((_container, port)) = start_mosquitto().await else {
         return;
     };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("qos1-window"));
-    let (tx, _rx) = flume::bounded::<PublishMessage>(8);
+    let (tx, _rx) = flume::bounded::<InboundMessage>(8);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -392,14 +392,14 @@ async fn mosquitto_publish_properties_roundtrip() {
     use std::num::NonZeroU32;
 
     use bytes::Bytes;
-    use mqtt_glide::{PublishMessage, PublishProperties};
+    use mqtt_glide::{InboundMessage, PublishProperties};
 
     let Some((_container, port)) = start_mosquitto().await else {
         return;
     };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("props"));
-    let (tx, rx) = flume::bounded::<PublishMessage>(8);
+    let (tx, rx) = flume::bounded::<InboundMessage>(8);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -506,7 +506,7 @@ async fn mosquitto_broker_kill_reconnects_and_emits_connected() {
     let policy = CountingTransportReconnect {
         transport_consults: Arc::clone(&transport_consults),
     };
-    let (tx, _rx) = flume::bounded::<PublishMessage>(8);
+    let (tx, _rx) = flume::bounded::<InboundMessage>(8);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), policy, tx, NoopLifecycle).expect("connect wiring");
 
@@ -598,7 +598,7 @@ async fn mosquitto_auth_fail_stops_without_endless_reconnect() {
         transport_consults: Arc::clone(&transport_consults),
     };
 
-    let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
     let (_client, connection, mut phase) = connect(options, creds, policy, tx, NoopLifecycle).expect("connect wiring");
 
     let run = tokio::spawn(connection.run());
@@ -682,7 +682,7 @@ async fn mosquitto_handoff_full_keep_alive_no_spurious_reconnect() {
         .client_id(ClientId::from_prefix("keepalive"))
         .keep_alive(keep_alive);
     // Capacity 1: one fill saturates; next inbound publish stalls Read on handoff (§3.2).
-    let (tx, rx) = flume::bounded::<PublishMessage>(1);
+    let (tx, rx) = flume::bounded::<InboundMessage>(1);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), TransportOnlyReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -784,7 +784,7 @@ async fn mosquitto_resubscribes_after_reconnect() {
     let options = ConnectOptions::new(url)
         .client_id(ClientId::from_prefix("resub"))
         .keep_alive(Duration::from_secs(5));
-    let (tx, rx) = flume::bounded::<PublishMessage>(8);
+    let (tx, rx) = flume::bounded::<InboundMessage>(8);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), TransportOnlyReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -873,7 +873,7 @@ async fn mosquitto_session_phase_updates_app_state_without_eventloop_poll() {
     let options = ConnectOptions::new(url)
         .client_id(ClientId::from_prefix("phase"))
         .keep_alive(Duration::from_secs(5));
-    let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), TransportOnlyReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -942,7 +942,7 @@ async fn mosquitto_handoff_survives_shutdown() {
     let topic = "handoff/survive";
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("handoff"));
-    let (tx, rx) = flume::bounded::<PublishMessage>(4);
+    let (tx, rx) = flume::bounded::<InboundMessage>(4);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -989,8 +989,8 @@ async fn mosquitto_two_parallel_connections_isolated_handoff_and_phase() {
     let options_a = ConnectOptions::new(url_a).client_id(ClientId::from_prefix("parallel-a"));
     let options_b = ConnectOptions::new(url_b).client_id(ClientId::from_prefix("parallel-b"));
 
-    let (tx_a, rx_a) = flume::bounded::<PublishMessage>(8);
-    let (tx_b, rx_b) = flume::bounded::<PublishMessage>(8);
+    let (tx_a, rx_a) = flume::bounded::<InboundMessage>(8);
+    let (tx_b, rx_b) = flume::bounded::<InboundMessage>(8);
 
     let (client_a, connection_a, mut phase_a) =
         connect(options_a, static_credentials(), NoReconnect, tx_a, NoopLifecycle).expect("connect A");

@@ -9,7 +9,7 @@ use super::test_support::*;
 use super::*;
 use crate::Publish;
 use crate::client::connect;
-use crate::codec::{DecodedFrame, Packet, PublishMessage};
+use crate::codec::{DecodedFrame, InboundMessage, Packet};
 use crate::error::{AuthError, ProtocolError};
 use crate::options::ConnectOptions;
 use crate::util::BrokerUrl;
@@ -36,20 +36,23 @@ fn map_broker_disconnect_classifies_error_reason_codes() {
 /// flume disconnects permanently when the last sender drops; anchor + Connection sender must survive read respawn.
 #[tokio::test]
 async fn handoff_channel_survives_read_sender_drop() {
-    use crate::codec::{PublishMessage, PublishProperties};
+    use crate::codec::{InboundMessage, PublishProperties, QoS};
     use bytes::Bytes;
     use bytestring::ByteString;
 
-    let (tx, rx) = flume::bounded::<PublishMessage>(8);
+    let (tx, rx) = flume::bounded::<InboundMessage>(8);
     let anchor = tx.clone();
     let conn = tx;
     drop(conn.clone()); // simulate read-task sender drop
     assert!(!anchor.is_disconnected());
     assert!(!rx.is_disconnected());
-    let msg = PublishMessage {
+    let msg = InboundMessage {
         topic: ByteString::from_static("t"),
         payload: Bytes::from_static(b"x"),
         properties: PublishProperties::default(),
+        qos: QoS::AtMostOnce,
+        retain: false,
+        dup: false,
     };
     anchor.send_async(msg).await.expect("send after read drop");
     let got = rx.recv_async().await.expect("recv after read drop");
@@ -113,22 +116,25 @@ fn generation_binding_smoke() {
 /// accept work (`PingReq`).
 #[tokio::test]
 async fn write_can_progress_while_handoff_stalls() {
-    use crate::codec::{PublishMessage, PublishProperties};
+    use crate::codec::{InboundMessage, PublishProperties, QoS};
     use crate::connection::ControlMessage;
     use bytes::Bytes;
     use bytestring::ByteString;
 
-    fn sample_publish(topic: &'static str, payload: &'static [u8]) -> PublishMessage {
-        PublishMessage {
+    fn sample_publish(topic: &'static str, payload: &'static [u8]) -> InboundMessage {
+        InboundMessage {
             topic: ByteString::from_static(topic),
             payload: Bytes::from_static(payload),
             properties: PublishProperties::default(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            dup: false,
         }
     }
 
     // Connection-bound handoff: capacity 1 so one fill saturates it.
     let port = spawn_mock_broker().await;
-    let (handoff_tx, _handoff_rx) = flume::bounded::<PublishMessage>(1);
+    let (handoff_tx, _handoff_rx) = flume::bounded::<InboundMessage>(1);
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
     let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
     let (client, connection, _phase) = connect(
@@ -176,7 +182,7 @@ async fn write_can_progress_while_handoff_stalls() {
 /// cause keepalive-death or a spurious reconnect (self-induced Read stall ≠ PINGRESP timeout).
 #[tokio::test]
 async fn keep_alive_survives_handoff_stall_without_spurious_reconnect() {
-    use crate::codec::{PublishMessage, PublishProperties};
+    use crate::codec::{InboundMessage, PublishProperties, QoS};
     use bytes::Bytes;
     use bytestring::ByteString;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -187,13 +193,16 @@ async fn keep_alive_survives_handoff_stall_without_spurious_reconnect() {
     let ping_count = Arc::new(AtomicUsize::new(0));
     let port = spawn_mock_broker_keepalive_enforcer(idle, true, true, false, Arc::clone(&ping_count)).await;
 
-    let (handoff_tx, handoff_rx) = flume::bounded::<PublishMessage>(1);
+    let (handoff_tx, handoff_rx) = flume::bounded::<InboundMessage>(1);
     // Pre-fill so the inbound stall PUBLISH parks Read on handoff push.
     handoff_tx
-        .send_async(PublishMessage {
+        .send_async(InboundMessage {
             topic: ByteString::from_static("fill"),
             payload: Bytes::from_static(b"1"),
             properties: PublishProperties::default(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            dup: false,
         })
         .await
         .expect("pre-fill handoff");
@@ -327,7 +336,7 @@ async fn missing_pingresp_disconnects_after_keep_alive() {
 /// Inbound PUBLISH without PINGRESP must clear the keepalive watchdog.
 #[tokio::test]
 async fn inbound_publish_clears_keepalive_watchdog_without_pingresp() {
-    use crate::codec::PublishMessage;
+    use crate::codec::InboundMessage;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let keep_alive = Duration::from_secs(1);
@@ -335,7 +344,7 @@ async fn inbound_publish_clears_keepalive_watchdog_without_pingresp() {
     let ping_count = Arc::new(AtomicUsize::new(0));
     let port = spawn_mock_broker_keepalive_enforcer(idle, false, false, true, Arc::clone(&ping_count)).await;
 
-    let (handoff_tx, handoff_rx) = flume::bounded::<PublishMessage>(8);
+    let (handoff_tx, handoff_rx) = flume::bounded::<InboundMessage>(8);
     let drain = tokio::spawn(async move { while handoff_rx.recv_async().await.is_ok() {} });
 
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
@@ -486,7 +495,7 @@ async fn inbound_topic_alias_on_read_path_disconnects() {
     let port = spawn_mock_broker_with_inbound_topic_alias().await;
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
     let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
-    let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
     let (_client, connection, mut phase) =
         connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -541,7 +550,7 @@ async fn inbound_qos1_does_not_puback_before_handoff_accept() {
     .await;
 
     // Capacity 0: rendezvous — no message is accepted until a receiver appears.
-    let (handoff_tx, handoff_rx) = flume::bounded::<PublishMessage>(0);
+    let (handoff_tx, handoff_rx) = flume::bounded::<InboundMessage>(0);
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
     let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(2).expect("nz"));
     let (client, connection, mut phase) = connect(
@@ -604,7 +613,7 @@ async fn inbound_qos1_does_not_puback_before_handoff_accept() {
 /// [MQTT-4.3.2-5] After PUBACK, the same Packet Identifier may identify a new Application Message.
 #[tokio::test]
 async fn inbound_qos1_same_packet_id_after_puback_is_new_message() {
-    use crate::codec::PublishMessage;
+    use crate::codec::InboundMessage;
     use std::sync::Arc;
     use tokio::time::timeout;
 
@@ -657,7 +666,7 @@ async fn inbound_qos1_same_packet_id_after_puback_is_new_message() {
     })
     .await;
 
-    let (handoff_tx, handoff_rx) = flume::bounded::<PublishMessage>(4);
+    let (handoff_tx, handoff_rx) = flume::bounded::<InboundMessage>(4);
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
     let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(2).expect("nz"));
     let (client, connection, mut phase) = connect(
@@ -757,7 +766,7 @@ async fn full_handoff_defers_pubacks_within_client_receive_maximum() {
     .await;
 
     // Handoff capacity 1 + blocking consumer: after one accept, further pushes stall.
-    let (handoff_tx, handoff_rx) = flume::bounded::<PublishMessage>(1);
+    let (handoff_tx, handoff_rx) = flume::bounded::<InboundMessage>(1);
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
     let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(2).expect("nz"));
     let (client, connection, mut phase) = connect(
@@ -860,7 +869,7 @@ async fn inbound_pubacks_sent_in_publish_receipt_order() {
     })
     .await;
 
-    let (handoff_tx, handoff_rx) = flume::bounded::<PublishMessage>(4);
+    let (handoff_tx, handoff_rx) = flume::bounded::<InboundMessage>(4);
     let drain = tokio::spawn(async move { while handoff_rx.recv_async().await.is_ok() {} });
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
     let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(4).expect("nz"));
@@ -908,7 +917,7 @@ async fn command_sender_remains_usable_during_reconnect_backoff() {
     let port = spawn_mock_broker_close_after_connack().await;
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
     let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
-    let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
     let (client, connection, mut phase) = connect(
         options,
         static_test_credentials(),
@@ -946,7 +955,7 @@ fn replenish_session_channels_swaps_shared_command_sender() {
     let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let shared = Arc::new(ArcSwap::from_pointee(command_tx));
-    let (handoff, _handoff_rx) = flume::bounded::<PublishMessage>(4);
+    let (handoff, _handoff_rx) = flume::bounded::<InboundMessage>(4);
     let (read_stub_exit_tx, read_stub_exit_rx) = mpsc::channel(1);
     let (write_stub_exit_tx, write_stub_exit_rx) = mpsc::channel(1);
 
@@ -1042,7 +1051,7 @@ async fn resubscribe_aborts_on_cancel() {
     let options = ConnectOptions::new(url)
         .receive_maximum(NonZeroU16::new(8).expect("nz"))
         .ack_timeout(Duration::from_secs(30));
-    let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
     let (client, connection, mut phase) = connect(
         options,
         static_test_credentials(),
@@ -1141,7 +1150,7 @@ async fn resubscribe_does_not_silently_drop_inbound_publish() {
 
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
     let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
-    let (tx, rx) = flume::bounded::<PublishMessage>(8);
+    let (tx, rx) = flume::bounded::<InboundMessage>(8);
     let (client, connection, mut phase) = connect(
         options,
         static_test_credentials(),
@@ -1217,7 +1226,7 @@ async fn resubscribe_fails_when_suback_not_granted() {
 
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
     let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
-    let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
     let (client, connection, mut phase) = connect(
         options,
         static_test_credentials(),
@@ -1322,7 +1331,7 @@ async fn lifecycle_hook_records_connected_then_disconnected() {
     let port = spawn_mock_broker().await;
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
     let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
-    let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
     let (client, connection, mut phase) =
         connect(options, static_test_credentials(), NoReconnect, tx, Arc::clone(&hook)).expect("connect wiring");
 
@@ -1382,7 +1391,7 @@ async fn handoff_survives_shutdown() {
     })
     .await;
 
-    let (handoff_tx, handoff_rx) = flume::bounded::<PublishMessage>(4);
+    let (handoff_tx, handoff_rx) = flume::bounded::<InboundMessage>(4);
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
     let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(2).expect("nz"));
     let (client, connection, mut phase) = connect(

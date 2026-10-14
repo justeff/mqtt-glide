@@ -271,7 +271,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let puback_id = inbound_publish_policy(&packet).map_err(ConnectionOutcome::Protocol)?;
-    if handoff.send(packet.message).await.is_err() {
+    if handoff.send(crate::codec::InboundMessage::from(packet)).await.is_err() {
         return Err(ConnectionOutcome::Application(AppError::InboundSinkClosed));
     }
     // PUBACK only after successful handoff accept (enqueue-before-ack).

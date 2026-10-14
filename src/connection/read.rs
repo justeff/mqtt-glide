@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::codec::FramedRead;
 use tokio_util::sync::CancellationToken;
 
-use crate::codec::{DecodeError, DecodedFrame, DisconnectReasonCode, Packet, PublishMessage, PublishPacket, V5Codec};
+use crate::codec::{DecodeError, DecodedFrame, DisconnectReasonCode, InboundMessage, Packet, PublishPacket, V5Codec};
 use crate::connection::{ControlMessage, Generation, effective_io_batch, inbound_publish_policy};
 use crate::error::{ProtocolError, TransportError};
 use crate::inbound_sink::{InboundSink, InboundTrySendError};
@@ -199,7 +199,7 @@ async fn handle_inbound_publish<H: InboundSink>(
     // Await handoff accept before PUBACK; the write task stays independent.
     match accept_publish_preferring_completed_push(
         handoff,
-        packet.message,
+        InboundMessage::from(packet),
         cancel,
         shutdown_notify,
         handoff_stalled,
@@ -261,7 +261,7 @@ impl Drop for HandoffStallGuard<'_> {
 /// without grace the next ping tick could spuriously time out before read catches up.
 async fn accept_publish_preferring_completed_push<H: InboundSink>(
     handoff: &H,
-    message: PublishMessage,
+    message: InboundMessage,
     cancel: &CancellationToken,
     shutdown_notify: &CancellationToken,
     handoff_stalled: &AtomicBool,
@@ -365,13 +365,16 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{PublishAccept, accept_publish_preferring_completed_push};
-    use crate::codec::PublishMessage;
+    use crate::codec::{InboundMessage, QoS};
 
-    fn sample_publish(payload: &'static [u8]) -> PublishMessage {
-        PublishMessage {
+    fn sample_publish(payload: &'static [u8]) -> InboundMessage {
+        InboundMessage {
             topic: ByteString::from("t"),
             payload: Bytes::from_static(payload),
             properties: Default::default(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            dup: false,
         }
     }
 
@@ -379,7 +382,7 @@ mod tests {
     /// accept (so the caller can still PUBACK) over CutOff in the same poll.
     #[tokio::test]
     async fn completed_handoff_wins_over_precancelled_shutdown_notify() {
-        let (tx, rx) = flume::bounded::<PublishMessage>(1);
+        let (tx, rx) = flume::bounded::<InboundMessage>(1);
         let cancel = CancellationToken::new();
         let shutdown_notify = CancellationToken::new();
         shutdown_notify.cancel();
@@ -405,7 +408,7 @@ mod tests {
     /// stalled full handoff still allows cut-off (message never accepted).
     #[tokio::test]
     async fn cutoff_wins_while_handoff_send_is_pending() {
-        let (tx, _rx) = flume::bounded::<PublishMessage>(1);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(1);
         tx.try_send(sample_publish(b"fill")).expect("fill");
         let cancel = CancellationToken::new();
         let shutdown_notify = CancellationToken::new();
@@ -449,7 +452,7 @@ mod tests {
     /// does not race the unread socket buffer.
     #[tokio::test]
     async fn stalled_accept_sets_inbound_activity_catchup_grace() {
-        let (tx, rx) = flume::bounded::<PublishMessage>(1);
+        let (tx, rx) = flume::bounded::<InboundMessage>(1);
         tx.try_send(sample_publish(b"fill")).expect("fill");
         let cancel = CancellationToken::new();
         let shutdown_notify = CancellationToken::new();

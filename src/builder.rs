@@ -40,7 +40,7 @@ use crate::client::{
     AnonymousCredentials, CredentialsProvider, MqttClient, NoReconnect, ReconnectPolicy, SharedCredentials,
     connect_with_shared,
 };
-use crate::codec::{PublishMessage, QoS};
+use crate::codec::{InboundMessage, QoS};
 use crate::connection::{LifecycleHook, NoopLifecycle, SessionParams, SessionPhase};
 use crate::error::{AppError, ConnectError, ConnectionOutcome, TransportError};
 use crate::inbound_sink::{InboundSink, OnInboundSink};
@@ -132,7 +132,7 @@ impl ClientBuilder<InboundSinkUnset> {
     /// Equivalent to [`Self::inbound_sink`]`(`[`OnInboundSink::new`]`(handler))`.
     pub fn on_inbound<F>(self, handler: F) -> ClientBuilder<InboundSinkReady<OnInboundSink<F>>>
     where
-        F: Fn(PublishMessage) + Send + Sync + 'static,
+        F: Fn(InboundMessage) + Send + Sync + 'static,
     {
         self.inbound_sink(OnInboundSink::new(handler))
     }
@@ -257,7 +257,7 @@ impl ClientBuilder<InboundSinkDiscard> {
 async fn finish_connect<S: InboundSink>(
     config: BuilderConfig,
     sink: S,
-    discard_rx: Option<flume::Receiver<PublishMessage>>,
+    discard_rx: Option<flume::Receiver<InboundMessage>>,
 ) -> Result<MqttClient, ConnectError> {
     let BuilderConfig {
         mut options,
@@ -296,7 +296,7 @@ async fn finish_connect<S: InboundSink>(
 /// Bounded discard handoff capacity = CONNECT `Receive Maximum`.
 fn make_discard_channel(
     receive_maximum: NonZeroU16,
-) -> (flume::Sender<PublishMessage>, flume::Receiver<PublishMessage>) {
+) -> (flume::Sender<InboundMessage>, flume::Receiver<InboundMessage>) {
     flume::bounded(usize::from(receive_maximum.get()))
 }
 
@@ -362,9 +362,7 @@ mod tests {
 
     use super::*;
     use crate::client::{StaticCredentials, connect};
-    use crate::codec::{
-        ConnectAck, DecodedFrame, Packet, PublishAck, PublishAckReason, PublishMessage, PublishProperties, QoS,
-    };
+    use crate::codec::{ConnectAck, DecodedFrame, Packet, PublishAck, PublishAckReason, PublishProperties, QoS};
     use crate::connection::NoopLifecycle;
     use crate::connection::test_support::{
         accept_connect_send_connack_with, await_connected, spawn_broker_loop, spawn_broker_once, spawn_mock_broker,
@@ -540,7 +538,7 @@ mod tests {
         })
         .await;
 
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let client = ClientBuilder::new(format!("mqtt://127.0.0.1:{port}"))
             .expect("url")
             .credentials(static_test_credentials())
@@ -599,7 +597,7 @@ mod tests {
         let port = spawn_mock_broker().await;
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("url");
         let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) = connect(
             options,
             StaticCredentials::new("user", "pass"),
@@ -623,7 +621,7 @@ mod tests {
     #[tokio::test]
     async fn builder_accepts_tokio_mpsc_handoff() {
         let port = spawn_mock_broker().await;
-        let (tx, _rx) = tokio::sync::mpsc::channel::<PublishMessage>(4);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<InboundMessage>(4);
         let client = ClientBuilder::new(format!("mqtt://127.0.0.1:{port}"))
             .expect("url")
             .credentials(static_test_credentials())
@@ -669,7 +667,7 @@ mod tests {
             .credentials(static_test_credentials())
             .on_inbound({
                 let seen = Arc::clone(&seen);
-                move |msg: PublishMessage| {
+                move |msg: InboundMessage| {
                     assert_eq!(&*msg.payload, b"inline-payload");
                     seen.fetch_add(1, Ordering::SeqCst);
                 }
@@ -699,10 +697,13 @@ mod tests {
     fn discard_channel_capacity_matches_receive_maximum() {
         let receive_maximum = NonZeroU16::new(7).expect("nz");
         let (tx, rx) = make_discard_channel(receive_maximum);
-        let stub = || PublishMessage {
+        let stub = || InboundMessage {
             topic: ByteString::from_static("t"),
             payload: Bytes::new(),
             properties: PublishProperties::default(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            dup: false,
         };
         for _ in 0..7 {
             assert!(tx.try_send(stub()).is_ok());

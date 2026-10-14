@@ -24,7 +24,8 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
 use crate::codec::{
-    DecodedFrame, Packet, PublishDelivery, PublishMessage, PublishProperties, QoS, V5Codec, encode_publish,
+    DecodedFrame, InboundMessage, Packet, PublishDelivery, PublishMessage, PublishProperties, QoS, V5Codec,
+    encode_publish,
 };
 use crate::connection::packet_id::InflightPots;
 use crate::connection::read::{ReadDoneSignal, ReadOutcome, ReadSession};
@@ -55,7 +56,7 @@ struct ReadTaskHandle {
     cancel: CancellationToken,
     inbound_activity: Arc<AtomicBool>,
     handoff_stalled: Arc<AtomicBool>,
-    handoff_rx: flume::Receiver<PublishMessage>,
+    handoff_rx: flume::Receiver<InboundMessage>,
     join: JoinHandle<ReadOutcome>,
     _stub_tx: mpsc::Sender<()>,
 }

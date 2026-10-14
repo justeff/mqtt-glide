@@ -55,9 +55,9 @@ Receiving is the mirror image: hand the client a channel sender, then read the r
 ```rust,no_run
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use mqtt_glide::{ClientBuilder, PublishMessage, QoS};
+    use mqtt_glide::{ClientBuilder, InboundMessage, QoS};
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<PublishMessage>(1024);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundMessage>(1024);
 
     let client = ClientBuilder::new("mqtt://127.0.0.1:1883")?
         .inbound_sink(tx)
@@ -284,6 +284,8 @@ QoS 2 is rejected (`AppError::InvalidRequest`). Packet ID / `dup` are assigned b
 | `.on_inbound(handler)` | Inline on the read task: counters, filters, metrics, tiny sync work. Not for heavy processing (stalls decode/keepalive) |
 | `.discard_inbound()` | Outbound-only / ignore inbound |
 | Custom `InboundSink` | Special buffers, existing systems |
+
+Each delivery is an `InboundMessage`: `topic`, `payload`, `properties`, plus `retain` (a retained message the broker sent because you subscribed, as opposed to a live one), `dup` (possible QoS 1 redelivery, e.g. after a reconnect into a resumed session) and the delivered `qos`. `Publish::from(msg)` republishes one.
 
 ### Subscribe, unsubscribe, shutdown
 

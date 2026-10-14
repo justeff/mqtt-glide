@@ -31,7 +31,7 @@ use bytes::Bytes;
 use bytestring::ByteString;
 
 use crate::client::{MqttClient, PublishCompletion};
-use crate::codec::{PublishMessage, PublishProperties, QoS};
+use crate::codec::{InboundMessage, PublishMessage, PublishProperties, QoS};
 use crate::error::AppError;
 
 /// One outbound PUBLISH: topic, payload, QoS, retain flag and MQTT 5 properties.
@@ -185,6 +185,15 @@ impl Publish {
     #[inline]
     pub fn into_parts(self) -> (PublishMessage, QoS, bool) {
         (self.message, self.qos, self.retain)
+    }
+}
+
+impl From<InboundMessage> for Publish {
+    /// Republish an inbound message: topic, payload and properties are kept; QoS 0 and
+    /// retain `false` like [`Publish::new`] (set them explicitly to forward the flags).
+    #[inline]
+    fn from(message: InboundMessage) -> Self {
+        Self::from(message.into_message())
     }
 }
 
@@ -375,7 +384,7 @@ mod tests {
 
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
         let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) =
             connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect");
         let run = tokio::spawn(connection.run());

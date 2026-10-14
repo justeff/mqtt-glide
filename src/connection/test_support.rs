@@ -13,7 +13,7 @@ use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::client::{ReconnectPolicy, StaticCredentials, connect};
-use crate::codec::{ConnectAck, DecodedFrame, Packet, PublishMessage, V5Codec};
+use crate::codec::{ConnectAck, DecodedFrame, InboundMessage, Packet, PublishMessage, V5Codec};
 use crate::connection::{Connection, NoopLifecycle, SessionParams, SessionPhase};
 use crate::error::ConnectionOutcome;
 use crate::options::ConnectOptions;
@@ -272,7 +272,7 @@ pub(crate) async fn test_connect() -> (crate::MqttClient, Connection, watch::Rec
     let port = spawn_mock_broker().await;
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
     let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
-    let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
     // NoReconnect: single mock session — peer close must not spin ImmediateReconnect.
     connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring")
 }

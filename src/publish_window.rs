@@ -137,7 +137,7 @@ mod tests {
 
     use super::*;
     use crate::client::{NoReconnect, connect};
-    use crate::codec::{ConnectAck, DecodedFrame, Packet, PublishAck, PublishAckReason, PublishMessage, QoS};
+    use crate::codec::{ConnectAck, DecodedFrame, InboundMessage, Packet, PublishAck, PublishAckReason, QoS};
     use crate::connection::NoopLifecycle;
     use crate::connection::test_support::{
         accept_connect_send_connack_with, await_connected, spawn_broker_once, static_test_credentials,
@@ -183,7 +183,7 @@ mod tests {
 
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
         let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(16).expect("nz"));
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) =
             connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect");
         let run = tokio::spawn(connection.run());
@@ -243,7 +243,7 @@ mod tests {
         .await;
 
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) = connect(
             ConnectOptions::new(url),
             static_test_credentials(),
@@ -274,7 +274,7 @@ mod tests {
         let port = crate::connection::test_support::spawn_mock_broker().await;
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
         let options = ConnectOptions::new(url);
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) =
             connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect");
         let run = tokio::spawn(connection.run());
@@ -330,7 +330,7 @@ mod tests {
 
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
         let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(16).expect("nz"));
-        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) =
             connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect");
         let run = tokio::spawn(connection.run());

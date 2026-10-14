@@ -145,6 +145,74 @@ impl std::fmt::Debug for PublishMessage {
     }
 }
 
+/// An inbound application message as delivered to the [`InboundSink`](crate::InboundSink).
+///
+/// Besides topic, payload and properties it carries the delivery flags the application may
+/// need: [`Self::retain`] tells a retained message (the broker's stored last value, sent on
+/// subscribe) from a live one, [`Self::dup`] marks a possible redelivery (QoS 1), and
+/// [`Self::qos`] is the QoS the broker delivered it with. Wire-level details (packet id,
+/// topic alias) are not exposed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InboundMessage {
+    /// Topic Name (aliases already resolved).
+    pub topic: ByteString,
+    /// Application payload.
+    pub payload: Bytes,
+    /// Transferable MQTT 5 properties.
+    pub properties: PublishProperties,
+    /// QoS the broker delivered the message with (at most the subscription's QoS).
+    pub qos: QoS,
+    /// RETAIN flag: a retained message sent because of a subscription (or forwarded as-is
+    /// with Retain As Published).
+    pub retain: bool,
+    /// DUP flag: the broker may have delivered this message before (QoS 1 redelivery).
+    pub dup: bool,
+}
+
+impl InboundMessage {
+    /// Topic, payload and properties as a [`PublishMessage`] (flags dropped).
+    #[inline]
+    pub fn into_message(self) -> PublishMessage {
+        PublishMessage {
+            topic: self.topic,
+            payload: self.payload,
+            properties: self.properties,
+        }
+    }
+}
+
+impl From<PublishPacket> for InboundMessage {
+    #[inline]
+    fn from(packet: PublishPacket) -> Self {
+        let PublishMessage {
+            topic,
+            payload,
+            properties,
+        } = packet.message;
+        Self {
+            topic,
+            payload,
+            properties,
+            qos: packet.meta.qos,
+            retain: packet.meta.retain,
+            dup: packet.meta.dup,
+        }
+    }
+}
+
+impl std::fmt::Debug for InboundMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboundMessage")
+            .field("topic", &self.topic)
+            .field("payload", &"<REDACTED>")
+            .field("properties", &self.properties)
+            .field("qos", &self.qos)
+            .field("retain", &self.retain)
+            .field("dup", &self.dup)
+            .finish()
+    }
+}
+
 /// Inbound PUBLISH wire metadata from the fixed header and variable header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublishPacketMeta {

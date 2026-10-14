@@ -121,7 +121,7 @@ impl<H: InboundSink> ConnectionChannels<H> {
 }
 
 /// I/O driver: connect, read/write tasks, reconnect until shutdown.
-pub struct Connection<H: InboundSink = flume::Sender<crate::codec::PublishMessage>> {
+pub struct Connection<H: InboundSink = flume::Sender<crate::codec::InboundMessage>> {
     options: ConnectOptions,
     credentials: SharedCredentials,
     reconnect: Arc<dyn ReconnectPolicy>,
