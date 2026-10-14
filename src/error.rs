@@ -49,7 +49,10 @@ pub enum ProtocolError {
 }
 
 /// Application-level failure (inbound sink closed, command channel closed).
+///
+/// `#[non_exhaustive]`: new failure kinds can be added without a breaking release.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum AppError {
     /// The injectable [`crate::InboundSink`] was closed or disconnected.
     #[error("inbound sink closed")]
@@ -97,6 +100,10 @@ pub enum AppError {
     /// Broker PUBACK completed the packet id with a non-success reason code.
     #[error("publish rejected by broker: {0}")]
     PublishRejected(String),
+    /// [`MqttClient::shutdown`](crate::MqttClient::shutdown) was called: no new commands are
+    /// accepted while the driver drains and disconnects.
+    #[error("client is shutting down")]
+    ShuttingDown,
 }
 
 /// Graceful or requested shutdown.

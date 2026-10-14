@@ -40,8 +40,9 @@ pub(crate) enum ReadOutcome {
 pub(crate) struct ReadSession {
     /// Session cancel (peer close / supervisor).
     pub cancel: CancellationToken,
-    /// App graceful-shutdown notify — cuts off further `framed.next()`.
-    pub shutdown_notify: CancellationToken,
+    /// Graceful stop: cancelled by the write task once a shutdown drain is done; cuts off
+    /// further `framed.next()`.
+    pub stop: CancellationToken,
     /// Connection generation for stale PUBACK discard.
     pub generation: Generation,
     /// Client Receive Maximum from CONNECT (adaptive buffered-frame burst).
@@ -104,7 +105,7 @@ where
     // Hold until every exit path so write observes a completed read-join.
     let _read_done = read_done;
     let cancel = session.cancel;
-    let shutdown_notify = session.shutdown_notify;
+    let shutdown_notify = session.stop;
     let generation = session.generation;
     let read_burst = effective_io_batch(session.receive_maximum, false);
     let handoff_stalled = session.handoff_stalled;

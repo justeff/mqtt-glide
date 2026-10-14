@@ -17,11 +17,16 @@ use crate::codec::{
 };
 use crate::connection::packet_id::InflightPots;
 use crate::connection::subscriptions::SubscriptionRegistry;
-use crate::connection::{CommandReceiver, ControlMessage, ControlReceiver, Generation, effective_io_batch};
+use crate::connection::{
+    ClientCommand, CommandReceiver, ControlMessage, ControlReceiver, Generation, effective_io_batch,
+};
 use crate::error::{AppError, ProtocolError, TransportError};
 
 use super::acks::{complete_publish_ack, complete_subscribe_ack, complete_unsubscribe_ack, fail_all_waiters};
-use super::{MAX_READY_DRAIN, PublishWaiters, SubUnsubWaiters, WRITE_BUFFER_SOFT_FLUSH_BYTES, WriteOutcome};
+use super::{
+    BrokerPublishLimits, MAX_READY_DRAIN, PendingOutboundPublish, PublishWaiters, SubUnsubWaiters,
+    WRITE_BUFFER_SOFT_FLUSH_BYTES, WriteOutcome,
+};
 
 /// How blocking socket flushes interact with cancellation.
 #[derive(Clone, Copy)]
@@ -42,19 +47,29 @@ pub(super) struct GracefulDisconnectCtx<'a> {
     pub(super) publish_waiters: &'a mut PublishWaiters,
     pub(super) inflight: &'a mut InflightPots,
     pub(super) flush_budget: Duration,
+    pub(super) command_rx: &'a mut CommandReceiver,
+    pub(super) publish_limits: BrokerPublishLimits,
+    pub(super) subscription_registry: &'a Arc<RwLock<SubscriptionRegistry>>,
+    pub(super) generation: Generation,
+    pub(super) read_stop: &'a CancellationToken,
 }
 
-/// Best-effort graceful shutdown: wait for read exit, flush pending inbound PUBACKs, then
-/// send DISCONNECT.
+/// Graceful shutdown, bounded by `flush_budget`:
 ///
-/// While waiting for `read_done`, control Acks are still received (avoids deadlock if read is
-/// blocked on `AckInboundPublish` send). After read exits, the control queue is vacuumed with
-/// `try_recv` — no idle timer. Order on the wire **MUST** be `[PubAck*, Disconnect]`.
+/// 1. Close the command channel and send what is already queued (publishes are encoded or
+///    parked; subscribe / unsubscribe fail with [`AppError::ShuttingDown`]).
+/// 2. Keep processing control while outbound QoS-1 publishes (in flight or parked) await
+///    their PUBACKs. The read task is still running, so inbound messages keep being
+///    delivered and acknowledged instead of being dropped in the socket buffer.
+/// 3. Stop the read task, flush its last inbound PUBACKs, send DISCONNECT.
+///
+/// Order on the wire **MUST** be `[…, PubAck*, Disconnect]`. Whatever is still
+/// unacknowledged when the budget runs out fails with [`AppError::ConnectionLost`].
 ///
 /// Socket flushes here **MUST NOT** race `shutdown_notify` or session `cancel`: both are
-/// typically already cancelled when this path runs (`client.shutdown` cancels notify then the
-/// driver token), so racing either would abort every flush without writing DISCONNECT. A stuck
-/// socket is bounded by `flush_budget` (and a short final DISCONNECT attempt) instead.
+/// typically already cancelled when this path runs, so racing either would abort every flush
+/// without writing DISCONNECT. A stuck socket is bounded by `flush_budget` (and a short final
+/// DISCONNECT attempt) instead.
 pub(super) async fn graceful_disconnect<W>(
     framed: &mut FramedWrite<W, V5Codec>,
     ctx: GracefulDisconnectCtx<'_>,
@@ -70,30 +85,72 @@ where
         gate.entered.notify_waiters();
         gate.release.notified().await;
     }
-    fail_all_waiters(
-        ctx.waiters,
-        ctx.publish_waiters,
-        ctx.inflight,
-        &AppError::ConnectionLost,
-    );
 
     let flush_abort = FlushAbort::Graceful;
+    let GracefulDisconnectCtx {
+        control_rx,
+        waiters,
+        publish_waiters,
+        inflight,
+        flush_budget,
+        command_rx,
+        publish_limits,
+        subscription_registry,
+        generation,
+        read_stop,
+    } = ctx;
 
-    let flush = async {
-        if let Err(outcome) =
-            drain_inbound_publish_acks_until_read_done(framed, ctx.control_rx, &mut read_done, flush_abort).await
-        {
-            return outcome;
+    let drain = async {
+        drain_queued_commands(framed, command_rx, inflight, publish_waiters, publish_limits).await?;
+        flush_writes(framed, flush_abort).await?;
+
+        let mut read_finished = false;
+        while !publish_waiters.by_id.is_empty() || !publish_waiters.parked.is_empty() {
+            tokio::select! {
+                biased;
+                msg = control_rx.recv() => match msg {
+                    Some(ControlMessage::PublishAck { ack, generation: ack_generation }) => {
+                        complete_publish_ack(publish_waiters, inflight, generation, ack_generation, ack);
+                        super::commands::send_parked_publishes(framed, inflight, publish_waiters)?;
+                        flush_writes(framed, flush_abort).await?;
+                    }
+                    Some(ControlMessage::AckInboundPublish { packet_id }) => {
+                        feed_inbound_publish_ack(framed, packet_id, None)?;
+                        flush_writes(framed, flush_abort).await?;
+                    }
+                    Some(ControlMessage::SubscribeAck { ack, generation: ack_generation }) => {
+                        complete_subscribe_ack(waiters, inflight, subscription_registry, generation, ack_generation, ack);
+                    }
+                    Some(ControlMessage::UnsubscribeAck { ack, generation: ack_generation }) => {
+                        complete_unsubscribe_ack(waiters, inflight, subscription_registry, generation, ack_generation, ack);
+                    }
+                    // The read task saw a protocol violation: nothing more will be acknowledged.
+                    Some(ControlMessage::ProtocolDisconnect) | None => break,
+                    #[allow(unreachable_patterns)] // test-only control variants
+                    Some(_) => {}
+                },
+                result = &mut read_done, if !read_finished => {
+                    // Peer closed / read failed: no PUBACK can arrive any more.
+                    let _ = result;
+                    read_finished = true;
+                    break;
+                }
+            }
         }
+
+        read_stop.cancel();
+        let read_done = (!read_finished).then_some(&mut read_done);
+        drain_inbound_publish_acks_until_read_done(framed, control_rx, read_done, flush_abort).await?;
         // Best-effort DISCONNECT so the broker sees a clean close after PUBACKs.
-        if let Err(outcome) = send_packet(framed, Packet::Disconnect(Disconnect::default()), flush_abort).await {
-            return outcome;
-        }
-        WriteOutcome::Shutdown
+        send_packet(framed, Packet::Disconnect(Disconnect::default()), flush_abort).await
     };
 
-    match tokio::time::timeout(ctx.flush_budget, flush).await {
-        Ok(outcome) => outcome,
+    let drained = tokio::time::timeout(flush_budget, drain).await;
+    read_stop.cancel();
+    fail_all_waiters(waiters, publish_waiters, inflight, &AppError::ConnectionLost);
+    match drained {
+        Ok(Ok(())) => WriteOutcome::Shutdown,
+        Ok(Err(outcome)) => outcome,
         Err(_elapsed) => {
             // Budget exhausted: still attempt DISCONNECT so the peer sees a clean reason.
             // Bound the attempt so a stuck socket cannot hang past the graceful path.
@@ -107,11 +164,65 @@ where
     }
 }
 
+/// Graceful step 1: closes the command channel and handles everything already queued.
+async fn drain_queued_commands<W>(
+    framed: &mut FramedWrite<W, V5Codec>,
+    command_rx: &mut CommandReceiver,
+    inflight: &mut InflightPots,
+    publish_waiters: &mut PublishWaiters,
+    limits: BrokerPublishLimits,
+) -> Result<(), WriteOutcome>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    command_rx.close();
+    while let Ok(command) = command_rx.try_recv() {
+        match command {
+            ClientCommand::Publish {
+                message,
+                qos,
+                retain,
+                reply,
+            } => {
+                // The parked queue may exceed its usual cap here: nothing new can arrive, so it
+                // stays bounded by the command channel capacity.
+                super::commands::handle_publish(
+                    framed,
+                    inflight,
+                    publish_waiters,
+                    PendingOutboundPublish {
+                        message,
+                        qos,
+                        retain,
+                        reply,
+                    },
+                    limits,
+                )
+                .await?;
+                flush_if_buffer_large(framed, FlushAbort::Graceful).await?;
+            }
+            ClientCommand::Subscribe { reply, .. } => {
+                let _ = reply.send(Err(AppError::ShuttingDown));
+            }
+            ClientCommand::Unsubscribe { reply, .. } => {
+                let _ = reply.send(Err(AppError::ShuttingDown));
+            }
+            #[cfg(test)]
+            ClientCommand::InsertPublishWaiter { packet_id, reply } if !reply.is_closed() => {
+                publish_waiters.insert(packet_id, reply);
+            }
+            #[allow(unreachable_patterns)] // Shutdown + test-only commands
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Drains [`ControlMessage::AckInboundPublish`] until the read task has exited, then vacuums.
 pub(super) async fn drain_inbound_publish_acks_until_read_done<W>(
     framed: &mut FramedWrite<W, V5Codec>,
     control_rx: &mut ControlReceiver,
-    read_done: &mut oneshot::Receiver<()>,
+    mut read_done: Option<&mut oneshot::Receiver<()>>,
     flush_abort: FlushAbort<'_>,
 ) -> Result<(), WriteOutcome>
 where
@@ -119,7 +230,8 @@ where
 {
     let mut dirty = false;
     // Recv Acks concurrently with waiting for read-join (read may still be sending Acks).
-    loop {
+    // `None`: the read task has already exited.
+    while let Some(read_done) = read_done.as_deref_mut() {
         tokio::select! {
             biased;
             msg = control_rx.recv() => {

@@ -294,6 +294,9 @@ impl MqttClient {
     /// Sends a command without waiting, mapping a full channel to [`AppError::Backpressure`].
     #[inline]
     fn try_send_command(&self, command: ClientCommand) -> Result<(), AppError> {
+        if self.shutdown_notify.is_cancelled() {
+            return Err(AppError::ShuttingDown);
+        }
         // ArcSwap load — no lock across await; sender is only swapped on reconnect.
         self.command_tx.load().try_send(command).map_err(|error| match error {
             TrySendError::Full(_) => AppError::Backpressure("command channel full".into()),
@@ -318,6 +321,9 @@ impl MqttClient {
     /// `try_send`, handing the command back when the channel is full.
     #[inline]
     fn try_send_or_return(&self, command: ClientCommand) -> Result<Option<ClientCommand>, AppError> {
+        if self.shutdown_notify.is_cancelled() {
+            return Err(AppError::ShuttingDown);
+        }
         match self.command_tx.load().try_send(command) {
             Ok(()) => Ok(None),
             Err(TrySendError::Full(command)) => Ok(Some(command)),
@@ -330,7 +336,11 @@ impl MqttClient {
         let deadline = tokio::time::Instant::now() + self.ack_timeout;
         loop {
             let sender = self.command_tx.load_full();
-            match tokio::time::timeout_at(deadline, sender.reserve()).await {
+            let reserved = tokio::select! {
+                reserved = tokio::time::timeout_at(deadline, sender.reserve()) => reserved,
+                () = self.shutdown_notify.cancelled() => return Err(AppError::ShuttingDown),
+            };
+            match reserved {
                 Ok(Ok(permit)) => {
                     permit.send(command);
                     return Ok(());
@@ -550,17 +560,22 @@ impl MqttClient {
 
     /// Requests graceful shutdown of the connection driver.
     ///
-    /// Signals the priority shutdown notify (not starved by a full command channel), best-effort
-    /// enqueues `Shutdown` for DISCONNECT, and cancels the driver token so connect/backoff and
-    /// an active session (session cancel is a child of this token) stop promptly.
+    /// From this call on, every client command fails with [`AppError::ShuttingDown`]. An
+    /// active session then drains, bounded by
+    /// [`ConnectOptions::graceful_disconnect_timeout`]: commands already queued are sent,
+    /// QoS 1 publishes get their `PUBACK`s, and the read task keeps delivering (and
+    /// acknowledging) inbound messages until that is done. Then the client sends DISCONNECT
+    /// and closes the connection. Whatever is still unacknowledged when the budget runs out
+    /// fails with [`AppError::ConnectionLost`].
+    ///
+    /// Returns once shutdown is requested, not when the driver finished; await the
+    /// [`Connection::run`] handle (or watch the session phase) for that. Connect / backoff
+    /// phases stop at once.
     pub async fn shutdown(&self) -> Result<(), AppError> {
+        // Signalled via tokens, not the command channel, so a full channel cannot delay it.
         self.shutdown_notify.cancel();
-        let send_result = self.try_send_command(ClientCommand::Shutdown);
         self.cancel.cancel();
-        match send_result {
-            Ok(()) | Err(AppError::CommandChannelClosed) | Err(AppError::Backpressure(_)) => Ok(()),
-            other => other,
-        }
+        Ok(())
     }
 
     /// Test hook: fills the command channel with no-op commands.
@@ -2028,7 +2043,8 @@ mod tests {
         let _ = run.await;
     }
 
-    /// Graceful `shutdown` with an in-flight QoS1 waiter → `ConnectionLost` (live `graceful_disconnect`).
+    /// Graceful `shutdown` with a QoS1 waiter the broker never acknowledges → `ConnectionLost`
+    /// once the graceful budget runs out (live `graceful_disconnect`).
     #[tokio::test]
     async fn qos1_publish_waiter_gets_connection_lost_on_graceful_shutdown() {
         use tokio::sync::Notify;
@@ -2048,7 +2064,11 @@ mod tests {
         })
         .await;
 
-        let (client, connection, mut phase) = connect_test_client(port).await;
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let options = ConnectOptions::new(url).graceful_disconnect_timeout(Duration::from_millis(100));
+        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (client, connection, mut phase) =
+            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
         let run = tokio::spawn(connection.run());
         await_connected(&mut phase).await;
@@ -2263,5 +2283,199 @@ mod tests {
 
         client.shutdown().await.expect("shutdown");
         let _ = run.await;
+    }
+
+    // --- graceful shutdown drain ---
+
+    /// Broker for drain tests: on each QoS 1 PUBLISH, first pushes `inbound_burst` QoS 0
+    /// PUBLISHes to the client, then (unless `never_ack`) waits `ack_delay` and PUBACKs.
+    /// Records the order of PUBACK-relevant events and whether DISCONNECT arrived.
+    async fn spawn_drain_broker(
+        inbound_burst: usize,
+        ack_delay: Duration,
+        never_ack: bool,
+        events: Arc<tokio::sync::Mutex<Vec<&'static str>>>,
+    ) -> u16 {
+        spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+            if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+                return;
+            }
+            while let Some(Ok(frame)) = framed_read.next().await {
+                match frame {
+                    (DecodedFrame::Publish(packet), _) => {
+                        events.lock().await.push("publish");
+                        let mut burst = bytes::BytesMut::new();
+                        for i in 0..inbound_burst {
+                            let inbound = PublishMessage::new("in/drain", format!("m{i}"));
+                            let delivery = crate::codec::PublishDelivery {
+                                dup: false,
+                                retain: false,
+                                qos: QoS::AtMostOnce,
+                                packet_id: None,
+                            };
+                            crate::codec::encode_publish(
+                                &inbound,
+                                delivery,
+                                crate::codec::DEFAULT_MAX_PACKET_SIZE,
+                                &mut burst,
+                            )
+                            .expect("encode inbound");
+                        }
+                        let _ = tokio::io::AsyncWriteExt::write_all(framed_write.get_mut(), &burst).await;
+                        let _ = framed_write.flush().await;
+                        let Some(id) = packet.meta.packet_id else {
+                            continue;
+                        };
+                        if never_ack {
+                            continue;
+                        }
+                        tokio::time::sleep(ack_delay).await;
+                        let _ = framed_write
+                            .send(Packet::PublishAck(PublishAck {
+                                packet_id: id,
+                                reason_code: crate::codec::PublishAckReason::Success,
+                                properties: Vec::new(),
+                                reason_string: None,
+                            }))
+                            .await;
+                        events.lock().await.push("puback");
+                    }
+                    (DecodedFrame::Control(Packet::Disconnect(_)), _) => {
+                        events.lock().await.push("disconnect");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+    }
+
+    /// Waits until the drain broker has recorded `n` events (it runs on its own task).
+    async fn drain_events(events: &tokio::sync::Mutex<Vec<&'static str>>, n: usize) -> Vec<&'static str> {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let seen = events.lock().await.clone();
+                if seen.len() >= n {
+                    return seen;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("broker did not record {n} events"))
+    }
+
+    /// Shutdown right after a QoS 1 publish waits for its delayed PUBACK instead of failing it,
+    /// and DISCONNECT goes out only after that.
+    #[tokio::test]
+    async fn shutdown_waits_for_outbound_puback() {
+        let events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let port = spawn_drain_broker(0, Duration::from_millis(100), false, Arc::clone(&events)).await;
+        let (client, connection, mut phase) = connect_test_client(port).await;
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let completion = client
+            .start_publish(Publish::new("t/drain", "x").qos(QoS::AtLeastOnce))
+            .expect("enqueue");
+        client.shutdown().await.expect("shutdown");
+        completion
+            .wait()
+            .await
+            .expect("publish enqueued before shutdown must complete on its PUBACK");
+        let _ = timeout(Duration::from_secs(3), run).await.expect("driver stops");
+        assert_eq!(drain_events(&events, 3).await, ["publish", "puback", "disconnect"]);
+    }
+
+    /// Inbound messages the broker sends while the client drains reach the app instead of
+    /// being dropped with the socket buffer.
+    #[tokio::test]
+    async fn shutdown_delivers_inbound_received_during_drain() {
+        let events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let port = spawn_drain_broker(100, Duration::from_millis(20), false, Arc::clone(&events)).await;
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let (tx, rx) = flume::bounded::<PublishMessage>(256);
+        let (client, connection, mut phase) = connect(
+            ConnectOptions::new(url),
+            static_test_credentials(),
+            NoReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let completion = client
+            .start_publish(Publish::new("t/drain", "x").qos(QoS::AtLeastOnce))
+            .expect("enqueue");
+        client.shutdown().await.expect("shutdown");
+        completion.wait().await.expect("PUBACK during drain");
+        let _ = timeout(Duration::from_secs(3), run).await.expect("driver stops");
+        assert_eq!(
+            rx.len(),
+            100,
+            "every inbound message sent before the PUBACK must be delivered"
+        );
+    }
+
+    /// Commands still queued when shutdown is requested are sent, and new ones are refused.
+    #[tokio::test]
+    async fn shutdown_sends_queued_publishes_and_refuses_new_ones() {
+        let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let port = spawn_mock_broker_record_publishes(Arc::clone(&observed), NonZeroU16::new(8).expect("nz")).await;
+        let (client, connection, mut phase) = connect_test_client(port).await;
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        // Queue without yielding, so the write task has not seen them before shutdown.
+        let completions: Vec<_> = (0..5u8)
+            .map(|i| {
+                client
+                    .start_publish(Publish::new("t/queued", Bytes::from(vec![i])).qos(QoS::AtLeastOnce))
+                    .expect("enqueue")
+            })
+            .collect();
+        client.shutdown().await.expect("shutdown");
+        let refused = client.publish("t/late", "x").await;
+        assert!(matches!(refused, Err(AppError::ShuttingDown)), "got {refused:?}");
+        for completion in completions {
+            completion
+                .wait()
+                .await
+                .expect("queued publish must be sent and acknowledged");
+        }
+        let _ = timeout(Duration::from_secs(3), run).await.expect("driver stops");
+        assert_eq!(observed.lock().await.len(), 5);
+    }
+
+    /// A broker that never acknowledges cannot hold shutdown past the graceful budget; the
+    /// publish fails with `ConnectionLost` and DISCONNECT is still attempted.
+    #[tokio::test]
+    async fn shutdown_drain_is_bounded_by_graceful_budget() {
+        let events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let port = spawn_drain_broker(0, Duration::ZERO, true, Arc::clone(&events)).await;
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let options = ConnectOptions::new(url).graceful_disconnect_timeout(Duration::from_millis(200));
+        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (client, connection, mut phase) =
+            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let completion = client
+            .start_publish(Publish::new("t/drain", "x").qos(QoS::AtLeastOnce))
+            .expect("enqueue");
+        let started = std::time::Instant::now();
+        client.shutdown().await.expect("shutdown");
+        let err = completion.wait().await.expect_err("never-acked publish must fail");
+        assert!(matches!(err, AppError::ConnectionLost), "got {err:?}");
+        let _ = timeout(Duration::from_secs(3), run).await.expect("driver stops");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "drain must respect the budget"
+        );
+        assert_eq!(drain_events(&events, 2).await, ["publish", "disconnect"]);
     }
 }

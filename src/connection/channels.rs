@@ -113,7 +113,9 @@ pub(crate) enum ClientCommand {
     #[cfg(test)]
     #[doc(hidden)]
     Noop,
-    /// Request graceful shutdown of the connection driver.
+    /// Test hook: enter graceful shutdown through the command channel (production uses the
+    /// shutdown token, which a full channel cannot delay).
+    #[cfg(test)]
     Shutdown,
     /// Outbound PUBLISH; QoS 0 completes after encode, QoS 1 after PUBACK.
     Publish {

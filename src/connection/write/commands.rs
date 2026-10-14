@@ -46,6 +46,7 @@ pub(super) enum CommandDispatch {
     /// Keep running the write loop.
     Continue,
     /// Caller should run [`graceful_disconnect`] (keeps shutdown ownership in `run`).
+    #[cfg(test)]
     GracefulShutdown,
 }
 
@@ -109,6 +110,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     match cmd {
+        #[cfg(test)]
         ClientCommand::Shutdown => Ok(CommandDispatch::GracefulShutdown),
         #[cfg(test)]
         ClientCommand::Noop => Ok(CommandDispatch::Continue),
@@ -284,10 +286,6 @@ where
     // failing the publish. Queue behind already-parked publishes to keep their order;
     // the write loop sends them as PUBACKs free slots.
     if !inflight.has_publish_capacity() || !publish_waiters.parked.is_empty() {
-        debug_assert!(
-            !publish_waiters.parked_full(),
-            "callers stop reading commands when full"
-        );
         publish_waiters.parked.push_back(publish);
         return Ok(());
     }

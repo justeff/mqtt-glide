@@ -425,12 +425,14 @@ impl<H: InboundSink> Connection<H> {
             return self.finish_session(outcome, false).await;
         }
 
-        // Session cancel is a child of the client reconnect cancel so `MqttClient::shutdown`
-        // stops an active session even when the command channel is full. Graceful
-        // DISCONNECT still wins via `shutdown_notify`, which the write task selects first.
-        let session_cancel = self.cancel.child_token();
+        // The session is not a child of the driver cancel: `MqttClient::shutdown` cancels that
+        // too, but an active session must stay up to drain. The write task sees
+        // `shutdown_notify`, drains (bounded by the graceful budget) and only then stops the
+        // read task via `read_stop`; the supervisor cancels the rest.
+        let session_cancel = CancellationToken::new();
         let read_cancel = session_cancel.child_token();
         let write_cancel = session_cancel.child_token();
+        let read_stop = CancellationToken::new();
 
         let control_tx = self.channels.control_tx.clone();
         let handoff = self.channels.handoff.clone();
@@ -472,7 +474,7 @@ impl<H: InboundSink> Connection<H> {
         let read_handle = tokio::spawn(read::run(
             read::ReadSession {
                 cancel: read_cancel.clone(),
-                shutdown_notify: self.shutdown_notify.clone(),
+                stop: read_stop.clone(),
                 generation,
                 receive_maximum: self.options.receive_maximum,
                 handoff_stalled: Arc::clone(&handoff_stalled),
@@ -506,6 +508,7 @@ impl<H: InboundSink> Connection<H> {
                 inbound_activity,
                 bench_inbound_publish_ack_counter: self.options.bench_inbound_publish_ack_counter.clone(),
                 session_carry: self.session_carry.clone(),
+                read_stop,
             },
             inflight,
             read_done_rx,

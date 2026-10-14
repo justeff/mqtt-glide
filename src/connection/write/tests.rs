@@ -96,6 +96,7 @@ where
             inbound_activity: Arc::new(AtomicBool::new(false)),
             bench_inbound_publish_ack_counter: None,
             session_carry: None,
+            read_stop: CancellationToken::new(),
         },
         InflightPots::new(overrides.inflight_capacity),
         read_done_rx,

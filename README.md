@@ -281,7 +281,7 @@ QoS 2 is rejected (`AppError::InvalidRequest`). Packet ID / `dup` are assigned b
 |--------|-------|
 | `subscribe(filters)` | Per-filter `SUBACK` reason codes. Accepts `[("topic", QoS)]`, `[Subscription::new(...).no_local(true)]`, or a `Vec`. |
 | `unsubscribe(filters)` | Per-filter `UNSUBACK` reason codes. Accepts `["topic"]` / `Vec` / any `IntoIterator`. |
-| `shutdown()` | Graceful `DISCONNECT`, flush inbound `PUBACK`s, join driver tasks. |
+| `shutdown()` | Graceful drain, then `DISCONNECT`: queued commands are sent, outbound QoS 1 waits for its `PUBACK`s, inbound keeps being delivered and acknowledged meanwhile. New commands fail with `AppError::ShuttingDown`. Bounded by `graceful_disconnect_timeout`. |
 
 Shared filters: build with `shared_filter(group, topic)` (validates ShareName).
 
@@ -314,7 +314,7 @@ Broader flows live under [`examples/`](examples/) and are the better starting po
 |------|--------:|-------|
 | `ack_timeout` | 5 s | Shared `PUBACK` / `SUBACK` / `UNSUBACK` await |
 | `connect_timeout` | 5 s | Shared TCP + TLS + `CONNACK` budget |
-| `graceful_disconnect_timeout` | 2 s | Caps read-join + inbound `PUBACK` flush + `DISCONNECT` on `shutdown` |
+| `graceful_disconnect_timeout` | 2 s | Caps the whole `shutdown` drain: queued sends, outbound `PUBACK` wait, inbound delivery + `PUBACK` flush, `DISCONNECT` |
 | Packet IDs | n/a | Reserved until matching ACK or session teardown (no reap-on-cancel) |
 | Inbound QoS 1 `PUBACK` | n/a | Only after successful `InboundSink` push; custom `send` **MUST** be cancel-safe |
 | Readiness | n/a | `ClientBuilder::connect` waits for the first `Connected` (`wait_connected`, default `true`); the low-level `connect` returns a `SessionPhase` watch instead. Use the hook or the watch for side effects, not both |

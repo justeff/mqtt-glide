@@ -279,6 +279,8 @@ pub(crate) struct WriteSession {
     /// Resumable session hand-over ([`SessionCarry`]); `None` when the session ends with
     /// the connection (Clean Start, or Session Expiry 0).
     pub session_carry: Option<SessionCarry>,
+    /// Stops the paired read task; cancelled by graceful shutdown after the outbound drain.
+    pub read_stop: CancellationToken,
 }
 
 /// Runs the write task until cancelled, shut down, or signalled to exit.
@@ -313,6 +315,7 @@ where
     let handoff_stalled = session.handoff_stalled;
     let inbound_activity = session.inbound_activity;
     let inbound_publish_ack_counter = session.bench_inbound_publish_ack_counter;
+    let read_stop = session.read_stop;
     let mut awaiting_pingresp = false;
     let generation = session.generation;
     let receive_maximum = session.receive_maximum;
@@ -337,6 +340,11 @@ where
                 publish_waiters: &mut publish_waiters,
                 inflight: &mut inflight,
                 flush_budget: graceful_disconnect_timeout,
+                command_rx: &mut command_rx,
+                publish_limits,
+                subscription_registry: &subscription_registry,
+                generation,
+                read_stop: &read_stop,
             },
             read_done,
             outcome,
@@ -360,6 +368,11 @@ where
                         publish_waiters: &mut publish_waiters,
                         inflight: &mut inflight,
                         flush_budget: graceful_disconnect_timeout,
+                        command_rx: &mut command_rx,
+                        publish_limits,
+                        subscription_registry: &subscription_registry,
+                        generation,
+                        read_stop: &read_stop,
                     },
                     read_done,
                     outcome,
@@ -387,6 +400,11 @@ where
                         publish_waiters: &mut publish_waiters,
                         inflight: &mut inflight,
                         flush_budget: graceful_disconnect_timeout,
+                        command_rx: &mut command_rx,
+                        publish_limits,
+                        subscription_registry: &subscription_registry,
+                        generation,
+                        read_stop: &read_stop,
                     },
                     read_done,
                 )
@@ -441,6 +459,11 @@ where
                             publish_waiters: &mut publish_waiters,
                             inflight: &mut inflight,
                             flush_budget: graceful_disconnect_timeout,
+                            command_rx: &mut command_rx,
+                            publish_limits,
+                            subscription_registry: &subscription_registry,
+                            generation,
+                            read_stop: &read_stop,
                         },
                         read_done,
                         outcome,
@@ -482,6 +505,11 @@ where
                                     publish_waiters: &mut publish_waiters,
                                     inflight: &mut inflight,
                                     flush_budget: graceful_disconnect_timeout,
+                                    command_rx: &mut command_rx,
+                                    publish_limits,
+                                    subscription_registry: &subscription_registry,
+                                    generation,
+                                    read_stop: &read_stop,
                                 },
                                 read_done,
                                 outcome,
@@ -508,6 +536,11 @@ where
                                     publish_waiters: &mut publish_waiters,
                                     inflight: &mut inflight,
                                     flush_budget: graceful_disconnect_timeout,
+                                    command_rx: &mut command_rx,
+                                    publish_limits,
+                                    subscription_registry: &subscription_registry,
+                                    generation,
+                                    read_stop: &read_stop,
                                 },
                                 read_done,
                                 outcome,
@@ -538,6 +571,11 @@ where
                                     publish_waiters: &mut publish_waiters,
                                     inflight: &mut inflight,
                                     flush_budget: graceful_disconnect_timeout,
+                                    command_rx: &mut command_rx,
+                                    publish_limits,
+                                    subscription_registry: &subscription_registry,
+                                    generation,
+                                    read_stop: &read_stop,
                                 },
                                 read_done,
                                 outcome,
@@ -631,6 +669,11 @@ where
                                             publish_waiters: &mut publish_waiters,
                                             inflight: &mut inflight,
                                             flush_budget: graceful_disconnect_timeout,
+                                            command_rx: &mut command_rx,
+                                            publish_limits,
+                                            subscription_registry: &subscription_registry,
+                                            generation,
+                                            read_stop: &read_stop,
                                         },
                                         read_done,
                                         outcome,
@@ -648,6 +691,11 @@ where
                                             publish_waiters: &mut publish_waiters,
                                             inflight: &mut inflight,
                                             flush_budget: graceful_disconnect_timeout,
+                                            command_rx: &mut command_rx,
+                                            publish_limits,
+                                            subscription_registry: &subscription_registry,
+                                            generation,
+                                            read_stop: &read_stop,
                                         },
                                         read_done,
                                         outcome,
@@ -673,6 +721,11 @@ where
                                                 publish_waiters: &mut publish_waiters,
                                                 inflight: &mut inflight,
                                                 flush_budget: graceful_disconnect_timeout,
+                                                command_rx: &mut command_rx,
+                                                publish_limits,
+                                                subscription_registry: &subscription_registry,
+                                                generation,
+                                                read_stop: &read_stop,
                                             },
                                             read_done,
                                             outcome,
@@ -690,6 +743,11 @@ where
                                         publish_waiters: &mut publish_waiters,
                                         inflight: &mut inflight,
                                         flush_budget: graceful_disconnect_timeout,
+                                        command_rx: &mut command_rx,
+                                        publish_limits,
+                                        subscription_registry: &subscription_registry,
+                                        generation,
+                                        read_stop: &read_stop,
                                     },
                                     read_done,
                                     outcome,
@@ -754,6 +812,7 @@ where
                 .await
                 {
                     Ok(CommandDispatch::Continue) => {}
+                    #[cfg(test)]
                     Ok(CommandDispatch::GracefulShutdown) => {
                         return graceful_disconnect(
                             &mut framed,
@@ -763,6 +822,11 @@ where
                                 publish_waiters: &mut publish_waiters,
                                 inflight: &mut inflight,
                                 flush_budget: graceful_disconnect_timeout,
+                                command_rx: &mut command_rx,
+                                publish_limits,
+                                subscription_registry: &subscription_registry,
+                                generation,
+                                read_stop: &read_stop,
                             },
                             read_done,
                         )
@@ -777,6 +841,11 @@ where
                                 publish_waiters: &mut publish_waiters,
                                 inflight: &mut inflight,
                                 flush_budget: graceful_disconnect_timeout,
+                                command_rx: &mut command_rx,
+                                publish_limits,
+                                subscription_registry: &subscription_registry,
+                                generation,
+                                read_stop: &read_stop,
                             },
                             read_done,
                             outcome,

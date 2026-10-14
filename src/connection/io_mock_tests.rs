@@ -82,7 +82,7 @@ where
     let join = tokio::spawn(crate::connection::read::run(
         ReadSession {
             cancel: cancel.clone(),
-            shutdown_notify: CancellationToken::new(),
+            stop: CancellationToken::new(),
             generation: Generation(1),
             receive_maximum: nonzero!(8u16),
             handoff_stalled: Arc::clone(&handoff_stalled),
@@ -145,6 +145,7 @@ where
             inbound_activity: Arc::new(AtomicBool::new(false)),
             bench_inbound_publish_ack_counter: None,
             session_carry: None,
+            read_stop: CancellationToken::new(),
         },
         InflightPots::new(NonZeroU16::new(4).expect("nz")),
         read_done_rx,
