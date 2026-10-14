@@ -12,7 +12,7 @@ mod keepalive;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -35,7 +35,7 @@ use crate::connection::{
 use crate::error::{ProtocolError, TransportError};
 
 use self::acks::{complete_subscribe_ack, complete_unsubscribe_ack, fail_waiters_for_outcome};
-use self::commands::{CommandDispatch, CommandDispatchCtx, dispatch_client_command};
+use self::commands::{CommandDispatch, CommandDispatchCtx, dispatch_client_command, send_parked_publishes};
 use self::io::{
     ControlCoalesceCtx, FlushAbort, GracefulDisconnectCtx, drain_ready_control_coalesce, feed_inbound_publish_ack,
     flush_writes, graceful_disconnect, handle_deferred_control, send_packet,
@@ -76,6 +76,9 @@ use tokio::sync::mpsc;
 pub(super) const WRITE_BUFFER_SOFT_FLUSH_BYTES: usize = 16 * 1024;
 
 pub(super) use crate::connection::io_batch::MAX_READY_DRAIN;
+
+/// Upper bound on QoS-1 PUBLISHes held while the broker's Receive Maximum window is full.
+pub(super) const MAX_PARKED_PUBLISHES: usize = crate::options::COMMAND_CHANNEL_CAPACITY;
 
 /// Outcome of the write task.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,14 +132,27 @@ impl SubUnsubWaiters {
 ///
 /// After a PUBLISH is encoded, the Packet Identifier stays reserved until that PUBACK
 /// (or session teardown) even if the caller drops the oneshot ([MQTT-2.2.1-3]).
+///
+/// `parked` is a FIFO of QoS-1 PUBLISHes that arrived while the broker's Receive Maximum
+/// window was full ([MQTT-4.9.0-2]). They are sent in order as PUBACKs free slots.
+/// SUBSCRIBE / UNSUBSCRIBE keep flowing past them; only when the queue reaches
+/// [`MAX_PARKED_PUBLISHES`] does the write task stop reading commands, so backpressure
+/// reaches the bounded command channel instead of growing memory.
 #[derive(Debug, Default)]
 pub(crate) struct PublishWaiters {
     pub(super) by_id: HashMap<NonZeroU16, PublishReply>,
+    pub(super) parked: VecDeque<PendingOutboundPublish>,
 }
 
 impl PublishWaiters {
     pub(super) fn new() -> Self {
-        Self { by_id: HashMap::new() }
+        Self::default()
+    }
+
+    /// Whether the parked queue is full (the write task must stop reading commands).
+    #[inline]
+    pub(super) fn parked_full(&self) -> bool {
+        self.parked.len() >= MAX_PARKED_PUBLISHES
     }
 
     pub(super) fn insert(&mut self, packet_id: NonZeroU16, reply: PublishReply) {
@@ -150,7 +166,8 @@ impl PublishWaiters {
 }
 
 /// Outbound PUBLISH command from the client API.
-pub(super) struct PendingOutboundPublish {
+#[derive(Debug)]
+pub(crate) struct PendingOutboundPublish {
     pub(super) message: PublishMessage,
     pub(super) qos: QoS,
     pub(super) retain: bool,
@@ -239,6 +256,29 @@ where
     };
 
     loop {
+        // A PUBACK handled in the previous iteration may have freed window slots.
+        if !publish_waiters.parked.is_empty() && inflight.has_publish_capacity() {
+            let sent = match send_parked_publishes(&mut framed, &mut inflight, &mut publish_waiters) {
+                Ok(()) => flush_writes(&mut framed, flush_abort).await,
+                Err(outcome) => Err(outcome),
+            };
+            if let Err(outcome) = sent {
+                return finish_hot_path_write_outcome(
+                    &mut framed,
+                    GracefulDisconnectCtx {
+                        control_rx: &mut control_rx,
+                        waiters: &mut waiters,
+                        publish_waiters: &mut publish_waiters,
+                        inflight: &mut inflight,
+                        flush_budget: graceful_disconnect_timeout,
+                    },
+                    read_done,
+                    outcome,
+                )
+                .await;
+            }
+        }
+
         // Do not put `#[cfg(test)]` on a `tokio::select!` arm — the macro rejects it.
         #[cfg(test)]
         let stub_exit = stub_exit_rx.recv();
@@ -598,7 +638,8 @@ where
                     unreachable!("stub_exit is pending in release builds");
                 }
             }
-            command = command_rx.recv() => {
+            // Full parked queue: leave commands in the bounded channel (backpressure).
+            command = command_rx.recv(), if !publish_waiters.parked_full() => {
                 let Some(cmd) = command else {
                     return finish_write_outcome(
                         &mut waiters,

@@ -1615,23 +1615,26 @@ mod tests {
         let _ = run.await;
     }
 
-    /// CONNACK `server_receive_maximum=1` with withheld PUBACK: second QoS1 `publish` returns
-    /// [`AppError::Backpressure`] promptly (no hang / abort-without-assert).
+    /// CONNACK `server_receive_maximum=1` with withheld PUBACK: a second QoS1 `publish` waits
+    /// for a window slot ([MQTT-4.9.0-2]) instead of failing, and stays off the wire.
     #[tokio::test]
-    async fn qos1_publish_returns_backpressure_when_inflight_exhausted() {
+    async fn qos1_publish_waits_for_window_when_inflight_exhausted() {
         use tokio::sync::Notify;
 
         let first_publish_seen = Arc::new(Notify::new());
         let first_publish_seen_broker = Arc::clone(&first_publish_seen);
+        let publishes_on_wire = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let publishes_on_wire_broker = Arc::clone(&publishes_on_wire);
         let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
             let mut ack = ConnectAck::default();
             ack.receive_max = NonZeroU16::new(1).expect("nz");
             if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
                 return;
             }
-            // Withhold PUBACKs so the outbound QoS1 window stays full; signal first PUBLISH on wire.
+            // Withhold PUBACKs so the outbound QoS1 window stays full; signal each PUBLISH on wire.
             while let Some(Ok(frame)) = framed_read.next().await {
                 if let (DecodedFrame::Publish(_), _) = frame {
+                    publishes_on_wire_broker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     first_publish_seen_broker.notify_one();
                 }
             }
@@ -1660,17 +1663,19 @@ mod tests {
             .await
             .expect("first QoS1 PUBLISH must reach the broker before second publish");
 
-        let err = timeout(
-            Duration::from_secs(2),
+        let second = timeout(
+            Duration::from_millis(300),
             client.publish(sample_message("t/b", b"2"), QoS::AtLeastOnce, false),
         )
-        .await
-        .expect("second QoS1 publish must not hang when inflight is exhausted")
-        .expect_err("second QoS1 publish must fail with typed Backpressure");
-
+        .await;
         assert!(
-            matches!(err, AppError::Backpressure(_)),
-            "expected AppError::Backpressure when CONNACK receive_max=1 window is full, got {err:?}"
+            second.is_err(),
+            "second QoS1 publish must wait for a window slot, not fail; got {second:?}"
+        );
+        assert_eq!(
+            publishes_on_wire.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "parked publish must not exceed the broker Receive Maximum on the wire"
         );
 
         first.abort();
@@ -1738,10 +1743,20 @@ mod tests {
         });
         // Fill the outbound QoS1 window before subscribe.
         tokio::time::sleep(Duration::from_millis(100)).await;
+        // A second publish parks behind the full window; subscribe must still get past it.
+        let parked_task = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .publish(sample_message("t/parked", b"2"), QoS::AtLeastOnce, false)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             observed.lock().await.iter().filter(|(kind, _)| *kind == 1).count(),
             1,
-            "expected exactly one QoS1 PUBLISH on the wire before subscribe"
+            "expected exactly one QoS1 PUBLISH on the wire before subscribe (second is parked)"
         );
 
         let reasons = timeout(
@@ -1768,6 +1783,7 @@ mod tests {
         );
 
         publish_task.abort();
+        parked_task.abort();
         client.shutdown().await.expect("shutdown");
         let _ = run.await;
     }

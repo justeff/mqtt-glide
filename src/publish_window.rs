@@ -372,6 +372,72 @@ mod tests {
         let _ = run.await;
     }
 
+    /// Window wider than the broker's Receive Maximum must wait for PUBACKs, not fail.
+    /// (Default mosquitto advertises 20; examples use a window of 64.)
+    #[tokio::test]
+    async fn publish_window_wider_than_server_receive_maximum() {
+        let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+            let mut ack = ConnectAck::default();
+            ack.receive_max = NonZeroU16::new(2).expect("nz");
+            if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
+                return;
+            }
+            loop {
+                match framed_read.next().await {
+                    Some(Ok((DecodedFrame::Publish(packet), _))) => {
+                        let Some(id) = packet.meta.packet_id else {
+                            continue;
+                        };
+                        // Delay so several publishes are queued while the window is full.
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        let _ = framed_write
+                            .send(Packet::PublishAck(PublishAck {
+                                packet_id: id,
+                                reason_code: PublishAckReason::Success,
+                                properties: Vec::new(),
+                                reason_string: None,
+                            }))
+                            .await;
+                    }
+                    Some(Ok((DecodedFrame::Control(Packet::Disconnect(_)), _))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
+                }
+            }
+        })
+        .await;
+
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (client, connection, mut phase) = connect(
+            ConnectOptions::new(url),
+            static_test_credentials(),
+            NoReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let mut pipe = client.publish_window(NonZeroUsize::new(8).expect("nz"));
+        for i in 0..20u8 {
+            pipe.publish_with()
+                .topic("t/window-rm")
+                .payload(Bytes::from(vec![i]))
+                .qos(QoS::AtLeastOnce)
+                .push_retry()
+                .await
+                .expect("push_retry must not fail on broker Receive Maximum");
+        }
+        pipe.drain()
+            .await
+            .expect("drain must not fail on broker Receive Maximum");
+
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
+
     #[tokio::test]
     async fn publish_window_push_message_api() {
         let port = crate::connection::test_support::spawn_mock_broker().await;

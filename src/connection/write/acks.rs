@@ -123,6 +123,9 @@ pub(super) fn fail_all_waiters(
         inflight.release_publish(id);
         let _ = reply.send(Err(error.clone()));
     }
+    for parked in publish_waiters.parked.drain(..) {
+        let _ = parked.reply.send(Err(error.clone()));
+    }
 }
 
 /// Fail outstanding waiters with the [`AppError`] class that matches `outcome`.

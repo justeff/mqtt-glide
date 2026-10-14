@@ -730,23 +730,19 @@ async fn complete_publish_ack_maps_failure_reason_to_publish_rejected() {
 }
 
 /// [MQTT-2.2.1-3]: after QoS1 PUBLISH is on the wire, dropping the caller oneshot must not
-/// free the packet id — a second publish at capacity must backpressure until PUBACK.
+/// free the packet id — a second publish at capacity waits (parked) until that PUBACK.
 #[tokio::test]
 async fn cancelled_qos1_publish_keeps_packet_id_until_puback() {
     use crate::codec::{DecodedFrame, Packet, PublishAck, PublishAckReason};
 
-    let (wired_tx, wired_rx) = oneshot::channel::<NonZeroU16>();
+    let (wired_tx, mut wired_rx) = mpsc::unbounded_channel::<NonZeroU16>();
     let (framed, peer_end) = duplex_framed_write();
     let peer = tokio::spawn(async move {
         let mut framed = FramedRead::new(peer_end, V5Codec::with_max_packet_size(0));
-        let mut wired_tx = Some(wired_tx);
         while let Some(frame) = framed.next().await {
             match frame {
                 Ok((DecodedFrame::Publish(p), _)) => {
-                    if let Some(tx) = wired_tx.take() {
-                        let id = p.meta.packet_id.expect("QoS1 packet id");
-                        let _ = tx.send(id);
-                    }
+                    let _ = wired_tx.send(p.meta.packet_id.expect("QoS1 packet id"));
                 }
                 Ok((DecodedFrame::Control(Packet::Disconnect(_)), _)) => break,
                 _ => {}
@@ -779,7 +775,7 @@ async fn cancelled_qos1_publish_keeps_packet_id_until_puback() {
         })
         .expect("first publish command");
 
-    let packet_id = timeout(Duration::from_secs(2), wired_rx)
+    let packet_id = timeout(Duration::from_secs(2), wired_rx.recv())
         .await
         .expect("wire timeout")
         .expect("wired packet id");
@@ -789,7 +785,7 @@ async fn cancelled_qos1_publish_keeps_packet_id_until_puback() {
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
 
-    let (reply2_tx, reply2_rx) = oneshot::channel();
+    let (reply2_tx, mut reply2_rx) = oneshot::channel();
     harness
         .command_tx
         .try_send(ClientCommand::Publish {
@@ -799,14 +795,13 @@ async fn cancelled_qos1_publish_keeps_packet_id_until_puback() {
             reply: reply2_tx,
         })
         .expect("second publish command");
-    let err = timeout(Duration::from_secs(1), reply2_rx)
-        .await
-        .expect("second reply timeout")
-        .expect("second oneshot")
-        .expect_err("second publish must backpressure while first id is held");
     assert!(
-        matches!(err, AppError::Backpressure(_)),
-        "expected Backpressure while cancelled publish still occupies the only slot, got {err:?}"
+        timeout(Duration::from_millis(200), &mut reply2_rx).await.is_err(),
+        "second publish must wait (parked) while the cancelled publish still holds the only slot"
+    );
+    assert!(
+        wired_rx.try_recv().is_err(),
+        "parked publish must not reach the wire before the slot is freed"
     );
 
     harness
@@ -822,20 +817,15 @@ async fn cancelled_qos1_publish_keeps_packet_id_until_puback() {
         })
         .expect("puback");
 
-    let (reply3_tx, reply3_rx) = oneshot::channel();
-    harness
-        .command_tx
-        .try_send(ClientCommand::Publish {
-            message,
-            qos: QoS::AtLeastOnce,
-            retain: false,
-            reply: reply3_tx,
-        })
-        .expect("third publish command");
-    // Third publish is accepted into inflight (awaiting its own PUBACK) — oneshot stays pending.
+    // PUBACK frees the slot: the parked publish goes out and now awaits its own PUBACK.
+    let second_id = timeout(Duration::from_secs(2), wired_rx.recv())
+        .await
+        .expect("parked publish must reach the wire after PUBACK")
+        .expect("wired packet id");
+    assert_eq!(second_id, packet_id, "freed id is reused for the parked publish");
     assert!(
-        timeout(Duration::from_millis(50), reply3_rx).await.is_err(),
-        "after PUBACK frees the slot, a new QoS1 publish must allocate (wait for its PUBACK)"
+        timeout(Duration::from_millis(50), reply2_rx).await.is_err(),
+        "parked publish completes only on its own PUBACK"
     );
 
     drop(harness.command_tx);

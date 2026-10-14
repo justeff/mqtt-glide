@@ -344,6 +344,57 @@ async fn mosquitto_qos1_publish_awaits_puback() {
     join_run_after_shutdown(run).await;
 }
 
+/// Default Mosquitto advertises Receive Maximum 20: a QoS 1 window of 64 must wait for
+/// slots, not fail with `Backpressure`.
+#[tokio::test]
+async fn mosquitto_qos1_window_wider_than_receive_maximum() {
+    use std::num::NonZeroUsize;
+
+    use mqtt_glide::PublishMessage;
+
+    let Some((_container, port)) = start_mosquitto().await else {
+        return;
+    };
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
+    let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("qos1-window"));
+    let (tx, _rx) = flume::bounded::<PublishMessage>(8);
+    let (client, connection, mut phase) =
+        connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
+
+    let run = tokio::spawn(connection.run());
+
+    let connected = wait_for_phase(&mut phase, Duration::from_secs(10), |p| {
+        matches!(
+            p,
+            SessionPhase::Connected {
+                session: SessionParams { from_connack: true, .. },
+                ..
+            }
+        )
+    })
+    .await;
+    let SessionPhase::Connected { session, .. } = connected else {
+        panic!("expected Connected, got {connected:?}");
+    };
+    assert!(
+        session.server_receive_maximum.get() < 64,
+        "test needs a broker window narrower than the publish window, got {}",
+        session.server_receive_maximum
+    );
+
+    let messages = (0..500).map(|i| PublishMessage::new("qos1/window", format!("m{i}")));
+    timeout(
+        Duration::from_secs(20),
+        client.publish_batch(messages, QoS::AtLeastOnce, false, NonZeroUsize::new(64).expect("nz")),
+    )
+    .await
+    .expect("publish_batch must not hang")
+    .expect("publish_batch wider than the broker Receive Maximum must succeed");
+
+    client.shutdown().await.expect("shutdown");
+    join_run_after_shutdown(run).await;
+}
+
 /// User Properties + Message Expiry Interval survive publish → subscribe echo via Mosquitto.
 #[tokio::test]
 async fn mosquitto_publish_properties_roundtrip() {

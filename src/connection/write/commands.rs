@@ -194,7 +194,8 @@ where
     // relevant here — use false so publish bursts can fill the adaptive window.
     let batch = effective_io_batch(ctx.receive_maximum, false);
     for _ in 0..MAX_READY_DRAIN {
-        if fed_publishes >= batch {
+        // Full parked queue: leave further commands in the bounded channel.
+        if fed_publishes >= batch || ctx.publish_waiters.parked_full() {
             break;
         }
         match ctx.command_rx.try_recv() {
@@ -279,7 +280,53 @@ where
         return Ok(());
     }
 
-    // QoS 1: allocate publish id, encode, complete reply on matching PUBACK.
+    // QoS 1: wait for a free slot in the broker's Receive Maximum window rather than
+    // failing the publish. Queue behind already-parked publishes to keep their order;
+    // the write loop sends them as PUBACKs free slots.
+    if !inflight.has_publish_capacity() || !publish_waiters.parked.is_empty() {
+        debug_assert!(
+            !publish_waiters.parked_full(),
+            "callers stop reading commands when full"
+        );
+        publish_waiters.parked.push_back(publish);
+        return Ok(());
+    }
+
+    encode_qos1_publish(framed, inflight, publish_waiters, publish)
+}
+
+/// Feeds parked QoS-1 publishes (FIFO) while the publish window has room. Caller flushes.
+pub(super) fn send_parked_publishes<W>(
+    framed: &mut FramedWrite<W, V5Codec>,
+    inflight: &mut InflightPots,
+    publish_waiters: &mut PublishWaiters,
+) -> Result<(), WriteOutcome>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    while inflight.has_publish_capacity() {
+        let Some(publish) = publish_waiters.parked.pop_front() else {
+            break;
+        };
+        // Caller gave up (ack timeout / drop) while parked: never put it on the wire.
+        if publish.reply.is_closed() {
+            continue;
+        }
+        encode_qos1_publish(framed, inflight, publish_waiters, publish)?;
+    }
+    Ok(())
+}
+
+/// Allocates a publish packet id, registers the waiter, and feeds the QoS-1 PUBLISH.
+fn encode_qos1_publish<W>(
+    framed: &mut FramedWrite<W, V5Codec>,
+    inflight: &mut InflightPots,
+    publish_waiters: &mut PublishWaiters,
+    publish: PendingOutboundPublish,
+) -> Result<(), WriteOutcome>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let packet_id = match inflight.alloc_publish() {
         Ok(id) => id,
         Err(error) => {

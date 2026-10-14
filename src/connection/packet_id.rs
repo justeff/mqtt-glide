@@ -84,6 +84,12 @@ impl InflightPots {
         ))
     }
 
+    /// Whether [`Self::alloc_publish`] can hand out another publish ID right now.
+    #[inline]
+    pub(crate) fn has_publish_capacity(&self) -> bool {
+        self.publish_count < self.publish_capacity
+    }
+
     /// Allocates a Packet Identifier for SUBSCRIBE or UNSUBSCRIBE.
     pub(crate) fn alloc_subscribe(&mut self) -> Result<NonZeroU16, AppError> {
         for _ in 0..u16::MAX {
