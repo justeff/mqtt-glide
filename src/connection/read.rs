@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::codec::FramedRead;
 use tokio_util::sync::CancellationToken;
 
-use crate::codec::{DecodeError, DecodedFrame, DisconnectReasonCode, InboundMessage, Packet, PublishPacket, V5Codec};
+use crate::codec::{DecodeError, DecodedFrame, InboundMessage, Packet, PublishPacket, V5Codec};
 use crate::connection::{ControlMessage, Generation, effective_io_batch, inbound_publish_policy};
 use crate::error::{ProtocolError, TransportError};
 use crate::inbound_sink::{InboundSink, InboundTrySendError};
@@ -30,7 +30,7 @@ pub(crate) enum ReadOutcome {
     /// Socket / decode I/O failure.
     Transport(TransportError),
     /// Broker sent DISCONNECT with a reason code (classified in the coordinator).
-    BrokerDisconnect(DisconnectReasonCode),
+    BrokerDisconnect(Box<crate::codec::Disconnect>),
     /// Protocol violation or decode failure.
     Protocol(ProtocolError),
 }
@@ -304,7 +304,7 @@ async fn dispatch_control(
 ) -> Option<ReadOutcome> {
     match packet {
         Packet::PingResponse => None,
-        Packet::Disconnect(disconnect) => Some(ReadOutcome::BrokerDisconnect(disconnect.reason_code)),
+        Packet::Disconnect(disconnect) => Some(ReadOutcome::BrokerDisconnect(Box::new(disconnect))),
         Packet::SubscribeAck(ack) => {
             if control_tx
                 .send(ControlMessage::SubscribeAck { ack, generation })

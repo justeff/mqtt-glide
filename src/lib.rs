@@ -30,6 +30,7 @@ compile_error!("features `tls-rustls-aws-lc` and `tls-rustls-ring` are mutually 
 #[cfg(not(any(feature = "tls-rustls-aws-lc", feature = "tls-rustls-ring")))]
 compile_error!("enable exactly one of `tls-rustls-aws-lc` or `tls-rustls-ring`");
 
+pub mod ack;
 pub mod builder;
 pub mod client;
 pub mod codec;
@@ -48,6 +49,7 @@ pub use client::{
 };
 // Application-facing message and option types. Wire-level packet types, the codec and the
 // encode helpers stay under [`codec`].
+pub use ack::{PublishRejection, SubscribeResponse, UnsubscribeResponse};
 pub use codec::{
     ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, DisconnectReasonCode, InboundMessage, PublishAckReason, PublishMessage,
     PublishProperties, QoS, RetainHandling, SubscribeAckReason, SubscriptionOptions, UnsubscribeAckReason,

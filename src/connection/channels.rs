@@ -5,10 +5,7 @@ use std::num::NonZeroU16;
 use bytestring::ByteString;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::codec::{
-    PublishAck, PublishMessage, QoS, SubscribeAck, SubscribeAckReason, SubscriptionOptions, UnsubscribeAck,
-    UnsubscribeAckReason,
-};
+use crate::codec::{PublishAck, PublishMessage, QoS, SubscribeAck, SubscriptionOptions, UnsubscribeAck};
 use crate::error::AppError;
 
 use super::Generation;
@@ -97,10 +94,10 @@ pub(crate) enum ControlMessage {
 }
 
 /// Reply channel for [`ClientCommand::Subscribe`].
-pub(crate) type SubscribeReply = oneshot::Sender<Result<Vec<SubscribeAckReason>, AppError>>;
+pub(crate) type SubscribeReply = oneshot::Sender<Result<crate::ack::SubscribeResponse, AppError>>;
 
 /// Reply channel for [`ClientCommand::Unsubscribe`].
-pub(crate) type UnsubscribeReply = oneshot::Sender<Result<Vec<UnsubscribeAckReason>, AppError>>;
+pub(crate) type UnsubscribeReply = oneshot::Sender<Result<crate::ack::UnsubscribeResponse, AppError>>;
 
 /// Reply channel for [`ClientCommand::Publish`].
 pub(crate) type PublishReply = oneshot::Sender<Result<(), AppError>>;

@@ -125,7 +125,7 @@ pub(crate) fn topic_name_invalid_reason(topic: &str) -> Option<&'static str> {
 /// Applies CONNACK properties onto local session parameters.
 pub(crate) fn apply_connack(client_keep_alive: Duration, ack: &ConnectAck) -> Result<SessionParams, ConnectionOutcome> {
     if ack.reason_code != ConnectAckReason::Success {
-        return Err(connack_failure_outcome(ack.reason_code));
+        return Err(connack_failure_outcome(ack.reason_code, ack.reason_string.as_deref()));
     }
 
     let keep_alive = ack
@@ -147,12 +147,16 @@ pub(crate) fn apply_connack(client_keep_alive: Duration, ack: &ConnectAck) -> Re
 }
 
 /// Maps a non-success CONNACK reason to a typed connection outcome.
-pub(crate) fn connack_failure_outcome(reason: ConnectAckReason) -> ConnectionOutcome {
+pub(crate) fn connack_failure_outcome(reason: ConnectAckReason, reason_string: Option<&str>) -> ConnectionOutcome {
+    let detail = super::broker_detail(reason_string, None);
     match reason {
         ConnectAckReason::NotAuthorized | ConnectAckReason::BadUserNameOrPassword => {
+            if !detail.is_empty() {
+                tracing::warn!(reason = ?reason, detail = %detail, "CONNACK refused credentials");
+            }
             ConnectionOutcome::Auth(AuthError::NotAuthorized)
         }
-        other => ConnectionOutcome::Protocol(ProtocolError::Violation(format!("CONNACK rejected: {other:?}"))),
+        other => ConnectionOutcome::Protocol(ProtocolError::Violation(format!("CONNACK rejected: {other:?}{detail}"))),
     }
 }
 
@@ -424,14 +428,14 @@ mod tests {
 
     #[test]
     fn connack_not_authorized_maps_to_auth_outcome() {
-        let outcome = connack_failure_outcome(ConnectAckReason::NotAuthorized);
+        let outcome = connack_failure_outcome(ConnectAckReason::NotAuthorized, None);
         assert!(matches!(outcome, ConnectionOutcome::Auth(AuthError::NotAuthorized)));
     }
 
     /// [MQTT-4.13.2-1] CONNACK reason codes ≥0x80 classify as session/network termination.
     #[test]
     fn connack_unspecified_error_maps_to_protocol_outcome() {
-        let outcome = connack_failure_outcome(ConnectAckReason::UnspecifiedError);
+        let outcome = connack_failure_outcome(ConnectAckReason::UnspecifiedError, Some("maintenance"));
         assert!(matches!(outcome, ConnectionOutcome::Protocol(_)));
     }
 

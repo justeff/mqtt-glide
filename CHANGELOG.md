@@ -36,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Requests that were waiting when the connection broke (QoS 1 publishes in flight or parked, subscribe / unsubscribe awaiting their ack) now always fail with `AppError::ConnectionLost`. Before, a write-side failure reported `SendFailed` and a read-side one `ConnectionLost` for the same situation, depending on which side noticed first. `SendFailed` remains for the one command whose own write failed
 
+- Broker diagnostics are passed through instead of dropped: `AppError::PublishRejected` now carries a `PublishRejection` (PUBACK reason code, Reason String, User Properties) instead of a formatted string; `subscribe` / `unsubscribe` return `SubscribeResponse` / `UnsubscribeResponse` (per-filter reason codes plus Reason String and User Properties; they deref to the reason list, compare equal to a `Vec` of reasons and offer `as_slice`, so most callers compile unchanged); the Reason String and Server Reference of a broker DISCONNECT and the Reason String of a refused CONNACK appear in the connection outcome
+
 ### Added
 
 - MQTT over WebSocket behind the optional `websocket` feature: `ws://` / `wss://` broker URLs (`BrokerUrl::websocket_path`), `mqtt` subprotocol, binary frames per §6, `wss` on the client's own rustls configuration. Without the feature such URLs fail with `BrokerUrlError::WebSocketUnsupported`

@@ -680,7 +680,26 @@ impl<H: InboundSink> Connection<H> {
             Ok(ReadOutcome::PeerClosed) => {
                 ConnectionOutcome::Transport(TransportError::Connection("peer closed".into()))
             }
-            Ok(ReadOutcome::BrokerDisconnect(reason)) => map_broker_disconnect_outcome(reason),
+            Ok(ReadOutcome::BrokerDisconnect(disconnect)) => {
+                let detail = broker_detail(
+                    disconnect.reason_string.as_deref(),
+                    disconnect.server_reference.as_deref(),
+                );
+                match map_broker_disconnect_outcome(disconnect.reason_code) {
+                    ConnectionOutcome::Transport(TransportError::Connection(message)) => {
+                        ConnectionOutcome::Transport(TransportError::Connection(message + &detail))
+                    }
+                    ConnectionOutcome::Protocol(ProtocolError::Violation(message)) => {
+                        ConnectionOutcome::Protocol(ProtocolError::Violation(message + &detail))
+                    }
+                    other => {
+                        if !detail.is_empty() {
+                            tracing::warn!(reason = ?disconnect.reason_code, detail = %detail, "broker DISCONNECT");
+                        }
+                        other
+                    }
+                }
+            }
             Ok(ReadOutcome::Transport(error)) => ConnectionOutcome::Transport(error),
             Ok(ReadOutcome::Protocol(error)) => ConnectionOutcome::Protocol(error),
             Err(join_err) => ConnectionOutcome::Application(AppError::TaskJoin(join_err.to_string())),
@@ -721,6 +740,18 @@ enum SessionDisposition {
     Retry,
     /// Driver finished; return this result to the caller.
     Stop(Result<(), ConnectionOutcome>),
+}
+
+/// Broker-supplied diagnostics for error messages: Reason String and Server Reference.
+pub(crate) fn broker_detail(reason_string: Option<&str>, server_reference: Option<&str>) -> String {
+    let mut detail = String::new();
+    if let Some(reason_string) = reason_string {
+        detail.push_str(&format!(" ({reason_string})"));
+    }
+    if let Some(server_reference) = server_reference {
+        detail.push_str(&format!(" [server reference: {server_reference}]"));
+    }
+    detail
 }
 
 /// Maps a broker DISCONNECT reason to a typed connection outcome.

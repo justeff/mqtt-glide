@@ -22,7 +22,7 @@ use secrecy::SecretString;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
-use crate::codec::{QoS, RetainHandling, SubscribeAckReason, SubscriptionOptions, UnsubscribeAckReason};
+use crate::codec::{QoS, RetainHandling, SubscriptionOptions};
 use crate::connection::{
     ClientCommand, CommandSender, Connection, ConnectionChannels, LifecycleHook, SessionPhase, control_channel_capacity,
 };
@@ -543,10 +543,12 @@ impl MqttClient {
         pipe.drain().await
     }
 
-    /// Subscribes to one or more topic filters and returns **per-filter** SUBACK reason codes.
+    /// Subscribes to one or more topic filters and returns the SUBACK: **per-filter** reason
+    /// codes plus the broker's Reason String and User Properties
+    /// ([`SubscribeResponse`](crate::SubscribeResponse), which reads like the reason list).
     ///
     /// Reason codes are not collapsed to a single bool — callers must inspect each entry
-    /// (e.g. [`SubscribeAckReason::NotAuthorized`] vs granted QoS).
+    /// (e.g. [`SubscribeAckReason::NotAuthorized`](crate::SubscribeAckReason::NotAuthorized) vs granted QoS).
     ///
     /// Accepts any [`IntoIterator`] of values convertible to [`Subscription`] — for example
     /// `[("topic", QoS::AtLeastOnce)]`, `[Subscription::new(...)]`, or a `Vec`.
@@ -560,7 +562,7 @@ impl MqttClient {
     pub async fn subscribe(
         &self,
         filters: impl IntoIterator<Item = impl Into<Subscription>>,
-    ) -> Result<Vec<SubscribeAckReason>, AppError> {
+    ) -> Result<crate::ack::SubscribeResponse, AppError> {
         let filters: Vec<_> = filters
             .into_iter()
             .map(|sub| {
@@ -577,7 +579,8 @@ impl MqttClient {
         await_ack(self.ack_timeout, reply_rx, AckKind::Subscribe).await
     }
 
-    /// Unsubscribes from topic filters and returns **per-filter** UNSUBACK reason codes.
+    /// Unsubscribes from topic filters and returns the UNSUBACK: **per-filter** reason codes
+    /// plus Reason String and User Properties ([`UnsubscribeResponse`](crate::UnsubscribeResponse)).
     ///
     /// Accepts any [`IntoIterator`] of values convertible to [`ByteString`] (e.g. `["a/b"]`,
     /// `vec![…]`).
@@ -590,7 +593,7 @@ impl MqttClient {
     pub async fn unsubscribe(
         &self,
         filters: impl IntoIterator<Item = impl Into<ByteString>>,
-    ) -> Result<Vec<UnsubscribeAckReason>, AppError> {
+    ) -> Result<crate::ack::UnsubscribeResponse, AppError> {
         let filters: Vec<_> = filters.into_iter().map(Into::into).collect();
         let (reply_tx, reply_rx) = oneshot::channel();
         self.send_command(ClientCommand::Unsubscribe {
@@ -2921,5 +2924,83 @@ mod tests {
         }
         client.shutdown().await.expect("shutdown");
         let _ = run.await;
+    }
+
+    /// Broker diagnostics reach the application: PUBACK rejection (reason, Reason String,
+    /// User Properties), SUBACK Reason String, and the DISCONNECT Reason String / Server
+    /// Reference in the session outcome.
+    #[tokio::test]
+    async fn broker_reason_strings_and_properties_reach_the_application() {
+        let port = spawn_broker_once(|mut framed_read, mut framed_write| async move {
+            if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+                return;
+            }
+            while let Some(Ok((frame, _))) = framed_read.next().await {
+                match frame {
+                    DecodedFrame::Publish(packet) => {
+                        let _ = framed_write
+                            .send(Packet::PublishAck(PublishAck {
+                                packet_id: packet.meta.packet_id.expect("QoS 1"),
+                                reason_code: crate::codec::PublishAckReason::QuotaExceeded,
+                                properties: vec![("limit", "100/s").into()],
+                                reason_string: Some("rate limit for tenant".into()),
+                            }))
+                            .await;
+                    }
+                    DecodedFrame::Control(Packet::Subscribe(sub)) => {
+                        let _ = framed_write
+                            .send(Packet::SubscribeAck(SubscribeAck {
+                                packet_id: sub.packet_id,
+                                properties: Vec::new(),
+                                reason_string: Some("no ACL for secret/#".into()),
+                                status: vec![SubscribeAckReason::NotAuthorized],
+                            }))
+                            .await;
+                        let disconnect = crate::codec::Disconnect {
+                            reason_code: crate::codec::DisconnectReasonCode::ServerMoved,
+                            reason_string: Some("maintenance".into()),
+                            server_reference: Some("mqtt2.example.com".into()),
+                            ..crate::codec::Disconnect::default()
+                        };
+                        let _ = framed_write.send(Packet::Disconnect(disconnect)).await;
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        let (client, connection, mut phase) = connect_test_client(port).await;
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let err = client
+            .publish("t/limited", "x")
+            .qos(QoS::AtLeastOnce)
+            .await
+            .expect_err("broker rejects");
+        let AppError::PublishRejected(rejection) = err else {
+            panic!("expected PublishRejected, got {err:?}");
+        };
+        assert_eq!(rejection.reason, crate::codec::PublishAckReason::QuotaExceeded);
+        assert_eq!(rejection.reason_string.as_deref(), Some("rate limit for tenant"));
+        assert_eq!(&*rejection.user_properties[0].value, "100/s");
+
+        let response = client
+            .subscribe([("secret/#", QoS::AtLeastOnce)])
+            .await
+            .expect("SUBACK");
+        assert_eq!(response, vec![SubscribeAckReason::NotAuthorized]);
+        assert_eq!(response.reason_string.as_deref(), Some("no ACL for secret/#"));
+
+        let outcome = timeout(Duration::from_secs(2), run)
+            .await
+            .expect("run ends")
+            .expect("join");
+        let message = format!("{outcome:?}");
+        assert!(
+            message.contains("maintenance") && message.contains("mqtt2.example.com"),
+            "DISCONNECT diagnostics in the outcome: {message}"
+        );
     }
 }

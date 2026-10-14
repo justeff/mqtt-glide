@@ -99,9 +99,10 @@ pub enum AppError {
     /// connection noticed the loss first.
     #[error("connection lost before acknowledgement")]
     ConnectionLost,
-    /// Broker PUBACK completed the packet id with a non-success reason code.
+    /// Broker PUBACK completed the packet id with a non-success reason code (boxed: it
+    /// carries the broker's Reason String and User Properties).
     #[error("publish rejected by broker: {0}")]
-    PublishRejected(String),
+    PublishRejected(Box<crate::ack::PublishRejection>),
     /// No connection is up and [`ConnectOptions::fail_fast_when_disconnected`](crate::ConnectOptions::fail_fast_when_disconnected)
     /// is set, so the command was not queued for the next connection.
     #[error("not connected")]

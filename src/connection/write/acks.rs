@@ -39,13 +39,17 @@ pub(crate) fn complete_publish_ack(
         return;
     };
     inflight.release_publish(ack.packet_id);
-    let _ = entry.reply.send(publish_ack_to_result(ack.reason_code));
+    let _ = entry.reply.send(publish_ack_to_result(ack));
 }
 
-pub(super) fn publish_ack_to_result(reason: PublishAckReason) -> Result<(), AppError> {
-    match reason {
+pub(super) fn publish_ack_to_result(ack: PublishAck) -> Result<(), AppError> {
+    match ack.reason_code {
         PublishAckReason::Success | PublishAckReason::NoMatchingSubscribers => Ok(()),
-        other => Err(AppError::PublishRejected(format!("{other:?}"))),
+        reason => Err(AppError::PublishRejected(Box::new(crate::ack::PublishRejection {
+            reason,
+            reason_string: ack.reason_string,
+            user_properties: ack.properties,
+        }))),
     }
 }
 
@@ -74,7 +78,11 @@ pub(super) fn complete_subscribe_ack(
     if let Ok(mut registry) = subscription_registry.write() {
         apply_subscribe_ack_to_registry(&mut registry, &pending.filters, &ack.status);
     }
-    let _ = pending.reply.send(Ok(ack.status));
+    let _ = pending.reply.send(Ok(crate::ack::SubscribeResponse {
+        reasons: ack.status,
+        reason_string: ack.reason_string,
+        user_properties: ack.properties,
+    }));
 }
 
 /// Completes an outbound unsubscribe waiter when `ack_generation` matches the write task generation.
@@ -102,7 +110,11 @@ pub(super) fn complete_unsubscribe_ack(
     if let Ok(mut registry) = subscription_registry.write() {
         apply_unsubscribe_ack_to_registry(&mut registry, &pending.filters, &ack.status);
     }
-    let _ = pending.reply.send(Ok(ack.status));
+    let _ = pending.reply.send(Ok(crate::ack::UnsubscribeResponse {
+        reasons: ack.status,
+        reason_string: ack.reason_string,
+        user_properties: ack.properties,
+    }));
 }
 
 pub(super) fn fail_all_waiters(
