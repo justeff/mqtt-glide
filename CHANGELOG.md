@@ -55,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A Will the encoder cannot send (U+0000 in its Content Type or User Properties, a topic, payload or Correlation Data over 65 535 bytes) is refused up front with `AppError::InvalidRequest`, like an invalid Will topic. It used to fail every CONNECT, so a retrying reconnect policy kept trying for good
 - The client pings on the Keep Alive it sent in CONNECT. A `keep_alive` with a fraction of a second (1.9 s went out as 1 s) or above 65 535 s made an idle client ping later than the broker expected, and the broker dropped it
 - `BrokerUrl::parse` (and so `ClientBuilder::new`) rejects a host with whitespace, control characters, `@`, `/`, `\`, `?`, `#` or stray brackets, and an IPv6 address without brackets (`mqtt://2001:db8::1` was read as host `2001:db8:` with port 1). Such a host reached DNS, the TLS server name and an HTTP proxy's `CONNECT` line, where CR/LF could add header lines
 - An inbound PUBLISH with Message Expiry Interval 0 (a broker forwarding a message whose lifetime is used up) is accepted. It was decoded as a Malformed Packet, so the client disconnected, and with a resumed session the broker redelivered the same message into a disconnect loop. `PublishProperties::message_expiry_interval` and `WillMessage::message_expiry_interval` are now `Option<u32>` (breaking); the `message_expiry(0)` setters still mean "no expiry"

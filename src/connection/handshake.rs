@@ -108,8 +108,37 @@ pub(crate) fn validate_will_message(will: &WillMessage) -> Result<(), AppError> 
     {
         return Err(AppError::InvalidRequest(format!("will response_topic: {reason}")));
     }
+    // Everything else the encoder would refuse on every attempt, so a reconnect policy would
+    // retry forever: UTF-8 strings without U+0000 ([MQTT-1.5.4-2]) and two-byte lengths (§1.5).
+    let mut strings = vec![("will topic", &will.topic)];
+    strings.extend(will.response_topic.iter().map(|topic| ("will response_topic", topic)));
+    strings.extend(will.content_type.iter().map(|value| ("will content_type", value)));
+    for property in &will.user_properties {
+        strings.push(("will user property name", &property.name));
+        strings.push(("will user property value", &property.value));
+    }
+    for (field, value) in strings {
+        if value.as_bytes().contains(&0) {
+            return Err(AppError::InvalidRequest(format!("{field} must not contain U+0000")));
+        }
+        if value.len() > MAX_TWO_BYTE_LENGTH {
+            return Err(AppError::InvalidRequest(format!("{field} is longer than 65535 bytes")));
+        }
+    }
+    let binary = [
+        ("will payload", Some(&will.payload)),
+        ("will correlation_data", will.correlation_data.as_ref()),
+    ];
+    for (field, value) in binary {
+        if value.is_some_and(|value| value.len() > MAX_TWO_BYTE_LENGTH) {
+            return Err(AppError::InvalidRequest(format!("{field} is longer than 65535 bytes")));
+        }
+    }
     Ok(())
 }
+
+/// Longest UTF-8 string or binary data with a two-byte length prefix (§1.5.4, §1.5.6).
+const MAX_TWO_BYTE_LENGTH: usize = u16::MAX as usize;
 
 /// Topic Name rules for Will Topic / Will Response Topic (mirrors outbound PUBLISH checks).
 pub(crate) fn topic_name_invalid_reason(topic: &str) -> Option<&'static str> {
@@ -360,6 +389,10 @@ mod tests {
     #[case::wildcard(WillMessage::new("a/+/b", "p"))]
     #[case::nul(WillMessage::new("a\0b", "p"))]
     #[case::bad_response_topic(WillMessage::new("ok", "p").response_topic("bad/#"))]
+    #[case::nul_in_content_type(WillMessage::new("ok", "p").content_type("text\0plain"))]
+    #[case::nul_in_user_property(WillMessage::new("ok", "p").user_property("k", "v\0"))]
+    #[case::long_topic(WillMessage::new("t".repeat(65_536), "p"))]
+    #[case::long_payload(WillMessage::new("ok", vec![0u8; 65_536]))]
     fn validate_will_message_rejects_invalid(#[case] will: WillMessage) {
         assert!(matches!(validate_will_message(&will), Err(AppError::InvalidRequest(_))));
     }
