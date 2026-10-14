@@ -93,7 +93,7 @@ macro_rules! publish_setters {
         /// Sets Message Expiry Interval in **seconds** (§3.3.2.3.3); `0` omits the property.
         #[inline]
         pub fn message_expiry(mut self, seconds: u32) -> Self {
-            self.inner_mut().message.properties.message_expiry_interval = std::num::NonZeroU32::new(seconds);
+            self.inner_mut().message.properties.message_expiry_interval = (seconds != 0).then_some(seconds);
             self
         }
 
@@ -326,10 +326,7 @@ mod tests {
             .map(|u| &*u.name)
             .collect();
         assert_eq!(names, ["a", "b", "c"]);
-        assert_eq!(
-            p.publish_properties().message_expiry_interval.map(|s| s.get()),
-            Some(30)
-        );
+        assert_eq!(p.publish_properties().message_expiry_interval, Some(30));
         assert_eq!(p.publish_properties().content_type.as_deref(), Some("text/plain"));
         assert_eq!(p.publish_properties().response_topic.as_deref(), Some("reply/t"));
         assert_eq!(p.publish_properties().correlation_data.as_deref(), Some(&b"id-1"[..]));

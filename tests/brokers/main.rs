@@ -393,8 +393,6 @@ async fn mosquitto_qos1_window_wider_than_receive_maximum() {
 /// User Properties + Message Expiry Interval survive publish → subscribe echo via Mosquitto.
 #[tokio::test]
 async fn mosquitto_publish_properties_roundtrip() {
-    use std::num::NonZeroU32;
-
     use bytes::Bytes;
     use mqtt_glide::{InboundMessage, PublishProperties};
 
@@ -440,7 +438,7 @@ async fn mosquitto_publish_properties_roundtrip() {
         "expected granted QoS, got {reasons:?}"
     );
 
-    let expiry = NonZeroU32::new(60).expect("nz");
+    let expiry = 60u32;
     client
         .send(
             Publish::new(topic, Bytes::from_static(b"props-body"))

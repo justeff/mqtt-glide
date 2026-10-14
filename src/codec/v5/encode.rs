@@ -514,7 +514,7 @@ mod tests {
                     payload: Bytes::from_static(b"message"),
                     will_delay_interval: Some(5),
                     correlation_data: Some(Bytes::from_static(b"correlationData")),
-                    message_expiry_interval: NonZeroU32::new(7),
+                    message_expiry_interval: Some(7),
                     content_type: Some(ByteString::from_static("contentType")),
                     user_properties: vec![("name", "value").into()],
                     payload_format_indicator: Some(true),

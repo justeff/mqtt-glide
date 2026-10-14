@@ -21,7 +21,7 @@ use crate::codec::v5::{UserProperties, UserProperty, property_type as pt};
 pub(crate) struct PublishWireProperties {
     pub topic_alias: Option<NonZeroU16>,
     pub correlation_data: Option<Bytes>,
-    pub message_expiry_interval: Option<NonZeroU32>,
+    pub message_expiry_interval: Option<u32>,
     pub content_type: Option<ByteString>,
     pub user_properties: UserProperties,
     pub payload_format_indicator: bool,
@@ -210,6 +210,21 @@ mod tests {
             result.map_err(|e| e.to_string()),
             Err(DecodeError::MalformedPacket("PUBLISH QoS 0 with DUP").to_string())
         );
+    }
+
+    /// §3.3.2.3.3: the Message Expiry Interval is a plain Four Byte Integer, and a broker
+    /// forwards the remaining lifetime, which can be 0. It decodes instead of failing the packet.
+    #[test]
+    fn publish_decode_message_expiry_zero_is_kept() {
+        let mut body = BytesMut::new();
+        ByteString::from_static("t").encode(&mut body).unwrap();
+        body.put_u8(5); // Property Length
+        body.put_u8(pt::MSG_EXPIRY_INT);
+        body.put_u32(0);
+        body.put_slice(b"x");
+
+        let publish = PublishPacket::decode(body.freeze(), QOS0_FLAGS).expect("expiry 0 is valid");
+        assert_eq!(publish.message.properties.message_expiry_interval, Some(0));
     }
 
     #[test]

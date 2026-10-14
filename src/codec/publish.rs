@@ -12,7 +12,7 @@
 //! (§3.3.2.3.4) surfaced on [`PublishPacket::wire_topic_alias`] until session policy
 //! validates or resolves it.
 
-use std::num::{NonZeroU16, NonZeroU32};
+use std::num::NonZeroU16;
 
 use bytes::Bytes;
 use bytestring::ByteString;
@@ -26,7 +26,7 @@ pub struct PublishProperties {
     /// Correlation Data (§3.3.2.3.6).
     pub correlation_data: Option<Bytes>,
     /// Message Expiry Interval (§3.3.2.3.3).
-    pub message_expiry_interval: Option<NonZeroU32>,
+    pub message_expiry_interval: Option<u32>,
     /// Content Type (§3.3.2.3.9).
     pub content_type: Option<ByteString>,
     /// User Property (§3.3.2.3.7).
@@ -65,7 +65,7 @@ impl PublishProperties {
     /// `0` clears expiry (property omitted).
     #[inline]
     pub fn message_expiry(mut self, seconds: u32) -> Self {
-        self.message_expiry_interval = NonZeroU32::new(seconds);
+        self.message_expiry_interval = (seconds != 0).then_some(seconds);
         self
     }
 
@@ -280,7 +280,7 @@ mod tests {
 
         assert_eq!(props.content_type.as_deref(), Some("application/json"));
         assert_eq!(props.response_topic.as_deref(), Some("resp/1"));
-        assert_eq!(props.message_expiry_interval, NonZeroU32::new(60));
+        assert_eq!(props.message_expiry_interval, Some(60));
         assert_eq!(props.correlation_data.as_deref(), Some(b"corr".as_slice()));
         assert!(props.payload_format_indicator);
         assert_eq!(props.user_properties.len(), 1);

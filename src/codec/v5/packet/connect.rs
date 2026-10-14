@@ -75,7 +75,7 @@ pub struct WillMessage {
     /// Correlation Data (§3.1.3.2.7).
     pub correlation_data: Option<Bytes>,
     /// Message Expiry Interval (§3.1.3.2.4).
-    pub message_expiry_interval: Option<NonZeroU32>,
+    pub message_expiry_interval: Option<u32>,
     /// Content Type (§3.1.3.2.5).
     pub content_type: Option<ByteString>,
     /// User Property (§3.1.3.2.8).
@@ -145,7 +145,7 @@ impl WillMessage {
     /// `0` clears expiry (property omitted).
     #[inline]
     pub fn message_expiry(mut self, seconds: u32) -> Self {
-        self.message_expiry_interval = NonZeroU32::new(seconds);
+        self.message_expiry_interval = (seconds != 0).then_some(seconds);
         self
     }
 
