@@ -64,6 +64,8 @@ jobs:
         run: cargo test --test connection ${{ matrix.args }}
       - name: brokers (${{ matrix.name }})
         run: cargo test --test brokers ${{ matrix.args }}
+      - name: faults (${{ matrix.name }})
+        run: cargo test --test faults ${{ matrix.args }}
 
   doc:
     name: doc
