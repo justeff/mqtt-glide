@@ -121,6 +121,24 @@ pub async fn start_mosquitto_on_port(port: u16) -> Option<ContainerAsync<Generic
     )
 }
 
+/// Starts HiveMQ Community Edition (anonymous via its bundled allow-all extension) and
+/// returns the container and the mapped MQTT port.
+///
+/// A second broker implementation with much tighter defaults than Mosquitto: CONNACK
+/// Receive Maximum 10, Topic Alias Maximum 5. Returns `None` when Docker is unavailable.
+pub async fn start_hivemq() -> Option<(ContainerAsync<GenericImage>, u16)> {
+    if skip_without_docker() {
+        return None;
+    }
+    let container = GenericImage::new("hivemq/hivemq-ce", "2026.5")
+        .with_wait_for(WaitFor::message_on_stdout("Started HiveMQ in"))
+        .start()
+        .await
+        .expect("failed to start HiveMQ CE container");
+    let port = container.get_host_port_ipv4(1883).await.expect("mapped hivemq port");
+    Some((container, port))
+}
+
 /// Second MQTT 5 session: CONNECT + QoS 0 PUBLISH + DISCONNECT (no client crate publish API yet).
 ///
 /// Used so broker integration can deliver application messages without.

@@ -8,6 +8,7 @@
 //! (see `skipping brokers test: docker unavailable`) instead of panicking.
 
 mod helpers;
+mod hivemq;
 
 #[path = "../common/mod.rs"]
 mod common;
