@@ -132,33 +132,38 @@ where
     let (read_done_tx, read_done_rx) = oneshot::channel();
     let _ = read_done_tx.send(());
 
-    let join = tokio::spawn(crate::connection::write::run(
-        control_rx,
-        command_rx,
-        stub_rx,
-        framed,
-        WriteSession {
-            generation: Generation(1),
-            keep_alive: Duration::from_secs(3600),
-            subscription_registry: Arc::new(RwLock::new(SubscriptionRegistry::default())),
-            cancel: cancel.clone(),
-            shutdown_notify: shutdown_notify.clone(),
-            graceful_disconnect_timeout: Duration::from_millis(200),
-            max_qos: QoS::AtLeastOnce,
-            retain_available: true,
-            receive_maximum: nonzero!(8u16),
-            handoff_stalled: Arc::new(AtomicBool::new(false)),
-            inbound_activity: Arc::new(AtomicBool::new(false)),
-            bench_inbound_publish_ack_counter: None,
-            session_carry: None,
-            read_stop: StopSignal::new(),
-            outbound_topic_aliases: 0,
-            subscription_identifiers_available: true,
-            stats: Default::default(),
-        },
-        InflightPots::new(NonZeroU16::new(4).expect("nz")),
-        read_done_rx,
-    ));
+    let session = WriteSession {
+        generation: Generation(1),
+        keep_alive: Duration::from_secs(3600),
+        subscription_registry: Arc::new(RwLock::new(SubscriptionRegistry::default())),
+        cancel: cancel.clone(),
+        shutdown_notify: shutdown_notify.clone(),
+        graceful_disconnect_timeout: Duration::from_millis(200),
+        max_qos: QoS::AtLeastOnce,
+        retain_available: true,
+        receive_maximum: nonzero!(8u16),
+        handoff_stalled: Arc::new(AtomicBool::new(false)),
+        inbound_activity: Arc::new(AtomicBool::new(false)),
+        bench_inbound_publish_ack_counter: None,
+        session_carry: None,
+        read_stop: StopSignal::new(),
+        outbound_topic_aliases: 0,
+        subscription_identifiers_available: true,
+        stats: Default::default(),
+    };
+    let join = tokio::spawn(async move {
+        let mut command_rx = command_rx;
+        crate::connection::write::run(
+            control_rx,
+            &mut command_rx,
+            stub_rx,
+            framed,
+            session,
+            InflightPots::new(NonZeroU16::new(4).expect("nz")),
+            read_done_rx,
+        )
+        .await
+    });
 
     WriteTaskHandle {
         control_tx,

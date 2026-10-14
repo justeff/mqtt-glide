@@ -958,21 +958,53 @@ async fn command_sender_remains_usable_during_reconnect_backoff() {
     let _ = timeout(Duration::from_secs(5), run).await;
 }
 
-/// Shared `command_tx` must point at the post-replenish channel (ArcSwap store).
+/// Commands queued between sessions survive the per-session channel refresh: the command
+/// channel lives as long as the client.
 #[test]
-fn replenish_session_channels_swaps_shared_command_sender() {
+fn replenish_session_channels_keeps_the_command_channel() {
+    let (mut channels, shared) = test_channels();
+    shared
+        .load()
+        .try_send(ClientCommand::Noop)
+        .expect("queued while disconnected");
+
+    channels.replenish_session_channels(COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY);
+    channels.replenish_session_channels(COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY);
+
+    let receiver = channels.command_rx.as_mut().expect("receiver kept");
+    assert!(matches!(receiver.try_recv(), Ok(ClientCommand::Noop)));
+}
+
+/// A receiver lost with a panicked write task is replaced, and the shared sender swapped so
+/// [`crate::MqttClient`] sends into the new channel.
+#[test]
+fn replenish_session_channels_replaces_a_lost_command_receiver() {
+    let (mut channels, shared) = test_channels();
+    let old_receiver = channels.command_rx.take().expect("receiver");
+    drop(old_receiver);
+
+    channels.replenish_session_channels(COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY);
+
+    shared.load().try_send(ClientCommand::Noop).expect("post-swap send");
+    let receiver = channels.command_rx.as_mut().expect("new receiver");
+    assert!(matches!(receiver.try_recv(), Ok(ClientCommand::Noop)));
+}
+
+fn test_channels() -> (
+    ConnectionChannels<flume::Sender<InboundMessage>>,
+    Arc<ArcSwap<crate::connection::CommandSender>>,
+) {
     let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let shared = Arc::new(ArcSwap::from_pointee(command_tx));
     let (handoff, _handoff_rx) = flume::bounded::<InboundMessage>(4);
     let (read_stub_exit_tx, read_stub_exit_rx) = mpsc::channel(1);
     let (write_stub_exit_tx, write_stub_exit_rx) = mpsc::channel(1);
-
-    let mut channels = ConnectionChannels {
+    let channels = ConnectionChannels {
         control_tx,
         control_rx,
         command_tx: Arc::clone(&shared),
-        command_rx,
+        command_rx: Some(command_rx),
         handoff: handoff.clone(),
         handoff_anchor: handoff,
         phase_tx: watch::channel(SessionPhase::initial()).0,
@@ -985,28 +1017,7 @@ fn replenish_session_channels_swaps_shared_command_sender() {
         write_stub_exit_tx,
         write_stub_exit_rx,
     };
-
-    // Pre-replenish: shared sender feeds the original receiver.
-    shared.load().try_send(ClientCommand::Noop).expect("pre-swap send");
-    assert!(matches!(channels.command_rx.try_recv(), Ok(ClientCommand::Noop)));
-
-    // Detach the old receiver so we can assert disconnect after swap.
-    let mut old_command_rx = {
-        let (_placeholder_tx, placeholder_rx) = mpsc::channel(1);
-        std::mem::replace(&mut channels.command_rx, placeholder_rx)
-    };
-
-    channels.replenish_session_channels(COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY);
-
-    // Old receiver closes once ArcSwap drops the previous sender.
-    assert!(matches!(
-        old_command_rx.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
-    ));
-
-    // Hot-path load must hit the new session channel.
-    shared.load().try_send(ClientCommand::Noop).expect("post-swap send");
-    assert!(matches!(channels.command_rx.try_recv(), Ok(ClientCommand::Noop)));
+    (channels, shared)
 }
 
 /// cancel during auto-resubscribe wait must abort promptly.

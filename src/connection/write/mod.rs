@@ -30,8 +30,8 @@ use crate::codec::{Disconnect, Packet, PublishMessage, QoS, SubscriptionOptions,
 use crate::connection::packet_id::{InflightPots, PacketIdMap};
 use crate::connection::subscriptions::SubscriptionRegistry;
 use crate::connection::{
-    ClientCommand, CommandReceiver, ControlMessage, ControlReceiver, Generation, PublishReply, StopSignal,
-    SubscribeReply, UnsubscribeReply,
+    CommandReceiver, ControlMessage, ControlReceiver, Generation, PublishReply, StopSignal, SubscribeReply,
+    UnsubscribeReply,
 };
 use crate::error::{ProtocolError, TransportError};
 
@@ -194,10 +194,9 @@ pub(crate) struct Carry {
     pub(crate) resumable: bool,
     /// Unacknowledged QoS-1 publishes (resumable sessions only), resent with DUP.
     pub(crate) unacked: Vec<CarriedPublish>,
-    /// Publishes never put on the wire (parked or still queued), sent like new ones.
+    /// Publishes parked behind the broker's Receive Maximum, never put on the wire; sent like
+    /// new ones, before the commands still waiting in the command channel.
     pub(crate) unsent: VecDeque<PendingOutboundPublish>,
-    /// Set on a connection loss; tells [`CommandRx`] to move queued publishes into `unsent`.
-    collect_queued: bool,
 }
 
 impl Carry {
@@ -208,71 +207,9 @@ impl Carry {
         }
     }
 
-    /// Lets the dropping [`CommandRx`] move still-queued publishes into `unsent`.
-    pub(super) fn mark_collect_queued(&mut self) {
-        self.collect_queued = true;
-    }
-
     /// Takes everything out, failing nothing (caller decides).
     pub(crate) fn take_all(&mut self) -> (Vec<CarriedPublish>, VecDeque<PendingOutboundPublish>) {
         (std::mem::take(&mut self.unacked), std::mem::take(&mut self.unsent))
-    }
-}
-
-/// Write-task command receiver; on a connection loss its drop hands queued publishes to the
-/// [`SessionCarry`] so the next connection sends them (instead of dropping them with the
-/// channel). Derefs to the [`CommandReceiver`].
-struct CommandRx {
-    rx: CommandReceiver,
-    carry: Option<SessionCarry>,
-}
-
-impl std::ops::Deref for CommandRx {
-    type Target = CommandReceiver;
-
-    fn deref(&self) -> &CommandReceiver {
-        &self.rx
-    }
-}
-
-impl std::ops::DerefMut for CommandRx {
-    fn deref_mut(&mut self) -> &mut CommandReceiver {
-        &mut self.rx
-    }
-}
-
-impl Drop for CommandRx {
-    fn drop(&mut self) {
-        let Some(carry) = &self.carry else {
-            return;
-        };
-        let mut carry = carry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !std::mem::take(&mut carry.collect_queued) {
-            return;
-        }
-        while let Ok(command) = self.rx.try_recv() {
-            match command {
-                ClientCommand::Publish {
-                    message,
-                    qos,
-                    retain,
-                    reply,
-                } => carry.unsent.push_back(PendingOutboundPublish {
-                    message,
-                    qos,
-                    retain,
-                    reply,
-                }),
-                ClientCommand::Subscribe { reply, .. } => {
-                    let _ = reply.send(Err(crate::error::AppError::ConnectionLost));
-                }
-                ClientCommand::Unsubscribe { reply, .. } => {
-                    let _ = reply.send(Err(crate::error::AppError::ConnectionLost));
-                }
-                #[allow(unreachable_patterns)] // test-only commands
-                _ => {}
-            }
-        }
     }
 }
 
@@ -401,9 +338,12 @@ pub(crate) struct WriteSession {
 ///
 /// `read_done` completes when the paired read task exits; graceful shutdown drains inbound
 /// PUBACKs until then, then sends DISCONNECT.
+///
+/// `command_rx` is the client's command channel, which outlives the session: commands still in
+/// it when the connection is lost go out on the next one.
 pub(crate) async fn run<W>(
     mut control_rx: ControlReceiver,
-    command_rx: CommandReceiver,
+    command_rx: &mut CommandReceiver,
     #[cfg(test)] mut stub_exit_rx: mpsc::Receiver<()>,
     mut framed: FramedWrite<W, V5Codec>,
     session: WriteSession,
@@ -418,10 +358,6 @@ where
     let shutdown_notify = session.shutdown_notify;
     let graceful_disconnect_timeout = session.graceful_disconnect_timeout;
     let mut waiters = SubUnsubWaiters::new();
-    let mut command_rx = CommandRx {
-        rx: command_rx,
-        carry: session.session_carry.clone(),
-    };
     let mut publish_waiters = PublishWaiters::with_carry(session.session_carry);
     publish_waiters.aliases = crate::connection::topic_alias::OutboundTopicAliases::new(session.outbound_topic_aliases);
     publish_waiters.stats = session.stats;
@@ -464,7 +400,7 @@ where
                 publish_waiters: &mut publish_waiters,
                 inflight: &mut inflight,
                 flush_budget: graceful_disconnect_timeout,
-                command_rx: &mut command_rx,
+                command_rx,
                 publish_limits,
                 subscription_registry: &subscription_registry,
                 generation,
@@ -498,7 +434,7 @@ where
                         publish_waiters: &mut publish_waiters,
                         inflight: &mut inflight,
                         flush_budget: graceful_disconnect_timeout,
-                        command_rx: &mut command_rx,
+                        command_rx,
                         publish_limits,
                         subscription_registry: &subscription_registry,
                         generation,
@@ -534,7 +470,7 @@ where
                         publish_waiters: &mut publish_waiters,
                         inflight: &mut inflight,
                         flush_budget: graceful_disconnect_timeout,
-                        command_rx: &mut command_rx,
+                        command_rx,
                         publish_limits,
                         subscription_registry: &subscription_registry,
                         generation,
@@ -593,7 +529,7 @@ where
                             publish_waiters: &mut publish_waiters,
                             inflight: &mut inflight,
                             flush_budget: graceful_disconnect_timeout,
-                            command_rx: &mut command_rx,
+                            command_rx,
                             publish_limits,
                             subscription_registry: &subscription_registry,
                             generation,
@@ -640,7 +576,7 @@ where
                                     publish_waiters: &mut publish_waiters,
                                     inflight: &mut inflight,
                                     flush_budget: graceful_disconnect_timeout,
-                                    command_rx: &mut command_rx,
+                                    command_rx,
                                     publish_limits,
                                     subscription_registry: &subscription_registry,
                                     generation,
@@ -671,7 +607,7 @@ where
                                     publish_waiters: &mut publish_waiters,
                                     inflight: &mut inflight,
                                     flush_budget: graceful_disconnect_timeout,
-                                    command_rx: &mut command_rx,
+                                    command_rx,
                                     publish_limits,
                                     subscription_registry: &subscription_registry,
                                     generation,
@@ -706,7 +642,7 @@ where
                                     publish_waiters: &mut publish_waiters,
                                     inflight: &mut inflight,
                                     flush_budget: graceful_disconnect_timeout,
-                                    command_rx: &mut command_rx,
+                                    command_rx,
                                     publish_limits,
                                     subscription_registry: &subscription_registry,
                                     generation,
@@ -780,7 +716,7 @@ where
                             &mut ControlCoalesceCtx {
                                 framed: &mut framed,
                                 control_rx: &mut control_rx,
-                                command_rx: &command_rx,
+                                command_rx,
                                 waiters: &mut waiters,
                                 publish_waiters: &mut publish_waiters,
                                 inflight: &mut inflight,
@@ -804,7 +740,7 @@ where
                                             publish_waiters: &mut publish_waiters,
                                             inflight: &mut inflight,
                                             flush_budget: graceful_disconnect_timeout,
-                                            command_rx: &mut command_rx,
+                                            command_rx,
                                             publish_limits,
                                             subscription_registry: &subscription_registry,
                                             generation,
@@ -826,7 +762,7 @@ where
                                             publish_waiters: &mut publish_waiters,
                                             inflight: &mut inflight,
                                             flush_budget: graceful_disconnect_timeout,
-                                            command_rx: &mut command_rx,
+                                            command_rx,
                                             publish_limits,
                                             subscription_registry: &subscription_registry,
                                             generation,
@@ -856,7 +792,7 @@ where
                                                 publish_waiters: &mut publish_waiters,
                                                 inflight: &mut inflight,
                                                 flush_budget: graceful_disconnect_timeout,
-                                                command_rx: &mut command_rx,
+                                                command_rx,
                                                 publish_limits,
                                                 subscription_registry: &subscription_registry,
                                                 generation,
@@ -878,7 +814,7 @@ where
                                         publish_waiters: &mut publish_waiters,
                                         inflight: &mut inflight,
                                         flush_budget: graceful_disconnect_timeout,
-                                        command_rx: &mut command_rx,
+                                        command_rx,
                                         publish_limits,
                                         subscription_registry: &subscription_registry,
                                         generation,
@@ -934,7 +870,7 @@ where
                     cmd,
                     &mut CommandDispatchCtx {
                         framed: &mut framed,
-                        command_rx: &mut command_rx,
+                        command_rx,
                         waiters: &mut waiters,
                         publish_waiters: &mut publish_waiters,
                         inflight: &mut inflight,
@@ -958,7 +894,7 @@ where
                                 publish_waiters: &mut publish_waiters,
                                 inflight: &mut inflight,
                                 flush_budget: graceful_disconnect_timeout,
-                                command_rx: &mut command_rx,
+                                command_rx,
                                 publish_limits,
                                 subscription_registry: &subscription_registry,
                                 generation,
@@ -977,7 +913,7 @@ where
                                 publish_waiters: &mut publish_waiters,
                                 inflight: &mut inflight,
                                 flush_budget: graceful_disconnect_timeout,
-                                command_rx: &mut command_rx,
+                                command_rx,
                                 publish_limits,
                                 subscription_registry: &subscription_registry,
                                 generation,

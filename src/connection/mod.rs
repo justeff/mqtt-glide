@@ -60,9 +60,13 @@ use self::read::ReadOutcome;
 pub(crate) struct ConnectionChannels<H: InboundSink> {
     pub control_tx: channels::ControlSender,
     pub control_rx: ControlReceiver,
-    /// Shared with [`crate::MqttClient`]; replaced on each reconnect session (lock-free load).
+    /// Shared with [`crate::MqttClient`]. One channel for the life of the client, so commands
+    /// queued while disconnected wait for the next session; only replaced if its receiver was
+    /// lost with a panicked write task.
     pub command_tx: Arc<ArcSwap<CommandSender>>,
-    pub command_rx: CommandReceiver,
+    /// The command receiver between sessions; lent to each session's write task, which hands
+    /// it back when it ends.
+    pub command_rx: Option<CommandReceiver>,
     pub handoff: H,
     /// Extra sink handle kept for the [`Connection`] lifetime so the injectable handoff
     /// never closes when a read-task sender is dropped/respawned.
@@ -102,22 +106,25 @@ impl<H: InboundSink> std::fmt::Debug for ConnectionChannels<H> {
 }
 
 impl<H: InboundSink> ConnectionChannels<H> {
-    /// Recreates per-session control/command channels after a connection loss.
+    /// Recreates the per-session control channel after a connection loss.
     ///
-    /// Updates the shared command sender so [`crate::MqttClient`] keeps working across reconnects.
-    /// Under `cfg(test)`, stub-exit channels are also replenished so supervision hooks that clone
-    /// senders before [`Connection::run`] remain valid across reconnect sessions.
+    /// The command channel stays: [`crate::MqttClient`] keeps sending into it across reconnects.
+    /// Only if its receiver was lost (a panicked write task) is it replaced, and the shared
+    /// sender swapped. Under `cfg(test)`, stub-exit channels are also replenished so supervision
+    /// hooks that clone senders before [`Connection::run`] remain valid across reconnect sessions.
     pub(crate) fn replenish_session_channels(
         &mut self,
         command_channel_capacity: usize,
         control_channel_capacity: usize,
     ) {
         let (control_tx, control_rx) = mpsc::channel(control_channel_capacity);
-        let (command_tx, command_rx) = mpsc::channel(command_channel_capacity);
         self.control_tx = control_tx;
         self.control_rx = control_rx;
-        self.command_tx.store(Arc::new(command_tx));
-        self.command_rx = command_rx;
+        if self.command_rx.is_none() {
+            let (command_tx, command_rx) = mpsc::channel(command_channel_capacity);
+            self.command_tx.store(Arc::new(command_tx));
+            self.command_rx = Some(command_rx);
+        }
 
         #[cfg(test)]
         {
@@ -484,10 +491,6 @@ impl<H: InboundSink> Connection<H> {
             &mut self.channels.control_rx,
             mpsc::channel(control_channel_capacity(self.options.receive_maximum)).1,
         );
-        let command_rx = std::mem::replace(
-            &mut self.channels.command_rx,
-            mpsc::channel(self.options.command_channel_capacity.get()).1,
-        );
         let inflight = std::mem::replace(
             &mut self.inflight,
             packet_id::InflightPots::new(self.options.receive_maximum),
@@ -530,36 +533,61 @@ impl<H: InboundSink> Connection<H> {
             read::ReadDoneSignal::new(read_done_tx),
         ));
 
-        let write_handle = tokio::spawn(write::run(
-            control_rx,
-            command_rx,
-            #[cfg(test)]
-            write_stub_exit_rx,
-            framed_write,
-            write::WriteSession {
-                generation,
-                keep_alive,
-                subscription_registry: Arc::clone(&self.subscription_registry),
-                cancel: write_cancel.clone(),
-                shutdown_notify: self.shutdown_notify.clone(),
-                graceful_disconnect_timeout: self.options.graceful_disconnect_timeout,
-                max_qos,
-                retain_available,
-                receive_maximum: self.options.receive_maximum,
-                handoff_stalled,
-                inbound_activity,
-                bench_inbound_publish_ack_counter: self.options.bench_inbound_publish_ack_counter.clone(),
-                session_carry: Some(Arc::clone(&self.session_carry)),
-                read_stop,
-                outbound_topic_aliases,
-                subscription_identifiers_available,
-                stats: self.channels.stats.clone(),
-            },
-            inflight,
-            read_done_rx,
-        ));
+        if self.channels.command_rx.is_none() {
+            // Lost with a panicked write task (see `replenish_session_channels`).
+            self.channels.replenish_session_channels(
+                self.options.command_channel_capacity.get(),
+                control_channel_capacity(self.options.receive_maximum),
+            );
+        }
+        let mut command_rx = self
+            .channels
+            .command_rx
+            .take()
+            .expect("command receiver between sessions");
+        let write_session = write::WriteSession {
+            generation,
+            keep_alive,
+            subscription_registry: Arc::clone(&self.subscription_registry),
+            cancel: write_cancel.clone(),
+            shutdown_notify: self.shutdown_notify.clone(),
+            graceful_disconnect_timeout: self.options.graceful_disconnect_timeout,
+            max_qos,
+            retain_available,
+            receive_maximum: self.options.receive_maximum,
+            handoff_stalled,
+            inbound_activity,
+            bench_inbound_publish_ack_counter: self.options.bench_inbound_publish_ack_counter.clone(),
+            session_carry: Some(Arc::clone(&self.session_carry)),
+            read_stop,
+            outbound_topic_aliases,
+            subscription_identifiers_available,
+            stats: self.channels.stats.clone(),
+        };
+        // The task hands the command receiver back with its outcome.
+        let write_handle = tokio::spawn(async move {
+            let outcome = write::run(
+                control_rx,
+                &mut command_rx,
+                #[cfg(test)]
+                write_stub_exit_rx,
+                framed_write,
+                write_session,
+                inflight,
+                read_done_rx,
+            )
+            .await;
+            (outcome, command_rx)
+        });
 
-        let (outcome, redirect) = Self::supervise_tasks(read_handle, write_handle, read_cancel, write_cancel).await;
+        let (outcome, redirect) = Self::supervise_tasks(
+            read_handle,
+            write_handle,
+            read_cancel,
+            write_cancel,
+            &mut self.channels.command_rx,
+        )
+        .await;
         self.channels.stats.outbound_window(0, 0);
         self.finish_session_or_redirect(outcome, true, redirect).await
     }
@@ -705,13 +733,22 @@ impl<H: InboundSink> Connection<H> {
         }
     }
 
+    /// Waits for both session tasks; the write task's command receiver goes back into
+    /// `command_rx` (left `None` if that task panicked).
     async fn supervise_tasks(
         read_handle: JoinHandle<ReadOutcome>,
-        write_handle: JoinHandle<WriteOutcome>,
+        write_handle: JoinHandle<(WriteOutcome, CommandReceiver)>,
         read_cancel: StopSignal,
         write_cancel: StopSignal,
+        command_rx: &mut Option<CommandReceiver>,
     ) -> (ConnectionOutcome, Option<redirect::ServerRedirect>) {
         tokio::pin!(read_handle);
+        let write_handle = async {
+            write_handle.await.map(|(outcome, receiver)| {
+                *command_rx = Some(receiver);
+                outcome
+            })
+        };
         tokio::pin!(write_handle);
 
         enum FirstResult {
@@ -860,3 +897,6 @@ mod io_mock_tests;
 #[cfg(test)]
 #[allow(clippy::box_default, clippy::manual_async_fn)]
 mod tests;
+
+#[cfg(test)]
+mod reconnect_tests;

@@ -16,9 +16,9 @@ use std::num::NonZeroU16;
 use futures_util::{SinkExt, StreamExt};
 use mqtt_glide::codec::{ConnectAck, DecodedFrame, Packet, PublishDelivery, encode_publish};
 use mqtt_glide::{
-    AuthError, BrokerUrl, ClientId, ConnectOptions, ConnectionOutcome, DisconnectReasonCode, InboundMessage,
-    DEFAULT_MAX_PACKET_SIZE, NoopLifecycle, ProtocolError, Publish, PublishMessage, QoS, SessionPhase,
-    StandardReconnectPolicy, connect,
+    AuthError, BrokerUrl, ClientId, ConnectOptions, ConnectionOutcome, DEFAULT_MAX_PACKET_SIZE, DisconnectReasonCode,
+    InboundMessage, NoopLifecycle, ProtocolError, Publish, PublishMessage, QoS, SessionPhase, StandardReconnectPolicy,
+    connect,
 };
 use secrecy::SecretString;
 use tokio::net::TcpListener;
@@ -366,9 +366,11 @@ async fn first_connect_resumes_an_existing_broker_session() {
         connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
     let run = tokio::spawn(connection.run());
 
-    wait_for_phase(&mut phase, Duration::from_secs(5), |event| {
-        matches!(event, SessionPhase::Connected { session, .. } if session.session_present)
-    })
+    wait_for_phase(
+        &mut phase,
+        Duration::from_secs(5),
+        |event| matches!(event, SessionPhase::Connected { session, .. } if session.session_present),
+    )
     .await;
     let message = timeout(Duration::from_secs(5), rx.recv_async())
         .await

@@ -178,7 +178,6 @@ pub(super) fn fail_waiters_for_outcome(
             });
         }
         slot.unsent.extend(publish_waiters.parked.drain(..));
-        slot.mark_collect_queued();
     }
     let error = waiter_error_for_outcome(outcome);
     fail_all_waiters(waiters, publish_waiters, inflight, &error);

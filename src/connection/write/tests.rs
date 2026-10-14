@@ -3,6 +3,7 @@ use crate::codec::{
     DisconnectReasonCode, PublishAckReason, PublishDelivery, PublishMessage, PublishProperties, QoS, V5Codec,
     encode_publish,
 };
+use crate::connection::ClientCommand;
 use crate::connection::{ControlMessage, Generation};
 use bytes::Bytes;
 use bytestring::ByteString;
@@ -78,33 +79,38 @@ where
     let _ = read_done_tx.send(());
     let subscription_registry = Arc::new(RwLock::new(SubscriptionRegistry::default()));
 
-    let join = tokio::spawn(run(
-        control_rx,
-        command_rx,
-        stub_rx,
-        framed,
-        WriteSession {
-            generation: Generation(1),
-            keep_alive: Duration::from_secs(3600),
-            subscription_registry: Arc::clone(&subscription_registry),
-            cancel: cancel.clone(),
-            shutdown_notify: CancellationToken::new(),
-            graceful_disconnect_timeout: Duration::from_secs(2),
-            max_qos: overrides.max_qos,
-            retain_available: overrides.retain_available,
-            receive_maximum: overrides.receive_maximum,
-            handoff_stalled: Arc::new(AtomicBool::new(false)),
-            inbound_activity: Arc::new(AtomicBool::new(false)),
-            bench_inbound_publish_ack_counter: None,
-            session_carry: None,
-            read_stop: StopSignal::new(),
-            outbound_topic_aliases: 0,
-            subscription_identifiers_available: true,
-            stats: Default::default(),
-        },
-        InflightPots::new(overrides.inflight_capacity),
-        read_done_rx,
-    ));
+    let session = WriteSession {
+        generation: Generation(1),
+        keep_alive: Duration::from_secs(3600),
+        subscription_registry: Arc::clone(&subscription_registry),
+        cancel: cancel.clone(),
+        shutdown_notify: CancellationToken::new(),
+        graceful_disconnect_timeout: Duration::from_secs(2),
+        max_qos: overrides.max_qos,
+        retain_available: overrides.retain_available,
+        receive_maximum: overrides.receive_maximum,
+        handoff_stalled: Arc::new(AtomicBool::new(false)),
+        inbound_activity: Arc::new(AtomicBool::new(false)),
+        bench_inbound_publish_ack_counter: None,
+        session_carry: None,
+        read_stop: StopSignal::new(),
+        outbound_topic_aliases: 0,
+        subscription_identifiers_available: true,
+        stats: Default::default(),
+    };
+    let join = tokio::spawn(async move {
+        let mut command_rx = command_rx;
+        run(
+            control_rx,
+            &mut command_rx,
+            stub_rx,
+            framed,
+            session,
+            InflightPots::new(overrides.inflight_capacity),
+            read_done_rx,
+        )
+        .await
+    });
 
     WriteTaskHandle {
         control_tx,

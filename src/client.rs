@@ -882,7 +882,7 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
         control_tx,
         control_rx,
         command_tx: Arc::clone(&command_tx),
-        command_rx,
+        command_rx: Some(command_rx),
         handoff: inbound,
         handoff_anchor,
         phase_tx,
