@@ -39,6 +39,7 @@ pub(crate) fn complete_publish_ack(
         return;
     };
     inflight.release_publish(ack.packet_id);
+    waiters.stats.publish_ack(ack.reason_code);
     let _ = entry.reply.send(publish_ack_to_result(ack));
 }
 

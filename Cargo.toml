@@ -26,7 +26,7 @@ exclude = [
 unsafe_code = "deny"
 
 [package.metadata.docs.rs]
-features = ["websocket", "testing"]
+features = ["websocket", "testing", "stats"]
 
 [[test]]
 name = "faults"
@@ -37,6 +37,11 @@ required-features = ["testing"]
 name = "testing"
 path = "tests/testing.rs"
 required-features = ["testing"]
+
+[[test]]
+name = "stats"
+path = "tests/stats.rs"
+required-features = ["testing", "stats"]
 
 [[bench]]
 name = "codec_throughput"
@@ -60,6 +65,9 @@ websocket = ["dep:tokio-tungstenite"]
 # Test helpers for applications: in-process `testing::TestBroker` and `testing::FaultProxy`.
 # Meant for `[dev-dependencies]`; adds no dependencies.
 testing = []
+# `MqttClient::stats()`: counters of what the connection did, for the application to export.
+# Adds no dependencies; without it the counting compiles away.
+stats = []
 
 [dependencies]
 arc-swap = "1.9"

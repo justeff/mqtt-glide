@@ -294,6 +294,7 @@ where
         if let Err(error) = feed_publish(framed, &mut publish_waiters.aliases, &publish.message, delivery) {
             return finish_publish_encode_error(Some(publish.reply), &publish.message, error);
         }
+        publish_waiters.stats.publish_sent(QoS::AtMostOnce);
         let _ = publish.reply.send(Ok(()));
         return Ok(());
     }
@@ -358,6 +359,7 @@ where
         inflight.release_publish(packet_id);
         return finish_publish_encode_error(Some(publish.reply), &publish.message, error);
     }
+    publish_waiters.stats.publish_sent(QoS::AtLeastOnce);
     publish_waiters.insert_sent(packet_id, publish);
     Ok(())
 }
@@ -409,6 +411,7 @@ where
             finish_publish_encode_error(Some(entry.reply), &entry.message, error)?;
             continue;
         }
+        publish_waiters.stats.publish_resent();
         publish_waiters.insert_sent(
             entry.packet_id,
             PendingOutboundPublish {

@@ -285,6 +285,9 @@ pub struct MqttClient {
     phase: watch::Receiver<SessionPhase>,
     /// Response routing for [`crate::Requester`] (shared with the driver's read path).
     router: Arc<crate::request::ResponseRouter>,
+    /// Counters kept by the driver.
+    #[cfg(feature = "stats")]
+    stats: crate::stats::Stats,
 }
 
 /// The [`ConnectOptions`] a client handle needs after the options moved into the driver.
@@ -298,6 +301,8 @@ struct DriverShared {
     connected: Arc<AtomicBool>,
     phase: watch::Receiver<SessionPhase>,
     router: Arc<crate::request::ResponseRouter>,
+    #[cfg(feature = "stats")]
+    stats: crate::stats::Stats,
 }
 
 impl MqttClient {
@@ -319,6 +324,8 @@ impl MqttClient {
             fail_fast_when_disconnected: options.fail_fast_when_disconnected,
             phase: shared.phase,
             router: shared.router,
+            #[cfg(feature = "stats")]
+            stats: shared.stats,
         }
     }
 
@@ -354,6 +361,39 @@ impl MqttClient {
     #[inline]
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Acquire)
+    }
+
+    /// What the connection has done since [`connect`], across reconnects: sessions,
+    /// publishes in and out, acknowledgements, the outbound window, bytes (`stats` feature).
+    ///
+    /// Cheap enough to call on every metrics scrape: a few dozen relaxed atomic loads. The
+    /// crate does not pick a metrics system; export the fields to whichever the application
+    /// uses. Errors the caller already sees (a publish ack timeout, backpressure) are not
+    /// counted here.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo(client: mqtt_glide::MqttClient) {
+    /// let mut every = tokio::time::interval(std::time::Duration::from_secs(15));
+    /// loop {
+    ///     every.tick().await;
+    ///     let stats = client.stats();
+    ///     tracing::info!(
+    ///         reconnects = stats.connection.connects.saturating_sub(1),
+    ///         sent = stats.outbound.publishes_qos1,
+    ///         rejected = stats.outbound.publishes_rejected,
+    ///         awaiting_ack = stats.outbound.awaiting_ack,
+    ///         sink_stalls = stats.inbound.handoff_stalls,
+    ///         "mqtt"
+    ///     );
+    /// }
+    /// # }
+    /// ```
+    #[cfg(feature = "stats")]
+    pub fn stats(&self) -> crate::ClientStats {
+        let commands = self.command_tx.load();
+        self.stats.snapshot(commands.max_capacity() - commands.capacity())
     }
 
     /// Refuses a command before it is queued: shutting down, or disconnected in fail-fast mode.
@@ -831,6 +871,7 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
     let shutdown_notify = CancellationToken::new();
     let connected = Arc::new(AtomicBool::new(false));
     let router = Arc::new(crate::request::ResponseRouter::default());
+    let stats = crate::stats::Stats::default();
     let client_options = ClientOptions {
         ack_timeout: options.ack_timeout,
         fail_fast_when_disconnected: options.fail_fast_when_disconnected,
@@ -848,6 +889,10 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
         lifecycle,
         connected: Arc::clone(&connected),
         response_router: Arc::clone(&router),
+        #[cfg(feature = "stats")]
+        stats: stats.clone(),
+        #[cfg(not(feature = "stats"))]
+        stats,
         #[cfg(test)]
         read_stub_exit_tx,
         #[cfg(test)]
@@ -877,6 +922,8 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
                 connected,
                 phase: phase_rx.clone(),
                 router,
+                #[cfg(feature = "stats")]
+                stats,
             },
         ),
         connection,

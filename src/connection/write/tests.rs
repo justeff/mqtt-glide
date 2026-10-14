@@ -100,6 +100,7 @@ where
             read_stop: StopSignal::new(),
             outbound_topic_aliases: 0,
             subscription_identifiers_available: true,
+            stats: Default::default(),
         },
         InflightPots::new(overrides.inflight_capacity),
         read_done_rx,

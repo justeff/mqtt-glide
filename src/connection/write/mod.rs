@@ -154,6 +154,8 @@ pub(crate) struct PublishWaiters {
     next_seq: u64,
     /// Outbound Topic Alias bindings of this connection.
     pub(super) aliases: crate::connection::topic_alias::OutboundTopicAliases,
+    /// Counters behind [`crate::MqttClient::stats`] (travels with the publish paths).
+    pub(super) stats: crate::stats::Stats,
 }
 
 /// One QoS-1 PUBLISH on the wire awaiting its PUBACK.
@@ -386,6 +388,8 @@ pub(crate) struct WriteSession {
     pub outbound_topic_aliases: u16,
     /// CONNACK Subscription Identifiers Available.
     pub subscription_identifiers_available: bool,
+    /// Counters behind [`crate::MqttClient::stats`].
+    pub stats: crate::stats::Stats,
 }
 
 /// Runs the write task until cancelled, shut down, or signalled to exit.
@@ -420,6 +424,7 @@ where
     };
     let mut publish_waiters = PublishWaiters::with_carry(session.session_carry);
     publish_waiters.aliases = crate::connection::topic_alias::OutboundTopicAliases::new(session.outbound_topic_aliases);
+    publish_waiters.stats = session.stats;
     let mut ping_timer = keep_alive_ping_timer(session.keep_alive);
     let keep_alive = session.keep_alive;
     let handoff_stalled = session.handoff_stalled;
@@ -505,6 +510,10 @@ where
                 .await;
             }
         }
+
+        publish_waiters
+            .stats
+            .outbound_window(publish_waiters.by_id.len(), publish_waiters.parked.len());
 
         // Do not put `#[cfg(test)]` on a `tokio::select!` arm — the macro rejects it.
         #[cfg(test)]
@@ -595,6 +604,7 @@ where
                     )
                     .await;
                 }
+                publish_waiters.stats.ping_sent();
                 awaiting_pingresp = true;
             }
             control = control_rx.recv() => {

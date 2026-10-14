@@ -412,6 +412,32 @@ The two helpers:
 
 The `TestBroker` checks your service, not mqtt-glide: it shares the crate's codec, so it cannot catch the crate's own misreadings of the spec. That is what the tests against real brokers and [`CONFORMANCE.md`](CONFORMANCE.md) are for.
 
+## Metrics
+
+With the `stats` feature, `client.stats()` returns what the connection has done since `connect`, across reconnects:
+
+- **Connection:** sessions established, failed attempts, lost sessions, keep-alive pings.
+- **Outbound:** publishes per QoS, resends after a reconnect, PUBACKs accepted and rejected, and right now: publishes waiting for their PUBACK, publishes waiting for a slot in the broker's Receive Maximum, commands queued for the connection.
+- **Inbound:** publishes per QoS, duplicates, how often and how long the inbound sink was full.
+- **Bytes** in each direction.
+
+The crate does not choose a metrics system for you. Read the snapshot on each scrape (a few dozen atomic loads) and hand the numbers to Prometheus, OpenTelemetry or a log line. Without the feature the counting is compiled out. With it on, each counted event is a plain atomic store on the task that owns the counter; in the [benchmarks](BENCHMARKS.md) that cost about 1% CPU per message and no throughput.
+
+```toml
+mqtt-glide = { version = "0.3", features = ["stats"] }
+```
+
+```rust,no_run
+# #[cfg(feature = "stats")]
+# fn demo(client: &mqtt_glide::MqttClient) {
+let stats = client.stats();
+let reconnects = stats.connection.connects.saturating_sub(1);
+let broker_is_slow = stats.outbound.awaiting_quota > 0;
+let consumer_held_up_the_broker_for = stats.inbound.handoff_stall_time;
+# let _ = (reconnects, broker_is_slow, consumer_held_up_the_broker_for);
+# }
+```
+
 ## Feature matrix
 
 The authoritative answer to "does it do X?", including the things it deliberately does not do.
@@ -435,6 +461,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | Will message (`CONNECT`) | ✅ | `.will(topic, payload)` (+ `.will_qos` / `.will_retain`); QoS 0\|1; power: `WillMessage` |
 | Optional `SO_SNDBUF` / `SO_RCVBUF` | ⚠️ | OS defaults today |
 | Broker diagnostics (Reason String, User Properties) | ✅ | Passed through on `PUBACK` rejections (`PublishRejection`), `SUBACK` / `UNSUBACK` (`SubscribeResponse` / `UnsubscribeResponse`), and in the outcome of a broker `DISCONNECT` / refused `CONNACK`. The client's own outbound `DISCONNECT` carries no reason string |
+| Client counters (`MqttClient::stats`) | ✅ opt-in | `stats` feature; see [Metrics](#metrics). No dependencies, no metrics system chosen for you |
 | Test helpers (`TestBroker`, `FaultProxy`) | ✅ opt-in | `testing` feature; see [Testing your application](#testing-your-application) |
 | HTTP proxy (`CONNECT` tunnel) | ✅ opt-in | `ConnectOptions::http_proxy(HttpProxy::parse("http://user:pass@proxy:3128")?)`; TLS / WebSocket run end to end through the tunnel; Basic auth optional. Not read from `HTTP(S)_PROXY`. SOCKS not supported |
 | Server redirection (§4.11) | ✅ opt-in | `follow_server_redirects(true)`: CONNACK / DISCONNECT 0x9C (Use another server, next connection only) or 0x9D (Server moved, for good) with a Server Reference reconnects there at once; scheme, TLS and WebSocket path stay, at most five redirects in a row. Off: reported in the outcome |

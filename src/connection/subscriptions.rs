@@ -167,6 +167,7 @@ where
             cancel,
             ResubscribeInbound {
                 handoff: inbound.handoff,
+                stats: inbound.stats,
                 topic_aliases: &mut *inbound.topic_aliases,
                 subscription_identifiers_available: inbound.subscription_identifiers_available,
                 response_router: inbound.response_router,
@@ -243,6 +244,8 @@ where
 /// resolving Topic Aliases with the connection's alias state.
 pub(crate) struct ResubscribeInbound<'a, H> {
     pub(crate) handoff: &'a H,
+    /// Counters behind [`crate::MqttClient::stats`].
+    pub(crate) stats: &'a crate::stats::Stats,
     pub(crate) topic_aliases: &'a mut super::topic_alias::InboundTopicAliases,
     /// CONNACK Subscription Identifiers Available.
     pub(crate) subscription_identifiers_available: bool,
@@ -360,6 +363,7 @@ where
         .resolve(&mut packet)
         .map_err(ConnectionOutcome::Protocol)?;
     let puback_id = inbound_publish_policy(&packet).map_err(ConnectionOutcome::Protocol)?;
+    inbound.stats.publish_received(packet.meta.qos, packet.meta.dup);
     if let Some(message) = inbound
         .response_router
         .route(crate::codec::InboundMessage::from(packet))

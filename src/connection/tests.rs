@@ -979,6 +979,7 @@ fn replenish_session_channels_swaps_shared_command_sender() {
         lifecycle: Arc::new(NoopLifecycle),
         connected: Arc::default(),
         response_router: Arc::default(),
+        stats: Default::default(),
         read_stub_exit_tx,
         read_stub_exit_rx,
         write_stub_exit_tx,

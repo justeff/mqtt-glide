@@ -55,6 +55,8 @@ pub(crate) struct ReadSession {
     pub topic_aliases: crate::connection::topic_alias::InboundTopicAliases,
     /// Request/response routing (responses bypass the inbound sink).
     pub response_router: Arc<crate::request::ResponseRouter>,
+    /// Counters behind [`crate::MqttClient::stats`].
+    pub stats: crate::stats::Stats,
 }
 
 /// Drop-guard: signals the write task that the read task has fully exited.
@@ -116,6 +118,7 @@ where
     let inbound_activity = session.inbound_activity;
     let mut topic_aliases = session.topic_aliases;
     let response_router = session.response_router;
+    let stats = session.stats;
     // Created once, not per iteration (see the write task): fresh `cancelled()` futures
     // register with the token under its mutex.
     let cancel_wait = cancel.cancelled();
@@ -160,8 +163,10 @@ where
                                 return protocol_error_disconnect(&control_tx, error, DisconnectReasonCode::TopicAliasInvalid)
                                     .await;
                             }
+                            stats.publish_received(packet.meta.qos, packet.meta.dup);
                             if let Some(outcome) = handle_inbound_publish(
                                 packet,
+                                &stats,
                                 &response_router,
                                 &handoff,
                                 &control_tx,
@@ -204,6 +209,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn handle_inbound_publish<H: InboundSink>(
     packet: PublishPacket,
+    stats: &crate::stats::Stats,
     response_router: &crate::request::ResponseRouter,
     handoff: &H,
     control_tx: &mpsc::Sender<ControlMessage>,
@@ -224,6 +230,7 @@ async fn handle_inbound_publish<H: InboundSink>(
         match accept_publish_preferring_completed_push(
             handoff,
             message,
+            stats,
             cancel,
             shutdown_notify,
             handoff_stalled,
@@ -287,6 +294,7 @@ impl Drop for HandoffStallGuard<'_> {
 async fn accept_publish_preferring_completed_push<H: InboundSink>(
     handoff: &H,
     message: InboundMessage,
+    stats: &crate::stats::Stats,
     cancel: &StopSignal,
     shutdown_notify: &StopSignal,
     handoff_stalled: &AtomicBool,
@@ -298,6 +306,7 @@ async fn accept_publish_preferring_completed_push<H: InboundSink>(
         Err(InboundTrySendError::Full(message)) => {
             handoff_stalled.store(true, Ordering::Release);
             let _stall_guard = HandoffStallGuard { flag: handoff_stalled };
+            let _stall_timer = stats.handoff_stall();
             let outcome = tokio::select! {
                 biased;
                 result = handoff.send(message) => match result {
@@ -432,6 +441,7 @@ mod tests {
         let outcome = accept_publish_preferring_completed_push(
             &tx,
             sample_publish(b"in"),
+            &crate::stats::Stats::default(),
             &cancel,
             &shutdown_notify,
             &stalled,
@@ -465,6 +475,7 @@ mod tests {
                 accept_publish_preferring_completed_push(
                     &tx,
                     sample_publish(b"stall"),
+                    &crate::stats::Stats::default(),
                     &cancel,
                     &shutdown_notify,
                     &stalled,
@@ -509,6 +520,7 @@ mod tests {
                 accept_publish_preferring_completed_push(
                     &tx,
                     sample_publish(b"stall"),
+                    &crate::stats::Stats::default(),
                     &cancel,
                     &shutdown_notify,
                     &stalled,

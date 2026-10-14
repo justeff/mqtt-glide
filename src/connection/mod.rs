@@ -77,6 +77,8 @@ pub(crate) struct ConnectionChannels<H: InboundSink> {
     pub connected: Arc<std::sync::atomic::AtomicBool>,
     /// Routes request/response replies to waiting [`crate::Requester`] requests.
     pub response_router: Arc<crate::request::ResponseRouter>,
+    /// Counters behind [`crate::MqttClient::stats`].
+    pub stats: crate::stats::Stats,
     /// Test/supervision hooks: clone senders before [`Connection::run`].
     #[cfg(test)]
     #[allow(dead_code)]
@@ -367,8 +369,8 @@ impl<H: InboundSink> Connection<H> {
     {
         let mut redirect = None;
         let establish = transport::establish_session_on(
-            read_half,
-            write_half,
+            self.channels.stats.count_reads(read_half),
+            self.channels.stats.count_writes(write_half),
             &self.options,
             &self.credentials,
             deadline,
@@ -474,6 +476,7 @@ impl<H: InboundSink> Connection<H> {
                     topic_aliases: &mut inbound_topic_aliases,
                     subscription_identifiers_available,
                     response_router: &self.channels.response_router,
+                    stats: &self.channels.stats,
                 },
             )
             .await
@@ -513,6 +516,7 @@ impl<H: InboundSink> Connection<H> {
         // Connected is published on the watch (never dropped for readiness) before
         // read/write spawn so session start cannot stall on a consumer.
         self.notify_connected(self.generation.0, session);
+        self.channels.stats.session_up();
         if self.cancel.is_cancelled() {
             return self
                 .finish_session(ConnectionOutcome::Shutdown(ShutdownError::Cancelled), false)
@@ -536,6 +540,7 @@ impl<H: InboundSink> Connection<H> {
                 inbound_activity: Arc::clone(&inbound_activity),
                 topic_aliases: inbound_topic_aliases,
                 response_router: Arc::clone(&self.channels.response_router),
+                stats: self.channels.stats.clone(),
             },
             #[cfg(test)]
             read_stub_exit_rx,
@@ -568,12 +573,14 @@ impl<H: InboundSink> Connection<H> {
                 read_stop,
                 outbound_topic_aliases,
                 subscription_identifiers_available,
+                stats: self.channels.stats.clone(),
             },
             inflight,
             read_done_rx,
         ));
 
         let (outcome, redirect) = Self::supervise_tasks(read_handle, write_handle, read_cancel, write_cancel).await;
+        self.channels.stats.outbound_window(0, 0);
         self.finish_session_or_redirect(outcome, true, redirect).await
     }
 
@@ -588,6 +595,7 @@ impl<H: InboundSink> Connection<H> {
         if let Some(redirect) = redirect
             && self.follow_redirect(&redirect)
         {
+            self.count_session_end(&outcome, from_active_session);
             self.state = ConnectionState::Draining;
             self.notify_disconnected(outcome);
             return self.backoff_then_retry(Duration::ZERO).await;
@@ -628,6 +636,7 @@ impl<H: InboundSink> Connection<H> {
 
     /// Emits `Disconnected`, applies reconnect policy, and decides whether to retry.
     async fn finish_session(&mut self, outcome: ConnectionOutcome, from_active_session: bool) -> SessionDisposition {
+        self.count_session_end(&outcome, from_active_session);
         self.redirects_in_row = 0;
         self.state = ConnectionState::Draining;
         self.notify_disconnected(outcome.clone());
@@ -670,6 +679,13 @@ impl<H: InboundSink> Connection<H> {
                     Some(delay) => self.backoff_then_retry(delay).await,
                 }
             }
+        }
+    }
+
+    /// A lost session or a failed attempt for [`crate::MqttClient::stats`]; a shutdown is neither.
+    fn count_session_end(&self, outcome: &ConnectionOutcome, from_active_session: bool) {
+        if !matches!(outcome, ConnectionOutcome::Shutdown(_)) {
+            self.channels.stats.session_ended(from_active_session);
         }
     }
 

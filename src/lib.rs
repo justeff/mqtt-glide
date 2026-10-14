@@ -41,6 +41,7 @@ pub mod policies;
 pub mod publish;
 pub mod publish_window;
 pub mod request;
+mod stats;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod util;
@@ -66,6 +67,8 @@ pub use options::{
 };
 pub use policies::{DEFAULT_AUTH_FAILURE_THRESHOLD, StandardReconnectPolicy};
 pub use request::{DEFAULT_REQUEST_TIMEOUT, RequestBuilder, Requester};
+#[cfg(feature = "stats")]
+pub use stats::{ClientStats, ConnectionStats, InboundStats, OutboundStats};
 pub use util::{
     BrokerUrl, BrokerUrlError, ClientId, ClientIdError, HttpProxy, ShareNameError, is_shared_subscription_filter,
     shared_filter, validate_share_name,
