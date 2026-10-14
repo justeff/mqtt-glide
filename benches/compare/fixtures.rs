@@ -60,11 +60,11 @@ pub const OUTBOUND_TOPIC: &str = "bench/compare/outbound";
 /// This crate’s version under test (`CARGO_PKG_VERSION`).
 pub const GLIDE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Locked peer crate for published baselines (`rumqttc-next` in `Cargo.toml`).
+/// Locked peer crate for published baselines (`rumqttc-v5-next` in `Cargo.toml`).
 pub const PEER_RUMQTTC_VERSION: &str = "0.33.3";
 
 /// Locked peer crate for published baselines (LabOverWire `mqtt5` in `Cargo.toml`).
-pub const PEER_MQTT5_VERSION: &str = "0.37.2";
+pub const PEER_MQTT5_VERSION: &str = "0.48.0";
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
@@ -167,7 +167,7 @@ pub fn parse_clients() -> Vec<ClientId> {
         }
         out.push(match part.as_str() {
             "glide" | "mqtt-glide" | "mqtt_glide" => ClientId::Glide,
-            "rumqttc" | "rumqttc-next" => ClientId::Rumqttc,
+            "rumqttc" | "rumqttc-next" | "rumqttc-v5-next" => ClientId::Rumqttc,
             "mqtt5" => ClientId::Mqtt5,
             other => panic!("invalid MQTT_COMPARE_CLIENTS entry {other:?}"),
         });

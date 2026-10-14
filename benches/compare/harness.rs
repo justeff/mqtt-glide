@@ -7,7 +7,7 @@ use async_trait::async_trait;
 pub enum ClientId {
     /// This crate (`mqtt-glide`).
     Glide,
-    /// `rumqttc-next`.
+    /// `rumqttc-v5-next`.
     Rumqttc,
     /// LabOverWire `mqtt5` crate.
     Mqtt5,

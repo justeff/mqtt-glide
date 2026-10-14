@@ -55,8 +55,8 @@ Default: all seven. The old `outbound_serial` throughput scenario was removed. R
 | Value | Crate | Version |
 |-------|--------|---------|
 | `glide` | mqtt-glide (this crate) | current checkout (`main`, pre-0.3) |
-| `rumqttc` | `rumqttc-next` | **0.33.3** (pinned; do not bump to 0.34+ without a full re-bench) |
-| `mqtt5` | LabOverWire `mqtt5` | **0.37.2** (pinned) |
+| `rumqttc` | `rumqttc-v5-next` | **0.33.3** (pinned; 0.34.0 scans its whole outgoing table on every flush) |
+| `mqtt5` | LabOverWire `mqtt5` | **0.48.0** (pinned) |
 
 Default: `glide,rumqttc,mqtt5`. Versions are written to each run's `meta.json` (`glide_version`, `rumqttc_version`, `mqtt5_version`).
 

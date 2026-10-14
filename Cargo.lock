@@ -1315,7 +1315,7 @@ dependencies = [
  "nonzero_ext",
  "proptest",
  "rstest",
- "rumqttc-next",
+ "rumqttc-v5-next",
  "rustls",
  "rustls-native-certs",
  "secrecy",
@@ -1333,9 +1333,9 @@ dependencies = [
 
 [[package]]
 name = "mqtt5"
-version = "0.37.2"
+version = "0.48.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff91219b6b52e4ce164f6c50bc5557ec271ecf726ed71ff45cbf15ff0dcb73dc"
+checksum = "47f7fc5315835ec09b02e3d3a58c97213bcaea28d995aef2ad5d003f13c3f37b"
 dependencies = [
  "base64",
  "bebytes",
@@ -1366,9 +1366,9 @@ dependencies = [
 
 [[package]]
 name = "mqtt5-protocol"
-version = "0.14.3"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16ea23fbb2ab11fb239d77da902e0f71ebac91de86618b8ea332264f6f697f17"
+checksum = "7127c4e0f1719483c3606ce51e0b27d036c4a22b985bef7ad375d89c34d5d145"
 dependencies = [
  "bebytes",
  "bytes",
@@ -1883,15 +1883,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
-]
-
-[[package]]
-name = "rumqttc-next"
-version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed1bad2180ff539da671da9a996152a921bc5316eb6d8a9cc3bd441653138b08"
-dependencies = [
- "rumqttc-v5-next",
 ]
 
 [[package]]

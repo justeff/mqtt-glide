@@ -84,7 +84,7 @@ fn main() {
         clients.iter().map(|c| c.as_str()).collect::<Vec<_>>()
     );
     eprintln!(
-        "  versions: mqtt-glide {GLIDE_VERSION}, rumqttc-next {PEER_RUMQTTC_VERSION}, mqtt5 {PEER_MQTT5_VERSION}"
+        "  versions: mqtt-glide {GLIDE_VERSION}, rumqttc-v5-next {PEER_RUMQTTC_VERSION}, mqtt5 {PEER_MQTT5_VERSION}"
     );
     eprintln!("  cells: {}", cells.len());
     eprintln!("  runs (median-of): {}", bench_runs());

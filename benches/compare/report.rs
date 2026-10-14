@@ -40,7 +40,7 @@ pub struct RunMeta<'a> {
     pub clients: Vec<&'a str>,
     /// `mqtt-glide` crate version under test.
     pub glide_version: &'a str,
-    /// Locked `rumqttc-next` version under test.
+    /// Locked `rumqttc-v5-next` version under test.
     pub rumqttc_version: &'a str,
     /// Locked LabOverWire `mqtt5` version under test.
     pub mqtt5_version: &'a str,

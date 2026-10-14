@@ -1,4 +1,4 @@
-//! rumqttc-next adapter (`manual_acks` after flume and auto-ack).
+//! rumqttc-v5-next adapter (`manual_acks` after flume and auto-ack).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use crate::compare::harness::{
 };
 use crate::support::handoff::BenchHandoff;
 
-/// rumqttc-next bench client.
+/// rumqttc-v5-next bench client.
 pub struct RumqttcClient;
 
 #[async_trait]

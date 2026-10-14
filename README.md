@@ -385,7 +385,7 @@ All results and the reading guide: [`BENCHMARKS.md`](BENCHMARKS.md). How to run 
 
 Headline at 256 B, QoS 1, tuned Mosquitto `2.1.2-alpine`, median of 5 runs, 50 000-message bursts, on an Intel Core Ultra 7 258V with the client pinned to 2 P-cores (msg/s · CPU ns/msg; **bold** = best in row):
 
-| Scenario | glide (main) | rumqttc-next 0.33.3 | mqtt5 0.37.2 |
+| Scenario | glide (main) | rumqttc-v5-next 0.33.3 | mqtt5 0.48.0 |
 |----------|------:|--------:|------:|
 | 64 callers sharing one client | **272 531** · **4 128** | 209 668 · 4 673 | 169 067 · 6 323 |
 | 512 callers sharing one client | **311 459** · **3 687** | 224 353 · 4 401 | 177 379 · 6 340 |

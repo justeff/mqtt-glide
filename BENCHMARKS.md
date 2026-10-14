@@ -1,8 +1,8 @@
 # Benchmarks
 
-Absolute numbers for mqtt-glide, rumqttc-next, and LabOverWire mqtt5 against the same broker, same payload, same harness. Nothing here is a paired A/B: every number is measured on its own and only means something together with the conditions it was measured under.
+Absolute numbers for mqtt-glide, rumqttc-v5-next, and LabOverWire mqtt5 against the same broker, same payload, same harness. Nothing here is a paired A/B: every number is measured on its own and only means something together with the conditions it was measured under.
 
-Versions: mqtt-glide `main` (pre-0.3; the crate still says 0.2.0), `rumqttc-next` 0.33.3, `mqtt5` 0.37.2. Payload 256 B, median of 5 runs, 50 000-message bursts. The headline scenario is a service sharing one client between many tasks (`outbound_concurrent`); the other scenarios model other shapes of use. Read [How to read this page](#how-to-read-this-page) before quoting any single number.
+Versions: mqtt-glide `main` (pre-0.3; the crate still says 0.2.0), `rumqttc-v5-next` 0.33.3, `mqtt5` 0.48.0. Payload 256 B, median of 5 runs, 50 000-message bursts. The headline scenario is a service sharing one client between many tasks (`outbound_concurrent`); the other scenarios model other shapes of use. Read [How to read this page](#how-to-read-this-page) before quoting any single number.
 
 ## How to read this page
 
@@ -116,7 +116,7 @@ The same call guarantees different things per client at QoS 0, which matters for
 | Client | `publish().await` returns when (QoS 0) |
 |--------|----------------------------------------|
 | mqtt-glide | The write task has encoded the packet into the connection write buffer |
-| rumqttc-next | The request is accepted onto the event-loop channel; encode and write happen later |
+| rumqttc-v5-next | The request is accepted onto the event-loop channel; encode and write happen later |
 | mqtt5 | The calling task has encoded and written the packet |
 
 Per-publish latency in `outbound_concurrent` and `outbound_rate` is the time to this completion (QoS 0) or to PUBACK (QoS 1), not wire arrival. Throughput is always wire-complete via the barrier above (mock) or PUBACK (Mosquitto).

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use mqtt5::{ConnectOptions, MqttClient, PublishOptions, QoS, SubscribeOptions};
+use mqtt5::{ConnectOptions, MqttClient, PublishOptions, PublishResult, QoS, SubscribeOptions};
 use tokio::task::JoinHandle;
 
 use crate::compare::fixtures::{HANDOFF_CAPACITY, INGRESS_TOPIC, KEEP_ALIVE, OUTBOUND_TOPIC, RECEIVE_MAXIMUM};
@@ -69,7 +69,9 @@ async fn publish_with_retry(client: &MqttClient, payload: Vec<u8>, opts: Publish
             .publish_with_options(OUTBOUND_TOPIC, payload.clone(), opts.clone())
             .await
         {
-            Ok(_) => return,
+            Ok(PublishResult::Sent(_)) => return,
+            // Since 0.4x a timed-out or interrupted QoS 1 publish is `Ok(Queued)`; never count it as sent.
+            Ok(PublishResult::Queued(_)) => panic!("peer mqtt5 publish was queued, not acknowledged"),
             Err(error) if is_transient_io(&error) && attempt + 1 < 32 => {
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_millis(50));
