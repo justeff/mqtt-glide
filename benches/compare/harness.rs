@@ -108,6 +108,8 @@ pub struct SessionCfg {
 }
 
 /// Client adapter: caps + session setup. Implementations stay idiomatic per crate.
+// async_trait expansion triggers clippy::double_must_use on returned futures.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait BenchClient: Send + Sync {
     /// Stable id (`glide`, `rumqttc`, `mqtt5`).
@@ -124,6 +126,8 @@ pub trait BenchClient: Send + Sync {
 }
 
 /// Ingress session: receive handoff, wait for ack/handoff barrier.
+// async_trait expansion triggers clippy::double_must_use on returned futures.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait IngressSession: Send + Sync {
     /// Subscribed topic (unique per session).
@@ -149,6 +153,8 @@ pub trait IngressSession: Send + Sync {
 ///
 /// `Sync` is required so outbound concurrent load can share one session across
 /// caller tasks (`publish_serial` only).
+// async_trait expansion triggers clippy::double_must_use on returned futures.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait OutboundSession: Send + Sync {
     /// One publish; QoS 1 awaits PUBACK, QoS 0 awaits write completion as defined by the client.

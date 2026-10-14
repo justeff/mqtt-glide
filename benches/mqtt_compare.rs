@@ -9,7 +9,8 @@ mod compare;
 mod support;
 
 use compare::fixtures::{
-    GLIDE_VERSION, LOAD_MESSAGES, LOAD_WINDOW, PEER_MQTT5_VERSION, PEER_RUMQTTC_VERSION, bench_runs, parse_clients,
+    GLIDE_VERSION, LOAD_WINDOW, PEER_MQTT5_VERSION, PEER_RUMQTTC_VERSION, bench_runs, child_cpus, load_messages,
+    parse_clients, parse_concurrency, parse_rates, rate_secs,
 };
 use compare::report::{ResultWriter, RunMeta, output_dir};
 use compare::run::MatrixCtx;
@@ -21,6 +22,18 @@ fn host_label() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "unknown-host".to_owned())
+}
+
+/// `Cpus_allowed_list` of this process (e.g. `0-3` under `taskset -c 0-3`).
+fn own_cpu_affinity() -> String {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Cpus_allowed_list:").map(|v| v.trim().to_owned()))
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn main() {
@@ -49,8 +62,14 @@ fn main() {
         host: &host_label(),
         broker: broker.label(),
         runs: bench_runs(),
-        load_messages: LOAD_MESSAGES,
+        load_messages: load_messages(),
         load_window: LOAD_WINDOW,
+        concurrency: parse_concurrency(),
+        rates: parse_rates(),
+        rate_secs: rate_secs(),
+        client_cpus: own_cpu_affinity(),
+        broker_cpus: child_cpus("MQTT_COMPARE_BROKER_CPUS"),
+        publisher_cpus: child_cpus("MQTT_COMPARE_PUBLISHER_CPUS"),
         clients: client_labels,
         glide_version: GLIDE_VERSION,
         rumqttc_version: PEER_RUMQTTC_VERSION,

@@ -360,17 +360,15 @@ Broker-dependent: Message Expiry *drop after interval* (property round-trip is t
 
 All results and the reading guide: [`BENCHMARKS.md`](BENCHMARKS.md). How to run them yourself: [`benches/README.md`](benches/README.md).
 
-Highlights at 256 B (load: msg/s · CPU ns/msg; latency: p50/p99 µs), measured against Mosquitto `2.1.2-alpine` as a median of 100 runs on an Apple M1 Max.
+Headline at 256 B, QoS 1, tuned Mosquitto `2.1.2-alpine`, median of 5 runs, 50 000-message bursts, on an Intel Core Ultra 7 258V with the client pinned to 2 P-cores (msg/s · CPU ns/msg; **bold** = best in row):
 
-| Scenario | glide | rumqttc | mqtt5 |
+| Scenario | glide (main) | rumqttc-next 0.33.3 | mqtt5 0.37.2 |
 |----------|------:|--------:|------:|
-| Ingress load QoS 1 `after_enqueue` | **56 914** · **4 695** | 52 654 · 7 864 | n/a |
-| Outbound pipelined QoS 1 | **101 179** · **5 541** | 86 440 · 9 407 | 61 848 · 30 199 |
-| Outbound serial QoS 1 | **3 932** · 47 417 | 3 736 · 51 299 | 3 826 · **37 221** |
-| Ingress serial QoS 1 `after_enqueue` | **312** / **488** | 314 / 846 | n/a |
-| Outbound serial latency QoS 1 | 250 / **400** | 254 / 482 | **250** / 437 |
+| 64 callers sharing one client | **272 531** · **4 128** | 209 668 · 4 673 | 169 067 · 6 323 |
+| 512 callers sharing one client | **311 459** · **3 687** | 224 353 · 4 401 | 177 379 · 6 340 |
+| Pipelined, window 64 | **304 930** · **3 768** | 216 711 · 4 463 | 169 280 · 7 374 |
 
-Compare only inside one cell: same scenario, QoS, payload, ack policy, and broker. glide's ingress QoS 1 rows use `after_enqueue` and are not comparable to a peer's auto-ack `before` row. For a cutover estimate, use QoS 1 with the pipelined or concurrent rows. Outbound QoS 0 exists on the mock broker only, and mock numbers are a client-side ceiling rather than a broker claim. Wire-only `encode_publish` costs about 27 ns/msg (`codec_throughput`).
+These are absolute numbers on one host and broker setup, not paired comparisons. Against a stock-limit Mosquitto (Receive Maximum 20) all clients lose throughput at high concurrency, and peers lead some cells (for example idle QoS 0 outbound latency and QoS 0 ingress load on the mock broker). Per-publish p50/p99/p99.9 latency, a task-per-message burst, fixed-rate load, ingress, and the pinning and fairness details are in [`BENCHMARKS.md`](BENCHMARKS.md). Wire-only `encode_publish` costs about 27 ns/msg (`codec_throughput`).
 
 Throughput knobs live under [Flow control](#flow-control); the `MQTT_COMPARE_*` variables configure the bench harness and have no effect on the library.
 

@@ -1,29 +1,32 @@
 # Benchmarks
 
-Absolute numbers for mqtt-glide, rumqttc-next, and LabOverWire mqtt5 against the same broker, same payloads, same harness. Nothing here is a paired A/B: every number is measured on its own and only means something together with the conditions it was measured under.
+Absolute numbers for mqtt-glide, rumqttc-next, and LabOverWire mqtt5 against the same broker, same payload, same harness. Nothing here is a paired A/B: every number is measured on its own and only means something together with the conditions it was measured under.
 
-mqtt-glide is the only client here that can ack after your queue accepted the message; sustained QoS 1 throughput and CPU per message vary by scenario. Read [How to read this page](#how-to-read-this-page) before quoting any single number.
+Versions: mqtt-glide `main` (pre-0.3; the crate still says 0.2.0), `rumqttc-next` 0.33.3, `mqtt5` 0.37.2. Payload 256 B, median of 5 runs, 50 000-message bursts. The headline scenario is a service sharing one client between many tasks (`outbound_concurrent`); the other scenarios model other shapes of use. Read [How to read this page](#how-to-read-this-page) before quoting any single number.
 
 ## How to read this page
 
-Every number is one cell: one client, one scenario, one QoS, one payload size, one ack policy, one broker. Cells are only comparable to cells that differ in the client column. "glide does 101 179 msg/s" on its own says nothing. The same client does 3 932 msg/s two sections down, because that row waits for a broker round trip per message.
+Every number is one cell: one client, one scenario (and level), one QoS, one ack policy, one broker. Cells are only comparable to cells that differ in the client column.
 
 ### Scenarios
 
-Every table belongs to one of six:
+| Scenario | Models | What it measures |
+|----------|--------|------------------|
+| `outbound_concurrent` | A service: one shared client, many request tasks | 8 / 64 / 512 long-lived caller tasks, each awaiting every `publish`. msg/s, CPU ns/msg, per-publish p50 / p99 / p99.9. **Headline.** |
+| `outbound_pipelined` | Bulk export | One task keeps a window of 64 in flight through each client's idiomatic pipeline. msg/s, CPU ns/msg |
+| `outbound_spawn` | A relay: one task per message | The whole 50 000-message burst is spawned at once, each task awaiting its publish. msg/s, CPU ns/msg (no latency: all tasks start at once) |
+| `outbound_rate` | A given load | Open loop at 10 000 and 50 000 msg/s offered (1 ms ticks, 2 s). The generator never waits on the client; latency runs from each task's release, so falling behind shows as latency and a lower achieved rate. CPU ns/msg at a fixed load |
+| `outbound_serial_latency` | Idle round-trip probe | One publish at a time on an idle connection. p50 / p99 |
+| `ingress_load` | A subscriber under burst | A publisher process bursts at the client under test: decode, bounded app queue, drain. msg/s, CPU ns/msg |
+| `ingress_serial` | Idle round-trip probe | One message at a time, publisher send until the subscriber pulls it off the app queue. p50 / p99 |
 
-| Scenario | What it measures |
-|----------|------------------|
-| Ingress load (`ingress_load`) | A burst published at the client under test, measured as decode → bounded app queue → drain |
-| Ingress serial latency (`ingress_serial`) | One message at a time: publisher send until the subscriber pulls it off the app queue |
-| Outbound serial (`outbound_serial`) | One task, `publish().await`, then the next. The cost of idiomatic one-at-a-time publishing |
-| Outbound pipelined (`outbound_pipelined`) | One feeder keeping a window of 64 in flight through each client's idiomatic pipeline |
-| Outbound concurrent (`outbound_concurrent`) | 64 tasks sharing one session, each awaiting its own `publish` (HTTP-style fan-out) |
-| Outbound serial latency (`outbound_serial_latency`) | Per-message stopwatch on the outbound path (QoS 1 on Mosquitto ends at PUBACK) |
+There is no serial-throughput scenario any more: one task awaiting each publish in turn mostly measures the round trip, so it survives only as the idle latency probe.
 
 ### Units
 
-Load cells are `msg/s · CPU ns/msg` (`getrusage` of the bench process; ingress load excludes the publisher child). Latency cells are `p50 / p99 µs`. Bold marks the best msg/s and the lowest CPU in a load row, or the lowest p50 and p99 in a latency row, among clients with `status: ok`. Ties are all bold.
+Load cells are `msg/s · CPU ns/msg`, extended with `· p50 / p99 / p99.9 µs` where the scenario records per-publish latency. Serial latency cells are `p50 / p99 µs`. **Bold** marks, per metric and per row, the best value among clients with `status: ok` (highest msg/s, lowest CPU and latency); ties are all bold. Bold is not a significance test.
+
+CPU ns/msg is `getrusage` of the whole bench process: the client, its runtime threads **and the harness tasks** (callers, spawner, ticker, drain). Harness work is identical across clients but not free. Ingress load excludes the publisher child process. Outbound rate rows show about 49.6k of the 50k offered for every client: the wall time also covers draining the last messages after the 2 s schedule, so this is not a client limit.
 
 ### Ack policies
 
@@ -34,17 +37,16 @@ Apply to ingress QoS 1 only and decide *when* PUBACK is sent relative to the app
 | `after_enqueue` | PUBACK after the app queue accepted the message | mqtt-glide (only mode), rumqttc via `manual_acks` |
 | `before` | PUBACK on decode, before the app sees the message | rumqttc auto-ack, mqtt5 (inherent) |
 
-Cross-policy cells (glide `after_enqueue` against mqtt5 or rumqttc `before`) are not cutover-fair.
+Cross-policy cells (glide `after_enqueue` against a peer's `before`) are not cutover-fair.
 
 ### `n/a` reasons
-
-Mark a capability gap or an intentional harness skip, never a failed run:
 
 | Marker | Meaning |
 |--------|---------|
 | `n/a (no_manual_ack)` | mqtt5 has no enqueue-before-ack API |
-| `n/a (no_auto_ack)` | mqtt-glide does not expose auto-ack; use `after_enqueue` for glide ingress QoS 1 |
-| `n/a (qos0_no_wire_counter)` | Mosquitto outbound QoS 0 has no wire counter, so the harness skips it (see Mock) |
+| `n/a (no_auto_ack)` | mqtt-glide does not expose auto-ack; use `after_enqueue` |
+
+Mosquitto outbound QoS 0 is not run at all, by design: there is no wire counter to know when the broker saw the messages (see below).
 
 ## Setup
 
@@ -52,118 +54,387 @@ Mark a capability gap or an intentional harness skip, never a failed run:
 
 | | |
 |--|--|
-| Machine | Apple MacBook Pro (`MacBookPro18,2`) |
-| Chip | Apple M1 Max, 10 cores (8 performance + 2 efficiency) |
-| Memory | 32 GB |
-| OS | macOS 26.5.2 |
+| CPU | Intel Core Ultra 7 258V (Lunar Lake): 4 P-cores (CPUs 0-3), 4 LP E-cores (CPUs 4-7), no SMT |
+| Memory | 32 GB (30 GiB usable) |
+| OS | Fedora Linux 44, kernel 7.2.10, cpufreq governor `performance` |
+| Toolchain | rustc 1.99.0 |
+| Container | Podman 5.8.7 (rootless), eclipse-mosquitto `2.1.2-alpine` |
 
-### Matrix for this baseline
+### CPU pinning
+
+| Process | CPUs |
+|---------|------|
+| Client under test (whole bench process; Tokio multi-thread runtime → 2 workers) | `taskset -c 0-1` |
+| Broker (mock child or Mosquitto container) and ingress publisher | 2-3 (`MQTT_COMPARE_BROKER_CPUS=2-3`, `MQTT_COMPARE_PUBLISHER_CPUS=2-3`) |
+
+Why: on this hybrid CPU, placing the broker on the LP E-cores made the broker the bottleneck (QoS 1 capped near 170k msg/s) and roughly doubled the client's CPU/msg through cross-cluster traffic. Sharing all P-cores lets client and broker compete and distorts p99. Splitting the P-cores 2/2 isolates both. Absolute numbers are specific to this split; on other hosts, re-pin accordingly.
+
+### Matrix
 
 | Knob | Value |
 |------|--------|
-| Runs | median-of 100 |
-| Load burst | 5 000 messages, window / concurrency 64 |
-| Payloads | 64 / 256 / 1 024 / 4 096 bytes |
-| QoS | 0 and 1 |
+| Runs | median of 5 |
+| Load burst | 50 000 messages (`MQTT_COMPARE_LOAD_MSGS`) |
+| Concurrency levels | 8, 64, 512 |
+| Offered rates | 10 000 and 50 000 msg/s, 2 s each |
+| Pipelined window | 64 |
+| Payload | 256 B |
+| QoS | mock: 0 and 1; Mosquitto (both): 1 |
 | Clients | `glide`, `rumqttc`, `mqtt5` |
-| mqtt-glide (this baseline) | 0.1.0 (not every release is re-benched) |
-| Peer crates (locked) | `rumqttc-next` 0.33.3, LabOverWire `mqtt5` 0.37.2 |
-| Ack (ingress QoS 1 only) | `after_enqueue`, `before` |
-| Source dirs | `target/mqtt_compare/full-mosquitto-100/`, `full-mock-100/`; concurrent: `outbound-concurrent-mosquitto-100/`, `outbound-concurrent-mock-100/` |
-| Outbound QoS 0 | Mock only (wire `WAIT`); Mosquitto → `n/a` (`qos0_no_wire_counter`) including latency |
-| Outbound QoS 1 | Mosquitto + mock (PUBACK / wire) |
+| Source | `target/mqtt_compare/full-{mock,mosquitto,mosquitto-stock}/` (JSONL + `meta.json`) |
 
-Mosquitto is the published baseline (eclipse-mosquitto `2.1.2-alpine`, bench-tuned).
-Mock is a ceiling / attribution broker (out-of-process, multi-thread, Arc fanout, inbound PUBLISH counter), not a production broker claim.
+Command (per broker; QoS `0,1` for mock, `1` for Mosquitto):
+
+```shell
+MQTT_COMPARE_BROKER=<mock|mosquitto|mosquitto-stock> MQTT_COMPARE_QOS=<0,1|1> \
+MQTT_COMPARE_BROKER_CPUS=2-3 MQTT_COMPARE_PUBLISHER_CPUS=2-3 MQTT_COMPARE_RUNS=5 \
+  taskset -c 0-1 cargo bench --bench mqtt_compare
+```
+
+### Brokers
+
+| Backend | Role |
+|---------|------|
+| `mosquitto` | Tuned (`max_inflight_messages 0`, `max_queued_messages 0`, `set_tcp_nodelay`, no persistence / `$SYS` / logs). The published baseline |
+| `mosquitto-stock` | Stock `max_inflight_messages 20` / `max_queued_messages 1000`, i.e. CONNACK Receive Maximum 20. Added because the tuned broker hid problems with a small broker window: mqtt-glide previously failed in this setup for windows wider than 20 (fixed on main) |
+| `mock` | Out-of-process mock MQTT 5 (multi-thread, Arc fanout, `TCP_NODELAY`, inbound PUBLISH counter, `receive_max` 1024). A client-side ceiling, not a broker claim |
 
 ## Fairness rules
 
-These are the constraints that make the numbers comparable at all. Read them before quoting a row.
-
 ### Ingress is always the handoff use case
 
-Takeaway: there is no "process it inline" number on this page.
+All ingress cells measure decode → bounded app queue (flume) → drain, never "handle inline in the decode path". Peers are adapted to that shape. QoS 1 `after_enqueue` / `before` only moves PUBACK relative to the handoff.
 
-All ingress cells (load + serial latency, QoS 0 and 1) measure decode → app queue (flume) → drain, not “handle the message inline in a decode/callback path.”
+### Outbound: wire counter (mock) vs Mosquitto
 
-- The harness always enqueues a handoff record and later `recv`s it (`recv_touch` / barrier on handoffs or PUBACKs).
-- That matches mqtt-glide’s product model (`InboundSink` accept). Peers are adapted to the same shape so cutover compares stay fair.
-- There is no bench cell for “I got a PUBLISH and processed it directly without an app queue.”
-- QoS 1 `after_enqueue` / `before` only changes when PUBACK is sent relative to that handoff; both still use the queue.
+On the mock, outbound wall time ends when its stats port answers `WAIT N` with the count of decoded PUBLISH frames; a count mismatch or timeout fails the cell, so an early `publish().await` return cannot end a cell early. On Mosquitto only QoS 1 is usable (PUBACK means the broker saw the message), so outbound QoS 0 is skipped there. Do not read that as missing coverage.
 
-### Outbound load: wire counter (mock) vs Mosquitto
+### What `publish().await` returns on
 
-Takeaway: outbound throughput is measured at the wire, and on Mosquitto that only works for QoS 1.
+The same call guarantees different things per client at QoS 0, which matters for the latency columns:
 
-On `MQTT_COMPARE_BROKER=mock`, outbound serial/pipelined/concurrent wall time ends when the mock stats port answers `WAIT N` with `RECEIVED <count>` (inbound PUBLISH frames decoded). `TIMEOUT <count>` or a count ≠ N fails the cell. Early `publish().await` completion cannot finish the cell early.
+| Client | `publish().await` returns when (QoS 0) |
+|--------|----------------------------------------|
+| mqtt-glide | The write task has encoded the packet into the connection write buffer |
+| rumqttc-next | The request is accepted onto the event-loop channel; encode and write happen later |
+| mqtt5 | The calling task has encoded and written the packet |
 
-On Mosquitto, all outbound QoS 0 cells (serial / pipelined / concurrent load + serial latency) are `n/a` (`qos0_no_wire_counter`). Prefer QoS 1 for Mosquitto cutover outbound (PUBACK ≈ broker saw the message). Fair QoS 0 wire attribution lives on the mock.
+Per-publish latency in `outbound_concurrent` and `outbound_rate` is the time to this completion (QoS 0) or to PUBACK (QoS 1), not wire arrival. Throughput is always wire-complete via the barrier above (mock) or PUBACK (Mosquitto).
 
-### Outbound feed shapes (serial vs pipelined vs concurrent)
+### Other notes
 
-Takeaway: the wall clock is fair across clients, but a serial `publish().await` does not mean the same thing in each of them.
+- Client adapters use idiomatic APIs, not a lowest-common-denominator path. Pipelined uses `publish_window` (glide), notices (rumqttc), and spawns (mqtt5).
+- `outbound_spawn` is an extreme shape: 50 000 tasks wait on the client at once.
+- Serial latency rows are broker round trips; small differences between clients there are within what a single idle probe can resolve.
 
-| Scenario | Feeder model | Per-message API |
-|----------|--------------|-----------------|
-| `outbound_serial` | One task | `publish().await` then next |
-| `outbound_pipelined` | One feeder, window 64 | Client-idiomatic pipeline (`publish_window` / rumqttc notices / mqtt5 spawns) |
-| `outbound_concurrent` | 64 harness tasks, shared session | Only `publish().await` / `publish_serial` (HTTP-style fan-out) |
+## Observations
 
-Mock outbound load ends on the same wire barrier (`WAIT N`), but clients still feed the burst differently when the harness calls idiomatic serial `publish().await` (Mock QoS 0 only; Mosquitto outbound QoS 0 is skipped):
+Facts read off the tables below, on this host and pinning only.
 
-| Client | What each serial `publish().await` does (QoS 0) | Encode / invalid-topic errors on that call? |
-|--------|--------------------------------------------------|-----------------------------------------------|
-| mqtt-glide | Waits until the write task has encoded into the connection write buffer (oneshot). | Yes (returned on the completion / `publish` result). |
-| rumqttc-next | Accepts the request onto the EventLoop channel only; encode/write happen later in the event loop (often batched). | No on that `await` (mainly channel full / early topic checks; later failures surface via the event loop). |
-| mqtt5 | Encodes and `write_packet` / TCP write on the calling task, then returns. | Yes (on that call). |
-
-With `WAIT N`, rumqttc cannot finish the cell early by enqueue-only awaits; wall msg/s is wire-complete for all three (and on Mock serial QoS 0, glide typically leads msg/s). What still differs is what each `publish().await` guarantees (write/completion vs channel accept) and thus CPU/shape of the feeder. Prefer outbound pipelined, outbound concurrent, and QoS 1 for “sustained publish throughput with visible per-message completion.” Serial remains useful as “cost of idiomatic one-at-a-time `publish().await`.” Concurrent keeps that same await API but overlaps many callers (fair across clients: harness spawn is identical).
-
-### Latency stopwatches
-
-Takeaway: each latency row stops at a different barrier, so check which one before comparing them to each other.
-
-| Cell | Barrier |
-|------|---------|
-| Ingress serial (QoS 0/1) | Publisher send → subscriber flume handoff `recv` (same app-queue path as ingress load) |
-| Outbound serial latency QoS 1 (Mosquitto) | `publish().await` until PUBACK |
-| Outbound serial latency (mock, QoS 0/1) | Start → `publish` → mock `WAIT 1` / `RECEIVED` (broker decoded the frame) |
-
-Do not treat Mosquitto outbound QoS 0 latency as missing coverage; it is intentionally skipped. Mock outbound QoS 0 latency is wire-complete, not API-queue latency.
-
-### Where the numbers are bounded by something other than the client
-
-Takeaway: serial QoS 1 is a broker round-trip measurement; do not read client differences into it.
-
-- Outbound serial QoS 1 is largely Mosquitto RTT-bound (~4 k msg/s ≈ 250 µs round-trip). msg/s parity is expected; CPU gaps while blocked on PUBACK are parking/overhead, not wire encode.
-- Outbound serial / pipelined / concurrent QoS 0 on mock is wire-complete (`WAIT N`); absolute rates still depend on client enqueue/write efficiency and (for serial) per-call await semantics above.
-- Keep Mosquitto outbound QoS 1 load (serial + pipelined + concurrent): that remains the cutover throughput / RTT story. Only QoS 0 outbound is dropped there.
+- QoS 1 on tuned Mosquitto: at 64 and 512 callers, glide has the highest msg/s and lowest CPU/msg in this run; at 8 callers all three are within about 6% of each other (the broker round trip dominates). Against stock Mosquitto (Receive Maximum 20) every client loses throughput at higher concurrency compared with the tuned broker, and the CPU/msg ordering at 64 and 512 callers is no longer glide first (rumqttc is lower there).
+- `outbound_spawn`: rumqttc reaches about 23-25k msg/s at about 44-48 µs CPU/msg, versus roughly 150-520k msg/s for the others. It slows sharply when tens of thousands of tasks wait on its request channel at once; this burst shape is extreme.
+- Peers win some cells: rumqttc and mqtt5 have lower idle `outbound_serial_latency` at QoS 0 on the mock (about 14-15 µs p50 versus 20 µs), mqtt5 is lowest on idle QoS 1 latency on tuned Mosquitto, and rumqttc is ahead on mock `ingress_load` at QoS 0.
+- `outbound_rate`: all clients keep up with 10k and 50k msg/s offered; the differences are CPU/msg and the tail (p99.9), not throughput.
+- Ingress load on Mosquitto is about 154k msg/s for every client, which is the broker/publisher pace, not a client limit.
 
 <!-- benchmarks:generated:start -->
 
-## Highlights (Mosquitto, 256 B)
+## Headline: QoS 1, 256 B, tuned Mosquitto
 
-Cutover-relevant where both support the cell. **Bold** = best msg/s or lowest CPU (or lowest p50/p99) among ok clients in that row.
+**Bold** = highest msg/s, lowest CPU ns/msg, lowest p50 / p99 / p99.9 among `status: ok` clients in that row (ties all bold).
 
 | Scenario | glide | rumqttc | mqtt5 |
-|----------|------:|--------:|------:|
-| Ingress load QoS 1 `after_enqueue` | **56 914** · **4 695** | 52 654 · 7 864 | n/a (`no_manual_ack`) |
-| Ingress load QoS 1 `before` | n/a (`no_auto_ack`) | **55 088** · **4 436** | 50 783 · 12 556 |
-| Outbound pipelined QoS 1 | **101 179** · **5 541** | 86 440 · 9 407 | 61 848 · 30 199 |
-| Outbound concurrent QoS 1 | **96 157** · **8 547** | 84 998 · 12 852 | 73 815 · 25 782 |
-| Outbound serial QoS 1 | **3 932** · 47 417 | 3 736 · 51 299 | 3 826 · **37 221** |
-| Ingress serial QoS 1 `after_enqueue` (p50/p99 µs) | **312** / **488** | 314 / 846 | n/a (`no_manual_ack`) |
-| Outbound serial latency QoS 1 (p50/p99 µs) | 250 / **400** | 254 / 482 | **250** / 437 |
+|---|---:|---:|---:|
+| Outbound concurrent, 64 callers | **272 531** · **4 128** · **243** / **311** / **505** µs | 209 668 · 4 673 · 298 / 506 / 1 828 µs | 169 067 · 6 323 · 377 / 488 / 993 µs |
+| Outbound concurrent, 512 callers | **311 459** · **3 687** · **1 661** / **2 022** / **2 378** µs | 224 353 · 4 401 · 2 371 / 3 778 / 4 392 µs | 177 379 · 6 340 · 2 883 / 4 312 / 4 624 µs |
+| Outbound spawn | **313 104** · **5 140** | 22 626 · 48 117 | 156 195 · 9 091 |
+| Outbound rate, 50 000 msg/s offered | 49 616 · **5 311** · **425** / **912** / **1 063** µs | **49 625** · 5 926 · 669 / 1 005 / 1 498 µs | 49 616 · 7 911 · 511 / 973 / 2 558 µs |
+| Outbound pipelined | **304 930** · **3 768** | 216 711 · 4 463 | 169 280 · 7 374 |
 
 ---
 
-## Mosquitto baseline
+## Mosquitto (tuned: unlimited inflight / queue)
 
-Broker: eclipse-mosquitto `2.1.2-alpine` via testcontainers (anonymous; `set_tcp_nodelay`; unlimited inflight/queue; no persistence / `$SYS` / logs).
+Broker: eclipse-mosquitto `2.1.2-alpine` via testcontainers (anonymous; `set_tcp_nodelay`; `max_inflight_messages 0`, `max_queued_messages 0`; no persistence / `$SYS` / logs).
 
-**Bold** = best msg/s / lowest CPU ns/msg (load), or lowest p50 / p99 (latency), among ok clients in the row.
+**Bold** = highest msg/s, lowest CPU ns/msg, lowest p50 / p99 / p99.9 among `status: ok` clients in that row (ties all bold).
 
-Outbound QoS 0 (serial / pipelined / concurrent load + serial latency) is omitted here — no wire counter without a measuring subscriber; see **Mock ceiling**.
+Outbound QoS 0 is omitted: no wire counter without a measuring subscriber; see the mock tables.
+
+### Outbound concurrent (callers sharing one client)
+
+Units: msg/s · CPU ns/msg · p50 / p99 / p99.9 µs per publish.
+
+#### QoS 1
+
+| Level | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 8 callers | **153 186** · **5 004** · **51.7** / **75.5** / **85.0** µs | 151 899 · 5 203 · 52.4 / 79.0 / 89.1 µs | 144 617 · 6 608 · 54.1 / 87.2 / 116 µs |
+| 64 callers | **272 531** · **4 128** · **243** / **311** / **505** µs | 209 668 · 4 673 · 298 / 506 / 1 828 µs | 169 067 · 6 323 · 377 / 488 / 993 µs |
+| 512 callers | **311 459** · **3 687** · **1 661** / **2 022** / **2 378** µs | 224 353 · 4 401 · 2 371 / 3 778 / 4 392 µs | 177 379 · 6 340 · 2 883 / 4 312 / 4 624 µs |
+
+### Outbound spawn (one task per message, 50k at once)
+
+Units: msg/s · CPU ns/msg (no latency: all tasks start at once).
+
+#### QoS 1
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | **313 104** · **5 140** | 22 626 · 48 117 | 156 195 · 9 091 |
+
+### Outbound rate (open loop, offered msg/s)
+
+Units: msg/s · CPU ns/msg · p50 / p99 / p99.9 µs per publish.
+
+#### QoS 1
+
+| Level | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 10 000 msg/s offered | 9 979 · **7 456** · 123 / **201** / **288** µs | 9 982 · 8 752 · 126 / 219 / 923 µs | **9 982** · 9 258 · **123** / 204 / 712 µs |
+| 50 000 msg/s offered | 49 616 · **5 311** · **425** / **912** / **1 063** µs | **49 625** · 5 926 · 669 / 1 005 / 1 498 µs | 49 616 · 7 911 · 511 / 973 / 2 558 µs |
+
+### Outbound pipelined (window 64, one task)
+
+Units: msg/s · CPU ns/msg.
+
+#### QoS 1
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | **304 930** · **3 768** | 216 711 · 4 463 | 169 280 · 7 374 |
+
+### Outbound serial latency (idle round trip)
+
+Units: p50 / p99 µs.
+
+#### QoS 1
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | 27.8 / 32.4 | 27.4 / 34.7 | **23.4** / **30.1** |
+
+### Ingress load
+
+Units: msg/s · CPU ns/msg.
+
+#### QoS 1 · `after_enqueue`
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | 154 187 · **4 171** | **154 622** · 4 817 | n/a (`no_manual_ack`) |
+
+#### QoS 1 · `before`
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | n/a (`no_auto_ack`) | **154 183** · **4 101** | 152 254 · 5 013 |
+
+### Ingress serial latency (idle)
+
+Units: p50 / p99 µs.
+
+#### QoS 1 · `after_enqueue`
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | 32.7 / 42.9 | **31.1** / **39.5** | n/a (`no_manual_ack`) |
+
+#### QoS 1 · `before`
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | n/a (`no_auto_ack`) | **27.0** / 60.8 | 27.6 / **59.4** |
+
+
+---
+
+## Mosquitto (stock limits)
+
+Broker: same image with Mosquitto's defaults, `max_inflight_messages 20` / `max_queued_messages 1000`. The broker advertises Receive Maximum 20 in CONNACK, so a client may have at most 20 unacknowledged QoS 1 PUBLISH packets in flight. QoS 1 only.
+
+**Bold** = highest msg/s, lowest CPU ns/msg, lowest p50 / p99 / p99.9 among `status: ok` clients in that row (ties all bold).
+
+### Outbound concurrent (callers sharing one client)
+
+Units: msg/s · CPU ns/msg · p50 / p99 / p99.9 µs per publish.
+
+#### QoS 1
+
+| Level | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 8 callers | **150 763** · **4 983** · **52.4** / **75.5** / **87.7** µs | 149 622 · 5 247 · 52.8 / 78.7 / 89.9 µs | 144 593 · 6 638 · 54.2 / 86.8 / 110 µs |
+| 64 callers | **215 191** · 4 973 · **298** / **379** / **497** µs | 210 991 · **4 517** · 302 / 379 / 614 µs | 170 234 · 6 404 · 373 / 514 / 1 030 µs |
+| 512 callers | **228 761** · 5 074 · **2 229** / 2 659 / **2 699** µs | 211 660 · **4 609** · 2 412 / **2 650** / 2 699 µs | 176 810 · 6 267 · 2 859 / 4 333 / 4 677 µs |
+
+### Outbound spawn (one task per message, 50k at once)
+
+Units: msg/s · CPU ns/msg (no latency: all tasks start at once).
+
+#### QoS 1
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | **183 165** · **7 627** | 22 590 · 48 719 | 156 934 · 9 011 |
+
+### Outbound rate (open loop, offered msg/s)
+
+Units: msg/s · CPU ns/msg · p50 / p99 / p99.9 µs per publish.
+
+#### QoS 1
+
+| Level | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 10 000 msg/s offered | 9 980 · **7 575** · 123 / 208 / 870 µs | 9 980 · 8 792 · 125 / 221 / 689 µs | **9 980** · 9 280 · **123** / **207** / **651** µs |
+| 50 000 msg/s offered | 49 617 · 6 480 · 405 / **910** / **1 322** µs | **49 621** · **6 366** · **395** / 950 / 1 721 µs | 49 613 · 7 794 · 508 / 987 / 2 370 µs |
+
+### Outbound pipelined (window 64, one task)
+
+Units: msg/s · CPU ns/msg.
+
+#### QoS 1
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | **226 648** · 4 474 | 213 620 · **3 969** | 170 700 · 7 510 |
+
+### Outbound serial latency (idle round trip)
+
+Units: p50 / p99 µs.
+
+#### QoS 1
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | 27.9 / 32.8 | **27.0** / **32.3** | 33.8 / 37.5 |
+
+### Ingress load
+
+Units: msg/s · CPU ns/msg.
+
+#### QoS 1 · `after_enqueue`
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | 154 368 · **4 143** | **154 997** · 4 879 | n/a (`no_manual_ack`) |
+
+#### QoS 1 · `before`
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | n/a (`no_auto_ack`) | **153 771** · **4 128** | 153 059 · 4 992 |
+
+### Ingress serial latency (idle)
+
+Units: p50 / p99 µs.
+
+#### QoS 1 · `after_enqueue`
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | 33.0 / 68.0 | **32.0** / **40.7** | n/a (`no_manual_ack`) |
+
+#### QoS 1 · `before`
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | n/a (`no_auto_ack`) | **25.7** / **37.6** | 28.1 / 37.9 |
+
+
+---
+
+## Mock ceiling
+
+Broker: out-of-process mock MQTT 5 (`MQTT_COMPARE_BROKER=mock`): multi-thread Tokio, Arc fanout, `TCP_NODELAY`, inbound PUBLISH counter, `receive_max` 1024.
+Use for client CPU / enqueue ceiling attribution, not as a broker product comparison.
+
+**Bold** = highest msg/s, lowest CPU ns/msg, lowest p50 / p99 / p99.9 among `status: ok` clients in that row (ties all bold).
+
+### Outbound concurrent (callers sharing one client)
+
+Units: msg/s · CPU ns/msg · p50 / p99 / p99.9 µs per publish.
+
+#### QoS 0
+
+| Level | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 8 callers | **1 162 328** · **1 447** · **6.3** / **17.5** / 55.9 µs | 275 261 · 4 310 · 28.9 / 32.1 / 162 µs | 309 121 · 2 239 · 25.8 / 29.5 / **35.5** µs |
+| 64 callers | **1 342 928** · **1 247** · **42.7** / **67.7** / **117** µs | 284 203 · 4 626 · 218 / 282 / 450 µs | 303 998 · 2 350 · 209 / 236 / 800 µs |
+| 512 callers | **1 411 507** · **1 232** · **261** / **1 771** / 3 227 µs | 268 771 · 4 823 · 1 837 / 2 082 / **2 143** µs | 302 374 · 2 307 · 1 666 / 1 943 / 2 981 µs |
+
+#### QoS 1
+
+| Level | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 8 callers | **332 024** · **4 069** · **23.0** / **38.4** / **54.4** µs | 232 811 · 4 688 · 30.2 / 58.2 / 65.8 µs | 222 294 · 5 900 · 35.3 / 61.3 / 139 µs |
+| 64 callers | **415 881** · **3 667** · **154** / **177** / **196** µs | 224 850 · 5 362 · 282 / 374 / 479 µs | 216 907 · 5 852 · 286 / 497 / 1 313 µs |
+| 512 callers | **418 046** · **3 523** · **1 221** / **1 895** / **2 376** µs | 235 208 · 5 334 · 2 197 / 2 830 / 3 562 µs | 209 771 · 6 134 · 2 369 / 3 718 / 3 994 µs |
+
+### Outbound spawn (one task per message, 50k at once)
+
+Units: msg/s · CPU ns/msg (no latency: all tasks start at once).
+
+#### QoS 0
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | **524 973** · **3 335** | 24 855 · 44 274 | 213 726 · 5 227 |
+
+#### QoS 1
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | **399 561** · **4 429** | 25 053 · 43 929 | 169 307 · 8 821 |
+
+### Outbound rate (open loop, offered msg/s)
+
+Units: msg/s · CPU ns/msg · p50 / p99 / p99.9 µs per publish.
+
+#### QoS 0
+
+| Level | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 10 000 msg/s offered | **9 982** · **5 881** · 24.8 / **53.9** / **63.1** µs | 9 981 · 6 372 · **18.6** / 59.3 / 87.3 µs | 9 980 · 6 578 · 31.4 / 62.0 / 788 µs |
+| 50 000 msg/s offered | 49 622 · 3 463 · **91.5** / 232 / 582 µs | 49 632 · 3 633 · 92.7 / 236 / **327** µs | **49 642** · **3 388** · 98.7 / **218** / 367 µs |
+
+#### QoS 1
+
+| Level | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 10 000 msg/s offered | **9 982** · **7 450** · **70.8** / **102** / **220** µs | 9 980 · 8 790 · 76.9 / 124 / 863 µs | 9 978 · 9 627 · 76.1 / 137 / 477 µs |
+| 50 000 msg/s offered | 49 628 · **4 321** · 261 / **334** / **799** µs | 49 627 · 5 174 · **250** / 364 / 1 334 µs | **49 629** · 5 429 · 302 / 495 / 2 397 µs |
+
+### Outbound pipelined (window 64, one task)
+
+Units: msg/s · CPU ns/msg.
+
+#### QoS 0
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | **1 897 562** · **937** | 262 258 · 5 850 | 253 378 · 4 717 |
+
+#### QoS 1
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | **436 053** · **3 509** | 236 235 · 4 965 | 192 680 · 7 095 |
+
+### Outbound serial latency (idle round trip)
+
+Units: p50 / p99 µs.
+
+#### QoS 0
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | 20.0 / 22.1 | 14.8 / 18.9 | **14.3** / **17.5** |
+
+#### QoS 1
+
+| Payload | glide | rumqttc | mqtt5 |
+|---:|---:|---:|---:|
+| 256 B | 29.3 / 32.5 | 29.1 / 33.5 | **24.7** / **29.9** |
 
 ### Ingress load
 
@@ -172,252 +443,42 @@ Units: msg/s · CPU ns/msg.
 #### QoS 0
 
 | Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **137 368** · **2 259** | 132 649 · 2 361 | 135 295 · 4 623 |
-| 256 B | **134 689** · 1 816 | 132 232 · **1 549** | 129 394 · 4 943 |
-| 1 024 B | **55 283** · 3 047 | 53 054 · **2 560** | 49 824 · 6 255 |
-| 4 096 B | **15 682** · 10 201 | 14 901 · **9 162** | 14 125 · 12 530 |
+|---:|---:|---:|---:|
+| 256 B | 356 246 · 2 698 | **385 952** · **2 289** | 249 962 · 4 241 |
 
 #### QoS 1 · `after_enqueue`
 
 | Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **61 085** · **4 575** | 58 440 · 7 699 | n/a (`no_manual_ack`) |
-| 256 B | **56 914** · **4 695** | 52 654 · 7 864 | n/a (`no_manual_ack`) |
-| 1 024 B | **40 354** · **5 002** | 37 471 · 7 757 | n/a (`no_manual_ack`) |
-| 4 096 B | **14 657** · **11 894** | 13 373 · 13 546 | n/a (`no_manual_ack`) |
+|---:|---:|---:|---:|
+| 256 B | **242 350** · **2 209** | 225 490 · 2 964 | n/a (`no_manual_ack`) |
 
 #### QoS 1 · `before`
 
 | Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | n/a (`no_auto_ack`) | **59 339** · **4 470** | 55 782 · 11 748 |
-| 256 B | n/a (`no_auto_ack`) | **55 088** · **4 436** | 50 783 · 12 556 |
-| 1 024 B | n/a (`no_auto_ack`) | **37 813** · **4 368** | 35 313 · 12 890 |
-| 4 096 B | n/a (`no_auto_ack`) | **13 502** · **10 286** | 12 737 · 17 736 |
+|---:|---:|---:|---:|
+| 256 B | n/a (`no_auto_ack`) | **213 044** · **2 162** | 196 341 · 5 160 |
 
-### Outbound serial
-
-#### QoS 1
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **3 943** · 47 199 | 3 797 · 50 665 | 3 880 · **36 889** |
-| 256 B | **3 932** · 47 417 | 3 736 · 51 299 | 3 826 · **37 221** |
-| 1 024 B | **3 911** · 47 681 | 3 749 · 51 198 | 3 571 · **40 372** |
-| 4 096 B | **3 352** · 46 611 | 3 246 · 50 035 | 3 056 · **42 775** |
-
-### Outbound pipelined (window 64)
-
-#### QoS 1
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **108 009** · **6 326** | 91 867 · 9 750 | 66 089 · 29 124 |
-| 256 B | **101 179** · **5 541** | 86 440 · 9 407 | 61 848 · 30 199 |
-| 1 024 B | **65 323** · **4 484** | 58 101 · 8 032 | 45 918 · 30 326 |
-| 4 096 B | **21 724** · **7 768** | 20 021 · 10 074 | 18 622 · 31 466 |
-
-### Outbound concurrent (64 callers)
-
-#### QoS 1
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **104 279** · **8 993** | 90 297 · 13 147 | 76 124 · 25 253 |
-| 256 B | **96 157** · **8 547** | 84 998 · 12 852 | 73 815 · 25 782 |
-| 1 024 B | 59 534 · **8 299** | **60 470** · 11 972 | 56 651 · 25 730 |
-| 4 096 B | **22 446** · **12 625** | 22 061 · 15 469 | 22 109 · 27 567 |
-
-### Ingress serial latency
+### Ingress serial latency (idle)
 
 Units: p50 / p99 µs.
 
 #### QoS 0
 
 | Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **245** / **377** | 264 / 458 | 257 / 496 |
-| 256 B | 259 / **391** | **255** / 509 | 284 / 549 |
-| 1 024 B | **252** / **401** | 255 / 433 | 264 / 569 |
-| 4 096 B | **300** / **482** | 318 / 748 | 303 / 533 |
+|---:|---:|---:|---:|
+| 256 B | **12.6** / **14.3** | 14.5 / 16.9 | 15.9 / 18.5 |
 
 #### QoS 1 · `after_enqueue`
 
 | Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **307** / **505** | 317 / 688 | n/a (`no_manual_ack`) |
-| 256 B | **312** / **488** | 314 / 846 | n/a (`no_manual_ack`) |
-| 1 024 B | 317 / **520** | **315** / 897 | n/a (`no_manual_ack`) |
-| 4 096 B | **342** / **811** | 346 / 1 252 | n/a (`no_manual_ack`) |
+|---:|---:|---:|---:|
+| 256 B | **12.2** / **15.3** | 14.7 / 17.6 | n/a (`no_manual_ack`) |
 
 #### QoS 1 · `before`
 
 | Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | n/a (`no_auto_ack`) | **307** / **736** | 310 / 974 |
-| 256 B | n/a (`no_auto_ack`) | **309** / **913** | 318 / 1 098 |
-| 1 024 B | n/a (`no_auto_ack`) | **313** / **679** | 324 / 723 |
-| 4 096 B | n/a (`no_auto_ack`) | 344 / 1 408 | **340** / **1 051** |
-
-### Outbound serial latency
-
-#### QoS 1
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **248** / **392** | 250 / 433 | 261 / 485 |
-| 256 B | 250 / **400** | 254 / 482 | **250** / 437 |
-| 1 024 B | 251 / **422** | 258 / 502 | **249** / 436 |
-| 4 096 B | 294 / 544 | 295 / 948 | **289** / **499** |
-
-
----
-
-## Mock ceiling
-
-Broker: out-of-process mock MQTT 5 (`MQTT_COMPARE_BROKER=mock`) — multi-thread Tokio, Arc fanout, `TCP_NODELAY`, inbound PUBLISH counter, `receive_max` 1024.
-Use for client CPU / enqueue ceiling attribution, not as a broker product comparison.
-
-### Ingress load
-
-#### QoS 0
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | 149 330 · 5 591 | **151 747** · **5 433** | 23 810 · 12 406 |
-| 256 B | **150 770** · 5 607 | 112 692 · **5 570** | 27 870 · 10 949 |
-| 1 024 B | **149 772** · **5 731** | 126 062 · 5 782 | 26 810 · 12 944 |
-| 4 096 B | **124 807** · 7 870 | 73 367 · **6 308** | 23 978 · 14 751 |
-
-#### QoS 1 · `after_enqueue`
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **103 739** · **6 336** | 57 200 · 6 843 | n/a (`no_manual_ack`) |
-| 256 B | **100 148** · **6 542** | 47 325 · 6 912 | n/a (`no_manual_ack`) |
-| 1 024 B | **98 268** · **6 692** | 38 704 · 7 134 | n/a (`no_manual_ack`) |
-| 4 096 B | **65 845** · **7 617** | 30 233 · 8 847 | n/a (`no_manual_ack`) |
-
-#### QoS 1 · `before`
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | n/a (`no_auto_ack`) | **49 687** · **5 191** | 23 265 · 10 053 |
-| 256 B | n/a (`no_auto_ack`) | **42 722** · **5 499** | 23 094 · 11 094 |
-| 1 024 B | n/a (`no_auto_ack`) | **35 619** · **5 529** | 21 373 · 11 877 |
-| 4 096 B | n/a (`no_auto_ack`) | **29 747** · **6 582** | 18 817 · 13 983 |
-
-### Outbound serial
-
-#### QoS 0
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **65 085** · 20 468 | 61 236 · 5 957 | 32 179 · **4 968** |
-| 256 B | **65 115** · 20 370 | 60 005 · 4 528 | 32 338 · **3 798** |
-| 1 024 B | **63 988** · 20 672 | 56 600 · 4 814 | 30 666 · **3 817** |
-| 4 096 B | **62 581** · 21 018 | 50 518 · 5 602 | 28 326 · **4 520** |
-
-#### QoS 1
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **21 959** · 25 678 | 18 507 · 26 885 | 18 579 · **19 465** |
-| 256 B | **21 322** · 26 262 | 18 456 · 27 012 | 19 680 · **19 127** |
-| 1 024 B | **22 268** · 24 898 | 18 425 · 27 238 | 19 331 · **19 825** |
-| 4 096 B | **21 855** · 24 977 | 18 046 · 27 916 | 18 383 · **21 003** |
-
-### Outbound pipelined (window 64)
-
-#### QoS 0
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **1 571 071** · **644** | 56 354 · 16 113 | 31 070 · 15 429 |
-| 256 B | **1 418 389** · **886** | 57 143 · 14 527 | 31 578 · 11 914 |
-| 1 024 B | **863 632** · **1 773** | 55 310 · 14 864 | 30 108 · 12 452 |
-| 4 096 B | **252 417** · **6 173** | 49 806 · 15 739 | 27 418 · 15 993 |
-
-#### QoS 1
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **195 574** · **8 665** | 41 545 · 22 567 | 23 611 · 29 559 |
-| 256 B | **182 628** · **10 010** | 40 911 · 22 910 | 24 281 · 27 885 |
-| 1 024 B | **172 530** · **9 755** | 40 603 · 23 146 | 24 398 · 27 734 |
-| 4 096 B | **130 554** · **12 499** | 36 530 · 24 224 | 23 485 · 29 918 |
-
-### Outbound concurrent (64 callers)
-
-#### QoS 0
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **1 083 160** · **4 336** | 138 265 · 14 894 | 146 732 · 8 951 |
-| 256 B | **988 492** · **5 054** | 132 060 · 15 517 | 141 628 · 9 222 |
-| 1 024 B | **647 994** · **5 278** | 124 614 · 16 285 | 128 560 · 9 904 |
-| 4 096 B | **237 365** · **9 135** | 115 981 · 17 432 | 101 065 · 12 042 |
-
-#### QoS 1
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **215 961** · **8 259** | 151 338 · 10 047 | 113 411 · 27 053 |
-| 256 B | **199 011** · **9 577** | 146 277 · 10 616 | 111 929 · 27 522 |
-| 1 024 B | **189 403** · **10 003** | 134 384 · 11 709 | 108 282 · 27 660 |
-| 4 096 B | **142 644** · **12 645** | 123 645 · 13 739 | 103 060 · 28 593 |
-
-### Ingress serial latency
-
-Units: p50 / p99 µs.
-
-#### QoS 0
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **45** / **86** | 57 / 213 | 72 / 230 |
-| 256 B | **45** / **83** | 59 / 224 | 73 / 275 |
-| 1 024 B | **45** / **84** | 59 / 232 | 73 / 292 |
-| 4 096 B | **46** / **88** | 63 / 241 | 75 / 278 |
-
-#### QoS 1 · `after_enqueue`
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **43** / **84** | 66 / 257 | n/a (`no_manual_ack`) |
-| 256 B | **43** / **84** | 69 / 273 | n/a (`no_manual_ack`) |
-| 1 024 B | **44** / **85** | 75 / 301 | n/a (`no_manual_ack`) |
-| 4 096 B | **44** / **89** | 79 / 318 | n/a (`no_manual_ack`) |
-
-#### QoS 1 · `before`
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | n/a (`no_auto_ack`) | **65** / **264** | 75 / 286 |
-| 256 B | n/a (`no_auto_ack`) | **72** / 296 | 76 / **162** |
-| 1 024 B | n/a (`no_auto_ack`) | **74** / 303 | 76 / **293** |
-| 4 096 B | n/a (`no_auto_ack`) | 79 / 330 | **78** / **294** |
-
-### Outbound serial latency
-
-#### QoS 0
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **63** / **104** | 77 / 330 | 71 / 126 |
-| 256 B | **63** / **104** | 78 / 328 | 72 / 109 |
-| 1 024 B | **64** / **106** | 78 / 328 | 72 / 113 |
-| 4 096 B | **65** / **104** | 78 / 326 | 74 / 143 |
-
-#### QoS 1
-
-| Payload | glide | rumqttc | mqtt5 |
-|--------:|------:|--------:|------:|
-| 64 B | **72** / **139** | 89 / 336 | 80 / 154 |
-| 256 B | **72** / **140** | 89 / 337 | 80 / 154 |
-| 1 024 B | **72** / **141** | 89 / 336 | 81 / 147 |
-| 4 096 B | **74** / **146** | 89 / 320 | 83 / 153 |
+|---:|---:|---:|---:|
+| 256 B | n/a (`no_auto_ack`) | **15.6** / **18.7** | 16.5 / 20.5 |
 
 
 ---
@@ -425,26 +486,18 @@ Units: p50 / p99 µs.
 ## Refresh
 
 ```shell
-# Mosquitto baseline (Podman or Docker) — default SCENARIOS includes outbound_concurrent
-MQTT_COMPARE_QOS=0,1 \
-MQTT_COMPARE_PAYLOADS=64,256,1024,4096 \
-MQTT_COMPARE_RUNS=100 \
-MQTT_COMPARE_OUT=target/mqtt_compare/full-mosquitto-100 \
-  cargo bench --bench mqtt_compare
+# one run per broker, pinned (see benches/README.md)
+for b in mock mosquitto mosquitto-stock; do
+  q=1; [ $b = mock ] && q=0,1
+  MQTT_COMPARE_BROKER=$b MQTT_COMPARE_QOS=$q \
+  MQTT_COMPARE_BROKER_CPUS=2-3 MQTT_COMPARE_PUBLISHER_CPUS=2-3 \
+  MQTT_COMPARE_RUNS=5 MQTT_COMPARE_OUT=target/mqtt_compare/full-$b \
+    taskset -c 0-1 cargo bench --bench mqtt_compare
+done
 
-# Mock ceiling
-MQTT_COMPARE_BROKER=mock \
-MQTT_COMPARE_QOS=0,1 \
-MQTT_COMPARE_PAYLOADS=64,256,1024,4096 \
-MQTT_COMPARE_RUNS=100 \
-MQTT_COMPARE_OUT=target/mqtt_compare/full-mock-100 \
-  cargo bench --bench mqtt_compare
-
-# Rebuild tables (bold winners) from JSONL
+# rebuild the tables above
 python3 benches/render_benchmarks.py
 ```
-
-This baseline’s concurrent rows were measured into `outbound-concurrent-mosquitto-100/` / `outbound-concurrent-mock-100/` and merged by hand; a full refresh into `full-*` (with default scenarios) is enough next time. Then sync the README highlight table if the Mosquitto 256 B story changes.
 
 <!-- benchmarks:generated:end -->
 

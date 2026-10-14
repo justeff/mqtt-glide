@@ -1,8 +1,8 @@
 //! Shared publisher subprocess spawn for ingress load.
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 
-use super::fixtures::LOAD_WINDOW;
+use super::fixtures::{LOAD_WINDOW, pinned_command};
 use super::harness::BenchQos;
 
 /// Spawns the `MQTT_COMPARE_ROLE=publisher` child of this bench binary.
@@ -15,7 +15,7 @@ pub fn spawn_publisher_child(
     qos: BenchQos,
 ) -> Child {
     let exe = std::env::current_exe().expect("current_exe for publisher child");
-    Command::new(exe)
+    pinned_command(&exe, "MQTT_COMPARE_PUBLISHER_CPUS")
         .env("MQTT_COMPARE_ROLE", "publisher")
         .env("MQTT_COMPARE_PORT", port.to_string())
         .env("MQTT_COMPARE_MSGS", messages.to_string())

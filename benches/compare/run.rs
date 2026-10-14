@@ -5,11 +5,11 @@ use std::time::{Duration, Instant};
 
 use super::clients::client_for;
 use super::fixtures::{
-    LOAD_CONCURRENCY, LOAD_MESSAGES, LOAD_WINDOW, SUMMARY_SAMPLES, WARMUP_SAMPLES, bench_runs, next_id, payload_bytes,
+    LOAD_WINDOW, SUMMARY_SAMPLES, WARMUP_SAMPLES, bench_runs, load_messages, next_id, payload_bytes, rate_secs,
 };
 use super::harness::{BenchClient, BenchQos, ClientId, OutboundSession, SessionCfg};
 use super::pubchild::{spawn_publisher_child, wait_child};
-use super::report::{ResultRow, ResultWriter, print_row_summary};
+use super::report::{CellKey, Metrics, ResultRow, ResultWriter, print_row_summary};
 use super::scenario::{Direction, ScenarioCell};
 use crate::support::broker::BenchBrokerBackend;
 use crate::support::cpu::process_cpu_time;
@@ -48,136 +48,64 @@ async fn measure_cell(
     caps: super::harness::ClientCaps,
     runs: usize,
 ) -> ResultRow {
-    let client_id = client.id();
-    let scenario = cell.direction.as_str();
-    let qos = cell.qos.as_u8();
-    let ack = cell.ack.map(|a| a.as_str());
+    let key = CellKey {
+        client: client.id(),
+        scenario: cell.direction.as_str(),
+        qos: cell.qos.as_u8(),
+        payload: cell.payload,
+        ack: cell.ack.map(|a| a.as_str()),
+        level: cell.level,
+    };
 
     if !caps.supports_qos(cell.qos) {
-        return ResultRow::na(client_id, scenario, qos, cell.payload, ack, "unsupported_qos", runs);
+        return ResultRow::na(key, "unsupported_qos", runs);
     }
     if let Some(ack_policy) = cell.ack
         && let Some(reason) = caps.ingress_ack_unsupported(ack_policy)
     {
-        return ResultRow::na(client_id, scenario, qos, cell.payload, ack, reason, runs);
+        return ResultRow::na(key, reason, runs);
     }
     // Mosquitto: no publish counter → all outbound QoS 0 cells are API-only / not wire-fair.
     // Keep outbound QoS 1 (PUBACK ≈ broker saw the message; cutover throughput + RTT).
-    if ctx.backend == BenchBrokerBackend::Mosquitto
-        && cell.qos == BenchQos::AtMostOnce
-        && matches!(
-            cell.direction,
-            Direction::OutboundSerial
-                | Direction::OutboundPipelined
-                | Direction::OutboundConcurrent
-                | Direction::OutboundSerialLatency
-        )
-    {
-        return ResultRow::na(
-            client_id,
-            scenario,
-            qos,
-            cell.payload,
-            ack,
-            "qos0_no_wire_counter",
-            runs,
-        );
+    if ctx.backend != BenchBrokerBackend::Mock && cell.qos == BenchQos::AtMostOnce && cell.direction.is_outbound() {
+        return ResultRow::na(key, "qos0_no_wire_counter", runs);
     }
 
-    match cell.direction {
-        Direction::IngressLoad => {
-            let samples = collect_load_runs(runs, || load_ingress(ctx.port, client, cell)).await;
-            median_load_row(client_id, scenario, qos, cell.payload, ack, &samples, runs)
-        }
-        Direction::OutboundSerial => {
-            let samples = collect_load_runs(runs, || load_outbound_serial(ctx, client, cell)).await;
-            median_load_row(client_id, scenario, qos, cell.payload, ack, &samples, runs)
-        }
-        Direction::OutboundPipelined => {
-            let samples = collect_load_runs(runs, || load_outbound_pipelined(ctx, client, cell)).await;
-            median_load_row(client_id, scenario, qos, cell.payload, ack, &samples, runs)
-        }
-        Direction::OutboundConcurrent => {
-            let samples = collect_load_runs(runs, || load_outbound_concurrent(ctx, client, cell)).await;
-            median_load_row(client_id, scenario, qos, cell.payload, ack, &samples, runs)
-        }
-        Direction::IngressSerial => {
-            let samples = collect_latency_runs(runs, || latency_ingress(ctx.port, client, cell)).await;
-            median_latency_row(client_id, scenario, qos, cell.payload, ack, &samples, runs)
-        }
-        Direction::OutboundSerialLatency => {
-            let samples = collect_latency_runs(runs, || latency_outbound(ctx, client, cell)).await;
-            median_latency_row(client_id, scenario, qos, cell.payload, ack, &samples, runs)
-        }
-    }
-}
-
-struct LoadSample {
-    msg_s: f64,
-    cpu_ns: f64,
-}
-
-struct LatencySample {
-    p50_us: f64,
-    p99_us: f64,
-}
-
-async fn collect_load_runs<F, Fut>(runs: usize, mut measure: F) -> Vec<LoadSample>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = LoadSample>,
-{
-    let mut out = Vec::with_capacity(runs);
+    let mut samples = Vec::with_capacity(runs);
     for _ in 0..runs {
-        out.push(measure().await);
+        let sample = match cell.direction {
+            Direction::IngressLoad => load_ingress(ctx.port, client, cell).await,
+            Direction::OutboundPipelined => load_outbound_pipelined(ctx, client, cell).await,
+            Direction::OutboundConcurrent => {
+                load_outbound_concurrent(ctx, client, cell, cell.level.expect("concurrency level")).await
+            }
+            Direction::OutboundSpawn => load_outbound_spawn(ctx, client, cell).await,
+            Direction::OutboundRate => load_outbound_rate(ctx, client, cell, cell.level.expect("rate level")).await,
+            Direction::IngressSerial => latency_ingress(ctx.port, client, cell).await,
+            Direction::OutboundSerialLatency => latency_outbound(ctx, client, cell).await,
+        };
+        samples.push(sample);
     }
-    out
+    ResultRow::measured(key, median_metrics(&samples), runs)
 }
 
-async fn collect_latency_runs<F, Fut>(runs: usize, mut measure: F) -> Vec<LatencySample>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = LatencySample>,
-{
-    let mut out = Vec::with_capacity(runs);
-    for _ in 0..runs {
-        out.push(measure().await);
+/// Median of each metric across runs (metrics absent in a run are skipped).
+fn median_metrics(samples: &[Metrics]) -> Metrics {
+    fn median(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+        let mut values: Vec<f64> = values.flatten().collect();
+        if values.is_empty() {
+            return None;
+        }
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Some(values[values.len() / 2])
     }
-    out
-}
-
-fn median_load_row(
-    client: ClientId,
-    scenario: &'static str,
-    qos: u8,
-    payload: usize,
-    ack: Option<&'static str>,
-    samples: &[LoadSample],
-    runs: usize,
-) -> ResultRow {
-    let mut rates: Vec<f64> = samples.iter().map(|s| s.msg_s).collect();
-    let mut cpus: Vec<f64> = samples.iter().map(|s| s.cpu_ns).collect();
-    rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    cpus.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = samples.len() / 2;
-    ResultRow::load(client, scenario, qos, payload, ack, rates[mid], cpus[mid], runs)
-}
-
-fn median_latency_row(
-    client: ClientId,
-    scenario: &'static str,
-    qos: u8,
-    payload: usize,
-    ack: Option<&'static str>,
-    samples: &[LatencySample],
-    runs: usize,
-) -> ResultRow {
-    let mut p50s: Vec<f64> = samples.iter().map(|s| s.p50_us).collect();
-    let mut p99s: Vec<f64> = samples.iter().map(|s| s.p99_us).collect();
-    p50s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    p99s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = samples.len() / 2;
-    ResultRow::latency(client, scenario, qos, payload, ack, p50s[mid], p99s[mid], runs)
+    Metrics {
+        msg_s: median(samples.iter().map(|s| s.msg_s)),
+        cpu_ns_per_msg: median(samples.iter().map(|s| s.cpu_ns_per_msg)),
+        p50_us: median(samples.iter().map(|s| s.p50_us)),
+        p99_us: median(samples.iter().map(|s| s.p99_us)),
+        p999_us: median(samples.iter().map(|s| s.p999_us)),
+    }
 }
 
 fn session_cfg(port: u16, client_id: String, cell: &ScenarioCell) -> SessionCfg {
@@ -189,7 +117,8 @@ fn session_cfg(port: u16, client_id: String, cell: &ScenarioCell) -> SessionCfg 
     }
 }
 
-async fn load_ingress(port: u16, client: &dyn BenchClient, cell: &ScenarioCell) -> LoadSample {
+async fn load_ingress(port: u16, client: &dyn BenchClient, cell: &ScenarioCell) -> Metrics {
+    let messages = load_messages();
     let cfg = session_cfg(port, next_id(&format!("{}-in", client.id().as_str())), cell);
     let session = client.setup_ingress(&cfg).await;
     let payload = Arc::new(payload_bytes(cell.payload));
@@ -214,107 +143,173 @@ async fn load_ingress(port: u16, client: &dyn BenchClient, cell: &ScenarioCell) 
     let wall_start = Instant::now();
     let child = spawn_publisher_child(
         port,
-        LOAD_MESSAGES,
+        messages,
         &next_id("child-pub"),
         session.topic(),
         cell.payload,
         cell.qos,
     );
-    for _ in 0..LOAD_MESSAGES {
+    for _ in 0..messages {
         session.recv_touch().await;
     }
-    session.wait_barrier(LOAD_MESSAGES).await;
+    session.wait_barrier(messages).await;
     wait_child(child);
     let wall = wall_start.elapsed();
     let cpu = process_cpu_time().saturating_sub(cpu_before);
     session.close().await;
-    load_sample(LOAD_MESSAGES, wall, cpu)
+    load_metrics(messages, wall, cpu, None)
 }
 
 /// Outbound load warmup publishes (drained on mock before the timed burst).
 const OUTBOUND_WARMUP: usize = 32;
 
-async fn load_outbound_serial(ctx: MatrixCtx, client: &dyn BenchClient, cell: &ScenarioCell) -> LoadSample {
-    let cfg = session_cfg(ctx.port, next_id(&format!("{}-out", client.id().as_str())), cell);
-    let session = client.setup_outbound(&cfg).await;
-    let payload = payload_bytes(cell.payload);
-    warmup_outbound(ctx.mock_stats, session.as_ref(), &payload).await;
-    let cpu_before = process_cpu_time();
-    let wall_start = Instant::now();
-    for _ in 0..LOAD_MESSAGES {
-        session.publish_serial(&payload).await;
-    }
-    if let Some(stats) = ctx.mock_stats {
-        stats
-            .wait_exact(LOAD_MESSAGES as u64)
-            .await
-            .unwrap_or_else(|error| panic!("outbound serial wire wait: {error}"));
-    }
-    let wall = wall_start.elapsed();
-    let cpu = process_cpu_time().saturating_sub(cpu_before);
-    session.close().await;
-    load_sample(LOAD_MESSAGES, wall, cpu)
-}
-
-async fn load_outbound_pipelined(ctx: MatrixCtx, client: &dyn BenchClient, cell: &ScenarioCell) -> LoadSample {
-    let cfg = session_cfg(ctx.port, next_id(&format!("{}-pipe", client.id().as_str())), cell);
-    let session = client.setup_outbound(&cfg).await;
-    let payload = payload_bytes(cell.payload);
-    warmup_outbound(ctx.mock_stats, session.as_ref(), &payload).await;
-    let cpu_before = process_cpu_time();
-    let wall_start = Instant::now();
-    session.publish_pipelined(&payload, LOAD_WINDOW, LOAD_MESSAGES).await;
-    if let Some(stats) = ctx.mock_stats {
-        stats
-            .wait_exact(LOAD_MESSAGES as u64)
-            .await
-            .unwrap_or_else(|error| panic!("outbound pipelined wire wait: {error}"));
-    }
-    let wall = wall_start.elapsed();
-    let cpu = process_cpu_time().saturating_sub(cpu_before);
-    session.close().await;
-    load_sample(LOAD_MESSAGES, wall, cpu)
-}
-
-/// HTTP-style fan-out: `LOAD_CONCURRENCY` tasks share one session and only call `publish_serial`.
-async fn load_outbound_concurrent(ctx: MatrixCtx, client: &dyn BenchClient, cell: &ScenarioCell) -> LoadSample {
-    let cfg = session_cfg(ctx.port, next_id(&format!("{}-conc", client.id().as_str())), cell);
+/// Shared outbound setup: session (shareable across tasks), payload, warmed-up broker counter.
+async fn outbound_session(
+    ctx: MatrixCtx,
+    client: &dyn BenchClient,
+    cell: &ScenarioCell,
+    tag: &str,
+) -> (Arc<dyn OutboundSession>, Arc<Vec<u8>>) {
+    let cfg = session_cfg(ctx.port, next_id(&format!("{}-{tag}", client.id().as_str())), cell);
     let session: Arc<dyn OutboundSession> = Arc::from(client.setup_outbound(&cfg).await);
     let payload = Arc::new(payload_bytes(cell.payload));
     warmup_outbound(ctx.mock_stats, session.as_ref(), payload.as_ref()).await;
+    (session, payload)
+}
+
+/// Mock: waits until the broker decoded all `messages` (QoS 0 completes before the wire).
+async fn wait_wire(ctx: MatrixCtx, messages: usize, label: &str) {
+    if let Some(stats) = ctx.mock_stats {
+        stats
+            .wait_exact(messages as u64)
+            .await
+            .unwrap_or_else(|error| panic!("{label} wire wait: {error}"));
+    }
+}
+
+async fn load_outbound_pipelined(ctx: MatrixCtx, client: &dyn BenchClient, cell: &ScenarioCell) -> Metrics {
+    let messages = load_messages();
+    let (session, payload) = outbound_session(ctx, client, cell, "pipe").await;
+    let cpu_before = process_cpu_time();
+    let wall_start = Instant::now();
+    session.publish_pipelined(&payload, LOAD_WINDOW, messages).await;
+    wait_wire(ctx, messages, "outbound pipelined").await;
+    let wall = wall_start.elapsed();
+    let cpu = process_cpu_time().saturating_sub(cpu_before);
+    session.close().await;
+    load_metrics(messages, wall, cpu, None)
+}
+
+/// Service shape: `concurrency` long-lived tasks share one session, each awaiting every publish.
+async fn load_outbound_concurrent(
+    ctx: MatrixCtx,
+    client: &dyn BenchClient,
+    cell: &ScenarioCell,
+    concurrency: u32,
+) -> Metrics {
+    let messages = load_messages();
+    let workers = usize::try_from(concurrency).expect("concurrency fits usize");
+    let (session, payload) = outbound_session(ctx, client, cell, "conc").await;
     let cpu_before = process_cpu_time();
     let wall_start = Instant::now();
 
-    let per_worker = LOAD_MESSAGES / LOAD_CONCURRENCY;
-    let remainder = LOAD_MESSAGES % LOAD_CONCURRENCY;
+    let per_worker = messages / workers;
+    let remainder = messages % workers;
     let mut joins = tokio::task::JoinSet::new();
-    for worker in 0..LOAD_CONCURRENCY {
-        let n = per_worker + if worker < remainder { 1 } else { 0 };
+    for worker in 0..workers {
+        let n = per_worker + usize::from(worker < remainder);
         if n == 0 {
             continue;
         }
         let session = Arc::clone(&session);
         let payload = Arc::clone(&payload);
         joins.spawn(async move {
+            let mut latencies = Vec::with_capacity(n);
             for _ in 0..n {
+                let start = Instant::now();
                 session.publish_serial(payload.as_ref()).await;
+                latencies.push(start.elapsed());
             }
+            latencies
         });
     }
+    let mut latencies = Vec::with_capacity(messages);
     while let Some(joined) = joins.join_next().await {
-        joined.expect("outbound concurrent worker");
+        latencies.extend(joined.expect("outbound concurrent worker"));
     }
 
-    if let Some(stats) = ctx.mock_stats {
-        stats
-            .wait_exact(LOAD_MESSAGES as u64)
-            .await
-            .unwrap_or_else(|error| panic!("outbound concurrent wire wait: {error}"));
-    }
+    wait_wire(ctx, messages, "outbound concurrent").await;
     let wall = wall_start.elapsed();
     let cpu = process_cpu_time().saturating_sub(cpu_before);
     session.close().await;
-    load_sample(LOAD_MESSAGES, wall, cpu)
+    load_metrics(messages, wall, cpu, Some(&mut latencies))
+}
+
+/// Relay shape: one producer spawns a task per message that awaits its publish
+/// (throughput and CPU only — the whole burst is spawned at once).
+async fn load_outbound_spawn(ctx: MatrixCtx, client: &dyn BenchClient, cell: &ScenarioCell) -> Metrics {
+    let messages = load_messages();
+    let (session, payload) = outbound_session(ctx, client, cell, "spawn").await;
+    let cpu_before = process_cpu_time();
+    let wall_start = Instant::now();
+
+    let mut joins = tokio::task::JoinSet::new();
+    for _ in 0..messages {
+        let session = Arc::clone(&session);
+        let payload = Arc::clone(&payload);
+        joins.spawn(async move { session.publish_serial(payload.as_ref()).await });
+    }
+    while let Some(joined) = joins.join_next().await {
+        joined.expect("outbound spawn task");
+    }
+
+    wait_wire(ctx, messages, "outbound spawn").await;
+    let wall = wall_start.elapsed();
+    let cpu = process_cpu_time().saturating_sub(cpu_before);
+    session.close().await;
+    // No latency: every task starts at once, so it would only measure the burst size.
+    load_metrics(messages, wall, cpu, None)
+}
+
+/// Open loop: publishes are released at `rate` msg/s (1 ms ticks), each in its own task.
+/// The generator never waits on the client, so a client that cannot keep up shows growing
+/// latency (measured from each task's release) and a lower achieved rate instead of
+/// silently slowing the generator down.
+async fn load_outbound_rate(ctx: MatrixCtx, client: &dyn BenchClient, cell: &ScenarioCell, rate: u32) -> Metrics {
+    let rate_f = f64::from(rate);
+    let messages = (rate_f * rate_secs()).round().max(1.0) as usize;
+    let (session, payload) = outbound_session(ctx, client, cell, "rate").await;
+    let cpu_before = process_cpu_time();
+    let wall_start = Instant::now();
+
+    let mut ticker = tokio::time::interval(Duration::from_millis(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+    let mut joins = tokio::task::JoinSet::new();
+    let mut released = 0usize;
+    while released < messages {
+        ticker.tick().await;
+        let due = ((wall_start.elapsed().as_secs_f64() * rate_f) as usize).min(messages);
+        while released < due {
+            let session = Arc::clone(&session);
+            let payload = Arc::clone(&payload);
+            let release = Instant::now();
+            joins.spawn(async move {
+                session.publish_serial(payload.as_ref()).await;
+                release.elapsed()
+            });
+            released += 1;
+        }
+    }
+    let mut latencies = Vec::with_capacity(messages);
+    while let Some(joined) = joins.join_next().await {
+        latencies.push(joined.expect("outbound rate task"));
+    }
+
+    wait_wire(ctx, messages, "outbound rate").await;
+    let wall = wall_start.elapsed();
+    let cpu = process_cpu_time().saturating_sub(cpu_before);
+    session.close().await;
+    load_metrics(messages, wall, cpu, Some(&mut latencies))
 }
 
 /// Warms the session; on mock, drains PUBLISHes to the broker then resets the counter.
@@ -339,7 +334,7 @@ async fn warmup_outbound(
     }
 }
 
-async fn latency_ingress(port: u16, client: &dyn BenchClient, cell: &ScenarioCell) -> LatencySample {
+async fn latency_ingress(port: u16, client: &dyn BenchClient, cell: &ScenarioCell) -> Metrics {
     let cfg = session_cfg(port, next_id(&format!("{}-lat-in", client.id().as_str())), cell);
     let session = client.setup_ingress(&cfg).await;
     let payload = payload_bytes(cell.payload);
@@ -360,10 +355,10 @@ async fn latency_ingress(port: u16, client: &dyn BenchClient, cell: &ScenarioCel
     }
     publisher.disconnect().await;
     session.close().await;
-    latency_from_samples(&samples)
+    latency_metrics(&mut samples)
 }
 
-async fn latency_outbound(ctx: MatrixCtx, client: &dyn BenchClient, cell: &ScenarioCell) -> LatencySample {
+async fn latency_outbound(ctx: MatrixCtx, client: &dyn BenchClient, cell: &ScenarioCell) -> Metrics {
     let cfg = session_cfg(ctx.port, next_id(&format!("{}-lat-out", client.id().as_str())), cell);
     let session = client.setup_outbound(&cfg).await;
     let payload = payload_bytes(cell.payload);
@@ -408,20 +403,16 @@ async fn latency_outbound(ctx: MatrixCtx, client: &dyn BenchClient, cell: &Scena
         }
     }
     session.close().await;
-    latency_from_samples(&samples)
+    latency_metrics(&mut samples)
 }
 
-fn load_sample(messages: usize, wall: Duration, cpu: Duration) -> LoadSample {
+fn load_metrics(messages: usize, wall: Duration, cpu: Duration, latencies: Option<&mut Vec<Duration>>) -> Metrics {
     let msg_s = if wall.is_zero() {
         0.0
     } else {
         messages as f64 / wall.as_secs_f64()
     };
-    let cpu_ns = if messages == 0 {
-        0.0
-    } else {
-        cpu.as_nanos() as f64 / messages as f64
-    };
+    let cpu_ns = cpu.as_nanos() as f64 / messages as f64;
     eprintln!(
         "    burst: {messages} msgs in {:.3}s wall / {:.3}s CPU → {:.0} msg/s, {:.0} CPU ns/msg",
         wall.as_secs_f64(),
@@ -429,17 +420,22 @@ fn load_sample(messages: usize, wall: Duration, cpu: Duration) -> LoadSample {
         msg_s,
         cpu_ns
     );
-    LoadSample { msg_s, cpu_ns }
+    let latency = latencies.map(|samples| latency_metrics(samples)).unwrap_or_default();
+    Metrics {
+        msg_s: Some(msg_s),
+        cpu_ns_per_msg: Some(cpu_ns),
+        ..latency
+    }
 }
 
-fn latency_from_samples(samples: &[Duration]) -> LatencySample {
-    let mut sorted = samples.to_vec();
-    sorted.sort_unstable();
-    let p50 = percentile(&sorted, 0.50);
-    let p99 = percentile(&sorted, 0.99);
-    LatencySample {
-        p50_us: p50.as_secs_f64() * 1_000_000.0,
-        p99_us: p99.as_secs_f64() * 1_000_000.0,
+fn latency_metrics(samples: &mut [Duration]) -> Metrics {
+    samples.sort_unstable();
+    let micros = |rank| percentile(samples, rank).as_secs_f64() * 1_000_000.0;
+    Metrics {
+        p50_us: Some(micros(0.50)),
+        p99_us: Some(micros(0.99)),
+        p999_us: Some(micros(0.999)),
+        ..Metrics::default()
     }
 }
 

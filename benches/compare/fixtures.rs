@@ -30,14 +30,23 @@ pub const WARMUP_SAMPLES: usize = 50;
 /// Samples for serial latency p50/p99.
 pub const SUMMARY_SAMPLES: usize = 200;
 
-/// Messages per sustained-load burst.
-pub const LOAD_MESSAGES: usize = 5_000;
+/// Default messages per sustained-load burst (`MQTT_COMPARE_LOAD_MSGS`).
+///
+/// Large enough that one burst runs for tens to hundreds of milliseconds, so scheduler
+/// jitter and warmup do not dominate the measurement.
+pub const DEFAULT_LOAD_MESSAGES: usize = 50_000;
 
 /// Max in-flight for ingress publisher and outbound pipelined load.
 pub const LOAD_WINDOW: usize = 64;
 
-/// Parallel caller tasks for outbound concurrent (HTTP-style fan-out) load.
-pub const LOAD_CONCURRENCY: usize = LOAD_WINDOW;
+/// Default caller-task counts for `outbound_concurrent` (`MQTT_COMPARE_CONCURRENCY`).
+pub const DEFAULT_CONCURRENCY: &str = "8,64,512";
+
+/// Default offered rates (msg/s) for `outbound_rate` (`MQTT_COMPARE_RATES`).
+pub const DEFAULT_RATES: &str = "10000,50000";
+
+/// Default duration of one `outbound_rate` run (`MQTT_COMPARE_RATE_SECS`).
+pub const DEFAULT_RATE_SECS: f64 = 2.0;
 
 /// Default median-of runs (`MQTT_COMPARE_RUNS`).
 pub const DEFAULT_BENCH_RUNS: usize = 5;
@@ -68,6 +77,74 @@ pub fn next_id(prefix: &str) -> String {
 /// Payload pattern of `size` bytes.
 pub fn payload_bytes(size: usize) -> Vec<u8> {
     (0..size).map(|index| (index % 251) as u8).collect()
+}
+
+/// `MQTT_COMPARE_LOAD_MSGS` (default [`DEFAULT_LOAD_MESSAGES`], min 1).
+pub fn load_messages() -> usize {
+    std::env::var("MQTT_COMPARE_LOAD_MSGS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|n: &usize| *n >= 1)
+        .unwrap_or(DEFAULT_LOAD_MESSAGES)
+}
+
+/// `MQTT_COMPARE_RATE_SECS` (default [`DEFAULT_RATE_SECS`]).
+pub fn rate_secs() -> f64 {
+    std::env::var("MQTT_COMPARE_RATE_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|secs: &f64| *secs > 0.0)
+        .unwrap_or(DEFAULT_RATE_SECS)
+}
+
+/// `MQTT_COMPARE_CONCURRENCY` — comma list of caller-task counts (default [`DEFAULT_CONCURRENCY`]).
+pub fn parse_concurrency() -> Vec<u32> {
+    parse_positive_list("MQTT_COMPARE_CONCURRENCY", DEFAULT_CONCURRENCY)
+}
+
+/// `MQTT_COMPARE_RATES` — comma list of offered msg/s (default [`DEFAULT_RATES`]).
+pub fn parse_rates() -> Vec<u32> {
+    parse_positive_list("MQTT_COMPARE_RATES", DEFAULT_RATES)
+}
+
+fn parse_positive_list(var: &str, default: &str) -> Vec<u32> {
+    let raw = std::env::var(var).unwrap_or_else(|_| default.into());
+    let out: Vec<u32> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse()
+                .ok()
+                .filter(|n: &u32| *n > 0)
+                .unwrap_or_else(|| panic!("invalid {var} entry {part:?}: expected a positive integer"))
+        })
+        .collect();
+    assert!(!out.is_empty(), "{var} must list at least one value");
+    out
+}
+
+/// CPU list for a bench child process (`taskset -c` syntax), e.g. `MQTT_COMPARE_BROKER_CPUS=4-7`.
+///
+/// Children inherit the parent's affinity; set these to keep the broker / publisher off
+/// the cores the client under test runs on (run the bench itself under `taskset`).
+pub fn child_cpus(var: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .map(|cpus| cpus.trim().to_owned())
+        .filter(|cpus| !cpus.is_empty())
+}
+
+/// Builds a `Command` for `exe`, wrapped in `taskset -c <cpus>` when `cpus_var` is set.
+pub fn pinned_command(exe: &std::path::Path, cpus_var: &str) -> std::process::Command {
+    match child_cpus(cpus_var) {
+        Some(cpus) => {
+            let mut command = std::process::Command::new("taskset");
+            command.arg("-c").arg(cpus).arg(exe);
+            command
+        }
+        None => std::process::Command::new(exe),
+    }
 }
 
 /// `MQTT_COMPARE_RUNS` (default [`DEFAULT_BENCH_RUNS`], min 1).
@@ -159,7 +236,7 @@ pub fn parse_ack_policies() -> Vec<AckPolicy> {
 /// `MQTT_COMPARE_SCENARIOS` — comma list of directions (default all load+latency).
 pub fn parse_directions() -> Vec<Direction> {
     let raw = std::env::var("MQTT_COMPARE_SCENARIOS").unwrap_or_else(|_| {
-        "ingress_load,outbound_serial,outbound_pipelined,outbound_concurrent,ingress_serial,outbound_serial_latency"
+        "ingress_load,outbound_concurrent,outbound_spawn,outbound_rate,outbound_pipelined,ingress_serial,outbound_serial_latency"
             .into()
     });
     let mut out = Vec::new();
@@ -170,9 +247,10 @@ pub fn parse_directions() -> Vec<Direction> {
         }
         out.push(match part.as_str() {
             "ingress_load" => Direction::IngressLoad,
-            "outbound_serial" => Direction::OutboundSerial,
             "outbound_pipelined" => Direction::OutboundPipelined,
             "outbound_concurrent" => Direction::OutboundConcurrent,
+            "outbound_spawn" => Direction::OutboundSpawn,
+            "outbound_rate" => Direction::OutboundRate,
             "ingress_serial" => Direction::IngressSerial,
             "outbound_serial_latency" => Direction::OutboundSerialLatency,
             other => panic!("invalid MQTT_COMPARE_SCENARIOS entry {other:?}"),

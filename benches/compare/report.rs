@@ -22,8 +22,20 @@ pub struct RunMeta<'a> {
     pub runs: usize,
     /// Load burst size.
     pub load_messages: usize,
-    /// Pipelined in-flight window / concurrent caller count / ingress publisher window.
+    /// Pipelined in-flight window / ingress publisher window.
     pub load_window: usize,
+    /// `outbound_concurrent` caller-task levels.
+    pub concurrency: Vec<u32>,
+    /// `outbound_rate` offered msg/s levels.
+    pub rates: Vec<u32>,
+    /// Seconds per `outbound_rate` run.
+    pub rate_secs: f64,
+    /// CPU affinity of this process (from `/proc/self/status`), e.g. `0-3`.
+    pub client_cpus: String,
+    /// `MQTT_COMPARE_BROKER_CPUS` (mock broker child), if set.
+    pub broker_cpus: Option<String>,
+    /// `MQTT_COMPARE_PUBLISHER_CPUS` (ingress publisher child), if set.
+    pub publisher_cpus: Option<String>,
     /// Selected clients.
     pub clients: Vec<&'a str>,
     /// `mqtt-glide` crate version under test.
@@ -32,6 +44,38 @@ pub struct RunMeta<'a> {
     pub rumqttc_version: &'a str,
     /// Locked LabOverWire `mqtt5` version under test.
     pub mqtt5_version: &'a str,
+}
+
+/// Measured values of one cell (median across runs, per metric).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Metrics {
+    /// Sustained msg/s.
+    pub msg_s: Option<f64>,
+    /// Process CPU nanoseconds per message.
+    pub cpu_ns_per_msg: Option<f64>,
+    /// Per-message latency p50 (µs).
+    pub p50_us: Option<f64>,
+    /// Per-message latency p99 (µs).
+    pub p99_us: Option<f64>,
+    /// Per-message latency p99.9 (µs).
+    pub p999_us: Option<f64>,
+}
+
+/// Identity of one cell in a result row.
+#[derive(Debug, Clone, Copy)]
+pub struct CellKey {
+    /// Client id.
+    pub client: ClientId,
+    /// Scenario direction label.
+    pub scenario: &'static str,
+    /// QoS 0 or 1.
+    pub qos: u8,
+    /// Payload bytes.
+    pub payload: usize,
+    /// Ack policy label, if applicable.
+    pub ack: Option<&'static str>,
+    /// Caller tasks (concurrent) or offered msg/s (rate).
+    pub level: Option<u32>,
 }
 
 /// One absolute result row (measured or N/A).
@@ -48,6 +92,9 @@ pub struct ResultRow {
     /// Ack policy label, if applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ack: Option<&'static str>,
+    /// Caller tasks (`outbound_concurrent`) or offered msg/s (`outbound_rate`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<u32>,
     /// `ok` or `n/a`.
     pub status: &'static str,
     /// Why skipped, if `n/a`.
@@ -65,91 +112,40 @@ pub struct ResultRow {
     /// Latency p99 microseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p99_us: Option<f64>,
+    /// Latency p99.9 microseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p999_us: Option<f64>,
     /// Number of runs aggregated.
     pub runs: usize,
 }
 
 impl ResultRow {
-    /// Measured load cell.
-    #[allow(clippy::too_many_arguments)]
-    pub fn load(
-        client: ClientId,
-        scenario: &'static str,
-        qos: u8,
-        payload: usize,
-        ack: Option<&'static str>,
-        msg_s: f64,
-        cpu_ns_per_msg: f64,
-        runs: usize,
-    ) -> Self {
+    /// Measured cell.
+    pub fn measured(key: CellKey, metrics: Metrics, runs: usize) -> Self {
         Self {
-            client: client.as_str(),
-            scenario,
-            qos,
-            payload,
-            ack,
+            client: key.client.as_str(),
+            scenario: key.scenario,
+            qos: key.qos,
+            payload: key.payload,
+            ack: key.ack,
+            level: key.level,
             status: "ok",
             reason: None,
-            msg_s: Some(msg_s),
-            cpu_ns_per_msg: Some(cpu_ns_per_msg),
-            p50_us: None,
-            p99_us: None,
+            msg_s: metrics.msg_s,
+            cpu_ns_per_msg: metrics.cpu_ns_per_msg,
+            p50_us: metrics.p50_us,
+            p99_us: metrics.p99_us,
+            p999_us: metrics.p999_us,
             runs,
         }
     }
 
-    /// Measured latency cell.
-    #[allow(clippy::too_many_arguments)]
-    pub fn latency(
-        client: ClientId,
-        scenario: &'static str,
-        qos: u8,
-        payload: usize,
-        ack: Option<&'static str>,
-        p50_us: f64,
-        p99_us: f64,
-        runs: usize,
-    ) -> Self {
+    /// Unsupported / skipped cell.
+    pub fn na(key: CellKey, reason: &'static str, runs: usize) -> Self {
         Self {
-            client: client.as_str(),
-            scenario,
-            qos,
-            payload,
-            ack,
-            status: "ok",
-            reason: None,
-            msg_s: None,
-            cpu_ns_per_msg: None,
-            p50_us: Some(p50_us),
-            p99_us: Some(p99_us),
-            runs,
-        }
-    }
-
-    /// Unsupported capability cell.
-    #[allow(clippy::too_many_arguments)]
-    pub fn na(
-        client: ClientId,
-        scenario: &'static str,
-        qos: u8,
-        payload: usize,
-        ack: Option<&'static str>,
-        reason: &'static str,
-        runs: usize,
-    ) -> Self {
-        Self {
-            client: client.as_str(),
-            scenario,
-            qos,
-            payload,
-            ack,
             status: "n/a",
             reason: Some(reason),
-            msg_s: None,
-            cpu_ns_per_msg: None,
-            p50_us: None,
-            p99_us: None,
-            runs,
+            ..Self::measured(key, Metrics::default(), runs)
         }
     }
 }
@@ -212,35 +208,25 @@ impl ResultWriter {
 /// Prints a short human summary line for a row.
 pub fn print_row_summary(row: &ResultRow) {
     let ack = row.ack.unwrap_or("-");
-    match row.status {
-        "n/a" => println!(
-            "  {} {} qos={} payload={} ack={} → n/a ({})",
-            row.client,
-            row.scenario,
-            row.qos,
-            row.payload,
-            ack,
-            row.reason.unwrap_or("unsupported")
-        ),
-        _ if row.msg_s.is_some() => println!(
-            "  {} {} qos={} payload={} ack={} → {:.1} msg/s, {:.0} CPU ns/msg",
-            row.client,
-            row.scenario,
-            row.qos,
-            row.payload,
-            ack,
-            row.msg_s.unwrap_or(0.0),
-            row.cpu_ns_per_msg.unwrap_or(0.0)
-        ),
-        _ => println!(
-            "  {} {} qos={} payload={} ack={} → p50={:.0}µs p99={:.0}µs",
-            row.client,
-            row.scenario,
-            row.qos,
-            row.payload,
-            ack,
-            row.p50_us.unwrap_or(0.0),
-            row.p99_us.unwrap_or(0.0)
-        ),
+    let level = row.level.map(|l| format!(" level={l}")).unwrap_or_default();
+    let head = format!(
+        "  {} {} qos={} payload={} ack={}{}",
+        row.client, row.scenario, row.qos, row.payload, ack, level
+    );
+    if row.status == "n/a" {
+        println!("{head} → n/a ({})", row.reason.unwrap_or("unsupported"));
+        return;
     }
+    let mut parts = Vec::new();
+    if let Some(msg_s) = row.msg_s {
+        parts.push(format!("{msg_s:.0} msg/s"));
+    }
+    if let Some(cpu) = row.cpu_ns_per_msg {
+        parts.push(format!("{cpu:.0} CPU ns/msg"));
+    }
+    if let (Some(p50), Some(p99)) = (row.p50_us, row.p99_us) {
+        let p999 = row.p999_us.map(|v| format!(" p99.9={v:.0}µs")).unwrap_or_default();
+        parts.push(format!("p50={p50:.0}µs p99={p99:.0}µs{p999}"));
+    }
+    println!("{head} → {}", parts.join(", "));
 }
