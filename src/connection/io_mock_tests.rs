@@ -54,6 +54,7 @@ fn sample_qos0_publish_wire() -> Bytes {
 
 struct ReadTaskHandle {
     cancel: StopSignal,
+    stop: StopSignal,
     inbound_activity: Arc<AtomicBool>,
     handoff_stalled: Arc<AtomicBool>,
     handoff_rx: flume::Receiver<InboundMessage>,
@@ -77,6 +78,7 @@ where
     let (stub_tx, stub_rx) = mpsc::channel(1);
     let (handoff_tx, handoff_rx) = flume::bounded(handoff_cap);
     let cancel = StopSignal::new();
+    let stop = StopSignal::new();
     let (read_done_tx, _read_done_rx) = oneshot::channel();
     let inbound_activity = Arc::new(AtomicBool::new(false));
     let handoff_stalled = Arc::new(AtomicBool::new(false));
@@ -84,7 +86,7 @@ where
     let join = tokio::spawn(crate::connection::read::run(
         ReadSession {
             cancel: cancel.clone(),
-            stop: StopSignal::new(),
+            stop: stop.clone(),
             topic_aliases: crate::connection::topic_alias::InboundTopicAliases::new(0),
             response_router: Arc::default(),
             stats: Default::default(),
@@ -102,6 +104,7 @@ where
 
     ReadTaskHandle {
         cancel,
+        stop,
         inbound_activity,
         handoff_stalled,
         handoff_rx,
@@ -725,4 +728,57 @@ async fn read_task_partial_frame_extra_split_points(#[case] split_at: usize) {
         .expect("join timeout")
         .expect("join");
     assert_eq!(outcome, ReadOutcome::Cancelled);
+}
+
+/// A QoS 1 PUBLISH still waiting for room in a full inbound sink when shutdown cuts the read
+/// task off was never accepted, so it is not acknowledged: the PUBACK follows accepting
+/// ownership of the message ([MQTT-4.3.2-4]).
+#[tokio::test]
+async fn read_task_cut_off_by_shutdown_does_not_puback_unaccepted_publish() {
+    let wire_for = |packet_id: u16| {
+        let delivery = PublishDelivery {
+            dup: false,
+            retain: false,
+            qos: QoS::AtLeastOnce,
+            packet_id: NonZeroU16::new(packet_id),
+        };
+        let message = PublishMessage {
+            topic: ByteString::from_static("io/mock"),
+            payload: Bytes::from_static(b"p"),
+            properties: PublishProperties::default(),
+        };
+        let mut buf = BytesMut::new();
+        encode_publish(&message, delivery, u32::MAX, &mut buf).expect("encode qos1 publish");
+        buf
+    };
+    let (task_end, mut peer) = tokio::io::duplex(512);
+    let framed = FramedRead::new(task_end, V5Codec::with_max_packet_size(0));
+    let mut harness = spawn_read_task_with_handoff_cap(framed, 1);
+
+    // Id 1 fills the one-slot sink and is acknowledged; id 2 then waits for room.
+    peer.write_all(&wire_for(1)).await.expect("first publish");
+    peer.write_all(&wire_for(2)).await.expect("second publish");
+    peer.flush().await.expect("flush");
+    wait_until(&harness.handoff_stalled, true, "handoff_stalled").await;
+
+    harness.stop.cancel();
+    let outcome = timeout(Duration::from_secs(2), harness.join)
+        .await
+        .expect("join timeout")
+        .expect("join");
+    assert_eq!(outcome, ReadOutcome::Cancelled);
+
+    let mut acked = Vec::new();
+    while let Ok(message) = harness.control_rx.try_recv() {
+        match message {
+            ControlMessage::AckInboundPublish { packet_id } => acked.push(packet_id.get()),
+            other => panic!("unexpected control message {other:?}"),
+        }
+    }
+    assert_eq!(acked, [1], "only the accepted publish may be acknowledged");
+    assert_eq!(
+        harness.handoff_rx.len(),
+        1,
+        "the cut-off publish never entered the sink"
+    );
 }

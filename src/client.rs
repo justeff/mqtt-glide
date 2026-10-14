@@ -1434,6 +1434,142 @@ mod tests {
         let _ = run.await;
     }
 
+    /// QoS 2 is refused by the client itself, before the command is queued: the error comes
+    /// back without a connection (the driver is never run here), also from the non-blocking
+    /// forms.
+    #[tokio::test]
+    async fn qos2_publish_is_rejected_before_it_is_queued() {
+        let port = spawn_mock_broker().await;
+        let (client, _connection, _phase) = connect_test_client(port).await;
+
+        let publish = || Publish::new("t/qos2", "x").qos(QoS::ExactlyOnce);
+        assert!(matches!(
+            client.try_start_publish(publish()),
+            Err(AppError::InvalidRequest(_))
+        ));
+        let started = timeout(Duration::from_secs(1), client.start_publish(publish()))
+            .await
+            .expect("rejected without waiting for a connection");
+        assert!(matches!(started, Err(AppError::InvalidRequest(_))));
+        let sent = timeout(
+            Duration::from_secs(1),
+            client.publish("t/qos2", "x").qos(QoS::ExactlyOnce),
+        )
+        .await
+        .expect("rejected without waiting for a connection");
+        assert!(matches!(sent, Err(AppError::InvalidRequest(_))));
+    }
+
+    /// A QoS 2 publish on a live connection fails with `InvalidRequest` and nothing reaches the
+    /// wire: the next PUBLISH the broker sees is the QoS 0 one sent after it.
+    #[tokio::test]
+    async fn qos2_publish_never_reaches_the_wire() {
+        let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let port = spawn_mock_broker_record_publishes(Arc::clone(&observed), NonZeroU16::new(8).expect("nz")).await;
+        let (client, connection, mut phase) = connect_test_client(port).await;
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let result = timeout(
+            Duration::from_secs(2),
+            client.publish("t/qos2", "refused").qos(QoS::ExactlyOnce),
+        )
+        .await
+        .expect("a QoS 2 publish fails at once");
+        assert!(matches!(result, Err(AppError::InvalidRequest(_))), "{result:?}");
+        client.publish("t/after", "marker").await.expect("qos 0 publish");
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+
+        let frames = observed.lock().await.clone();
+        assert_eq!(frames, [(QoS::AtMostOnce, None, Bytes::from_static(b"marker"))]);
+    }
+
+    /// With a window larger than one, every QoS 1 PUBLISH in flight has its own Packet
+    /// Identifier, and the one freed by a PUBACK is the one the next PUBLISH gets
+    /// ([MQTT-2.2.1-3], [MQTT-4.3.2-1]).
+    #[tokio::test]
+    async fn in_flight_qos1_publishes_have_distinct_packet_ids_until_puback() {
+        use crate::codec::PublishAckReason;
+
+        let (ids_tx, ids_rx) = oneshot::channel::<(Vec<NonZeroU16>, bool, Option<NonZeroU16>)>();
+        let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+            let mut ack = ConnectAck::default();
+            ack.receive_max = NonZeroU16::new(4).expect("nz");
+            if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
+                return;
+            }
+            async fn next_publish_id(framed_read: &mut crate::connection::test_support::MockFramedRead) -> NonZeroU16 {
+                loop {
+                    if let Some(Ok((DecodedFrame::Publish(packet), _))) = framed_read.next().await {
+                        return packet.meta.packet_id.expect("QoS 1 packet id");
+                    }
+                }
+            }
+            let puback = |packet_id| {
+                Packet::PublishAck(PublishAck {
+                    packet_id,
+                    reason_code: PublishAckReason::Success,
+                    properties: Vec::new(),
+                    reason_string: None,
+                })
+            };
+            // The window of 4 fills; the fifth PUBLISH must wait for a PUBACK.
+            let mut first_window = Vec::new();
+            for _ in 0..4 {
+                first_window.push(next_publish_id(&mut framed_read).await);
+            }
+            let early_fifth = timeout(Duration::from_millis(200), framed_read.next()).await.is_ok();
+            // Free one slot that is neither the first nor the last allocated.
+            let freed = first_window[1];
+            if framed_write.send(puback(freed)).await.is_err() {
+                return;
+            }
+            let fifth = timeout(Duration::from_secs(2), next_publish_id(&mut framed_read))
+                .await
+                .ok();
+            for id in first_window.iter().copied().filter(|id| *id != freed).chain(fifth) {
+                let _ = framed_write.send(puback(id)).await;
+            }
+            let _ = ids_tx.send((first_window, early_fifth, fifth));
+            while framed_read.next().await.is_some() {}
+        })
+        .await;
+        let (client, connection, mut phase) = connect_test_client(port).await;
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let completions: Vec<_> = (0..5u8)
+            .map(|n| {
+                client
+                    .try_start_publish(Publish::new("t/window", vec![n]).qos(QoS::AtLeastOnce))
+                    .expect("queued")
+            })
+            .collect();
+        let (first_window, early_fifth, fifth) = timeout(Duration::from_secs(5), ids_rx)
+            .await
+            .expect("broker result in time")
+            .expect("broker result");
+        let distinct: std::collections::HashSet<_> = first_window.iter().collect();
+        assert_eq!(distinct.len(), 4, "ids in flight must differ: {first_window:?}");
+        assert!(!early_fifth, "the fifth PUBLISH must wait for a PUBACK");
+        assert_eq!(
+            fifth,
+            Some(first_window[1]),
+            "the identifier freed by the PUBACK is the only one available"
+        );
+
+        for completion in completions {
+            timeout(Duration::from_secs(5), completion.wait())
+                .await
+                .expect("acked in time")
+                .expect("acked");
+        }
+
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
+
     /// Barrier: `publish().await` stays pending until the matching PUBACK is released; the
     /// PUBLISH stays unacknowledged until then ([MQTT-4.3.2-3]).
     #[tokio::test]
@@ -3828,5 +3964,369 @@ mod tests {
         }
 
         client.shutdown().await.expect("shutdown");
+    }
+
+    /// `MqttClient::stats()` counters against scripted brokers, asserted to exact values.
+    #[cfg(feature = "stats")]
+    mod stats {
+        use std::sync::atomic::AtomicU64;
+
+        use tokio::io::AsyncWriteExt;
+        use tokio_util::codec::Encoder;
+
+        use super::*;
+        use crate::ClientStats;
+        use crate::codec::{PublishAckReason, PublishDelivery, V5Codec, encode_publish};
+        use crate::connection::test_support::{send_inbound_qos1_publish_dup, spawn_mock_broker_keepalive_enforcer};
+
+        /// Polls `client.stats()` until `done` holds; the gauges settle a moment after the
+        /// caller's await returns.
+        async fn stats_until(client: &MqttClient, done: impl Fn(&ClientStats) -> bool) -> ClientStats {
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    let stats = client.stats();
+                    if done(&stats) {
+                        return stats;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("stats did not settle: {:?}", client.stats()))
+        }
+
+        /// Wires a client with a roomy inbound sink and spawns its driver.
+        async fn start(
+            options: ConnectOptions,
+        ) -> (
+            MqttClient,
+            flume::Receiver<InboundMessage>,
+            tokio::task::JoinHandle<Result<(), ConnectionOutcome>>,
+        ) {
+            let (tx, rx) = flume::bounded::<InboundMessage>(8);
+            let (client, connection, mut phase) =
+                connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
+            let run = tokio::spawn(connection.run());
+            await_connected(&mut phase).await;
+            (client, rx, run)
+        }
+
+        fn options_for(port: u16) -> ConnectOptions {
+            ConnectOptions::new(BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url"))
+        }
+
+        /// Only PUBLISHes carrying the DUP flag are duplicates; the others are not.
+        #[tokio::test]
+        async fn inbound_duplicates_counts_only_publishes_with_dup_set() {
+            let port = spawn_broker_once(|mut framed_read, mut framed_write| async move {
+                if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+                    return;
+                }
+                for (id, dup) in [(1, false), (2, true), (3, false)] {
+                    send_inbound_qos1_publish_dup(
+                        &mut framed_write,
+                        "in/dup",
+                        b"x",
+                        NonZeroU16::new(id).expect("nz"),
+                        PublishProperties::default(),
+                        dup,
+                    )
+                    .await;
+                }
+                while framed_read.next().await.is_some() {}
+            })
+            .await;
+            let (client, rx, run) = start(options_for(port)).await;
+
+            for _ in 0..3 {
+                timeout(Duration::from_secs(2), rx.recv_async())
+                    .await
+                    .expect("message in time")
+                    .expect("sink open");
+            }
+            let inbound = client.stats().inbound;
+            assert_eq!((inbound.publishes_qos1, inbound.duplicates), (3, 1), "{inbound:?}");
+
+            client.shutdown().await.expect("shutdown");
+            let _ = run.await;
+        }
+
+        /// Resending the unacknowledged QoS 1 publishes of a resumed session counts each one as
+        /// resent, and not again as a first transmission.
+        #[tokio::test]
+        async fn resumed_session_counts_every_resent_publish() {
+            let seen: SeenPublishes = Arc::default();
+            let port = spawn_resume_broker(Arc::clone(&seen), true).await;
+            let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+            let (client, connection, mut phase) = connect(
+                resumable_options(port),
+                static_test_credentials(),
+                ImmediateReconnect,
+                tx,
+                NoopLifecycle,
+            )
+            .expect("connect wiring");
+            let run = tokio::spawn(connection.run());
+            await_connected(&mut phase).await;
+
+            let completions: Vec<_> = ["a", "b"]
+                .into_iter()
+                .map(|payload| {
+                    client
+                        .try_start_publish(Publish::new("t/resume", payload).qos(QoS::AtLeastOnce))
+                        .expect("enqueue")
+                })
+                .collect();
+            for completion in completions {
+                timeout(Duration::from_secs(3), completion.wait())
+                    .await
+                    .expect("resolves after the resend")
+                    .expect("acknowledged");
+            }
+
+            let stats = stats_until(&client, |stats| stats.outbound.publishes_acked == 2).await;
+            let outbound = stats.outbound;
+            assert_eq!(
+                (
+                    outbound.publishes_qos1,
+                    outbound.publishes_resent,
+                    outbound.publishes_acked
+                ),
+                (2, 2, 2),
+                "{outbound:?}"
+            );
+
+            client.shutdown().await.expect("shutdown");
+            let _ = run.await;
+        }
+
+        /// With the broker's Receive Maximum at 1 and its PUBACK withheld, one publish waits for
+        /// its ack and the rest wait for quota; a PUBACK moves one from the second to the first.
+        #[tokio::test]
+        async fn publishes_beyond_receive_maximum_count_as_awaiting_quota() {
+            let (ack_tx, ack_rx) = oneshot::channel::<()>();
+            let port = spawn_broker_once(|mut framed_read, mut framed_write| async move {
+                let mut ack = ConnectAck::default();
+                ack.receive_max = NonZeroU16::new(1).expect("nz");
+                if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
+                    return;
+                }
+                let Some(Ok((DecodedFrame::Publish(first), _))) = framed_read.next().await else {
+                    return;
+                };
+                let _ = ack_rx.await;
+                let puback = Packet::PublishAck(PublishAck {
+                    packet_id: first.meta.packet_id.expect("QoS 1 packet id"),
+                    reason_code: PublishAckReason::Success,
+                    properties: Vec::new(),
+                    reason_string: None,
+                });
+                let _ = framed_write.send(puback).await;
+                while framed_read.next().await.is_some() {}
+            })
+            .await;
+            let (client, _rx, run) = start(options_for(port)).await;
+
+            let _completions: Vec<_> = (0..3u8)
+                .map(|n| {
+                    client
+                        .try_start_publish(Publish::new("t/quota", vec![n]).qos(QoS::AtLeastOnce))
+                        .expect("queued")
+                })
+                .collect();
+            let outbound = stats_until(&client, |stats| stats.outbound.awaiting_quota == 2)
+                .await
+                .outbound;
+            assert_eq!((outbound.awaiting_ack, outbound.awaiting_quota), (1, 2), "{outbound:?}");
+
+            let _ = ack_tx.send(());
+            let outbound = stats_until(&client, |stats| stats.outbound.publishes_acked == 1)
+                .await
+                .outbound;
+            assert_eq!((outbound.awaiting_ack, outbound.awaiting_quota), (1, 1), "{outbound:?}");
+
+            client.shutdown().await.expect("shutdown");
+            let _ = run.await;
+        }
+
+        /// An idle connection pings once per Keep Alive, and the pings are counted.
+        #[tokio::test]
+        async fn idle_connection_counts_the_pings_it_sends() {
+            let pings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let port =
+                spawn_mock_broker_keepalive_enforcer(Duration::from_secs(5), false, true, false, Arc::clone(&pings))
+                    .await;
+            let (client, _rx, run) = start(options_for(port).keep_alive(Duration::from_secs(1))).await;
+
+            let stats = stats_until(&client, |stats| stats.connection.pings_sent >= 1).await;
+            assert!(stats.connection.pings_sent >= 1, "{stats:?}");
+            assert!(
+                pings.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+                "the broker saw a PINGREQ"
+            );
+
+            client.shutdown().await.expect("shutdown");
+            let _ = run.await;
+        }
+
+        /// PUBACK reason No Matching Subscribers (0x10) means the broker took the message, so it
+        /// counts as acknowledged; an error reason code counts as rejected.
+        #[tokio::test]
+        async fn no_matching_subscribers_puback_counts_as_acked() {
+            let reasons = [
+                PublishAckReason::Success,
+                PublishAckReason::NoMatchingSubscribers,
+                PublishAckReason::NotAuthorized,
+            ];
+            let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+                if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+                    return;
+                }
+                let mut reasons = reasons.into_iter();
+                while let Some(Ok(frame)) = framed_read.next().await {
+                    if let (DecodedFrame::Publish(packet), _) = frame {
+                        let puback = Packet::PublishAck(PublishAck {
+                            packet_id: packet.meta.packet_id.expect("QoS 1 packet id"),
+                            reason_code: reasons.next().expect("three publishes"),
+                            properties: Vec::new(),
+                            reason_string: None,
+                        });
+                        if framed_write.send(puback).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+            .await;
+            let (client, _rx, run) = start(options_for(port)).await;
+
+            client
+                .publish("t/ack", "1")
+                .qos(QoS::AtLeastOnce)
+                .await
+                .expect("success");
+            client
+                .publish("t/ack", "2")
+                .qos(QoS::AtLeastOnce)
+                .await
+                .expect("no matching subscribers is not an error");
+            client
+                .publish("t/ack", "3")
+                .qos(QoS::AtLeastOnce)
+                .await
+                .expect_err("not authorized");
+
+            let outbound = stats_until(&client, |stats| stats.outbound.awaiting_ack == 0)
+                .await
+                .outbound;
+            assert_eq!(
+                (outbound.publishes_acked, outbound.publishes_rejected),
+                (2, 1),
+                "{outbound:?}"
+            );
+
+            client.shutdown().await.expect("shutdown");
+            let _ = run.await;
+        }
+
+        /// The byte counters equal the size of the packets that crossed the connection, as the
+        /// broker measured them: CONNECT and a PUBLISH out; CONNACK, a PUBACK and a PUBLISH in.
+        #[tokio::test]
+        async fn byte_counters_match_the_packets_on_the_wire() {
+            let read_by_broker = Arc::new(AtomicU64::new(0));
+            let written_by_broker = Arc::new(AtomicU64::new(0));
+            let (publish_len_tx, publish_len_rx) = oneshot::channel::<u64>();
+            let port = spawn_broker_once({
+                let read_by_broker = Arc::clone(&read_by_broker);
+                let written_by_broker = Arc::clone(&written_by_broker);
+                move |mut framed_read, mut framed_write| async move {
+                    let count = |total: &AtomicU64, len: u64| {
+                        total.fetch_add(len, std::sync::atomic::Ordering::SeqCst);
+                    };
+                    // The decoder reports the Remaining Length; add the fixed header (1 + 1 byte here).
+                    let wire_len = |remaining: u32| {
+                        assert!(remaining < 128, "one-byte Remaining Length expected");
+                        u64::from(remaining) + 2
+                    };
+                    let encoded = |packet: Packet| {
+                        let mut buf = bytes::BytesMut::new();
+                        V5Codec::with_max_packet_size(0)
+                            .encode(packet, &mut buf)
+                            .expect("encode");
+                        buf
+                    };
+                    let Some(Ok((DecodedFrame::Control(Packet::Connect(_)), len))) = framed_read.next().await else {
+                        return;
+                    };
+                    count(&read_by_broker, wire_len(len));
+                    let connack = encoded(Packet::ConnectAck(Box::default()));
+                    count(&written_by_broker, connack.len() as u64);
+                    if framed_write.get_mut().write_all(&connack).await.is_err() {
+                        return;
+                    }
+
+                    let Some(Ok((DecodedFrame::Publish(publish), len))) = framed_read.next().await else {
+                        return;
+                    };
+                    count(&read_by_broker, wire_len(len));
+                    let _ = publish_len_tx.send(wire_len(len));
+                    let puback = encoded(Packet::PublishAck(PublishAck {
+                        packet_id: publish.meta.packet_id.expect("QoS 1 packet id"),
+                        reason_code: PublishAckReason::Success,
+                        properties: Vec::new(),
+                        reason_string: None,
+                    }));
+                    count(&written_by_broker, puback.len() as u64);
+
+                    let mut inbound = bytes::BytesMut::new();
+                    let delivery = PublishDelivery {
+                        dup: false,
+                        retain: false,
+                        qos: QoS::AtMostOnce,
+                        packet_id: None,
+                    };
+                    encode_publish(
+                        &sample_message("in/t", b"abc"),
+                        delivery,
+                        crate::codec::DEFAULT_MAX_PACKET_SIZE,
+                        &mut inbound,
+                    )
+                    .expect("encode");
+                    // 1 fixed header + 1 length + 2 + 4 topic + 1 properties + 3 payload.
+                    assert_eq!(inbound.len(), 12);
+                    count(&written_by_broker, inbound.len() as u64);
+                    let mut wire = puback;
+                    wire.extend_from_slice(&inbound);
+                    if framed_write.get_mut().write_all(&wire).await.is_err() {
+                        return;
+                    }
+                    while framed_read.next().await.is_some() {}
+                }
+            })
+            .await;
+            let (client, rx, run) = start(options_for(port)).await;
+
+            client
+                .publish("t/b", "hello")
+                .qos(QoS::AtLeastOnce)
+                .await
+                .expect("acknowledged");
+            timeout(Duration::from_secs(2), rx.recv_async())
+                .await
+                .expect("inbound publish in time")
+                .expect("sink open");
+
+            let publish_len = publish_len_rx.await.expect("publish length");
+            // 1 fixed header + 1 length + 2 + 3 topic + 2 packet id + 1 properties + 5 payload.
+            assert_eq!(publish_len, 15);
+            let stats = client.stats();
+            let read = read_by_broker.load(std::sync::atomic::Ordering::SeqCst);
+            let written = written_by_broker.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(stats.outbound.bytes, read, "{stats:?}");
+            assert_eq!(stats.inbound.bytes, written, "{stats:?}");
+
+            client.shutdown().await.expect("shutdown");
+            let _ = run.await;
+        }
     }
 }

@@ -454,4 +454,26 @@ mod tests {
             "8-slot window with one migrated subscribe leaves 7 publish ids"
         );
     }
+
+    /// With a window of several, only the identifier that was released is handed out again, and
+    /// never one that is still outstanding ([MQTT-2.2.1-3], [MQTT-4.3.2-1]).
+    #[test]
+    fn released_publish_id_is_reused_while_the_others_stay_reserved() {
+        let mut pots = InflightPots::new(nonzero!(4u16));
+        let mut outstanding: Vec<NonZeroU16> = (0..4).map(|_| pots.alloc_publish().expect("alloc")).collect();
+        let distinct: HashSet<_> = outstanding.iter().collect();
+        assert_eq!(distinct.len(), 4, "four outstanding ids must differ: {outstanding:?}");
+        assert!(matches!(pots.alloc_publish(), Err(AppError::Backpressure(_))));
+
+        // Release in a scrambled order, every time with the counter somewhere else.
+        for round in 0..12 {
+            let released = outstanding.remove((round * 3) % outstanding.len());
+            pots.release_publish(released);
+            let again = pots.alloc_publish().expect("a slot was released");
+            assert_eq!(again, released, "round {round}: only the released id is free");
+            outstanding.push(again);
+            let distinct: HashSet<_> = outstanding.iter().collect();
+            assert_eq!(distinct.len(), 4, "round {round}: duplicate in {outstanding:?}");
+        }
+    }
 }

@@ -1036,3 +1036,68 @@ async fn shutdown_flushes_pending_inbound_publish_acks_before_disconnect() {
     );
     assert_eq!(order[puback_pos].1, 42);
 }
+
+/// QoS 2 is refused on the write path as well (the client API refuses it first): the command
+/// is answered with `InvalidRequest` and nothing is written, although the broker would allow
+/// QoS 2 here.
+#[tokio::test]
+async fn handle_publish_rejects_qos2_without_wire_publish() {
+    use crate::codec::{DecodedFrame, Packet};
+
+    let (framed, peer_end) = duplex_framed_write();
+    let peer = tokio::spawn(async move {
+        let mut framed = FramedRead::new(peer_end, V5Codec::with_max_packet_size(0));
+        let mut frames = 0;
+        let _ = timeout(Duration::from_millis(100), async {
+            while let Some(frame) = framed.next().await {
+                if let Ok((DecodedFrame::Control(Packet::Disconnect(_)), _)) = frame {
+                    break;
+                }
+                frames += 1;
+            }
+        })
+        .await;
+        frames
+    });
+
+    let harness = spawn_write_task(
+        framed,
+        WriteSessionOverrides {
+            max_qos: QoS::ExactlyOnce,
+            ..Default::default()
+        },
+    );
+
+    let (tx, rx) = oneshot::channel();
+    harness
+        .command_tx
+        .send(ClientCommand::Publish {
+            message: PublishMessage {
+                topic: ByteString::from_static("t/qos2"),
+                payload: Bytes::from_static(b"x"),
+                properties: PublishProperties::default(),
+            },
+            qos: QoS::ExactlyOnce,
+            retain: false,
+            reply: tx,
+        })
+        .await
+        .expect("publish command");
+    let err = timeout(Duration::from_secs(1), rx)
+        .await
+        .expect("reply timeout")
+        .expect("oneshot")
+        .expect_err("QoS 2 must fail");
+    assert!(matches!(err, AppError::InvalidRequest(_)), "{err:?}");
+
+    drop(harness.command_tx);
+    drop(harness.control_tx);
+    harness.cancel.cancel();
+    let _ = timeout(Duration::from_secs(2), harness.join).await;
+
+    let frames = timeout(Duration::from_secs(2), peer)
+        .await
+        .expect("peer timeout")
+        .expect("peer join");
+    assert_eq!(frames, 0, "a rejected QoS 2 publish must write nothing");
+}

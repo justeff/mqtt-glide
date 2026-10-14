@@ -247,6 +247,18 @@ pub(crate) async fn send_inbound_qos1_publish(
     packet_id: NonZeroU16,
     properties: crate::codec::PublishProperties,
 ) {
+    send_inbound_qos1_publish_dup(framed_write, topic, payload, packet_id, properties, false).await;
+}
+
+/// [`send_inbound_qos1_publish`] with the DUP flag chosen by the caller (a redelivery).
+pub(crate) async fn send_inbound_qos1_publish_dup(
+    framed_write: &mut MockFramedWrite,
+    topic: &str,
+    payload: &[u8],
+    packet_id: NonZeroU16,
+    properties: crate::codec::PublishProperties,
+    dup: bool,
+) {
     use crate::codec::{DEFAULT_MAX_PACKET_SIZE, PublishDelivery, encode_publish};
     use bytes::BytesMut;
 
@@ -256,7 +268,7 @@ pub(crate) async fn send_inbound_qos1_publish(
         properties,
     };
     let delivery = PublishDelivery {
-        dup: false,
+        dup,
         retain: false,
         qos: crate::codec::QoS::AtLeastOnce,
         packet_id: Some(packet_id),
