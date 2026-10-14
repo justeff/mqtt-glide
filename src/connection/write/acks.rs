@@ -167,8 +167,25 @@ pub(super) fn fail_waiters_for_outcome(
         slot.unsent.extend(publish_waiters.parked.drain(..));
         slot.mark_collect_queued();
     }
-    let error = app_error_from_write_outcome(outcome);
+    let error = waiter_error_for_outcome(outcome);
     fail_all_waiters(waiters, publish_waiters, inflight, &error);
+}
+
+/// Error for requests that were *waiting* (in flight, parked) when the session ended.
+///
+/// Whether the read or the write side noticed a dying connection first is timing, so a
+/// transport or protocol loss is always [`AppError::ConnectionLost`] here: the request may
+/// or may not have reached the broker. [`app_error_from_write_outcome`] stays for the one
+/// command whose own write failed.
+pub(super) fn waiter_error_for_outcome(outcome: &WriteOutcome) -> AppError {
+    match outcome {
+        WriteOutcome::CommandChannelClosed | WriteOutcome::ControlChannelClosed => AppError::CommandChannelClosed,
+        WriteOutcome::Transport(_) | WriteOutcome::Protocol(_) | WriteOutcome::Cancelled | WriteOutcome::Shutdown => {
+            AppError::ConnectionLost
+        }
+        #[cfg(test)]
+        WriteOutcome::StubExit => AppError::CommandChannelClosed,
+    }
 }
 
 pub(super) fn app_error_from_write_outcome(outcome: &WriteOutcome) -> AppError {

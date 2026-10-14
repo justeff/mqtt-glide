@@ -238,7 +238,8 @@ fn app_error_from_write_outcome_mapping() {
     );
 }
 
-/// transport/encode outcomes must fail QoS1 waiters as SendFailed, not channel-closed.
+/// Transport loss fails waiting QoS1 publishes as ConnectionLost (same as a read-side loss),
+/// never as channel-closed.
 #[tokio::test]
 async fn fail_waiters_for_outcome_maps_transport_not_command_channel_closed() {
     let mut waiters = SubUnsubWaiters {
@@ -258,8 +259,8 @@ async fn fail_waiters_for_outcome_maps_transport_not_command_channel_closed() {
     assert!(!inflight.publish_contains(id));
     let err = rx.await.expect("oneshot").expect_err("waiter must fail");
     assert!(
-        matches!(err, AppError::SendFailed(_)),
-        "transport write failure must map to SendFailed, got {err:?}"
+        matches!(err, AppError::ConnectionLost),
+        "transport loss must fail waiters with ConnectionLost, got {err:?}"
     );
     assert!(
         !matches!(err, AppError::CommandChannelClosed),

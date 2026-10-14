@@ -34,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Inbound messages are delivered as the new `InboundMessage` (topic, payload, properties plus `retain`, `dup`, `qos`) instead of `PublishMessage`, so applications can tell retained messages from live ones and see redeliveries. `InboundSink`, `on_inbound` and the inbound channel types change accordingly (`flume::Sender<InboundMessage>`, `tokio::sync::mpsc::Sender<InboundMessage>`); field access (`msg.topic`, `msg.payload`) is unchanged. `Publish::from(InboundMessage)` republishes one
 
+- Requests that were waiting when the connection broke (QoS 1 publishes in flight or parked, subscribe / unsubscribe awaiting their ack) now always fail with `AppError::ConnectionLost`. Before, a write-side failure reported `SendFailed` and a read-side one `ConnectionLost` for the same situation, depending on which side noticed first. `SendFailed` remains for the one command whose own write failed
+
 ### Added
 
 - `MqttClient::session_phase`: the session-phase watch, now also reachable for clients made with `ClientBuilder` (which only returns the `MqttClient`)

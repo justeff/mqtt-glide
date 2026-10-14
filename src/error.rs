@@ -94,8 +94,10 @@ pub enum AppError {
     /// Outbound encode/write failed while handling a client command.
     #[error("send failed: {0}")]
     SendFailed(String),
-    /// Connection ended before an outstanding QoS-1 publish received PUBACK (no hang).
-    #[error("connection lost before publish acknowledgement")]
+    /// The connection ended while the request waited for its acknowledgement (or to be
+    /// sent): it may or may not have reached the broker. Raised whichever side of the
+    /// connection noticed the loss first.
+    #[error("connection lost before acknowledgement")]
     ConnectionLost,
     /// Broker PUBACK completed the packet id with a non-success reason code.
     #[error("publish rejected by broker: {0}")]
