@@ -46,6 +46,7 @@ pub const DEFAULT_GRACEFUL_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2)
 
 /// TLS trust configuration for broker connections.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TlsConfig {
     /// Use the operating system's trusted root certificate store.
     SystemRoots,
@@ -146,11 +147,9 @@ pub struct ConnectOptions {
     ///
     /// Default `None`: connect directly. Not read from `HTTP(S)_PROXY`; set it explicitly.
     pub http_proxy: Option<HttpProxy>,
-    /// Optional counter incremented when the write task feeds an inbound QoS-1 PUBACK.
-    ///
-    /// Bench / diagnostic hook only (`None` in production). Does not change enqueue-before-ack semantics.
-    #[doc(hidden)]
-    pub bench_inbound_publish_ack_counter: Option<Arc<AtomicUsize>>,
+    /// Counter incremented when the write task feeds an inbound QoS-1 PUBACK; set only by the
+    /// benches (`__bench` feature). Does not change enqueue-before-ack semantics.
+    pub(crate) bench_inbound_publish_ack_counter: Option<Arc<AtomicUsize>>,
 }
 
 impl ConnectOptions {
@@ -215,6 +214,7 @@ impl ConnectOptions {
     }
 
     /// Increments `counter` each time the write task feeds an inbound QoS-1 PUBACK (bench hook).
+    #[cfg(feature = "__bench")]
     #[doc(hidden)]
     pub fn bench_inbound_publish_ack_counter(mut self, counter: Arc<AtomicUsize>) -> Self {
         self.bench_inbound_publish_ack_counter = Some(counter);

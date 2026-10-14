@@ -10,6 +10,7 @@ use thiserror::Error;
 
 /// Authentication failure (CONNACK NotAuthorized, credentials provider error, etc.).
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum AuthError {
     /// Broker rejected the supplied username or password.
     ///
@@ -25,6 +26,7 @@ pub enum AuthError {
 
 /// Transport-level failure (TCP, TLS, DNS).
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum TransportError {
     /// The TCP connection could not be established or was reset.
     #[error("connection failed: {0}")]
@@ -36,6 +38,7 @@ pub enum TransportError {
 
 /// MQTT protocol violation or unexpected control packet.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum ProtocolError {
     /// A received frame could not be decoded.
     #[error("decode error: {0}")]
@@ -116,6 +119,7 @@ pub enum AppError {
 
 /// Graceful or requested shutdown.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum ShutdownError {
     /// Shutdown was requested by the application.
     #[error("shutdown requested")]
@@ -131,6 +135,7 @@ pub enum ShutdownError {
 /// application / shutdown). Prefer this type for session-lifetime and reconnect decisions;
 /// use [`ConnectError`] for the synchronous [`crate::connect`] precondition path.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnectionOutcome {
     /// Authentication failure — reconnect per policy; invalidate credentials only for
     /// [`AuthError::NotAuthorized`].
@@ -182,6 +187,7 @@ impl fmt::Display for ConnectionOutcome {
 /// (for example a closed handoff); TCP + CONNECT/CONNACK failures surface later via
 /// [`Connection::run`](crate::Connection::run) as [`ConnectionOutcome`].
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ConnectError {
     /// Authentication failed before or during CONNECT/CONNACK.
     #[error(transparent)]

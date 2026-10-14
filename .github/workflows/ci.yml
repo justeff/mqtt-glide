@@ -43,7 +43,7 @@ jobs:
       - name: clippy (${{ matrix.name }})
         run: cargo clippy --all-targets --features testing ${{ matrix.args }} -- -D warnings
       - name: clippy with stats (${{ matrix.name }})
-        run: cargo clippy --all-targets --features testing,stats ${{ matrix.args }} -- -D warnings
+        run: cargo clippy --all-targets --features testing,stats,__bench ${{ matrix.args }} -- -D warnings
 
   test:
     name: test

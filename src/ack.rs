@@ -11,6 +11,7 @@ use crate::codec::{PublishAckReason, SubscribeAckReason, UnsubscribeAckReason, U
 /// A QoS 1 PUBLISH the broker refused (PUBACK reason code 0x80 or higher), carried by
 /// [`AppError::PublishRejected`](crate::AppError::PublishRejected).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PublishRejection {
     /// PUBACK reason code, e.g. [`PublishAckReason::NotAuthorized`] or `QuotaExceeded`.
     pub reason: PublishAckReason,
@@ -37,6 +38,7 @@ macro_rules! ack_response {
     ($(#[$doc:meta])* $name:ident, $reason:ty) => {
         $(#[$doc])*
         #[derive(Debug, Clone, PartialEq, Eq)]
+        #[non_exhaustive]
         pub struct $name {
             /// One reason code per topic filter, in request order.
             pub reasons: Vec<$reason>,

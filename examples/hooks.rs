@@ -48,7 +48,7 @@ impl LifecycleHook for LogLifecycle {
             SessionPhase::Disconnected(outcome) => {
                 println!("lifecycle: disconnected {outcome:?}");
             }
-            SessionPhase::NeverConnected => {}
+            _ => {}
         }
     }
 }

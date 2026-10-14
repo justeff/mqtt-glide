@@ -98,17 +98,17 @@ The client's own cores are set by running the bench under `taskset` (`meta.json`
 # Published baseline (one run per broker; see BENCHMARKS.md for the host)
 MQTT_COMPARE_BROKER=<mock|mosquitto|mosquitto-stock> MQTT_COMPARE_QOS=<0,1 for mock | 1> \
 MQTT_COMPARE_BROKER_CPUS=2-3 MQTT_COMPARE_PUBLISHER_CPUS=2-3 MQTT_COMPARE_RUNS=5 \
-  taskset -c 0-1 cargo bench --bench mqtt_compare
+  taskset -c 0-1 cargo bench --features __bench --bench mqtt_compare
 
 # Smoke (mock, one run, qos1 payload 256 only)
-MQTT_COMPARE_BROKER=mock MQTT_COMPARE_RUNS=1 cargo bench --bench mqtt_compare
+MQTT_COMPARE_BROKER=mock MQTT_COMPARE_RUNS=1 cargo bench --features __bench --bench mqtt_compare
 
 # Only the service-style fan-out at one level
 MQTT_COMPARE_BROKER=mock MQTT_COMPARE_RUNS=1 MQTT_COMPARE_SCENARIOS=outbound_concurrent \
-MQTT_COMPARE_CONCURRENCY=64 cargo bench --bench mqtt_compare
+MQTT_COMPARE_CONCURRENCY=64 cargo bench --features __bench --bench mqtt_compare
 
 # Only glide + rumqttc, after_enqueue cutover-style cells
-MQTT_COMPARE_CLIENTS=glide,rumqttc MQTT_COMPARE_ACK=after_enqueue MQTT_COMPARE_RUNS=10 cargo bench --bench mqtt_compare
+MQTT_COMPARE_CLIENTS=glide,rumqttc MQTT_COMPARE_ACK=after_enqueue MQTT_COMPARE_RUNS=10 cargo bench --features __bench --bench mqtt_compare
 ```
 
 Pin the client, broker and publisher to disjoint cores when you can; on hybrid CPUs, avoid putting the broker on slow cores (it becomes the bottleneck) and avoid sharing cores between client and broker (it distorts tails).

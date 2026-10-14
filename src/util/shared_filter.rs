@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// ShareName validation failure ([MQTT-4.8.2-1], [MQTT-4.8.2-2]).
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum ShareNameError {
     /// ShareName must contain at least one character.
     #[error("share name must not be empty")]

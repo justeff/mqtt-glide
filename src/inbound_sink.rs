@@ -18,7 +18,8 @@ use std::sync::Arc;
 use crate::codec::InboundMessage;
 
 /// The publish-sink consumer is gone; further pushes fail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("inbound sink closed")]
 pub struct InboundSinkClosed;
 
 /// Failure of a non-blocking [`InboundSink::try_send`].
@@ -26,12 +27,14 @@ pub struct InboundSinkClosed;
 /// Carries the message by value (same shape as flume / Tokio `TrySendError`) so the
 /// full-buffer path can await [`InboundSink::send`] without an extra heap allocation.
 /// Clippy `result_large_err` is allowed: `Ok(())` is the hot path; `Err` is stall/close.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[allow(clippy::result_large_err)] // message must round-trip by value on Full/Closed
 pub enum InboundTrySendError {
     /// Channel is at capacity; message is returned for a blocking [`InboundSink::send`].
+    #[error("inbound sink full")]
     Full(InboundMessage),
     /// No receivers remain; message is returned.
+    #[error("inbound sink closed")]
     Closed(InboundMessage),
 }
 
@@ -117,6 +120,12 @@ impl InboundSink for tokio::sync::mpsc::Sender<InboundMessage> {
 /// delivered.
 pub struct OnInboundSink<F> {
     handler: Arc<F>,
+}
+
+impl<F> std::fmt::Debug for OnInboundSink<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnInboundSink").finish_non_exhaustive()
+    }
 }
 
 impl<F> OnInboundSink<F>

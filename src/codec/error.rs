@@ -11,6 +11,7 @@ use crate::codec::v5::{DisconnectReasonCode, ToReasonCode};
 
 /// Errors while decoding MQTT frames from a byte stream.
 #[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
 pub enum DecodeError {
     #[error("Invalid protocol")]
     InvalidProtocol,
@@ -71,6 +72,7 @@ impl ToReasonCode for DecodeError {
 
 /// Errors while encoding MQTT packets to a byte stream.
 #[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
 pub enum EncodeError {
     #[error("Packet is bigger than peer's Maximum Packet Size: size={size}, max={max}")]
     OverMaxPacketSize { size: u32, max: u32 },

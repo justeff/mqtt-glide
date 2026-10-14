@@ -88,7 +88,7 @@ Command (per broker; QoS `0,1` for mock, `1` for Mosquitto):
 ```shell
 MQTT_COMPARE_BROKER=<mock|mosquitto|mosquitto-stock> MQTT_COMPARE_QOS=<0,1|1> \
 MQTT_COMPARE_BROKER_CPUS=2-3 MQTT_COMPARE_PUBLISHER_CPUS=2-3 MQTT_COMPARE_RUNS=5 \
-  taskset -c 0-1 cargo bench --bench mqtt_compare
+  taskset -c 0-1 cargo bench --features __bench --bench mqtt_compare
 ```
 
 ### Brokers
@@ -494,7 +494,7 @@ for b in mock mosquitto mosquitto-stock; do
   MQTT_COMPARE_BROKER=$b MQTT_COMPARE_QOS=$q \
   MQTT_COMPARE_BROKER_CPUS=2-3 MQTT_COMPARE_PUBLISHER_CPUS=2-3 \
   MQTT_COMPARE_RUNS=5 MQTT_COMPARE_OUT=target/mqtt_compare/full-$b \
-    taskset -c 0-1 cargo bench --bench mqtt_compare
+    taskset -c 0-1 cargo bench --features __bench --bench mqtt_compare
 done
 
 # rebuild the tables above

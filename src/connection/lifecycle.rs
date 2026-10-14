@@ -17,6 +17,7 @@ use super::handshake::SessionParams;
 /// double-counting is easy when both paths react. Prefer the watch as the source of
 /// truth for "are we connected right now?".
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionPhase {
     /// Watch initial value / before the first session attempt completes.
     NeverConnected,

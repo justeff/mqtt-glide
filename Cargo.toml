@@ -52,6 +52,7 @@ harness = false
 name = "mqtt_compare"
 path = "benches/mqtt_compare.rs"
 harness = false
+required-features = ["__bench"]
 
 [features]
 default = ["tls-rustls-aws-lc"]
@@ -68,6 +69,8 @@ testing = []
 # `MqttClient::stats()`: counters of what the connection did, for the application to export.
 # Adds no dependencies; without it the counting compiles away.
 stats = []
+# Internal: hooks for the `mqtt_compare` bench only. Not part of the public API.
+__bench = []
 
 [dependencies]
 arc-swap = "1.9"

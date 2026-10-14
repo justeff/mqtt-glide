@@ -40,7 +40,7 @@ impl ReconnectPolicy for TransportOnlyReconnect {
     fn delay_after(&self, outcome: &ConnectionOutcome) -> Option<Duration> {
         match outcome {
             ConnectionOutcome::Transport(_) | ConnectionOutcome::Protocol(_) => Some(Duration::from_millis(100)),
-            ConnectionOutcome::Auth(_) | ConnectionOutcome::Shutdown(_) | ConnectionOutcome::Application(_) => None,
+            _ => None,
         }
     }
 }
@@ -58,7 +58,7 @@ impl ReconnectPolicy for CountingTransportReconnect {
                 Some(Duration::from_millis(100))
             }
             ConnectionOutcome::Protocol(_) => Some(Duration::from_millis(100)),
-            ConnectionOutcome::Auth(_) | ConnectionOutcome::Shutdown(_) | ConnectionOutcome::Application(_) => None,
+            _ => None,
         }
     }
 }
@@ -80,7 +80,7 @@ impl ReconnectPolicy for CountingStopOnAuth {
                 self.transport_consults.fetch_add(1, Ordering::SeqCst);
                 Some(Duration::from_millis(50))
             }
-            ConnectionOutcome::Shutdown(_) | ConnectionOutcome::Application(_) => None,
+            _ => None,
         }
     }
 }
@@ -738,7 +738,7 @@ async fn mosquitto_handoff_full_keep_alive_no_spurious_reconnect() {
         phase.wait_for(|p| match p {
             SessionPhase::Disconnected(_) => true,
             SessionPhase::Connected { generation, .. } => *generation != gen_before,
-            SessionPhase::NeverConnected => false,
+            _ => false,
         }),
     )
     .await
