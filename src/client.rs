@@ -12,6 +12,7 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -273,6 +274,13 @@ pub struct MqttClient {
     shutdown_notify: CancellationToken,
     /// Deadline waiting for PUBACK / SUBACK / UNSUBACK (from [`ConnectOptions::ack_timeout`]).
     ack_timeout: Duration,
+    /// Set by the driver between Connected and Disconnected.
+    connected: Arc<AtomicBool>,
+    /// Set by [`Self::shutdown`]. Checked on every command, so it is a plain atomic:
+    /// `CancellationToken::is_cancelled` takes a mutex.
+    shutting_down: Arc<AtomicBool>,
+    /// [`ConnectOptions::fail_fast_when_disconnected`].
+    fail_fast_when_disconnected: bool,
 }
 
 impl MqttClient {
@@ -282,21 +290,45 @@ impl MqttClient {
         cancel: CancellationToken,
         shutdown_notify: CancellationToken,
         ack_timeout: Duration,
+        fail_fast_when_disconnected: bool,
+        connected: Arc<AtomicBool>,
     ) -> Self {
         Self {
             command_tx,
             cancel,
             shutdown_notify,
             ack_timeout,
+            connected,
+            shutting_down: Arc::default(),
+            fail_fast_when_disconnected,
         }
+    }
+
+    /// Whether a session is currently up (between `Connected` and `Disconnected`).
+    ///
+    /// A snapshot: the connection can drop right after this returns. For readiness waits use
+    /// the [`SessionPhase`] watch or a [`LifecycleHook`].
+    #[inline]
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// Refuses a command before it is queued: shutting down, or disconnected in fail-fast mode.
+    #[inline]
+    fn check_accepting(&self) -> Result<(), AppError> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(AppError::ShuttingDown);
+        }
+        if self.fail_fast_when_disconnected && !self.is_connected() {
+            return Err(AppError::NotConnected);
+        }
+        Ok(())
     }
 
     /// Sends a command without waiting, mapping a full channel to [`AppError::Backpressure`].
     #[inline]
     fn try_send_command(&self, command: ClientCommand) -> Result<(), AppError> {
-        if self.shutdown_notify.is_cancelled() {
-            return Err(AppError::ShuttingDown);
-        }
+        self.check_accepting()?;
         // ArcSwap load — no lock across await; sender is only swapped on reconnect.
         self.command_tx.load().try_send(command).map_err(|error| match error {
             TrySendError::Full(_) => AppError::Backpressure("command channel full".into()),
@@ -321,9 +353,7 @@ impl MqttClient {
     /// `try_send`, handing the command back when the channel is full.
     #[inline]
     fn try_send_or_return(&self, command: ClientCommand) -> Result<Option<ClientCommand>, AppError> {
-        if self.shutdown_notify.is_cancelled() {
-            return Err(AppError::ShuttingDown);
-        }
+        self.check_accepting()?;
         match self.command_tx.load().try_send(command) {
             Ok(()) => Ok(None),
             Err(TrySendError::Full(command)) => Ok(Some(command)),
@@ -336,15 +366,14 @@ impl MqttClient {
         let deadline = tokio::time::Instant::now() + self.ack_timeout;
         loop {
             let sender = self.command_tx.load_full();
-            let reserved = tokio::select! {
-                reserved = tokio::time::timeout_at(deadline, sender.reserve()) => reserved,
-                () = self.shutdown_notify.cancelled() => return Err(AppError::ShuttingDown),
-            };
-            match reserved {
+            // No select on the shutdown token: registering on it takes its mutex for every
+            // waiter. Shutdown closes the channel instead, which ends `reserve` here.
+            match tokio::time::timeout_at(deadline, sender.reserve()).await {
                 Ok(Ok(permit)) => {
                     permit.send(command);
                     return Ok(());
                 }
+                Ok(Err(_closed)) if self.shutting_down.load(Ordering::Acquire) => return Err(AppError::ShuttingDown),
                 Ok(Err(_closed)) if !Arc::ptr_eq(&sender, &self.command_tx.load_full()) => continue,
                 Ok(Err(_closed)) => return Err(AppError::CommandChannelClosed),
                 Err(_elapsed) => {
@@ -573,6 +602,7 @@ impl MqttClient {
     /// phases stop at once.
     pub async fn shutdown(&self) -> Result<(), AppError> {
         // Signalled via tokens, not the command channel, so a full channel cannot delay it.
+        self.shutting_down.store(true, Ordering::Release);
         self.shutdown_notify.cancel();
         self.cancel.cancel();
         Ok(())
@@ -710,7 +740,9 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
     let (write_stub_exit_tx, write_stub_exit_rx) = mpsc::channel(1);
     let cancel = CancellationToken::new();
     let shutdown_notify = CancellationToken::new();
+    let connected = Arc::new(AtomicBool::new(false));
     let ack_timeout = options.ack_timeout;
+    let fail_fast_when_disconnected = options.fail_fast_when_disconnected;
 
     let handoff_anchor = inbound.clone();
     let channels = ConnectionChannels {
@@ -722,6 +754,7 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
         handoff_anchor,
         phase_tx,
         lifecycle,
+        connected: Arc::clone(&connected),
         #[cfg(test)]
         read_stub_exit_tx,
         #[cfg(test)]
@@ -742,7 +775,14 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
     );
 
     Ok((
-        MqttClient::new(command_tx, cancel, shutdown_notify, ack_timeout),
+        MqttClient::new(
+            command_tx,
+            cancel,
+            shutdown_notify,
+            ack_timeout,
+            fail_fast_when_disconnected,
+            connected,
+        ),
         connection,
         phase_rx,
     ))
@@ -2571,5 +2611,125 @@ mod tests {
 
         client.shutdown().await.expect("shutdown");
         let _ = run.await;
+    }
+
+    /// `is_connected` follows the session; with `fail_fast_when_disconnected` commands issued
+    /// while no connection is up fail at once with `NotConnected` instead of queueing.
+    #[tokio::test]
+    async fn fail_fast_when_disconnected_rejects_during_reconnect() {
+        // Every connection: CONNACK, then close after the first PUBLISH.
+        let port = crate::connection::test_support::spawn_broker_loop(|mut framed_read, mut framed_write| async move {
+            if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+                return;
+            }
+            while let Some(Ok(frame)) = framed_read.next().await {
+                if matches!(frame, (DecodedFrame::Publish(_), _)) {
+                    return;
+                }
+            }
+        })
+        .await;
+
+        /// Long backoff so the test can observe the disconnected window.
+        struct SlowReconnect;
+        impl ReconnectPolicy for SlowReconnect {
+            fn delay_after(&self, outcome: &ConnectionOutcome) -> Option<Duration> {
+                match outcome {
+                    ConnectionOutcome::Shutdown(_) | ConnectionOutcome::Application(_) => None,
+                    _ => Some(Duration::from_secs(30)),
+                }
+            }
+        }
+
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let options = ConnectOptions::new(url).fail_fast_when_disconnected(true);
+        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (client, connection, mut phase) =
+            connect(options, static_test_credentials(), SlowReconnect, tx, NoopLifecycle).expect("connect wiring");
+        assert!(!client.is_connected(), "not connected before the driver runs");
+        assert!(matches!(client.publish("t/ff", "x").await, Err(AppError::NotConnected)));
+
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+        assert!(client.is_connected());
+        client
+            .publish("t/ff", "x")
+            .await
+            .expect("QoS 0 publish while connected");
+
+        crate::connection::test_support::await_disconnected(&mut phase).await;
+        assert!(!client.is_connected());
+        let started = std::time::Instant::now();
+        let err = client
+            .publish("t/ff", "y")
+            .qos(QoS::AtLeastOnce)
+            .await
+            .expect_err("publish during backoff must fail fast");
+        assert!(matches!(err, AppError::NotConnected), "got {err:?}");
+        assert!(started.elapsed() < Duration::from_millis(100), "no ack_timeout wait");
+        let err = client
+            .subscribe([("t/#", QoS::AtMostOnce)])
+            .await
+            .expect_err("subscribe too");
+        assert!(matches!(err, AppError::NotConnected), "got {err:?}");
+
+        client.shutdown().await.expect("shutdown");
+        let _ = timeout(Duration::from_secs(3), run).await;
+    }
+
+    /// Default (queue): a publish issued during backoff is not rejected but waits.
+    #[tokio::test]
+    async fn default_queues_while_disconnected() {
+        let url = BrokerUrl::parse("mqtt://127.0.0.1:9").expect("valid url");
+        let options = ConnectOptions::new(url).ack_timeout(Duration::from_millis(50));
+        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (client, _connection, _phase) =
+            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
+        assert!(!client.is_connected());
+        let err = client.publish("t/q", "x").await.expect_err("nobody encodes it");
+        assert!(
+            matches!(err, AppError::PublishAckTimeout(_)),
+            "queued, then timed out: {err:?}"
+        );
+    }
+
+    /// A caller waiting for command-channel room is released by `shutdown` with
+    /// `ShuttingDown`, not after its ack timeout.
+    #[tokio::test]
+    async fn shutdown_releases_callers_waiting_for_channel_room() {
+        // Accept TCP but never CONNACK: no write task drains the channel.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let _held = listener.accept().await;
+            std::future::pending::<()>().await;
+        });
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let options = ConnectOptions::new(url)
+            .command_channel_capacity(NonZeroUsize::new(1).expect("nz"))
+            .ack_timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(10));
+        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (client, connection, _phase) =
+            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+
+        let _queued = client
+            .start_publish(Publish::new("t/w", "fills the channel"))
+            .expect("first fits");
+        let waiter = tokio::spawn({
+            let client = client.clone();
+            async move { client.publish("t/w", "waits for room").await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "second publish must be waiting for room");
+
+        client.shutdown().await.expect("shutdown");
+        let result = timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter released promptly")
+            .expect("join");
+        assert!(matches!(result, Err(AppError::ShuttingDown)), "got {result:?}");
+        let _ = timeout(Duration::from_secs(2), run).await;
     }
 }

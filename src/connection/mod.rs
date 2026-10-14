@@ -65,6 +65,8 @@ pub(crate) struct ConnectionChannels<H: InboundSink> {
     pub phase_tx: watch::Sender<SessionPhase>,
     /// Optional sync side effects for lifecycle transitions.
     pub lifecycle: Arc<dyn LifecycleHook>,
+    /// Shared with [`crate::MqttClient::is_connected`]; true between Connected and Disconnected.
+    pub connected: Arc<std::sync::atomic::AtomicBool>,
     /// Test/supervision hooks: clone senders before [`Connection::run`].
     #[cfg(test)]
     #[allow(dead_code)]
@@ -241,6 +243,9 @@ impl<H: InboundSink> Connection<H> {
     /// Publishes `Connected` on the phase watch and invokes the lifecycle hook (sync).
     fn notify_connected(&self, generation: u64, session: SessionParams) {
         let phase = SessionPhase::Connected { generation, session };
+        self.channels
+            .connected
+            .store(true, std::sync::atomic::Ordering::Release);
         self.channels.phase_tx.send_replace(phase.clone());
         self.channels.lifecycle.on_lifecycle(&phase);
     }
@@ -248,6 +253,9 @@ impl<H: InboundSink> Connection<H> {
     /// Publishes `Disconnected` on the phase watch and invokes the lifecycle hook (sync).
     fn notify_disconnected(&self, outcome: ConnectionOutcome) {
         let phase = SessionPhase::Disconnected(outcome);
+        self.channels
+            .connected
+            .store(false, std::sync::atomic::Ordering::Release);
         self.channels.phase_tx.send_replace(phase.clone());
         self.channels.lifecycle.on_lifecycle(&phase);
     }

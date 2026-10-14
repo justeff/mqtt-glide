@@ -68,10 +68,11 @@ pub struct ConnectOptions {
     pub receive_maximum: NonZeroU16,
     /// MQTT v5 **Clean Start** flag.
     ///
-    /// `false` asks the broker to resume a stored session **for this process**. The driver
-    /// keeps no local QoS 1 DUP store; subscriptions are re-issued whenever the broker
-    /// answers `session_present = false`. Resume also needs a non-zero [`Self::session_expiry`]
-    /// — with the default (`None` → 0 on the wire) the broker ends the session on disconnect.
+    /// `false` asks the broker to resume a stored session. Within the process, unacknowledged
+    /// QoS 1 publishes are then resent with DUP after a reconnect ([MQTT-4.4.0-1]; in memory,
+    /// not across restarts), and subscriptions are re-issued whenever the broker answers
+    /// `session_present = false`. Resume also needs a non-zero [`Self::session_expiry`] —
+    /// with the default (`None` → 0 on the wire) the broker ends the session on disconnect.
     /// Cross-process resume requires a stable [`ClientId`] (via [`ClientId::try_new`]).
     /// [`ClientId::from_prefix`] always mints a fresh UUID.
     pub clean_start: bool,
@@ -86,17 +87,19 @@ pub struct ConnectOptions {
     /// Shared budget for TCP dial + optional TLS + waiting for CONNACK
     /// ([`DEFAULT_CONNECT_TIMEOUT`] when unset). Stage-specific timeout messages still apply.
     pub connect_timeout: Duration,
-    /// Budget for flushing pending inbound PUBACKs + DISCONNECT on [`crate::MqttClient::shutdown`].
+    /// Budget for the [`crate::MqttClient::shutdown`] drain.
     ///
-    /// Default: [`DEFAULT_GRACEFUL_DISCONNECT_TIMEOUT`] (2 s). Caps the write-task
-    /// read-join + drain (`AckInboundPublish*` then `DISCONNECT`) so shutdown cannot hang
-    /// on a stalled flush.
+    /// Default: [`DEFAULT_GRACEFUL_DISCONNECT_TIMEOUT`] (2 s). Caps sending queued commands,
+    /// waiting for outbound `PUBACK`s while inbound is still delivered, the final inbound
+    /// `PUBACK` flush and `DISCONNECT`, so shutdown cannot hang on a stalled broker or socket.
     pub graceful_disconnect_timeout: Duration,
     /// Bounded capacity of the application → write-task command channel.
     ///
-    /// When full, [`crate::MqttClient::publish`], `subscribe`, and `unsubscribe` return
-    /// [`crate::AppError::Backpressure`]. This queue is independent of MQTT **Receive Maximum**
-    /// (inbound QoS-1 pipelining) and outbound publish inflight limits.
+    /// When full, awaited calls ([`crate::MqttClient::publish`], `send`, `subscribe`,
+    /// `unsubscribe`, `PublishWindow::push`) wait up to [`Self::ack_timeout`] for room, then
+    /// return [`crate::AppError::Backpressure`]; [`crate::MqttClient::start_publish`] fails at
+    /// once. This queue is independent of MQTT **Receive Maximum** (inbound QoS-1 pipelining)
+    /// and outbound publish inflight limits.
     ///
     /// Default: [`COMMAND_CHANNEL_CAPACITY`] (32). Zero is rejected (`NonZeroUsize`).
     pub command_channel_capacity: NonZeroUsize,
@@ -110,6 +113,13 @@ pub struct ConnectOptions {
     /// ([MQTT-3.1.2-24]). Default: [`DEFAULT_MAX_PACKET_SIZE`] (1 MiB). Broker CONNACK limits
     /// still apply only to outbound encode.
     pub max_packet_size: NonZeroU32,
+    /// Reject commands with [`crate::AppError::NotConnected`] while no connection is up
+    /// (connecting, reconnect backoff) instead of queueing them for the next connection.
+    ///
+    /// Default `false`: queueing is what a resumable session wants, and the caller's wait is
+    /// still bounded by [`Self::ack_timeout`]. Set it when a publish that cannot go out now is
+    /// worthless (live telemetry) or the application keeps its own buffer.
+    pub fail_fast_when_disconnected: bool,
     /// Optional counter incremented when the write task feeds an inbound QoS-1 PUBACK.
     ///
     /// Bench / diagnostic hook only (`None` in production). Does not change enqueue-before-ack semantics.
@@ -139,8 +149,15 @@ impl ConnectOptions {
                 .expect("COMMAND_CHANNEL_CAPACITY is non-zero"),
             will_message: None,
             max_packet_size: NonZeroU32::new(DEFAULT_MAX_PACKET_SIZE).expect("DEFAULT_MAX_PACKET_SIZE non-zero"),
+            fail_fast_when_disconnected: false,
             bench_inbound_publish_ack_counter: None,
         }
+    }
+
+    /// Sets [`Self::fail_fast_when_disconnected`].
+    pub fn fail_fast_when_disconnected(mut self, fail_fast: bool) -> Self {
+        self.fail_fast_when_disconnected = fail_fast;
+        self
     }
 
     /// Increments `counter` each time the write task feeds an inbound QoS-1 PUBACK (bench hook).

@@ -959,6 +959,7 @@ fn replenish_session_channels_swaps_shared_command_sender() {
         handoff_anchor: handoff,
         phase_tx: watch::channel(SessionPhase::initial()).0,
         lifecycle: Arc::new(NoopLifecycle),
+        connected: Arc::default(),
         read_stub_exit_tx,
         read_stub_exit_rx,
         write_stub_exit_tx,

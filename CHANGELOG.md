@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `MqttClient::is_connected` and `ConnectOptions::fail_fast_when_disconnected`: with it, publish / subscribe / unsubscribe fail at once with the new `AppError::NotConnected` while no connection is up, instead of queueing for the next connection (the default, still bounded by `ack_timeout`)
 - `Publish` setters for Content Type, Response Topic and Correlation Data; read accessors (`topic`, `payload`, `qos_level`, `is_retained`, `publish_properties`, `into_parts`)
 - `PublishBuilder::start` (enqueue without waiting) and `PublishBuilder::into_publish`
 

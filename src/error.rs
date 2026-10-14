@@ -100,6 +100,10 @@ pub enum AppError {
     /// Broker PUBACK completed the packet id with a non-success reason code.
     #[error("publish rejected by broker: {0}")]
     PublishRejected(String),
+    /// No connection is up and [`ConnectOptions::fail_fast_when_disconnected`](crate::ConnectOptions::fail_fast_when_disconnected)
+    /// is set, so the command was not queued for the next connection.
+    #[error("not connected")]
+    NotConnected,
     /// [`MqttClient::shutdown`](crate::MqttClient::shutdown) was called: no new commands are
     /// accepted while the driver drains and disconnects.
     #[error("client is shutting down")]

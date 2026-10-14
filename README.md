@@ -210,6 +210,7 @@ A caller that stops waiting earlier (its `ack_timeout` ran out during a long rec
 | reconnect policy | `NoReconnect` | the process must outlive a broker restart |
 | `client_id` | random UUID | you need session resume across restarts (`.client_id("…")?`) |
 | `clean_start` / `session_expiry` | `true` / unset | same (needs the stable `client_id` too) |
+| `fail_fast_when_disconnected` | `false` (queue) | a publish that cannot go out now is worthless, or you buffer yourself: commands then fail with `AppError::NotConnected` during reconnects; check `client.is_connected()` for a snapshot |
 | `command_channel_capacity` | `32` | you keep more than ~32 publishes in flight |
 | `receive_maximum` | `32` | inbound QoS 1 rate is high and workers are fast |
 | `keep_alive` | 60 s | your broker or NAT expects otherwise |
