@@ -11,10 +11,14 @@ use common::{
     CountingInvalidate, NoReconnect, join_peer, spawn_connack_then_disconnect, spawn_peer_broker, static_credentials,
     wait_for_phase, wait_until,
 };
-use mqtt_glide::codec::ConnectAck;
+use std::num::NonZeroU16;
+
+use futures_util::{SinkExt, StreamExt};
+use mqtt_glide::codec::{ConnectAck, DecodedFrame, Packet, PublishDelivery, encode_publish};
 use mqtt_glide::{
     AuthError, BrokerUrl, ClientId, ConnectOptions, ConnectionOutcome, DisconnectReasonCode, InboundMessage,
-    NoopLifecycle, ProtocolError, Publish, QoS, SessionPhase, StandardReconnectPolicy, connect,
+    DEFAULT_MAX_PACKET_SIZE, NoopLifecycle, ProtocolError, Publish, PublishMessage, QoS, SessionPhase,
+    StandardReconnectPolicy, connect,
 };
 use secrecy::SecretString;
 use tokio::net::TcpListener;
@@ -312,67 +316,66 @@ async fn clean_start_session_present_stops_without_reconnect() {
     join_peer(peer).await;
 }
 
-/// [MQTT-3.2.2-4]: Present=1 without prior affinity stops; after a successful resume session,
-/// an empty registry still keeps affinity so Present=1 is accepted.
+/// [MQTT-3.2.2-4]: a client connecting with Clean Start = 0 holds Session State (empty after
+/// a process restart), so the first connection of a process resumes the broker's session:
+/// Session Present = 1 is accepted and messages the broker queued for it are delivered,
+/// although this process never subscribed to them.
 #[tokio::test]
-async fn resume_affinity_survives_empty_registry() {
-    let stage = Arc::new(AtomicUsize::new(0));
-    let (port, peer) = spawn_peer_broker({
-        let stage = Arc::clone(&stage);
-        move |broker| async move {
-            let mut session = broker.accept_session().await;
-            let connect = session.expect_connect().await;
-            assert!(!connect.clean_start);
-            session.send_connack_success().await;
-            stage.store(1, Ordering::SeqCst);
-            session.send_disconnect(DisconnectReasonCode::NormalDisconnection).await;
-
-            let mut session = broker.accept_session().await;
-            session.expect_connect().await;
-            session
-                .send_connack(ConnectAck {
-                    session_present: true,
-                    ..Default::default()
-                })
-                .await;
-            stage.store(2, Ordering::SeqCst);
-            session.hold().await;
+async fn first_connect_resumes_an_existing_broker_session() {
+    let (port, peer) = spawn_peer_broker(|broker| async move {
+        let mut session = broker.accept_session().await;
+        let connect = session.expect_connect().await;
+        assert!(!connect.clean_start);
+        session
+            .send_connack(ConnectAck {
+                session_present: true,
+                ..Default::default()
+            })
+            .await;
+        // A message queued for the session while the client was gone.
+        let delivery = PublishDelivery {
+            dup: false,
+            retain: false,
+            qos: QoS::AtLeastOnce,
+            packet_id: NonZeroU16::new(7),
+        };
+        encode_publish(
+            &PublishMessage::new("queued/while/offline", "hello"),
+            delivery,
+            DEFAULT_MAX_PACKET_SIZE,
+            session.write.write_buffer_mut(),
+        )
+        .expect("encode");
+        session.write.flush().await.expect("flush");
+        match session.read.next().await {
+            Some(Ok((DecodedFrame::Control(Packet::PublishAck(ack)), _))) => assert_eq!(ack.packet_id.get(), 7),
+            other => panic!("expected PUBACK, got {other:?}"),
         }
+        session.hold().await;
     })
     .await;
 
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
     let options = ConnectOptions::new(url)
-        .client_id(ClientId::from_prefix("desync-affinity"))
+        .client_id(ClientId::try_new("restarted-service").expect("client id"))
         .clean_start(false)
         .session_expiry(Some(Duration::from_secs(60)))
         .connect_timeout(Duration::from_secs(1));
-    let policy = StandardReconnectPolicy::new(Duration::from_millis(50), Duration::from_secs(1));
-    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, rx) = flume::bounded::<InboundMessage>(4);
     let (client, connection, mut phase) =
-        connect(options, static_credentials(), policy, tx, NoopLifecycle).expect("wiring");
+        connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
     let run = tokio::spawn(connection.run());
 
     wait_for_phase(&mut phase, Duration::from_secs(5), |event| {
-        matches!(event, SessionPhase::Connected { .. })
+        matches!(event, SessionPhase::Connected { session, .. } if session.session_present)
     })
     .await;
-
-    wait_until(
-        Duration::from_secs(5),
-        || stage.load(Ordering::SeqCst) >= 2,
-        "second session",
-    )
-    .await;
-
-    let reconnected = wait_for_phase(&mut phase, Duration::from_secs(5), |event| {
-        matches!(event, SessionPhase::Connected { .. })
-    })
-    .await;
-    assert!(
-        matches!(reconnected, SessionPhase::Connected { .. }),
-        "empty-registry resume with Present=1 must stay connected, got {reconnected:?}"
-    );
+    let message = timeout(Duration::from_secs(5), rx.recv_async())
+        .await
+        .expect("queued message in time")
+        .expect("sink open");
+    assert_eq!(&*message.topic, "queued/while/offline");
+    assert!(client.is_connected(), "resuming must not end the session");
 
     client.shutdown().await.expect("shutdown");
     let _ = timeout(Duration::from_secs(5), run)

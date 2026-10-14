@@ -72,11 +72,9 @@ pub enum AppError {
     /// not for tokio task join failures.
     #[error("internal error: {0}")]
     Internal(String),
-    /// Broker `Session Present` is inconsistent with local session affinity.
+    /// The broker answered Clean Start = 1 with Session Present = 1 ([MQTT-3.2.2-2]).
     ///
-    /// Used for [MQTT-3.2.2-2] (Clean Start = 1 but Present = 1) and [MQTT-3.2.2-4]
-    /// (Present = 1 without process-local resume affinity). Surfaces as
-    /// [`ConnectionOutcome::Application`] so reconnect policies do not loop.
+    /// Surfaces as [`ConnectionOutcome::Application`] so reconnect policies do not loop.
     #[error("{0}")]
     SessionPresentInconsistent(String),
     /// SUBSCRIBE was sent but no matching SUBACK arrived before the deadline.

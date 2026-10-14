@@ -69,7 +69,7 @@ MQTT-3.2.0-2	server		The Server MUST NOT send more than one CONNACK in a Network
 MQTT-3.2.2-1	client		Byte 1 is the "Connect Acknowledge Flags". Bits 7-1 are reserved and MUST be set to 0.
 MQTT-3.2.2-2	server		If the Server accepts a connection with Clean Start set to 1, the Server MUST set Session Present to 0 in the CONNACK packet in addition to setting a 0x00 (Success) Reason Code in the CONNACK packet.
 MQTT-3.2.2-3	server		If the Server accepts a connection with Clean Start set to 0 and the Server has Session State for the ClientID, it MUST set Session Present to 1 in the CONNACK packet, otherwise it MUST set Session Present to 0 in the CONNACK packet. In both cases it MUST set a 0x00 (Success) Reason Code in the CONNACK packet.
-MQTT-3.2.2-4	client		If the Client does not have Session State and receives Session Present set to 1 it MUST close the Network Connection.
+MQTT-3.2.2-4	client	With Clean Start 0 the client holds Session State (empty after a restart), so it resumes	If the Client does not have Session State and receives Session Present set to 1 it MUST close the Network Connection.
 MQTT-3.2.2-5	client		If the Client does have Session State and receives Session Present set to 0 it MUST discard its Session State if it continues with the Network Connection.
 MQTT-3.2.2-6	server		If a Server sends a CONNACK packet containing a non-zero Reason Code it MUST set Session Present to 0.
 MQTT-3.2.2-7	server		If a Server sends a CONNACK packet containing a Reason code of 0x80 or greater it MUST then close the Network Connection.

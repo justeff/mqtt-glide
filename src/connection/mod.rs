@@ -148,9 +148,6 @@ pub struct Connection<H: InboundSink = flume::Sender<crate::codec::InboundMessag
     inflight: packet_id::InflightPots,
     /// Topic filters to restore after Clean Start reconnect.
     subscription_registry: std::sync::Arc<std::sync::RwLock<SubscriptionRegistry>>,
-    /// Whether this process has established a resumeable MQTT session (`clean_start = false`
-    /// past a successful CONNACK). Used for [MQTT-3.2.2-4]; independent of subscription count.
-    session_affinity: subscriptions::SessionAffinity,
     /// What one connection still owes the application, handed to the next connection
     /// (never-sent publishes always; unacknowledged QoS 1 when the session is resumable).
     session_carry: write::SessionCarry,
@@ -194,7 +191,6 @@ impl<H: InboundSink> Connection<H> {
             state: ConnectionState::Stopped,
             inflight,
             subscription_registry: std::sync::Arc::new(std::sync::RwLock::new(SubscriptionRegistry::default())),
-            session_affinity: subscriptions::SessionAffinity::None,
             session_carry,
             redirect_once: None,
             redirects_in_row: 0,
@@ -423,19 +419,11 @@ impl<H: InboundSink> Connection<H> {
             Err(outcome) => return self.finish_session(outcome, false).await,
         };
 
-        // Session Present must match Clean Start / local session affinity. Reconnecting into
-        // the same claim would loop, so this stops (Application → no retry). Prefer a
-        // Protocol Error DISCONNECT before dropping TCP when the write half is still open.
-        if !subscriptions::session_resume_consistent(
-            self.options.clean_start,
-            session.session_present,
-            self.session_affinity,
-        ) {
-            let message = if self.options.clean_start {
-                "broker set Session Present = 1 after Clean Start = 1 ([MQTT-3.2.2-2])"
-            } else {
-                "broker reports Session Present but the client holds no session state ([MQTT-3.2.2-4])"
-            };
+        // Session Present = 1 after Clean Start = 1 is a broker bug. Reconnecting into the same
+        // claim would loop, so this stops (Application → no retry). Prefer a Protocol Error
+        // DISCONNECT before dropping TCP when the write half is still open.
+        if !subscriptions::session_resume_consistent(self.options.clean_start, session.session_present) {
+            let message = "broker set Session Present = 1 after Clean Start = 1 ([MQTT-3.2.2-2])";
             let _ = framed_write
                 .send(Packet::Disconnect(Disconnect::new(DisconnectReasonCode::ProtocolError)))
                 .await;
@@ -446,14 +434,6 @@ impl<H: InboundSink> Connection<H> {
                 )
                 .await;
         }
-        // Affinity follows Clean Start: a clean session clears it; a resume path marks us as
-        // holding local session state even when the subscription registry is empty.
-        self.session_affinity = if self.options.clean_start {
-            subscriptions::SessionAffinity::None
-        } else {
-            subscriptions::SessionAffinity::Held
-        };
-
         // No session on the broker: the client MUST discard its own state too
         // ([MQTT-3.2.2-5]), so unacknowledged publishes are not resent. Never-sent ones still go.
         if !session.session_present {
