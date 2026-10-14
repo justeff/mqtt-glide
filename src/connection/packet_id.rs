@@ -7,8 +7,9 @@
 //! recording ownership in the matching pot.
 //!
 //! Publish IDs are allocated in `1..=publish_capacity` via a dense [`Vec`] slot table
-//! (ID = index). Subscribe/unsubscribe may use any free ID; IDs with value ≥
-//! `slots.len()` live in a small [`HashSet`]. Growing the table migrates any
+//! (ID = index). Subscribe/unsubscribe take IDs above that window when one is free, so they
+//! do not shrink it; one that still lands inside counts against the publish capacity. IDs
+//! with value ≥ `slots.len()` live in a small [`HashSet`]. Growing the table migrates any
 //! overlapping `subscribe_high` entries into slots so that invariant stays exact.
 
 use std::collections::{HashMap, HashSet};
@@ -66,6 +67,8 @@ pub(crate) struct InflightPots {
     subscribe_high: HashSet<NonZeroU16>,
     /// Outstanding publish IDs (soft-capped by [`Self::publish_capacity`]).
     publish_count: u16,
+    /// Subscribe/unsubscribe IDs inside `1..=publish_capacity`: they take publish slots.
+    subscribe_in_window: u16,
     /// Next publish candidate in `1..=publish_capacity`.
     next_publish: u16,
     /// Next subscribe/unsubscribe candidate in `1..=u16::MAX`.
@@ -82,6 +85,7 @@ impl InflightPots {
             slots: vec![Slot::Free; usize::from(cap) + 1],
             subscribe_high: HashSet::new(),
             publish_count: 0,
+            subscribe_in_window: 0,
             next_publish: 1,
             next_control: 1,
             publish_capacity: cap,
@@ -92,7 +96,7 @@ impl InflightPots {
     ///
     /// IDs are chosen from `1..=publish_capacity` only (dense slot table).
     pub(crate) fn alloc_publish(&mut self) -> Result<NonZeroU16, AppError> {
-        if self.publish_count >= self.publish_capacity {
+        if !self.has_publish_capacity() {
             return Err(AppError::Backpressure("publish inflight at capacity".into()));
         }
         self.ensure_slot_len(usize::from(self.publish_capacity) + 1);
@@ -133,23 +137,35 @@ impl InflightPots {
     /// Whether [`Self::alloc_publish`] can hand out another publish ID right now.
     #[inline]
     pub(crate) fn has_publish_capacity(&self) -> bool {
-        self.publish_count < self.publish_capacity
+        u32::from(self.publish_count) + u32::from(self.subscribe_in_window) < u32::from(self.publish_capacity)
     }
 
-    /// Allocates a Packet Identifier for SUBSCRIBE or UNSUBSCRIBE.
+    /// Allocates a Packet Identifier for SUBSCRIBE or UNSUBSCRIBE: above the publish window
+    /// when one is free there, inside it only when the space above is exhausted.
     pub(crate) fn alloc_subscribe(&mut self) -> Result<NonZeroU16, AppError> {
-        for _ in 0..u16::MAX {
-            let candidate = if self.next_control == 0 { 1 } else { self.next_control };
-            self.next_control = candidate.wrapping_add(1);
-
-            let Some(id) = NonZeroU16::new(candidate) else {
-                continue;
-            };
-            if self.in_use(id) {
-                continue;
+        let above = self.publish_capacity.saturating_add(1);
+        if above > self.publish_capacity {
+            let span = u16::MAX - above + 1;
+            for _ in 0..span {
+                let candidate = if self.next_control < above {
+                    above
+                } else {
+                    self.next_control
+                };
+                self.next_control = if candidate == u16::MAX { above } else { candidate + 1 };
+                let id = NonZeroU16::new(candidate).expect("above the window is non-zero");
+                if !self.in_use(id) {
+                    self.mark_subscribe(id);
+                    return Ok(id);
+                }
             }
-            self.mark_subscribe(id);
-            return Ok(id);
+        }
+        for candidate in 1..=self.publish_capacity {
+            let id = NonZeroU16::new(candidate).expect("window starts at 1");
+            if !self.in_use(id) {
+                self.mark_subscribe(id);
+                return Ok(id);
+            }
         }
         Err(AppError::Backpressure("no free packet identifiers".into()))
     }
@@ -175,6 +191,11 @@ impl InflightPots {
         if self.next_publish == 0 || self.next_publish > cap {
             self.next_publish = 1;
         }
+        let in_window = self.slots[1..=usize::from(cap)]
+            .iter()
+            .filter(|slot| **slot == Slot::Subscribe)
+            .count();
+        self.subscribe_in_window = u16::try_from(in_window).expect("window holds at most u16::MAX slots");
     }
 
     /// Current publish soft-cap (for tests / observability).
@@ -188,6 +209,9 @@ impl InflightPots {
         let index = usize::from(id.get());
         if index < self.slots.len() && self.slots[index] == Slot::Subscribe {
             self.slots[index] = Slot::Free;
+            if id.get() <= self.publish_capacity {
+                self.subscribe_in_window -= 1;
+            }
             return;
         }
         self.subscribe_high.remove(&id);
@@ -223,6 +247,9 @@ impl InflightPots {
         if index < self.slots.len() {
             debug_assert_eq!(self.slots[index], Slot::Free);
             self.slots[index] = Slot::Subscribe;
+            if id.get() <= self.publish_capacity {
+                self.subscribe_in_window += 1;
+            }
         } else {
             self.subscribe_high.insert(id);
         }
@@ -285,6 +312,40 @@ mod tests {
         assert!(!pots.publish_contains(subscribe));
         assert!(pots.subscribe_contains(subscribe));
         assert!(!pots.subscribe_contains(publish_a));
+    }
+
+    /// A SUBSCRIBE waiting for its SUBACK must not take one of the broker's Receive Maximum
+    /// slots: its id comes from above the publish window.
+    #[test]
+    fn subscribe_ids_stay_out_of_the_publish_window() {
+        let mut pots = InflightPots::new(nonzero!(2u16));
+        let subscribe = pots.alloc_subscribe().expect("subscribe");
+        assert!(
+            subscribe.get() > 2,
+            "subscribe id {subscribe} inside the publish window"
+        );
+        pots.alloc_publish().expect("first publish");
+        pots.alloc_publish()
+            .expect("second publish: the full window is still free for publishes");
+        assert!(!pots.has_publish_capacity());
+    }
+
+    /// Without room above the window a subscribe id lands inside it and then counts against
+    /// the publish capacity, so a publish parks instead of failing on a missing id.
+    #[test]
+    fn subscribe_id_inside_the_window_counts_against_publish_capacity() {
+        let mut pots = InflightPots::new(nonzero!(65535u16));
+        pots.set_publish_capacity(nonzero!(65535u16));
+        let subscribe = pots.alloc_subscribe().expect("subscribe");
+        assert!(pots.subscribe_contains(subscribe));
+        for _ in 0..65534 {
+            pots.alloc_publish().expect("publish");
+        }
+        assert!(!pots.has_publish_capacity(), "the subscribe holds the last slot");
+        assert!(matches!(pots.alloc_publish(), Err(AppError::Backpressure(_))));
+        pots.release_subscribe(subscribe);
+        assert!(pots.has_publish_capacity());
+        pots.alloc_publish().expect("slot freed by the SUBACK");
     }
 
     #[test]
