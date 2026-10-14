@@ -85,6 +85,24 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # Short smoke run on every push; longer runs are local (see fuzz/README.md).
+  fuzz:
+    name: fuzz (decode_frames, 60 s)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: fuzz
+      - name: cargo fuzz run
+        working-directory: fuzz
+        run: cargo fuzz run decode_frames -- -max_total_time=60 -max_len=4096
+
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest

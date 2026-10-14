@@ -1,0 +1,18 @@
+# Fuzzing
+
+Fuzz targets for the MQTT 5 codec, built with [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz)
+(nightly Rust). This crate is not part of the library workspace or the published package.
+
+| Target | Feeds | Checks |
+|--------|-------|--------|
+| `decode_frames` | Arbitrary bytes as they could arrive from a broker, split into arbitrary reads, with an arbitrary inbound size limit | No panic; the decoded frames and the first error do not depend on read boundaries; every decoded frame re-encodes and decodes back to itself |
+
+```shell
+cargo install cargo-fuzz
+cd fuzz
+cargo +nightly fuzz run decode_frames -j 6 -- -max_total_time=600 -max_len=4096
+```
+
+CI runs each target for 60 s per push. A crash leaves its input under `artifacts/<target>/`;
+reproduce it with `cargo +nightly fuzz run <target> artifacts/<target>/<file>`, then add it as a
+regression test next to the codec unit tests.
