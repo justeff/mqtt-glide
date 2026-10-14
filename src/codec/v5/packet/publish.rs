@@ -3,7 +3,7 @@
 //! # Errors
 //! Rejects QoS 0 with DUP ([MQTT-3.3.1-2]), invalid Topic Names ([MQTT-3.3.2-2]),
 //! empty Topic Name without Topic Alias (§3.3.2.1), and trailing/malformed
-//! property blocks ([MQTT-2.2.2-2], §2.1.4).
+//! property blocks (§2.2.2.2, §2.1.4).
 
 use std::{num::NonZeroU16, num::NonZeroU32};
 
@@ -202,6 +202,7 @@ mod tests {
         assert_eq!(publish.message.payload.as_ref(), b"data");
     }
 
+    /// A PUBLISH with QoS 0 and DUP 1 is malformed ([MQTT-3.3.1-2]).
     #[test]
     fn publish_decode_qos0_dup_rejected() {
         let result = PublishPacket::decode(topic_and_prop0_payload(b"data"), QOS0_DUP_FLAGS);
@@ -264,6 +265,7 @@ mod tests {
         assert!(matches!(result, Err(DecodeError::MalformedPacket(_))));
     }
 
+    /// [MQTT-3.3.1-4] QoS bits 1,1 are not a valid PUBLISH.
     #[test]
     fn publish_decode_rejects_both_qos_bits_set() {
         const QOS3_FLAGS: u8 = 0b0110;
@@ -320,6 +322,7 @@ mod tests {
         ));
     }
 
+    /// [MQTT-3.3.2-19] Content Type must be a UTF-8 Encoded String.
     #[test]
     fn publish_decode_rejects_invalid_utf8_content_type() {
         // Topic "t" + Property Length 5 + CONTENT_TYPE + invalid UTF-8 + empty payload.
@@ -365,6 +368,7 @@ mod tests {
         );
     }
 
+    /// A QoS 0 PUBLISH goes out with DUP 0 ([MQTT-4.3.1-1], [MQTT-3.3.1-2]).
     #[test]
     fn publish_encode_qos0_wire_dup_flag_clear() {
         let message = PublishMessage {

@@ -308,6 +308,7 @@ mod tests {
         assert!(pots.subscribe_contains(subscribe));
     }
 
+    /// An identifier in use is not assigned again until its PUBLISH completes ([MQTT-4.3.2-1]).
     #[test]
     fn publish_packet_id_remains_allocated_until_explicit_release() {
         let mut pots = InflightPots::new(nonzero!(1u16));

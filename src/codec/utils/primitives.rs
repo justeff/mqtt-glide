@@ -23,7 +23,7 @@ pub(crate) trait Decode: Sized {
     fn decode(src: &mut Bytes) -> Result<Self, DecodeError>;
 }
 
-/// Read a property value once; duplicate identifiers are a protocol error ([MQTT-2.2.2-2]).
+/// Read a property value once; duplicate identifiers are a protocol error (§2.2.2.2).
 pub(in crate::codec) trait Property {
     /// Reads the property value, rejecting a second assignment of the same field.
     fn read_value(&mut self, src: &mut Bytes) -> Result<(), DecodeError>;

@@ -437,6 +437,13 @@ mod tests {
         assert_eq!(expected, &v[..]);
     }
 
+    /// Exact CONNECT bytes: Protocol Name "MQTT" ([MQTT-3.1.2-1]); the Client Identifier is the
+    /// first Payload field ([MQTT-3.1.3-3]); Will Flag 1 brings Will Properties, Will Topic and
+    /// Will Message ([MQTT-3.1.2-9]) with the Will QoS bits as set ([MQTT-3.1.2-12]); Will Flag 0
+    /// leaves Will QoS and Will Retain at 0 ([MQTT-3.1.2-11], [MQTT-3.1.2-13]); User Name and
+    /// Password are present exactly when their flags are set ([MQTT-3.1.2-17], [MQTT-3.1.2-18],
+    /// [MQTT-3.1.2-19]). Fixed Header flags of CONNECT and DISCONNECT are 0 ([MQTT-2.1.3-1]) and
+    /// DISCONNECT carries a defined Reason Code ([MQTT-3.14.2-1]).
     #[test]
     fn test_encode_connect_packets() {
         assert_encode_packet(
@@ -563,12 +570,59 @@ mod tests {
         assert_encode_packet(&Packet::Auth(Auth::default()), b"\xf0\x00");
     }
 
+    /// With every optional Payload field present, CONNECT carries them in the order Client
+    /// Identifier, Will Properties, Will Topic, Will Payload, User Name, Password
+    /// ([MQTT-3.1.3-1]). Each field holds distinct bytes so a swapped pair changes the wire.
+    #[test]
+    fn test_encode_connect_payload_field_order() {
+        assert_encode_packet(
+            &Packet::Connect(Box::new(Connect {
+                clean_start: false,
+                keep_alive: 60,
+                client_id: ByteString::from_static("cid"),
+                will_message: Some(WillMessage {
+                    qos: QoS::AtLeastOnce,
+                    retain: false,
+                    topic: ByteString::from_static("wt"),
+                    payload: Bytes::from_static(b"wpayload"),
+                    will_delay_interval: Some(5),
+                    correlation_data: None,
+                    message_expiry_interval: None,
+                    content_type: None,
+                    user_properties: vec![("k", "v").into()],
+                    payload_format_indicator: None,
+                    response_topic: None,
+                }),
+                username: Some(ByteString::from_static("usr")),
+                password: Some(Bytes::from_static(b"pw")),
+                session_expiry_interval: 0,
+                auth_method: None,
+                auth_data: None,
+                request_problem_info: true,
+                request_response_info: false,
+                receive_max: None,
+                topic_alias_max: 0,
+                user_properties: vec![],
+                max_packet_size: None,
+            })),
+            &b"\x10\x34\x00\x04MQTT\x05\xCC\x00\x3C\x00\
+\x00\x03cid\
+\x0C\x18\x00\x00\x00\x05\x26\x00\x01k\x00\x01v\
+\x00\x02wt\
+\x00\x08wpayload\
+\x00\x03usr\
+\x00\x02pw"[..],
+        );
+    }
+
     fn assert_encode_publish(message: &PublishMessage, delivery: PublishDelivery, expected: &[u8]) {
         let mut wire = BytesMut::new();
         encode_publish(message, delivery, MAX_PACKET_SIZE, &mut wire).expect("encode publish");
         assert_eq!(expected, &wire[..]);
     }
 
+    /// Exact PUBLISH bytes; a PUBLISH without properties still carries a Property Length of
+    /// zero ([MQTT-2.2.2-1]).
     #[test]
     fn test_encode_publish_packets() {
         assert_encode_publish(
@@ -612,6 +666,7 @@ mod tests {
         );
     }
 
+    /// A QoS 0 PUBLISH is never sent with DUP set ([MQTT-4.3.1-1]).
     #[test]
     fn test_encode_publish_qos0_dup_rejected() {
         let message = PublishMessage {
@@ -632,6 +687,9 @@ mod tests {
         ));
     }
 
+    /// Exact SUBSCRIBE / UNSUBSCRIBE bytes: Fixed Header 0x82 / 0xA2, i.e. reserved flags
+    /// 0,0,1,0 ([MQTT-2.1.3-1], [MQTT-3.8.1-1], [MQTT-3.10.1-1]); no properties still means a
+    /// Property Length of zero ([MQTT-2.2.2-1]).
     #[test]
     fn test_encode_subscribe_packets() {
         assert_encode_packet(
@@ -832,6 +890,121 @@ mod tests {
         assert!(packet.message.properties.is_wire_empty());
     }
 
+    /// Property identifiers of an encoded PUBLISH, in wire order. Walks the property block
+    /// (every value is skipped by its data type, so an unknown identifier panics instead of
+    /// being guessed at).
+    fn publish_property_ids(wire: &[u8], has_packet_id: bool) -> Vec<u8> {
+        fn var_int(bytes: &[u8]) -> (usize, usize) {
+            let (mut value, mut shift) = (0usize, 0);
+            for (index, byte) in bytes.iter().enumerate() {
+                value |= usize::from(byte & 0x7F) << shift;
+                if byte & 0x80 == 0 {
+                    return (value, index + 1);
+                }
+                shift += 7;
+            }
+            panic!("truncated variable byte integer");
+        }
+        let u16_at = |at: usize| usize::from(u16::from_be_bytes([wire[at], wire[at + 1]]));
+
+        let (_remaining, consumed) = var_int(&wire[1..]);
+        let mut at = 1 + consumed;
+        at += 2 + u16_at(at); // Topic Name
+        if has_packet_id {
+            at += 2;
+        }
+        let (props_len, consumed) = var_int(&wire[at..]);
+        at += consumed;
+        let end = at + props_len;
+
+        let mut ids = Vec::new();
+        while at < end {
+            let id = wire[at];
+            at += 1;
+            ids.push(id);
+            at += match id {
+                0x01 => 1,                      // Payload Format Indicator
+                0x02 => 4,                      // Message Expiry Interval
+                0x03 | 0x08 => 2 + u16_at(at),  // Content Type, Response Topic
+                0x09 => 2 + u16_at(at),         // Correlation Data
+                0x0B => var_int(&wire[at..]).1, // Subscription Identifier
+                0x23 => 2,                      // Topic Alias
+                0x26 => {
+                    let key = 2 + u16_at(at);
+                    key + 2 + u16_at(at + key) // User Property
+                }
+                other => panic!("unexpected PUBLISH property {other:#04x}"),
+            };
+        }
+        assert_eq!(at, end, "property block ends on a property boundary");
+        assert_eq!(end, wire.len() - 1, "payload (one byte) follows the property block");
+        ids
+    }
+
+    /// A PUBLISH the client sends never carries a Subscription Identifier (0x0B), even with
+    /// every property it can set ([MQTT-3.3.4-6]); the walk also pins the properties that are
+    /// there, so a skipped or misparsed block cannot pass.
+    #[test]
+    fn encode_publish_never_writes_subscription_identifier() {
+        let message = PublishMessage::new("telemetry/device/status", "x").properties(
+            PublishProperties::default()
+                .correlation_data(Bytes::from_static(b"corr"))
+                .message_expiry(60)
+                .content_type("text/plain")
+                .user_property("k1", "v1")
+                .user_property("k2", "v2")
+                .payload_format_indicator(true)
+                .response_topic("reply/to"),
+        );
+        let props = &message.properties;
+        assert!(
+            props.correlation_data.is_some()
+                && props.message_expiry_interval.is_some()
+                && props.content_type.is_some()
+                && !props.user_properties.is_empty()
+                && props.payload_format_indicator
+                && props.response_topic.is_some(),
+            "every PublishProperties field is set"
+        );
+        let alias = NonZeroU16::new(7).expect("nz");
+
+        for qos in [QoS::AtMostOnce, QoS::AtLeastOnce] {
+            let delivery = PublishDelivery {
+                dup: false,
+                retain: false,
+                qos,
+                packet_id: (qos != QoS::AtMostOnce).then(|| packet_id(9)),
+            };
+            let has_packet_id = delivery.packet_id.is_some();
+
+            let mut buf = BytesMut::new();
+            encode_publish(&message, delivery, u32::MAX, &mut buf).expect("encode");
+            let mut ids = publish_property_ids(&buf, has_packet_id);
+            assert!(
+                !ids.contains(&0x0B),
+                "{qos:?}: Subscription Identifier on the wire: {ids:02x?}"
+            );
+            ids.sort_unstable();
+            assert_eq!(ids, [0x01, 0x02, 0x03, 0x08, 0x09, 0x26, 0x26], "{qos:?}");
+
+            for mode in [OutboundTopicAlias::Assign(alias), OutboundTopicAlias::Reuse(alias)] {
+                let mut buf = BytesMut::new();
+                encode_publish_with_alias(&message, delivery, Some(mode), u32::MAX, &mut buf).expect("encode");
+                let mut ids = publish_property_ids(&buf, has_packet_id);
+                assert!(
+                    !ids.contains(&0x0B),
+                    "{qos:?} {mode:?}: Subscription Identifier on the wire: {ids:02x?}"
+                );
+                ids.sort_unstable();
+                assert_eq!(
+                    ids,
+                    [0x01, 0x02, 0x03, 0x08, 0x09, 0x23, 0x26, 0x26],
+                    "{qos:?} {mode:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn encode_publish_never_writes_topic_alias_property() {
         // [MQTT-3.2.2-17], [MQTT-3.2.2-18] outbound path never encodes Topic Alias (product max=0)
@@ -854,6 +1027,8 @@ mod tests {
         );
     }
 
+    /// A Topic Name never carries wildcards ([MQTT-3.3.2-2], [MQTT-4.7.0-1]) or U+0000
+    /// ([MQTT-4.7.3-2]); nothing is written for a rejected PUBLISH.
     #[rstest]
     #[case::empty("")]
     #[case::plus_wildcard("a/+")]
@@ -884,7 +1059,7 @@ mod tests {
         );
     }
 
-    /// [MQTT-3.3.2-13/14] Response Topic follows Topic Name rules: non-empty, no wildcards.
+    /// [MQTT-3.3.2-13], [MQTT-3.3.2-14] Response Topic follows Topic Name rules: non-empty, no wildcards.
     #[rstest]
     #[case::empty("")]
     #[case::plus_wildcard("reply/+")]
@@ -933,7 +1108,7 @@ mod tests {
     }
 
     /// [MQTT-1.5.4-2] U+0000 in publish UTF-8 properties is rejected at plan time,
-    /// before any wire bytes.
+    /// before any wire bytes. The Content Type case covers [MQTT-3.3.2-19].
     #[rstest]
     #[case::content_type(PublishProperties::default().content_type("text/\0plain"))]
     #[case::user_property_name(PublishProperties::default().user_property("k\0", "v"))]

@@ -148,7 +148,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     for (id, filters) in groups {
-        // A broker that stopped offering identifiers must not get one ([MQTT-3.8.2-1]);
+        // A broker that stopped offering identifiers must not get one (§3.2.2.3.12);
         // the subscription itself still matters more than the routing hint.
         let id = match id {
             Some(_) if !inbound.subscription_identifiers_available => {

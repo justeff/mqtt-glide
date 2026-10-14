@@ -96,6 +96,7 @@ mod tests {
         assert!(matches!(err, AppError::InvalidRequest(_)));
     }
 
+    /// [MQTT-3.2.2-14] No RETAIN publish once the broker announced Retain Available 0.
     #[test]
     fn validate_publish_rejects_retain_when_unavailable() {
         let err = validate_publish_against_broker_limits(QoS::AtMostOnce, true, QoS::AtLeastOnce, false)

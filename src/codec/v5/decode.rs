@@ -475,7 +475,8 @@ mod tests {
         decode_packet(cur, fixed)
     }
 
-    /// Reserved Fixed Header flag bits must match the packet type ([MQTT-2.1.3-1] and per-type rules).
+    /// Reserved Fixed Header flag bits must match the packet type ([MQTT-2.1.3-1] and per-type rules);
+    /// AUTH's must be 0 ([MQTT-3.15.1-1]).
     #[rstest]
     #[case::puback_reserved_flag_set(&[0x41, 0x02, 0x43, 0x21])]
     #[case::subscribe_reserved_flag_set(&[
@@ -486,6 +487,7 @@ mod tests {
     #[case::connack_reserved_flag_set(&[0x21, 0x03, 0x01, 0x86, 0x00])]
     #[case::suback_reserved_flag_set(&[0x91, 0x02, 0x12, 0x34, 0x00])]
     #[case::unsuback_reserved_flag_set(&[0xB1, 0x02, 0x12, 0x34])]
+    #[case::auth_reserved_flag_set(&[0xF1, 0x00])]
     // [MQTT-3.10.1-1] UNSUBSCRIBE reserved flags must be 0,0,1,0 (0xA2).
     #[case::unsubscribe_flags_all_clear(&[0xA0, 0x06, 0x12, 0x34, 0x00, 0x00, 0x01, b't'])]
     #[case::unsubscribe_flags_extra_bit(&[0xA3, 0x06, 0x12, 0x34, 0x00, 0x00, 0x01, b't'])]

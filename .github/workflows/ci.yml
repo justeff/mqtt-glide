@@ -85,6 +85,13 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  conformance:
+    name: conformance matrix up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 conformance/render.py --check
+
   # Short smoke run on every push; longer runs are local (see fuzz/README.md).
   fuzz:
     name: fuzz (decode_frames, 60 s)

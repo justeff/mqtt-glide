@@ -114,6 +114,7 @@ async fn join_run_after_shutdown(run: tokio::task::JoinHandle<Result<(), Connect
 }
 
 /// Successful CONNECT/CONNACK against Mosquitto, then disconnect via shutdown.
+/// The MQTT exchange runs over plain TCP, an ordered lossless byte stream ([MQTT-4.2.0-1]).
 #[tokio::test]
 async fn mosquitto_connect_connack_and_disconnect() {
     let Some((_container, port)) = start_mosquitto().await else {

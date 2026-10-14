@@ -225,6 +225,8 @@ mod tests {
         handshake(&options, tcp, Instant::now() + Duration::from_secs(5)).await
     }
 
+    /// Packets are not assumed to align with WebSocket frames ([MQTT-6.0.0-2]). The in-process
+    /// server also asserts the client offered the `mqtt` subprotocol ([MQTT-6.0.0-3]).
     #[tokio::test]
     async fn frames_read_as_one_byte_stream() {
         let port = server(Some("mqtt"), |mut ws| {
@@ -244,6 +246,7 @@ mod tests {
         assert_eq!(all, [1, 2, 3, 4, 5, 6], "frame boundaries are invisible; Close is EOF");
     }
 
+    /// A non-binary data frame fails the connection ([MQTT-6.0.0-1]).
     #[tokio::test]
     async fn text_frame_is_a_protocol_error() {
         let port = server(Some("mqtt"), |mut ws| {
@@ -259,6 +262,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
+    /// Control Packets are sent in binary data frames ([MQTT-6.0.0-1]).
     #[tokio::test]
     async fn writes_go_out_as_one_binary_frame_per_flush() {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -277,6 +281,8 @@ mod tests {
         assert_eq!(frame, Message::Binary(Bytes::from_static(b"abcd")));
     }
 
+    /// The client offers `mqtt` ([MQTT-6.0.0-3]; asserted by the in-process server) and refuses
+    /// a server that does not select it.
     #[tokio::test]
     async fn server_without_mqtt_subprotocol_is_refused() {
         let port = server(None, |_ws| Box::pin(async {})).await;

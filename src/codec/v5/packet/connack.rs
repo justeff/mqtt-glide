@@ -4,7 +4,7 @@
 //!
 //! # Errors
 //! Decode rejects reserved Acknowledge flags ([MQTT-3.2.2-1]), duplicate property
-//! identifiers ([MQTT-2.2.2-2]), and trailing bytes after the properties (§2.1.4).
+//! identifiers (§2.2.2.2), and trailing bytes after the properties (§2.1.4).
 
 use std::num::NonZeroU16;
 
@@ -227,7 +227,7 @@ impl ConnectAck {
                 pt::SESS_EXPIRY_INT => session_expiry_interval.read_value(prop_src)?,
                 pt::RECEIVE_MAX => receive_max.read_value(prop_src)?,
                 pt::MAX_QOS => {
-                    // Duplicate property identifier ([MQTT-2.2.2-2]).
+                    // Duplicate property identifier (§2.2.2.2).
                     ensure!(max_qos.is_none(), DecodeError::MalformedPacket("invalid encoding"));
                     ensure!(prop_src.has_remaining(), DecodeError::InvalidLength);
                     max_qos = Some(prop_src.get_u8().try_into()?);

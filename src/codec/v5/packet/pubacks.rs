@@ -402,6 +402,7 @@ mod tests {
         assert_eq!(result.map_err(|e| e.to_string()), Err(error.to_string()));
     }
 
+    /// The client's PUBACK is the minimal form: Success, nothing else ([MQTT-3.4.2-1]).
     #[test]
     fn encode_publish_ack_matches_minimal_packet_path_bytes() {
         let mut buf = BytesMut::new();
@@ -442,6 +443,7 @@ mod tests {
         });
     }
 
+    /// [MQTT-3.4.2-2] Reason String is dropped rather than exceed the receiver's Maximum Packet Size.
     #[test]
     fn puback_encode_omits_reason_string_when_it_exceeds_max_packet_size() {
         let ack = PublishAck {
@@ -460,6 +462,7 @@ mod tests {
         );
     }
 
+    /// [MQTT-3.4.2-3] User Property is dropped rather than exceed the receiver's Maximum Packet Size.
     #[test]
     fn puback_encode_omits_user_property_when_it_exceeds_max_packet_size() {
         let ack = PublishAck {

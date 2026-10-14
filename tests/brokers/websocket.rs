@@ -42,7 +42,8 @@ async fn stop(client: Client) {
 }
 
 /// Subscribe and publish over WebSocket: a QoS 1 burst plus payloads far larger than one
-/// write, all delivered back intact.
+/// write, all delivered back intact. MQTT runs over WebSocket as a second byte-stream
+/// transport ([MQTT-4.2.0-1]).
 #[tokio::test]
 async fn websocket_roundtrip_burst_and_large_payloads() {
     let Some((_broker, _tcp_port, ws_port)) = start_mosquitto_websockets().await else {

@@ -1291,7 +1291,8 @@ mod tests {
 
     // --- publish / flow-control contracts ---
 
-    /// QoS 0: no packet-id / publish-permit / PUBACK wait — message must reach the wire.
+    /// QoS 0: no packet-id / publish-permit / PUBACK wait — message must reach the wire, and
+    /// without a Packet Identifier ([MQTT-2.2.1-2]).
     #[tokio::test]
     async fn qos0_publish_reaches_wire_without_packet_id() {
         let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -1331,7 +1332,8 @@ mod tests {
         let _ = run.await;
     }
 
-    /// QoS 1: `publish().await` resolves only after PUBACK (mock broker).
+    /// QoS 1: `publish().await` resolves only after PUBACK (mock broker). The PUBLISH goes out
+    /// as QoS 1 with a Packet Identifier ([MQTT-4.3.2-2]).
     #[tokio::test]
     async fn qos1_publish_awaits_matching_puback() {
         let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -1381,7 +1383,8 @@ mod tests {
         let _ = run.await;
     }
 
-    /// Barrier: `publish().await` stays pending until the matching PUBACK is released.
+    /// Barrier: `publish().await` stays pending until the matching PUBACK is released; the
+    /// PUBLISH stays unacknowledged until then ([MQTT-4.3.2-3]).
     #[tokio::test]
     async fn qos1_publish_future_stays_pending_until_delayed_puback() {
         let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -1483,7 +1486,8 @@ mod tests {
         let _ = run.await;
     }
 
-    /// Wrong Packet Identifier PUBACK must not complete the publish; matching id does.
+    /// Wrong Packet Identifier PUBACK must not complete the publish; matching id does
+    /// ([MQTT-4.3.2-3]).
     #[tokio::test]
     async fn qos1_publish_ignores_wrong_packet_id_puback_until_match() {
         let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -1735,6 +1739,9 @@ mod tests {
     }
 
     /// CONNACK `server_receive_maximum` caps outbound QoS 1 inflight (not only ConnectOptions).
+    /// With Receive Maximum 1 exactly one PUBLISH goes out: the initial send quota is non-zero
+    /// and no larger than Receive Maximum ([MQTT-4.9.0-1]), and the client never has more
+    /// unacknowledged QoS 1 PUBLISHes than that ([MQTT-3.3.4-7], [MQTT-4.9.0-2]).
     #[tokio::test]
     async fn outbound_qos1_inflight_capped_by_connack_server_receive_maximum() {
         let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -1797,7 +1804,7 @@ mod tests {
     }
 
     /// CONNACK `server_receive_maximum=1` with withheld PUBACK: a second QoS1 `publish` waits
-    /// for a window slot ([MQTT-4.9.0-2]) instead of failing, and stays off the wire.
+    /// for a window slot ([MQTT-4.9.0-2], [MQTT-3.3.4-7]) instead of failing, and stays off the wire.
     #[tokio::test]
     async fn qos1_publish_waits_for_window_when_inflight_exhausted() {
         use tokio::sync::Notify;
@@ -1865,6 +1872,8 @@ mod tests {
     }
 
     /// Rumqttc #1057 class: subscribe must complete while the outbound QoS1 window is full.
+    /// SUBSCRIBE is not delayed by the exhausted quota ([MQTT-3.3.4-8]) and its SUBACK is still
+    /// processed ([MQTT-4.9.0-3]).
     #[tokio::test]
     async fn subscribe_completes_while_many_qos1_publishes_in_flight() {
         let observed = Arc::new(tokio::sync::Mutex::new(Vec::<(u8, NonZeroU16)>::new()));
@@ -2241,7 +2250,7 @@ mod tests {
         let _ = run.await;
     }
 
-    // --- [MQTT-4.4.0-1] resend of unacknowledged QoS 1 on session resume ---
+    // --- resend of unacknowledged QoS 1 on session resume ---
 
     /// Frames a resume-test broker saw: `(connection index, packet id, dup, payload)`.
     type SeenPublishes = Arc<tokio::sync::Mutex<Vec<(usize, NonZeroU16, bool, Bytes)>>>;
@@ -2300,6 +2309,9 @@ mod tests {
 
     /// Session Present after reconnect: both PUBLISHes are resent in order, with their
     /// original ids and DUP set, and the callers' completions resolve on the new PUBACKs.
+    /// Covers [MQTT-4.4.0-1] (resend with original ids), [MQTT-4.6.0-1] (original order),
+    /// [MQTT-3.3.1-1] (DUP 1 on re-delivery), [MQTT-4.3.2-2] (first transmission has DUP 0) and
+    /// [MQTT-3.1.2-23] (the unacknowledged PUBLISHes survive the closed connection).
     #[tokio::test]
     async fn unacked_qos1_is_resent_with_dup_on_session_resume() {
         let seen: SeenPublishes = Arc::default();
@@ -2347,7 +2359,8 @@ mod tests {
     }
 
     /// No session on the broker after reconnect: the client discards its own state
-    /// ([MQTT-3.2.2-5]) — nothing is resent and the callers see `ConnectionLost`.
+    /// ([MQTT-3.2.2-5]) — nothing is resent ([MQTT-4.4.0-1]: no resend at any other time) and the
+    /// callers see `ConnectionLost`.
     #[tokio::test]
     async fn unacked_qos1_fails_when_broker_lost_the_session() {
         let seen: SeenPublishes = Arc::default();
@@ -2387,7 +2400,8 @@ mod tests {
         let _ = run.await;
     }
 
-    /// Clean Start sessions keep the old behaviour: connection loss fails in-flight QoS 1.
+    /// Clean Start sessions keep the old behaviour: connection loss fails in-flight QoS 1
+    /// (Clean Start 1 discards the old session, [MQTT-3.1.2-4]).
     #[tokio::test]
     async fn unacked_qos1_fails_on_connection_loss_with_clean_start() {
         let seen: SeenPublishes = Arc::default();
@@ -2416,6 +2430,113 @@ mod tests {
             .expect("completion must resolve")
             .expect_err("clean session loss must fail the publish");
         assert!(matches!(err, AppError::ConnectionLost), "got {err:?}");
+
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
+
+    /// A PUBACK with a Reason Code of 0x80 or more still acknowledges the PUBLISH: in a
+    /// persistent session that is resumed after the connection drops, the rejected PUBLISH is
+    /// not resent ([MQTT-4.4.0-2]). Only the follow-up PUBLISH sent on the new connection goes
+    /// out, and it goes out as a first transmission.
+    #[tokio::test]
+    async fn rejected_qos1_is_not_resent_on_session_resume() {
+        let seen: SeenPublishes = Arc::default();
+        let seen_broker = Arc::clone(&seen);
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (resumed_tx, resumed_rx) = flume::bounded::<()>(1);
+        let port = crate::connection::test_support::spawn_broker_loop(move |mut framed_read, mut framed_write| {
+            let seen = Arc::clone(&seen_broker);
+            let connections = Arc::clone(&connections);
+            let resumed_tx = resumed_tx.clone();
+            async move {
+                let index = connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut ack = ConnectAck::default();
+                ack.session_present = index > 0;
+                if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
+                    return;
+                }
+                if index > 0 {
+                    let _ = resumed_tx.try_send(());
+                }
+                while let Some(Ok(frame)) = framed_read.next().await {
+                    let (DecodedFrame::Publish(packet), _) = frame else {
+                        continue;
+                    };
+                    let id = packet.meta.packet_id.expect("QoS 1 packet id");
+                    seen.lock()
+                        .await
+                        .push((index, id, packet.meta.dup, packet.message.payload.clone()));
+                    let reason_code = if index == 0 {
+                        crate::codec::PublishAckReason::NotAuthorized
+                    } else {
+                        crate::codec::PublishAckReason::Success
+                    };
+                    let _ = framed_write
+                        .send(Packet::PublishAck(PublishAck {
+                            packet_id: id,
+                            reason_code,
+                            properties: Vec::new(),
+                            reason_string: None,
+                        }))
+                        .await;
+                    if index == 0 {
+                        return; // drop the connection right after the rejection
+                    }
+                }
+            }
+        })
+        .await;
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+        let (client, connection, mut phase) = connect(
+            resumable_options(port),
+            static_test_credentials(),
+            ImmediateReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let err = timeout(
+            Duration::from_secs(3),
+            client.publish("t/rejected", "rejected").qos(QoS::AtLeastOnce),
+        )
+        .await
+        .expect("PUBACK arrives")
+        .expect_err("broker rejects the publish");
+        let AppError::PublishRejected(rejection) = err else {
+            panic!("expected PublishRejected, got {err:?}");
+        };
+        assert_eq!(rejection.reason, crate::codec::PublishAckReason::NotAuthorized);
+
+        // The broker has dropped the connection and accepted the reconnect with Session Present 1.
+        timeout(Duration::from_secs(3), resumed_rx.recv_async())
+            .await
+            .expect("client reconnects")
+            .expect("broker alive");
+
+        // A marker PUBLISH proves the resume has run: a resend would precede or follow it.
+        timeout(
+            Duration::from_secs(3),
+            client.publish("t/rejected", "marker").qos(QoS::AtLeastOnce),
+        )
+        .await
+        .expect("marker acknowledged")
+        .expect("marker accepted");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let frames = seen.lock().await.clone();
+        assert_eq!(frames.iter().filter(|f| f.0 == 0).count(), 1, "one first transmission");
+        let resumed: Vec<_> = frames.iter().filter(|f| f.0 == 1).collect();
+        assert_eq!(
+            resumed.len(),
+            1,
+            "only the marker may appear on the resumed connection, got {resumed:?}"
+        );
+        assert_eq!(resumed[0].3.as_ref(), b"marker");
+        assert!(!resumed[0].2, "the marker is a first transmission, not DUP");
 
         client.shutdown().await.expect("shutdown");
         let _ = run.await;
@@ -2896,7 +3017,8 @@ mod tests {
 
     /// Outbound aliases: the first PUBLISH per topic binds an alias (topic + alias), later
     /// ones send an empty topic + alias; with more topics than aliases the least recently
-    /// used binding is rebound. Never more aliases than the broker's maximum.
+    /// used binding is rebound. Never more aliases than the broker's maximum ([MQTT-3.3.2-9])
+    /// and never alias 0 ([MQTT-3.3.2-8]).
     #[tokio::test]
     async fn outbound_topic_aliases_bind_reuse_and_rebind() {
         let seen = Arc::new(tokio::sync::Mutex::new(Vec::<(String, Option<u16>)>::new()));
@@ -2955,7 +3077,7 @@ mod tests {
     }
 
     /// Inbound aliases: the broker binds an alias, then sends only the alias; the
-    /// application sees the full topic both times.
+    /// application sees the full topic both times ([MQTT-3.3.2-10]).
     #[tokio::test]
     async fn inbound_topic_aliases_are_resolved_before_delivery() {
         let port = spawn_broker_once(|mut framed_read, mut framed_write| async move {
@@ -3292,5 +3414,264 @@ mod tests {
         );
         client.shutdown().await.expect("shutdown");
         let _ = run.await;
+    }
+
+    // --- acknowledgement, AUTH and ClientID conformance ---
+
+    /// The client acknowledges every inbound QoS 1 PUBLISH, whatever the application does with
+    /// it: here the messages are discarded without ever being read ([MQTT-4.5.0-2]).
+    #[tokio::test]
+    async fn inbound_qos1_is_acknowledged_when_the_application_discards_it() {
+        let (acked_tx, acked_rx) = flume::bounded::<Vec<NonZeroU16>>(1);
+        let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+            if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+                return;
+            }
+            let ids = [NonZeroU16::new(7).expect("nz"), NonZeroU16::new(8).expect("nz")];
+            let mut wire = bytes::BytesMut::new();
+            for id in ids {
+                let message = PublishMessage::new("t/discarded", "payload");
+                let delivery = crate::codec::PublishDelivery {
+                    dup: false,
+                    retain: false,
+                    qos: QoS::AtLeastOnce,
+                    packet_id: Some(id),
+                };
+                crate::codec::encode_publish(&message, delivery, crate::codec::DEFAULT_MAX_PACKET_SIZE, &mut wire)
+                    .expect("encode inbound publish");
+            }
+            let _ = tokio::io::AsyncWriteExt::write_all(framed_write.get_mut(), &wire).await;
+
+            let mut acked = Vec::new();
+            while acked.len() < ids.len() {
+                match framed_read.next().await {
+                    Some(Ok((DecodedFrame::Control(Packet::PublishAck(ack)), _))) => acked.push(ack.packet_id),
+                    Some(Ok(_)) => {}
+                    _ => break,
+                }
+            }
+            let _ = acked_tx.send(acked);
+            while framed_read.next().await.is_some() {}
+        })
+        .await;
+
+        let client = crate::ClientBuilder::new(format!("mqtt://127.0.0.1:{port}"))
+            .expect("url")
+            .credentials(static_test_credentials())
+            .discard_inbound()
+            .connect()
+            .await
+            .expect("connect");
+
+        let acked = timeout(Duration::from_secs(3), acked_rx.recv_async())
+            .await
+            .expect("broker must receive a PUBACK for each QoS 1 PUBLISH")
+            .expect("broker alive");
+        assert_eq!(
+            acked,
+            [NonZeroU16::new(7).expect("nz"), NonZeroU16::new(8).expect("nz")],
+            "one PUBACK per inbound packet id"
+        );
+
+        client.shutdown().await.expect("shutdown");
+    }
+
+    /// Without an Authentication Method the client never sends AUTH ([MQTT-4.12.0-7]): not for
+    /// connect, subscribe, QoS 0 and QoS 1 publishes, an AUTH the broker sends anyway (ignored),
+    /// or graceful shutdown. Every packet the broker receives is recorded by type.
+    #[tokio::test]
+    async fn client_never_sends_auth_without_authentication_method() {
+        const AUTH_TYPE: u8 = 15;
+        const PUBLISH_TYPE: u8 = 3;
+        let received = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let received_broker = Arc::clone(&received);
+        let (done_tx, done_rx) = flume::bounded::<()>(1);
+        let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+            // CONNECT is the first packet; record it like the rest.
+            let Some(Ok((frame, _))) = framed_read.next().await else {
+                return;
+            };
+            let DecodedFrame::Control(connect @ Packet::Connect(_)) = frame else {
+                return;
+            };
+            received_broker.lock().await.push(connect.packet_type() >> 4);
+            if framed_write.send(Packet::ConnectAck(Box::default())).await.is_err() {
+                return;
+            }
+            while let Some(Ok((frame, _))) = framed_read.next().await {
+                let (kind, reply) = match &frame {
+                    DecodedFrame::Publish(packet) => (
+                        PUBLISH_TYPE,
+                        packet.meta.packet_id.map(|packet_id| {
+                            Packet::PublishAck(PublishAck {
+                                packet_id,
+                                reason_code: crate::codec::PublishAckReason::Success,
+                                properties: Vec::new(),
+                                reason_string: None,
+                            })
+                        }),
+                    ),
+                    DecodedFrame::Control(Packet::Subscribe(sub)) => (
+                        Packet::Subscribe(sub.clone()).packet_type() >> 4,
+                        Some(Packet::SubscribeAck(SubscribeAck {
+                            packet_id: sub.packet_id,
+                            properties: Vec::new(),
+                            reason_string: None,
+                            status: sub
+                                .topic_filters
+                                .iter()
+                                .map(|_| SubscribeAckReason::GrantedQos1)
+                                .collect(),
+                        })),
+                    ),
+                    DecodedFrame::Control(packet) => (packet.packet_type() >> 4, None),
+                };
+                received_broker.lock().await.push(kind);
+                if let Some(reply) = reply {
+                    let is_suback = matches!(reply, Packet::SubscribeAck(_));
+                    if framed_write.send(reply).await.is_err() {
+                        return;
+                    }
+                    if is_suback {
+                        // An AUTH the client did not ask for: ignored, not answered.
+                        let _ = framed_write.send(Packet::Auth(crate::codec::Auth::default())).await;
+                    }
+                }
+            }
+            let _ = done_tx.send(());
+        })
+        .await;
+
+        let (client, connection, mut phase) = connect_test_client(port).await;
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        client
+            .subscribe([("t/auth", QoS::AtLeastOnce)])
+            .await
+            .expect("subscribe");
+        client.publish("t/auth", "q0").await.expect("QoS 0 publish");
+        // Acknowledged after the broker's AUTH on the wire, so the client has read (and ignored) it.
+        client
+            .publish("t/auth", "q1")
+            .qos(QoS::AtLeastOnce)
+            .await
+            .expect("QoS 1 publish");
+        client.shutdown().await.expect("shutdown");
+        let _ = timeout(Duration::from_secs(3), run).await;
+        timeout(Duration::from_secs(3), done_rx.recv_async())
+            .await
+            .expect("broker sees the connection end")
+            .expect("broker alive");
+
+        let received = received.lock().await.clone();
+        // CONNECT, SUBSCRIBE, PUBLISH (QoS 0), PUBLISH (QoS 1), DISCONNECT.
+        assert_eq!(
+            received,
+            [1, 8, PUBLISH_TYPE, PUBLISH_TYPE, 14],
+            "session was recorded in full"
+        );
+        assert!(
+            !received.contains(&AUTH_TYPE),
+            "client sent AUTH without an Authentication Method: {received:?}"
+        );
+    }
+
+    /// Broker that records the Client Identifier of every CONNECT and, for the first
+    /// `drops` connections, closes the transport right after CONNACK.
+    async fn spawn_client_id_recording_broker(drops: usize) -> (u16, Arc<tokio::sync::Mutex<Vec<(String, bool)>>>) {
+        let seen: Arc<tokio::sync::Mutex<Vec<(String, bool)>>> = Arc::default();
+        let seen_broker = Arc::clone(&seen);
+        let port = crate::connection::test_support::spawn_broker_loop(move |mut framed_read, mut framed_write| {
+            let seen = Arc::clone(&seen_broker);
+            async move {
+                let Some(Ok((DecodedFrame::Control(Packet::Connect(connect)), _))) = framed_read.next().await else {
+                    return;
+                };
+                let index = {
+                    let mut seen = seen.lock().await;
+                    seen.push((connect.client_id.to_string(), connect.clean_start));
+                    seen.len() - 1
+                };
+                if framed_write.send(Packet::ConnectAck(Box::default())).await.is_err() {
+                    return;
+                }
+                if index >= drops {
+                    while framed_read.next().await.is_some() {}
+                }
+            }
+        })
+        .await;
+        (port, seen)
+    }
+
+    async fn wait_for_connects(seen: &tokio::sync::Mutex<Vec<(String, bool)>>, n: usize) -> Vec<(String, bool)> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let connects = seen.lock().await.clone();
+                if connects.len() >= n {
+                    return connects;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("client reconnects")
+    }
+
+    /// The Client Identifier names the session ([MQTT-3.1.3-2]): a client that keeps its session
+    /// (Clean Start 0) presents the same ID on the first connection and on both reconnects.
+    #[tokio::test]
+    async fn clean_start_false_reconnects_present_the_same_client_id() {
+        let (port, seen) = spawn_client_id_recording_broker(2).await;
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+        let (client, connection, _phase) = connect(
+            resumable_options(port),
+            static_test_credentials(),
+            ImmediateReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+
+        let connects = wait_for_connects(&seen, 3).await;
+        assert_eq!(connects.len(), 3, "first connection plus two reconnects");
+        for (client_id, clean_start) in &connects {
+            assert_eq!(client_id, "resume-test", "every CONNECT carries the session's ClientID");
+            assert!(!clean_start, "the session is kept across reconnects");
+        }
+
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
+
+    /// A ClientID the builder generates (no `client_id` set, Clean Start 0) is minted once and
+    /// reused by every reconnect, so the generated ID keeps naming the same session
+    /// ([MQTT-3.1.3-2]).
+    #[tokio::test]
+    async fn generated_client_id_is_the_same_across_reconnects() {
+        let (port, seen) = spawn_client_id_recording_broker(2).await;
+        let client = crate::ClientBuilder::new(format!("mqtt://127.0.0.1:{port}"))
+            .expect("url")
+            .credentials(static_test_credentials())
+            .options(|options| options.clean_start(false).session_expiry(Some(Duration::from_secs(60))))
+            .reconnect(ImmediateReconnect)
+            .wait_connected(false) // the broker drops the first connections at once
+            .discard_inbound()
+            .connect()
+            .await
+            .expect("connect");
+
+        let connects = wait_for_connects(&seen, 3).await;
+        assert_eq!(connects.len(), 3, "first connection plus two reconnects");
+        let first = &connects[0].0;
+        assert!(first.starts_with("glide-"), "generated ClientID, got {first}");
+        for (client_id, clean_start) in &connects {
+            assert_eq!(client_id, first, "generated ClientID must not change on reconnect");
+            assert!(!clean_start, "the session is kept across reconnects");
+        }
+
+        client.shutdown().await.expect("shutdown");
     }
 }

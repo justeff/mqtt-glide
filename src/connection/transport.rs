@@ -315,6 +315,8 @@ mod tests {
         assert_eq!(resolve_tls_mode(&options), TlsMode::RustlsSystemRoots);
     }
 
+    /// The first byte the client puts on a fresh connection is the CONNECT Fixed Header
+    /// ([MQTT-3.1.0-1]).
     #[tokio::test]
     async fn handshake_sends_connect_as_first_client_packet() {
         use bytes::BytesMut;

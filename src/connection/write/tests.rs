@@ -307,6 +307,7 @@ async fn graceful_shutdown_fail_all_waiters_uses_connection_lost() {
     );
 }
 
+/// [MQTT-3.8.3-4] No Local on a Shared Subscription is refused before anything is sent.
 #[test]
 fn validate_subscribe_request_rejects_no_local_on_shared_filter() {
     let filters = [(
@@ -368,6 +369,9 @@ fn validate_subscribe_request_accepts_shared_filter_without_no_local() {
     validate_subscribe_request(&filters).expect("default options on shared filter");
 }
 
+/// Shared Subscription filters need a non-empty ShareName without `/`, `+`, `#`, followed by
+/// `/` and a Topic Filter ([MQTT-4.8.2-1], [MQTT-4.8.2-2]); U+0000 in a filter is refused
+/// ([MQTT-4.7.3-2], [MQTT-3.8.3-1]).
 #[rstest]
 #[case::empty_share_name("$share//topic")]
 #[case::plus_in_share_name("$share/a+b/topic")]
@@ -444,6 +448,8 @@ fn finish_publish_encode_error_maps_bad_topic_to_invalid_request(#[case] topic: 
     }
 }
 
+/// A wildcard Topic Name is refused and no PUBLISH reaches the wire ([MQTT-3.3.2-2],
+/// [MQTT-4.7.0-1]).
 #[tokio::test]
 async fn handle_publish_rejects_invalid_topic_without_wire_publish() {
     use crate::codec::{DecodedFrame, Packet};
@@ -509,7 +515,8 @@ async fn handle_publish_rejects_invalid_topic_without_wire_publish() {
 }
 
 /// [MQTT-3.14.4-1/2]: protocol-error DISCONNECT is last frame; write half closes (peer EOF)
-/// before the write task waits for supervisor cancel.
+/// before the write task waits for supervisor cancel. The DISCONNECT carries a defined Reason
+/// Code, Protocol Error ([MQTT-3.14.2-1]).
 #[tokio::test]
 async fn protocol_disconnect_is_terminal_no_frames_after() {
     use crate::codec::{DecodedFrame, Packet};
@@ -586,7 +593,7 @@ async fn protocol_disconnect_is_terminal_no_frames_after() {
     );
 }
 
-/// [MQTT-3.2.2-11/14]: broker limits reject on the write path — no PUBLISH on the wire.
+/// [MQTT-3.2.2-11], [MQTT-3.2.2-14]: broker limits reject on the write path — no PUBLISH on the wire.
 #[tokio::test]
 async fn handle_publish_rejects_above_broker_limits_without_wire_publish() {
     use crate::codec::{DecodedFrame, Packet, PublishMessage, PublishProperties};
@@ -755,7 +762,8 @@ async fn complete_publish_ack_maps_failure_reason_to_publish_rejected() {
 }
 
 /// [MQTT-2.2.1-3]: after QoS1 PUBLISH is on the wire, dropping the caller oneshot must not
-/// free the packet id — a second publish at capacity waits (parked) until that PUBACK.
+/// free the packet id — a second publish at capacity waits (parked) until that PUBACK
+/// ([MQTT-4.3.2-1]: only unused identifiers are assigned).
 #[tokio::test]
 async fn cancelled_qos1_publish_keeps_packet_id_until_puback() {
     use crate::codec::{DecodedFrame, Packet, PublishAck, PublishAckReason};

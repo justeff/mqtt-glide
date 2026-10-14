@@ -157,6 +157,7 @@ mod tests {
         assert_eq!("".parse::<ClientId>(), Err(ClientIdError::Empty));
     }
 
+    /// A Client Identifier must be a UTF-8 Encoded String, so U+0000 is refused ([MQTT-3.1.3-4]).
     #[test]
     fn try_new_rejects_nul() {
         assert_eq!(ClientId::try_new("bad\0id"), Err(ClientIdError::ContainsNul));

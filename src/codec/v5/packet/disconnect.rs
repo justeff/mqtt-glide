@@ -246,6 +246,7 @@ mod tests {
         ));
     }
 
+    /// [MQTT-3.14.2-3] Reason String is dropped rather than exceed the receiver's Maximum Packet Size.
     #[test]
     fn disconnect_encode_omits_reason_string_when_it_exceeds_max_packet_size() {
         let disconnect = Disconnect {
@@ -263,6 +264,7 @@ mod tests {
         );
     }
 
+    /// [MQTT-3.14.2-4] User Property is dropped rather than exceed the receiver's Maximum Packet Size.
     #[test]
     fn disconnect_encode_omits_user_property_when_it_exceeds_max_packet_size() {
         let disconnect = Disconnect {

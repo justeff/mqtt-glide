@@ -32,7 +32,7 @@ impl InboundTopicAliases {
 
     /// Replaces an aliased PUBLISH's topic with the bound one (or records a new binding) and
     /// clears the wire alias. Alias 0, an alias above our maximum, or an unbound alias with
-    /// an empty topic are protocol errors ([MQTT-3.3.2-7], [MQTT-3.3.2-9], [MQTT-3.3.4-7]).
+    /// an empty topic are protocol errors ([MQTT-3.3.2-7], [MQTT-3.3.2-10], §3.3.2.3.4).
     pub(crate) fn resolve(&mut self, packet: &mut PublishPacket) -> Result<(), ProtocolError> {
         let Some(alias) = packet.wire_topic_alias.take() else {
             return Ok(());
@@ -152,6 +152,7 @@ mod tests {
         }
     }
 
+    /// Aliases within the advertised maximum are accepted, bound and resolved ([MQTT-3.3.2-10]).
     #[test]
     fn inbound_binds_then_resolves() {
         let mut aliases = InboundTopicAliases::new(4);
@@ -180,6 +181,7 @@ mod tests {
         assert!(aliases.resolve(&mut packet("x", None)).is_ok(), "no alias is fine");
     }
 
+    /// Outbound aliases start at 1 and never use 0 ([MQTT-3.3.2-8]).
     #[test]
     fn outbound_assigns_reuses_and_evicts_least_recently_used() {
         let mut aliases = OutboundTopicAliases::new(2);

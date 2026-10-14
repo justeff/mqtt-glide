@@ -120,7 +120,8 @@ Read and write run as separate tasks on a split socket. While the read task wait
 ## Design goals
 
 - Clean drain: graceful shutdown without reaching into crate internals, and no "acked but not forwarded" window.
-- Spec-backed: client **MUST**s from [OASIS MQTT 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html) are tracked in [`tests/conformance/checklist.md`](tests/conformance/checklist.md).
+- Spec-backed: every normative statement of [OASIS MQTT 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html) is listed in [`CONFORMANCE.md`](CONFORMANCE.md) with its scope for a client and the tests that check it. The page is generated from the `[MQTT-x.y.z-n]` references in the tests, and CI fails when it goes stale.
+- Fuzzed: the codec is fuzzed with arbitrary broker input in arbitrary read sizes ([`fuzz/`](fuzz/README.md)).
 - Auth stays outside: a `CredentialsProvider` hook is the whole story. No OAuth or token manager lives in this crate.
 
 Non-goals are deliberate rather than unfinished; the [feature matrix](#feature-matrix) lists them.

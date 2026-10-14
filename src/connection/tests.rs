@@ -182,6 +182,8 @@ async fn write_can_progress_while_handoff_stalls() {
 
 /// MQTT §3.2: keep-alive must send PINGREQ during a full-handoff stall; stall must not
 /// cause keepalive-death or a spurious reconnect (self-induced Read stall ≠ PINGRESP timeout).
+/// The mock broker drops a connection that is idle past the Keep Alive window, so surviving it
+/// proves the idle client sends PINGREQ ([MQTT-3.1.2-20]).
 #[tokio::test]
 async fn keep_alive_survives_handoff_stall_without_spurious_reconnect() {
     use crate::codec::{InboundMessage, PublishProperties, QoS};
@@ -404,7 +406,8 @@ async fn inbound_publish_clears_keepalive_watchdog_without_pingresp() {
     drain.abort();
 }
 
-/// [MQTT-3.1.2-21] / [MQTT-3.2.2-21] Server Keep Alive from CONNACK drives PINGREQ cadence.
+/// [MQTT-3.1.2-21] / [MQTT-3.2.2-21] Server Keep Alive from CONNACK drives PINGREQ cadence;
+/// an otherwise idle client sends PINGREQ within the Keep Alive interval ([MQTT-3.1.2-20]).
 #[tokio::test]
 async fn server_keep_alive_from_connack_drives_pingreq_interval() {
     use crate::codec::ConnectAck;
@@ -520,7 +523,9 @@ async fn inbound_topic_alias_on_read_path_disconnects() {
 
 // --- inbound enqueue-before-ack / flow-control contracts ---
 
-/// Inbound QoS 1 must not PUBACK before flume handoff accepts the message.
+/// Inbound QoS 1 must not PUBACK before flume handoff accepts the message. The PUBACK carries
+/// the Packet Identifier of the incoming PUBLISH ([MQTT-2.2.1-5], [MQTT-4.3.2-4]); a QoS 1
+/// PUBLISH is answered with a PUBACK ([MQTT-3.3.4-1]).
 #[tokio::test]
 async fn inbound_qos1_does_not_puback_before_handoff_accept() {
     use std::sync::Arc;
@@ -614,6 +619,7 @@ async fn inbound_qos1_does_not_puback_before_handoff_accept() {
 }
 
 /// [MQTT-4.3.2-5] After PUBACK, the same Packet Identifier may identify a new Application Message.
+/// Each PUBACK repeats the Packet Identifier of its PUBLISH ([MQTT-2.2.1-5], [MQTT-4.3.2-4]).
 #[tokio::test]
 async fn inbound_qos1_same_packet_id_after_puback_is_new_message() {
     use crate::codec::InboundMessage;

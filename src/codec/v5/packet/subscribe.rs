@@ -581,7 +581,7 @@ mod tests {
     // [MQTT-3.8.3-2] / [MQTT-3.10.3-2] payload must contain at least one Topic Filter
     #[case::subscribe_empty_topic_filters(SubscribeFamily::Subscribe, vec![0x12, 0x34, 0x00])]
     #[case::unsubscribe_empty_topic_filters(SubscribeFamily::Unsubscribe, vec![0x12, 0x34, 0x00])]
-    // Topic Filter must be well-formed UTF-8
+    // [MQTT-3.8.3-1] / [MQTT-3.10.3-1] Topic Filters must be UTF-8 Encoded Strings
     #[case::subscribe_invalid_utf8_topic_filter(SubscribeFamily::Subscribe, vec![0x12, 0x34, 0x00, 0x00, 0x02, 0xC0, 0x80, 0x00])]
     #[case::unsubscribe_invalid_utf8_topic_filter(SubscribeFamily::Unsubscribe, vec![0x12, 0x34, 0x00, 0x00, 0x02, 0xC0, 0x80])]
     // Reason code 0x7F is not a defined SUBACK/UNSUBACK reason

@@ -21,8 +21,7 @@
 //! `mqtt-glide = { ..., default-features = false, features = ["tls-rustls-aws-lc"] }`.
 //!
 //! Crate overview: see the [repository README](https://github.com/justeff/mqtt-glide).
-//! MUST tracker:
-//! `tests/conformance/checklist.md`.
+//! Spec coverage: `CONFORMANCE.md` in the repository.
 
 #[cfg(all(feature = "tls-rustls-aws-lc", feature = "tls-rustls-ring"))]
 compile_error!("features `tls-rustls-aws-lc` and `tls-rustls-ring` are mutually exclusive");

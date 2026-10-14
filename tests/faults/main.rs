@@ -405,7 +405,7 @@ async fn refused_reconnects_recover() {
 
 /// Topic Aliases are per connection: after an RST the client must bind the alias again
 /// before reusing it (the broker would otherwise reject the PUBLISH), including for the
-/// publishes it resends into the resumed session.
+/// publishes it resends into the resumed session ([MQTT-3.3.2-7]).
 #[tokio::test]
 async fn reset_with_topic_aliases_rebinds_on_the_new_connection() {
     let Some((_broker, broker_port)) = helpers::start_mosquitto().await else {

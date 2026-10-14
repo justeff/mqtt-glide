@@ -584,6 +584,8 @@ mod tests {
         assert_eq!(result.map_err(|e| e.to_string()), Err(expected.to_string()));
     }
 
+    /// Encoding sets the User Name / Password flags and writes both fields
+    /// ([MQTT-3.1.2-17], [MQTT-3.1.2-19]).
     #[test]
     fn connect_encode_sets_username_password_flags_with_payload() {
         // [MQTT-3.1.2-16..19] encode: flags match username/password presence

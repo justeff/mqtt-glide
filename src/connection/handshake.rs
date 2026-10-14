@@ -348,6 +348,7 @@ mod tests {
         assert!(matches!(validate_will_message(&will), Err(AppError::InvalidRequest(_))));
     }
 
+    /// A Will QoS of 1 is accepted ([MQTT-3.1.2-12]); QoS 2 is refused above, like PUBLISH.
     #[test]
     fn validate_will_message_accepts_qos1() {
         validate_will_message(&WillMessage::new("ok", "p").qos(QoS::AtLeastOnce)).expect("qos1 ok");

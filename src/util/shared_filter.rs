@@ -72,11 +72,13 @@ mod tests {
         assert_eq!(shared_filter("g", "a/+/b/#").expect("valid"), "$share/g/a/+/b/#");
     }
 
+    /// [MQTT-4.8.2-1] A ShareName is at least one character long.
     #[test]
     fn validate_share_name_rejects_empty() {
         assert_eq!(validate_share_name(""), Err(ShareNameError::Empty));
     }
 
+    /// [MQTT-4.8.2-2] A ShareName never contains `/`, `+` or `#`.
     #[rstest]
     #[case::slash("a/b")]
     #[case::plus("a+b")]
