@@ -9,6 +9,8 @@
 
 mod helpers;
 mod hivemq;
+#[cfg(feature = "websocket")]
+mod websocket;
 
 #[path = "../common/mod.rs"]
 mod common;

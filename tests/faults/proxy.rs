@@ -23,8 +23,9 @@ use tokio::sync::Notify;
 struct Faults {
     latency_ms: AtomicU64,
     stalled: AtomicBool,
-    /// 0 = no slicing.
-    slice: AtomicUsize,
+    /// 0 = no slicing. Towards the broker / towards the client.
+    slice_up: AtomicUsize,
+    slice_down: AtomicUsize,
     refusing: AtomicBool,
     /// Bumped by `reset_all`; connections from an older epoch abort.
     epoch: AtomicU64,
@@ -91,8 +92,18 @@ impl FaultProxy {
         self.faults.stalled.store(stalled, Ordering::SeqCst);
     }
 
+    /// Slices both directions.
     pub fn set_slice(&self, bytes: Option<usize>) {
-        self.faults.slice.store(bytes.unwrap_or(0), Ordering::SeqCst);
+        self.set_slice_towards_broker(bytes);
+        self.set_slice_towards_client(bytes);
+    }
+
+    pub fn set_slice_towards_broker(&self, bytes: Option<usize>) {
+        self.faults.slice_up.store(bytes.unwrap_or(0), Ordering::SeqCst);
+    }
+
+    pub fn set_slice_towards_client(&self, bytes: Option<usize>) {
+        self.faults.slice_down.store(bytes.unwrap_or(0), Ordering::SeqCst);
     }
 
     pub fn set_refusing(&self, refusing: bool) {
@@ -130,13 +141,19 @@ async fn serve(client: TcpStream, upstream: TcpStream, faults: Arc<Faults>) {
     }
     tokio::select! {
         () = &mut reset => {}
-        () = pump(client_read, upstream_write, Arc::clone(&faults)) => {}
-        () = pump(upstream_read, client_write, Arc::clone(&faults)) => {}
+        () = pump(client_read, upstream_write, Arc::clone(&faults), Direction::TowardsBroker) => {}
+        () = pump(upstream_read, client_write, Arc::clone(&faults), Direction::TowardsClient) => {}
     }
     // Dropping all four halves closes both sockets (RST towards the client).
 }
 
-async fn pump(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, faults: Arc<Faults>) {
+#[derive(Clone, Copy)]
+enum Direction {
+    TowardsBroker,
+    TowardsClient,
+}
+
+async fn pump(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, faults: Arc<Faults>, direction: Direction) {
     let mut buf = vec![0u8; 16 * 1024];
     loop {
         let read = match from.read(&mut buf).await {
@@ -150,7 +167,11 @@ async fn pump(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, faults: Arc<Fault
         if latency > 0 {
             tokio::time::sleep(Duration::from_millis(latency)).await;
         }
-        let slice = match faults.slice.load(Ordering::SeqCst) {
+        let slice = match direction {
+            Direction::TowardsBroker => &faults.slice_up,
+            Direction::TowardsClient => &faults.slice_down,
+        };
+        let slice = match slice.load(Ordering::SeqCst) {
             0 => read,
             n => n,
         };

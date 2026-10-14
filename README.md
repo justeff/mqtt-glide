@@ -8,7 +8,7 @@ An MQTT 5 client for Tokio. You connect once, get a cloneable handle, and publis
 
 Inbound messages go to a sink you provide: a channel, or a closure that runs inline. For QoS 1, mqtt-glide sends `PUBACK` only after that sink has accepted the message, so a message the broker considers delivered is already in your queue, not in flight somewhere inside the client.
 
-MQTT 5 only, QoS 0 and 1, TCP and TLS. No MQTT 3.1.1, no QoS 2, no WebSockets, `no_std`, or business logic; see the [feature matrix](#feature-matrix) before you adopt it.
+MQTT 5 only, QoS 0 and 1, over TCP, TLS or (opt-in) WebSocket. No MQTT 3.1.1, no QoS 2, `no_std`, or business logic; see the [feature matrix](#feature-matrix) before you adopt it.
 
 ## Install
 
@@ -24,6 +24,14 @@ TLS goes through rustls. Enable **exactly one** crypto provider: `tls-rustls-aws
 ```toml
 mqtt-glide = { version = "0.2", default-features = false, features = ["tls-rustls-ring"] }
 ```
+
+MQTT over WebSocket (for networks that only let HTTP(S) out, or brokers behind an HTTP ingress) is behind the optional `websocket` feature; it adds `tokio-tungstenite` for the handshake and framing only:
+
+```toml
+mqtt-glide = { version = "0.2", features = ["websocket"] }
+```
+
+Then connect with `ws://broker:8080/mqtt` or `wss://broker/mqtt`.
 
 ## Quickstart
 
@@ -364,7 +372,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | Will message (`CONNECT`) | ✅ | `.will(topic, payload)` (+ `.will_qos` / `.will_retain`); QoS 0\|1; power: `WillMessage` |
 | Optional `SO_SNDBUF` / `SO_RCVBUF` | ⚠️ | OS defaults today |
 | Enhanced AUTH | ❌ | |
-| WebSockets | ❌ | TCP (+ TLS) only |
+| WebSockets | ✅ opt-in | `websocket` feature: `ws://host[:port]/path` / `wss://…` (subprotocol `mqtt`, binary frames, §6). `wss` uses the same rustls setup as `mqtts`. Without the feature such URLs fail to parse |
 | Topic Alias | ✅ opt-in | Inbound: `topic_alias_maximum(n)`, resolved before delivery. Outbound: `outbound_topic_aliases(n)`, capped by the broker's maximum, LRU rebinding. Per connection, reset on reconnect |
 | QoS 2 | ❌ | Rejected at the API (no 4-way handshake / store-and-forward) |
 | Persistent sessions / DUP redelivery | ✅ in process | Resumed sessions resend unacknowledged QoS 1 with `DUP` and original ids ([MQTT-4.4.0-1]); state is in memory, not persisted across restarts. Needs a stable client ID (`.client_id("…")?` / `ClientId::try_new`; `ClientId::from_prefix` always mints a fresh UUID), `clean_start(false)` and a non-zero `session_expiry` |

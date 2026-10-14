@@ -22,6 +22,8 @@ use crate::error::{ConnectionOutcome, ProtocolError, TransportError};
 use crate::options::ConnectOptions;
 
 type TlsIo = TlsStream<TcpStream>;
+#[cfg(feature = "websocket")]
+type WsIo<S> = super::websocket::WsByteStream<S>;
 
 /// CONNECT/CONNACK on already-split transport halves.
 pub(crate) async fn establish_session_on<R, W>(
@@ -111,31 +113,64 @@ pub(crate) async fn open_tcp(options: &ConnectOptions, deadline: Instant) -> Res
     Ok(stream)
 }
 
-pub(crate) async fn tls_handshake(
+/// TCP, split into owned halves.
+pub(crate) async fn dial_tcp(
+    options: &ConnectOptions,
+    deadline: Instant,
+) -> Result<(tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf), ConnectionOutcome> {
+    Ok(open_tcp(options, deadline).await?.into_split())
+}
+
+/// TCP + TLS, split.
+pub(crate) async fn dial_tls(
+    options: &ConnectOptions,
+    deadline: Instant,
+) -> Result<(ReadHalf<TlsIo>, WriteHalf<TlsIo>), ConnectionOutcome> {
+    let tcp_stream = open_tcp(options, deadline).await?;
+    Ok(split(tls_connect(options, tcp_stream, deadline).await?))
+}
+
+/// TCP + WebSocket handshake, split.
+#[cfg(feature = "websocket")]
+pub(crate) async fn dial_ws(
+    options: &ConnectOptions,
+    deadline: Instant,
+) -> Result<(ReadHalf<WsIo<TcpStream>>, WriteHalf<WsIo<TcpStream>>), ConnectionOutcome> {
+    let tcp_stream = open_tcp(options, deadline).await?;
+    Ok(split(super::websocket::handshake(options, tcp_stream, deadline).await?))
+}
+
+/// TCP + TLS (this crate's rustls setup) + WebSocket handshake, split.
+#[cfg(feature = "websocket")]
+pub(crate) async fn dial_wss(
+    options: &ConnectOptions,
+    deadline: Instant,
+) -> Result<(ReadHalf<WsIo<TlsIo>>, WriteHalf<WsIo<TlsIo>>), ConnectionOutcome> {
+    let tcp_stream = open_tcp(options, deadline).await?;
+    let tls_stream = tls_connect(options, tcp_stream, deadline).await?;
+    Ok(split(super::websocket::handshake(options, tls_stream, deadline).await?))
+}
+
+async fn tls_connect(
     options: &ConnectOptions,
     tcp_stream: TcpStream,
     deadline: Instant,
-) -> Result<(ReadHalf<TlsIo>, WriteHalf<TlsIo>), ConnectionOutcome> {
+) -> Result<TlsIo, ConnectionOutcome> {
     let connector = rustls_connector()?;
     let server_name = tls_server_name(options.broker_url.host())?;
-    let tls_stream = match timeout_at(
+    match timeout_at(
         tokio::time::Instant::from_std(deadline),
         connector.connect(server_name, tcp_stream),
     )
     .await
     {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => {
-            return Err(ConnectionOutcome::Transport(TransportError::Tls(error.to_string())));
-        }
-        Err(_) => {
-            return Err(ConnectionOutcome::Transport(TransportError::Tls(format!(
-                "TLS handshake timed out after {:?}",
-                options.connect_timeout
-            ))));
-        }
-    };
-    Ok(split(tls_stream))
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(error)) => Err(ConnectionOutcome::Transport(TransportError::Tls(error.to_string()))),
+        Err(_) => Err(ConnectionOutcome::Transport(TransportError::Tls(format!(
+            "TLS handshake timed out after {:?}",
+            options.connect_timeout
+        )))),
+    }
 }
 
 /// Crypto provider selected by the active `tls-rustls-*` Cargo feature.

@@ -433,3 +433,95 @@ async fn reset_with_topic_aliases_rebinds_on_the_new_connection() {
     stop(session).await;
     stop(watcher).await;
 }
+
+/// Subscribes and publishes 20 messages of growing size over `url` after `slice` was
+/// applied, and checks every echo arrives intact.
+#[cfg(feature = "websocket")]
+async fn websocket_roundtrip_over_sliced_link(url: String, proxy: &FaultProxy, slice: impl FnOnce(&FaultProxy)) {
+    let session = start(ConnectOptions::new(BrokerUrl::parse(&url).expect("ws url"))).await;
+    // Slice only after the HTTP upgrade: tungstenite rejects a handshake that arrives in
+    // more than 64 reads averaging under 128 bytes as a slowloris attempt. Everything after
+    // the upgrade (WebSocket frames, MQTT packets) is what these tests are about.
+    slice(proxy);
+    session
+        .client
+        .subscribe([("faults/ws/#", QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe over sliced ws");
+    for i in 0..20usize {
+        let payload: Vec<u8> = (0..i * 211).map(|b| (b % 251) as u8).collect();
+        session
+            .client
+            .publish(format!("faults/ws/{i}"), payload)
+            .qos(QoS::AtLeastOnce)
+            .await
+            .expect("publish over sliced ws");
+    }
+    for i in 0..20usize {
+        let message = timeout(Duration::from_secs(10), session.inbound.recv_async())
+            .await
+            .expect("echo")
+            .expect("open");
+        assert_eq!(&*message.topic, format!("faults/ws/{i}"));
+        assert_eq!(message.payload.len(), i * 211);
+        assert!(message.payload.iter().enumerate().all(|(b, v)| *v == (b % 251) as u8));
+    }
+    stop(session).await;
+}
+
+/// WebSocket over a link that forwards single bytes in both directions (HiveMQ): WebSocket
+/// frames and the MQTT packets inside them arrive split at every boundary, on the client and
+/// on the broker, and must still round-trip.
+#[cfg(feature = "websocket")]
+#[tokio::test]
+async fn websocket_byte_by_byte_link_round_trips_hivemq() {
+    let Some((_broker, _tcp_port, ws_port)) = helpers::start_hivemq_with_websocket().await else {
+        return;
+    };
+    let proxy = FaultProxy::start(ws_port).await;
+    let url = format!("ws://127.0.0.1:{}/mqtt", proxy.port());
+    websocket_roundtrip_over_sliced_link(url, &proxy, |proxy| proxy.set_slice(Some(1))).await;
+}
+
+/// Same against Mosquitto's WebSocket listener (the 2.0 line, see
+/// `helpers::start_mosquitto_websockets` for why not 2.1), sliced in both directions.
+#[cfg(feature = "websocket")]
+#[tokio::test]
+async fn websocket_byte_by_byte_link_round_trips_mosquitto() {
+    let Some((_broker, _tcp_port, ws_port)) = helpers::start_mosquitto_websockets().await else {
+        return;
+    };
+    let proxy = FaultProxy::start(ws_port).await;
+    let url = format!("ws://127.0.0.1:{}/mqtt", proxy.port());
+    websocket_roundtrip_over_sliced_link(url, &proxy, |proxy| proxy.set_slice(Some(1))).await;
+}
+
+/// Resumed session over WebSocket: an RST mid-burst loses nothing (reconnect redoes the
+/// WebSocket handshake, unacknowledged publishes are resent).
+#[cfg(feature = "websocket")]
+#[tokio::test]
+async fn websocket_reset_mid_burst_resumed_session_delivers_everything() {
+    let Some((_broker, tcp_port, ws_port)) = helpers::start_mosquitto_websockets().await else {
+        return;
+    };
+    let watcher = observer(tcp_port, "faults/wsresume").await;
+    let proxy = FaultProxy::start(ws_port).await;
+    let url = BrokerUrl::parse(&format!("ws://127.0.0.1:{}/mqtt", proxy.port())).expect("ws url");
+    let session = start(
+        ConnectOptions::new(url)
+            .client_id(ClientId::try_new("faults-ws-resume").expect("client id"))
+            .clean_start(false)
+            .session_expiry(Some(Duration::from_secs(60))),
+    )
+    .await;
+
+    let results = burst_with_fault(&session.client, "faults/wsresume", 1_000, 300, || proxy.reset_all()).await;
+    for (i, result) in results.iter().enumerate() {
+        assert!(result.is_ok(), "publish {i} must survive the reset: {result:?}");
+    }
+    let seen = collect_indices(&watcher.inbound, Duration::from_secs(10), |seen| seen.len() == 1_000).await;
+    assert_eq!(seen.len(), 1_000);
+    assert!(proxy.accepted() >= 2, "the reset must have forced a reconnect");
+    stop(session).await;
+    stop(watcher).await;
+}

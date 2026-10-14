@@ -121,6 +121,43 @@ pub async fn start_mosquitto_on_port(port: u16) -> Option<ContainerAsync<Generic
     )
 }
 
+/// Mosquitto image for the WebSocket tests (see [`start_mosquitto_websockets`]).
+#[cfg(feature = "websocket")]
+pub const MOSQUITTO_WEBSOCKET_TAG: &str = "2.0.22";
+
+/// Mosquitto with a plain TCP listener (1883) and a WebSocket listener (8080).
+///
+/// Uses the 2.0 line (libwebsockets) on purpose: Mosquitto 2.1.x's built-in WebSocket
+/// support drops a client whose frames reach it split across TCP reads ("disconnected:
+/// oversize packet"); 2.0.22 and HiveMQ accept the same frames.
+#[cfg(feature = "websocket")]
+const CONF_WEBSOCKETS: &str = "listener 1883\nlistener 8080\nprotocol websockets\nallow_anonymous true\n";
+
+/// Starts Mosquitto with TCP and WebSocket listeners; returns `(container, tcp_port, ws_port)`.
+///
+/// Returns `None` (after a skip message) when Docker is unavailable.
+#[cfg(feature = "websocket")]
+pub async fn start_mosquitto_websockets() -> Option<(ContainerAsync<GenericImage>, u16, u16)> {
+    if skip_without_docker() {
+        return None;
+    }
+    use testcontainers::core::ContainerPort;
+
+    // The image only exposes 1883; the WebSocket port has to be exposed explicitly.
+    let container = GenericImage::new("eclipse-mosquitto", MOSQUITTO_WEBSOCKET_TAG)
+        .with_exposed_port(ContainerPort::Tcp(8080))
+        .with_wait_for(WaitFor::message_on_stderr("mosquitto version"))
+        .with_wait_for(WaitFor::message_on_stderr(" running"))
+        .with_copy_to("/mosquitto-test.conf", CONF_WEBSOCKETS.as_bytes().to_vec())
+        .with_cmd(["mosquitto", "-c", "/mosquitto-test.conf"])
+        .start()
+        .await
+        .expect("failed to start Mosquitto container (websockets)");
+    let tcp_port = container.get_host_port_ipv4(1883).await.expect("mapped tcp port");
+    let ws_port = container.get_host_port_ipv4(8080).await.expect("mapped ws port");
+    Some((container, tcp_port, ws_port))
+}
+
 /// Starts HiveMQ Community Edition (anonymous via its bundled allow-all extension) and
 /// returns the container and the mapped MQTT port.
 ///
@@ -130,13 +167,27 @@ pub async fn start_hivemq() -> Option<(ContainerAsync<GenericImage>, u16)> {
     if skip_without_docker() {
         return None;
     }
+    let (container, port, _ws_port) = start_hivemq_with_websocket().await?;
+    Some((container, port))
+}
+
+/// [`start_hivemq`] plus HiveMQ's WebSocket listener (container port 8000, path `/mqtt`);
+/// returns `(container, tcp_port, ws_port)`.
+pub async fn start_hivemq_with_websocket() -> Option<(ContainerAsync<GenericImage>, u16, u16)> {
+    if skip_without_docker() {
+        return None;
+    }
+    use testcontainers::core::ContainerPort;
+
     let container = GenericImage::new("hivemq/hivemq-ce", "2026.5")
+        .with_exposed_port(ContainerPort::Tcp(8000))
         .with_wait_for(WaitFor::message_on_stdout("Started HiveMQ in"))
         .start()
         .await
         .expect("failed to start HiveMQ CE container");
     let port = container.get_host_port_ipv4(1883).await.expect("mapped hivemq port");
-    Some((container, port))
+    let ws_port = container.get_host_port_ipv4(8000).await.expect("mapped hivemq ws port");
+    Some((container, port, ws_port))
 }
 
 /// Second MQTT 5 session: CONNECT + QoS 0 PUBLISH + DISCONNECT (no client crate publish API yet).

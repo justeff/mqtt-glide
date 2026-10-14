@@ -11,6 +11,8 @@ mod state;
 pub(crate) mod subscriptions;
 pub(crate) mod topic_alias;
 mod transport;
+#[cfg(feature = "websocket")]
+mod websocket;
 pub(crate) mod write;
 
 use std::sync::Arc;
@@ -284,54 +286,52 @@ impl<H: InboundSink> Connection<H> {
         self.state = ConnectionState::Connecting;
         let deadline = Instant::now() + self.options.connect_timeout;
 
-        // Dial under `select!` with borrowed `options` (no per-attempt `ConnectOptions` clone).
-        // Scope the dial so `&self.options` / `&self.cancel` end before `&mut self` resume.
-        match resolve_tls_mode(&self.options) {
-            TlsMode::PlainTcp => {
-                let dialed = {
-                    let options = &self.options;
-                    let cancel = &self.cancel;
-                    tokio::select! {
-                        result = async {
-                            let tcp_stream = transport::open_tcp(options, deadline).await?;
-                            Ok(tcp_stream.into_split())
-                        } => Some(result),
-                        () = cancel.cancelled() => None,
-                    }
-                };
-                match dialed {
-                    Some(Ok((read_half, write_half))) => {
-                        self.run_one_session_from_halves(read_half, write_half, deadline).await
-                    }
-                    Some(Err(outcome)) => self.finish_session(outcome, false).await,
-                    None => {
-                        self.finish_session(ConnectionOutcome::Shutdown(ShutdownError::Cancelled), false)
-                            .await
-                    }
-                }
+        // Dial under `select!` with borrowed `options` (no per-attempt `ConnectOptions` clone);
+        // the borrow ends before `&mut self` resumes in `session_after_dial`.
+        let websocket = self.options.broker_url.websocket_path().is_some();
+        match (resolve_tls_mode(&self.options), websocket) {
+            (TlsMode::PlainTcp, false) => {
+                let dialed = dial_or_cancel(&self.cancel, transport::dial_tcp(&self.options, deadline)).await;
+                self.session_after_dial(dialed, deadline).await
             }
-            TlsMode::RustlsSystemRoots => {
-                let dialed = {
-                    let options = &self.options;
-                    let cancel = &self.cancel;
-                    tokio::select! {
-                        result = async {
-                            let tcp_stream = transport::open_tcp(options, deadline).await?;
-                            transport::tls_handshake(options, tcp_stream, deadline).await
-                        } => Some(result),
-                        () = cancel.cancelled() => None,
-                    }
-                };
-                match dialed {
-                    Some(Ok((read_half, write_half))) => {
-                        self.run_one_session_from_halves(read_half, write_half, deadline).await
-                    }
-                    Some(Err(outcome)) => self.finish_session(outcome, false).await,
-                    None => {
-                        self.finish_session(ConnectionOutcome::Shutdown(ShutdownError::Cancelled), false)
-                            .await
-                    }
-                }
+            (TlsMode::RustlsSystemRoots, false) => {
+                let dialed = dial_or_cancel(&self.cancel, transport::dial_tls(&self.options, deadline)).await;
+                self.session_after_dial(dialed, deadline).await
+            }
+            #[cfg(feature = "websocket")]
+            (TlsMode::PlainTcp, true) => {
+                let dialed = dial_or_cancel(&self.cancel, transport::dial_ws(&self.options, deadline)).await;
+                self.session_after_dial(dialed, deadline).await
+            }
+            #[cfg(feature = "websocket")]
+            (TlsMode::RustlsSystemRoots, true) => {
+                let dialed = dial_or_cancel(&self.cancel, transport::dial_wss(&self.options, deadline)).await;
+                self.session_after_dial(dialed, deadline).await
+            }
+            // `BrokerUrl::parse` rejects ws:// / wss:// without the feature.
+            #[cfg(not(feature = "websocket"))]
+            (_, true) => unreachable!("WebSocket URL without the `websocket` feature"),
+        }
+    }
+
+    /// Continues after a dial attempt: handshake + session, or the dial's failure / cancel.
+    async fn session_after_dial<R, W>(
+        &mut self,
+        dialed: Option<Result<(R, W), ConnectionOutcome>>,
+        deadline: Instant,
+    ) -> SessionDisposition
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        match dialed {
+            Some(Ok((read_half, write_half))) => {
+                self.run_one_session_from_halves(read_half, write_half, deadline).await
+            }
+            Some(Err(outcome)) => self.finish_session(outcome, false).await,
+            None => {
+                self.finish_session(ConnectionOutcome::Shutdown(ShutdownError::Cancelled), false)
+                    .await
             }
         }
     }
@@ -701,6 +701,17 @@ impl<H: InboundSink> Connection<H> {
             Ok(WriteOutcome::Protocol(error)) => ConnectionOutcome::Protocol(error),
             Err(join_err) => ConnectionOutcome::Application(AppError::TaskJoin(join_err.to_string())),
         }
+    }
+}
+
+/// Races a dial against the driver cancel; `None` = cancelled.
+async fn dial_or_cancel<T>(
+    cancel: &CancellationToken,
+    dial: impl std::future::Future<Output = Result<T, ConnectionOutcome>>,
+) -> Option<Result<T, ConnectionOutcome>> {
+    tokio::select! {
+        result = dial => Some(result),
+        () = cancel.cancelled() => None,
     }
 }
 

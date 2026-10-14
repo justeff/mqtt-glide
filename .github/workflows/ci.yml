@@ -30,6 +30,8 @@ jobs:
             args: ""
           - name: ring
             args: --no-default-features --features tls-rustls-ring
+          - name: websocket
+            args: --features websocket
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -52,6 +54,8 @@ jobs:
             args: ""
           - name: ring
             args: --no-default-features --features tls-rustls-ring
+          - name: websocket
+            args: --features websocket
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

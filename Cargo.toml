@@ -39,6 +39,9 @@ default = ["tls-rustls-aws-lc"]
 # `--all-features`. Consumers embed via `default-features = false, features = [...]`.
 tls-rustls-aws-lc = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
 tls-rustls-ring = ["rustls/ring", "tokio-rustls/ring"]
+# MQTT over WebSocket (`ws://` / `wss://` broker URLs). `wss` reuses the client's own rustls
+# setup; tokio-tungstenite only does the WebSocket handshake and framing.
+websocket = ["dep:tokio-tungstenite"]
 
 [dependencies]
 arc-swap = "1.9"
@@ -61,6 +64,8 @@ tokio-rustls = { version = "0.26", default-features = false }
 tracing = { version = "0.1", default-features = false }
 uuid = { version = "1.24", features = ["v4"] }
 tokio-util = { version = "0.7", default-features = false, features = ["codec", "rt"] }
+# Optional (`websocket` feature): handshake + framing only, no TLS / crypto provider of its own.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
 
 # Dev/bench only — not linked into dependents or a plain `cargo build`.
 # `cargo test` / `cargo bench` resolve them (including rumqttc for mqtt_compare).
