@@ -1146,3 +1146,89 @@ async fn mosquitto_two_parallel_connections_isolated_handoff_and_phase() {
     client_b.shutdown().await.expect("shutdown B");
     join_run_after_shutdown(run_b).await;
 }
+
+/// Outbound Topic Aliases accepted by Mosquitto (default Topic Alias Maximum 10).
+#[tokio::test]
+async fn mosquitto_outbound_topic_aliases() {
+    let Some((_container, port)) = start_mosquitto().await else {
+        return;
+    };
+    hivemq::outbound_aliases_roundtrip(port, "mosq/alias").await;
+}
+
+/// Mosquitto 2.1 creates Topic Aliases towards clients that accept them (it binds an alias on
+/// the first message per topic, then sends an empty topic + alias): a subscriber with a
+/// non-zero `topic_alias_maximum` must still see every message under its full topic. This
+/// needs the 2.1 line; 2.0 never sends aliases.
+#[tokio::test]
+async fn mosquitto_broker_created_topic_aliases_resolve() {
+    let Some((_container, port)) = start_mosquitto().await else {
+        return;
+    };
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let (tx, inbound) = flume::bounded::<InboundMessage>(1_000);
+    let (subscriber, connection, mut phase) = connect(
+        ConnectOptions::new(url.clone()).topic_alias_maximum(4),
+        static_credentials(),
+        NoReconnect,
+        tx,
+        NoopLifecycle,
+    )
+    .expect("connect");
+    let sub_run = tokio::spawn(connection.run());
+    wait_for_phase(&mut phase, Duration::from_secs(10), |p| {
+        matches!(p, SessionPhase::Connected { .. })
+    })
+    .await;
+    subscriber
+        .subscribe([("alias-in/#", QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe");
+
+    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (publisher, connection, mut phase) = connect(
+        ConnectOptions::new(url),
+        static_credentials(),
+        NoReconnect,
+        tx,
+        NoopLifecycle,
+    )
+    .expect("connect");
+    let pub_run = tokio::spawn(connection.run());
+    wait_for_phase(&mut phase, Duration::from_secs(10), |p| {
+        matches!(p, SessionPhase::Connected { .. })
+    })
+    .await;
+    // Six topics, four aliases: the broker has to rebind aliases on the way.
+    let mut expected = Vec::new();
+    for round in 0..5 {
+        for topic in 0..6 {
+            let topic = format!("alias-in/sensor-{topic}/temperature");
+            publisher
+                .publish(topic.clone(), round.to_string())
+                .qos(QoS::AtLeastOnce)
+                .await
+                .expect("publish");
+            expected.push((topic, round.to_string()));
+        }
+    }
+    for (topic, payload) in expected {
+        let message = timeout(Duration::from_secs(5), inbound.recv_async())
+            .await
+            .expect("delivery")
+            .expect("open");
+        assert_eq!(
+            (&*message.topic, &*message.payload),
+            (topic.as_str(), payload.as_bytes())
+        );
+    }
+    assert!(
+        subscriber.is_connected(),
+        "alias resolution must not have failed the session"
+    );
+
+    publisher.shutdown().await.expect("shutdown");
+    subscriber.shutdown().await.expect("shutdown");
+    join_run_after_shutdown(pub_run).await;
+    join_run_after_shutdown(sub_run).await;
+}

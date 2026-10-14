@@ -38,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Topic Aliases, opt-in: `ConnectOptions::topic_alias_maximum` accepts aliases from the broker (resolved before delivery), `ConnectOptions::outbound_topic_aliases` uses them when publishing (capped by the broker's CONNACK maximum, least recently used topic rebound when full, reset on every new connection). `SessionParams::server_topic_alias_maximum`; codec: `encode_publish_with_alias` / `OutboundTopicAlias`
 - `MqttClient::session_phase`: the session-phase watch, now also reachable for clients made with `ClientBuilder` (which only returns the `MqttClient`)
 - `MqttClient::is_connected` and `ConnectOptions::fail_fast_when_disconnected`: with it, publish / subscribe / unsubscribe fail at once with the new `AppError::NotConnected` while no connection is up, instead of queueing for the next connection (the default, still bounded by `ack_timeout`)
 - `Publish` setters for Content Type, Response Topic and Correlation Data; read accessors (`topic`, `payload`, `qos_level`, `is_retained`, `publish_properties`, `into_parts`)

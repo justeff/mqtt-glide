@@ -29,6 +29,8 @@ pub struct SessionParams {
     pub retain_available: bool,
     /// Server Receive Maximum from CONNACK (outbound QoS-1 window).
     pub server_receive_maximum: NonZeroU16,
+    /// Server Topic Alias Maximum from CONNACK (0 = the broker accepts no aliases).
+    pub server_topic_alias_maximum: u16,
     /// Session Present flag from CONNACK (§3.2.2.1.1): `true` when the broker resumed a
     /// stored session. Drives resubscribe for `clean_start = false` connections.
     pub session_present: bool,
@@ -78,7 +80,7 @@ pub(crate) fn build_connect(options: &ConnectOptions, client_id: &str, credentia
         session_expiry_interval: session_expiry_secs(options.session_expiry),
         receive_max: Some(options.receive_maximum),
         max_packet_size: Some(options.max_packet_size),
-        topic_alias_max: 0,
+        topic_alias_max: options.topic_alias_maximum,
         client_id: ByteString::from(client_id),
         username,
         password,
@@ -139,6 +141,7 @@ pub(crate) fn apply_connack(client_keep_alive: Duration, ack: &ConnectAck) -> Re
         max_qos: ack.max_qos,
         retain_available: ack.retain_available,
         server_receive_maximum: ack.receive_max,
+        server_topic_alias_maximum: ack.topic_alias_max,
         session_present: ack.session_present,
     })
 }

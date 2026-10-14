@@ -2810,4 +2810,116 @@ mod tests {
         client.shutdown().await.expect("shutdown");
         let _ = run.await;
     }
+
+    // --- Topic Aliases ---
+
+    /// Outbound aliases: the first PUBLISH per topic binds an alias (topic + alias), later
+    /// ones send an empty topic + alias; with more topics than aliases the least recently
+    /// used binding is rebound. Never more aliases than the broker's maximum.
+    #[tokio::test]
+    async fn outbound_topic_aliases_bind_reuse_and_rebind() {
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::<(String, Option<u16>)>::new()));
+        let seen_broker = Arc::clone(&seen);
+        let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+            let mut ack = ConnectAck::default();
+            ack.topic_alias_max = 2;
+            if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
+                return;
+            }
+            while let Some(Ok((frame, _))) = framed_read.next().await {
+                if let DecodedFrame::Publish(packet) = frame {
+                    seen_broker.lock().await.push((
+                        packet.message.topic.to_string(),
+                        packet.wire_topic_alias.map(|a| a.get()),
+                    ));
+                }
+            }
+        })
+        .await;
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+        let options = ConnectOptions::new(url).outbound_topic_aliases(8);
+        let (client, connection, mut phase) =
+            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        for topic in ["dev/a", "dev/a", "dev/b", "dev/a", "dev/c", "dev/c"] {
+            client.publish(topic, "x").await.expect("publish");
+        }
+        let frames = timeout(Duration::from_secs(2), async {
+            loop {
+                let frames = seen.lock().await.clone();
+                if frames.len() == 6 {
+                    return frames;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all frames");
+        let expected = [
+            ("dev/a", Some(1)), // bind a→1
+            ("", Some(1)),      // reuse
+            ("dev/b", Some(2)), // bind b→2
+            ("", Some(1)),      // reuse a (b is now least recently used)
+            ("dev/c", Some(2)), // capped at the broker's 2: rebind b's alias to c
+            ("", Some(2)),      // reuse c
+        ];
+        let frames: Vec<(&str, Option<u16>)> = frames.iter().map(|(t, a)| (t.as_str(), *a)).collect();
+        assert_eq!(frames, expected);
+
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
+
+    /// Inbound aliases: the broker binds an alias, then sends only the alias; the
+    /// application sees the full topic both times.
+    #[tokio::test]
+    async fn inbound_topic_aliases_are_resolved_before_delivery() {
+        let port = spawn_broker_once(|mut framed_read, mut framed_write| async move {
+            let Some(Ok((DecodedFrame::Control(Packet::Connect(connect)), _))) = framed_read.next().await else {
+                return;
+            };
+            assert_eq!(connect.topic_alias_max, 4, "client advertises its inbound maximum");
+            let _ = framed_write.send(Packet::ConnectAck(Box::default())).await;
+            let mut wire = bytes::BytesMut::new();
+            let delivery = crate::codec::PublishDelivery {
+                dup: false,
+                retain: false,
+                qos: QoS::AtMostOnce,
+                packet_id: None,
+            };
+            let alias = NonZeroU16::new(3).expect("nz");
+            for (payload, mode) in [
+                ("first", crate::codec::OutboundTopicAlias::Assign(alias)),
+                ("second", crate::codec::OutboundTopicAlias::Reuse(alias)),
+            ] {
+                let message = PublishMessage::new("sensors/hall/temperature", payload);
+                crate::codec::encode_publish_with_alias(&message, delivery, Some(mode), u32::MAX, &mut wire)
+                    .expect("encode aliased publish");
+            }
+            let _ = tokio::io::AsyncWriteExt::write_all(framed_write.get_mut(), &wire).await;
+            while framed_read.next().await.is_some() {}
+        })
+        .await;
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let (tx, rx) = flume::bounded::<InboundMessage>(4);
+        let options = ConnectOptions::new(url).topic_alias_maximum(4);
+        let (client, connection, mut phase) =
+            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        for payload in ["first", "second"] {
+            let message = timeout(Duration::from_secs(2), rx.recv_async())
+                .await
+                .expect("delivery")
+                .expect("open");
+            assert_eq!(&*message.topic, "sensors/hall/temperature");
+            assert_eq!(&*message.payload, payload.as_bytes());
+        }
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
 }

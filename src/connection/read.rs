@@ -51,6 +51,8 @@ pub(crate) struct ReadSession {
     pub handoff_stalled: Arc<AtomicBool>,
     /// Set on any successfully decoded inbound frame (clears the ping watchdog).
     pub inbound_activity: Arc<AtomicBool>,
+    /// Inbound Topic Alias bindings of this connection (continued from the resubscribe wait).
+    pub topic_aliases: crate::connection::topic_alias::InboundTopicAliases,
 }
 
 /// Drop-guard: signals the write task that the read task has fully exited.
@@ -110,6 +112,7 @@ where
     let read_burst = effective_io_batch(session.receive_maximum, false);
     let handoff_stalled = session.handoff_stalled;
     let inbound_activity = session.inbound_activity;
+    let mut topic_aliases = session.topic_aliases;
 
     loop {
         // Do not put `#[cfg(test)]` on a `tokio::select!` arm — the macro rejects it.
@@ -142,8 +145,11 @@ where
                     match pending {
                         None => return ReadOutcome::PeerClosed,
                         Some(Err(error)) => return map_decode_error(error),
-                        Some(Ok((DecodedFrame::Publish(packet), _wire_len))) => {
+                        Some(Ok((DecodedFrame::Publish(mut packet), _wire_len))) => {
                             inbound_activity.store(true, Ordering::Release);
+                            if let Err(error) = topic_aliases.resolve(&mut packet) {
+                                return protocol_error_disconnect(&control_tx, error).await;
+                            }
                             if let Some(outcome) = handle_inbound_publish(
                                 packet,
                                 &handoff,
@@ -183,6 +189,7 @@ where
     }
 }
 
+/// `packet` must already have its Topic Alias resolved.
 async fn handle_inbound_publish<H: InboundSink>(
     packet: PublishPacket,
     handoff: &H,

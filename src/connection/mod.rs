@@ -9,6 +9,7 @@ pub(crate) mod read;
 pub(crate) mod session_policy;
 mod state;
 pub(crate) mod subscriptions;
+pub(crate) mod topic_alias;
 mod transport;
 pub(crate) mod write;
 
@@ -379,6 +380,12 @@ impl<H: InboundSink> Connection<H> {
     {
         self.generation = self.generation.next();
         let keep_alive = session.keep_alive;
+        // Topic Aliases are per network connection ([MQTT-3.3.2-7]): fresh maps every time.
+        let mut inbound_topic_aliases = topic_alias::InboundTopicAliases::new(self.options.topic_alias_maximum);
+        let outbound_topic_aliases = self
+            .options
+            .outbound_topic_aliases
+            .min(session.server_topic_alias_maximum);
         let max_qos = session.max_qos;
         let retain_available = session.retain_available;
         self.inflight.set_publish_capacity(session.server_receive_maximum);
@@ -436,7 +443,10 @@ impl<H: InboundSink> Connection<H> {
                 pending,
                 self.options.ack_timeout,
                 &self.cancel,
-                &self.channels.handoff,
+                subscriptions::ResubscribeInbound {
+                    handoff: &self.channels.handoff,
+                    topic_aliases: &mut inbound_topic_aliases,
+                },
             )
             .await
         {
@@ -497,6 +507,7 @@ impl<H: InboundSink> Connection<H> {
                 receive_maximum: self.options.receive_maximum,
                 handoff_stalled: Arc::clone(&handoff_stalled),
                 inbound_activity: Arc::clone(&inbound_activity),
+                topic_aliases: inbound_topic_aliases,
             },
             #[cfg(test)]
             read_stub_exit_rx,
@@ -527,6 +538,7 @@ impl<H: InboundSink> Connection<H> {
                 bench_inbound_publish_ack_counter: self.options.bench_inbound_publish_ack_counter.clone(),
                 session_carry: Some(Arc::clone(&self.session_carry)),
                 read_stop,
+                outbound_topic_aliases,
             },
             inflight,
             read_done_rx,

@@ -35,6 +35,7 @@ pub use v5::{
     SubscribeAck, SubscribeAckReason, SubscriptionOptions, Unsubscribe, UnsubscribeAck, UnsubscribeAckReason,
     UserProperties, UserProperty, WillMessage, encode_publish,
 };
+pub use v5::{OutboundTopicAlias, encode_publish_with_alias};
 
 /// PUBREL packet body (alias for the shared PUBREL/PUBCOMP payload type).
 pub type PubRel = PubRelComp;

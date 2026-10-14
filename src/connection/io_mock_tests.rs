@@ -84,6 +84,7 @@ where
         ReadSession {
             cancel: cancel.clone(),
             stop: CancellationToken::new(),
+            topic_aliases: crate::connection::topic_alias::InboundTopicAliases::new(0),
             generation: Generation(1),
             receive_maximum: nonzero!(8u16),
             handoff_stalled: Arc::clone(&handoff_stalled),
@@ -147,6 +148,7 @@ where
             bench_inbound_publish_ack_counter: None,
             session_carry: None,
             read_stop: CancellationToken::new(),
+            outbound_topic_aliases: 0,
         },
         InflightPots::new(NonZeroU16::new(4).expect("nz")),
         read_done_rx,

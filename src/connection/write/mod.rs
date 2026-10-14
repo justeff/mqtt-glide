@@ -150,6 +150,8 @@ pub(crate) struct PublishWaiters {
     keep_messages: bool,
     /// Send order of in-flight publishes, for ordered resend after reconnect.
     next_seq: u64,
+    /// Outbound Topic Alias bindings of this connection.
+    pub(super) aliases: crate::connection::topic_alias::OutboundTopicAliases,
 }
 
 /// One QoS-1 PUBLISH on the wire awaiting its PUBACK.
@@ -378,6 +380,8 @@ pub(crate) struct WriteSession {
     pub session_carry: Option<SessionCarry>,
     /// Stops the paired read task; cancelled by graceful shutdown after the outbound drain.
     pub read_stop: CancellationToken,
+    /// Outbound Topic Aliases to use on this connection (already capped by the broker).
+    pub outbound_topic_aliases: u16,
 }
 
 /// Runs the write task until cancelled, shut down, or signalled to exit.
@@ -411,6 +415,7 @@ where
         carry: session.session_carry.clone(),
     };
     let mut publish_waiters = PublishWaiters::with_carry(session.session_carry);
+    publish_waiters.aliases = crate::connection::topic_alias::OutboundTopicAliases::new(session.outbound_topic_aliases);
     let mut ping_timer = keep_alive_ping_timer(session.keep_alive);
     let keep_alive = session.keep_alive;
     let handoff_stalled = session.handoff_stalled;

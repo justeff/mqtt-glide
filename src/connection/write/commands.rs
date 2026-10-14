@@ -275,7 +275,7 @@ where
             qos: publish.qos,
             packet_id: None,
         };
-        if let Err(error) = feed_publish(framed, &publish.message, delivery) {
+        if let Err(error) = feed_publish(framed, &mut publish_waiters.aliases, &publish.message, delivery) {
             return finish_publish_encode_error(Some(publish.reply), &publish.message, error);
         }
         let _ = publish.reply.send(Ok(()));
@@ -338,7 +338,7 @@ where
         qos: publish.qos,
         packet_id: Some(packet_id),
     };
-    if let Err(error) = feed_publish(framed, &publish.message, delivery) {
+    if let Err(error) = feed_publish(framed, &mut publish_waiters.aliases, &publish.message, delivery) {
         inflight.release_publish(packet_id);
         return finish_publish_encode_error(Some(publish.reply), &publish.message, error);
     }
@@ -388,7 +388,7 @@ where
             qos: QoS::AtLeastOnce,
             packet_id: Some(entry.packet_id),
         };
-        if let Err(error) = feed_publish(framed, &entry.message, delivery) {
+        if let Err(error) = feed_publish(framed, &mut publish_waiters.aliases, &entry.message, delivery) {
             inflight.release_publish(entry.packet_id);
             finish_publish_encode_error(Some(entry.reply), &entry.message, error)?;
             continue;

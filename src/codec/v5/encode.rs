@@ -1,3 +1,5 @@
+use std::num::NonZeroU16;
+
 use bytes::{BufMut, BytesMut};
 
 use super::packet::*;
@@ -21,12 +23,38 @@ use crate::codec::v5::property_type as pt;
 struct V5PublishBody<'a> {
     message: &'a PublishMessage,
     delivery: PublishDelivery,
+    alias: Option<OutboundTopicAlias>,
 }
+
+/// How an outbound PUBLISH uses a Topic Alias (§3.3.2.3.4). Aliases are per connection
+/// and must not exceed the broker's CONNACK Topic Alias Maximum ([MQTT-3.3.2-9]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundTopicAlias {
+    /// Send the Topic Name together with the alias, (re)binding the alias to that topic.
+    Assign(NonZeroU16),
+    /// Send a zero-length Topic Name plus the alias already bound on this connection.
+    Reuse(NonZeroU16),
+}
+
+impl OutboundTopicAlias {
+    fn alias(self) -> NonZeroU16 {
+        match self {
+            Self::Assign(alias) | Self::Reuse(alias) => alias,
+        }
+    }
+
+    fn omits_topic(self) -> bool {
+        matches!(self, Self::Reuse(_))
+    }
+}
+
+/// Topic Alias property: type byte + two-byte value.
+const TOPIC_ALIAS_PROPERTY_LEN: usize = 3;
 
 /// Summed property wire size. Rejects U+0000 in the UTF-8 property strings
 /// ([MQTT-1.5.4-2]) within the same plan-time walk over the properties — the hot
 /// no-properties path never calls this (see `is_wire_empty`).
-fn canonical_props_len(props: &PublishProperties) -> Result<usize, EncodeError> {
+fn canonical_props_len(props: &PublishProperties, alias: Option<OutboundTopicAlias>) -> Result<usize, EncodeError> {
     if let Some(content_type) = props.content_type.as_ref()
         && contains_nul(content_type.as_bytes())
     {
@@ -44,13 +72,20 @@ fn canonical_props_len(props: &PublishProperties) -> Result<usize, EncodeError> 
         + encoded_property_size(&props.content_type)
         + encoded_property_size_default(&props.payload_format_indicator, false)
         + encoded_property_size(&props.response_topic)
-        + user_props_len;
+        + user_props_len
+        + alias.map_or(0, |_| TOPIC_ALIAS_PROPERTY_LEN);
     Ok(prop_len + var_int_len(prop_len) as usize)
 }
 
-fn encode_canonical_props(props: &PublishProperties, buf: &mut BytesMut, max_out: u32) -> Result<(), EncodeError> {
+fn encode_canonical_props(
+    props: &PublishProperties,
+    alias: Option<OutboundTopicAlias>,
+    buf: &mut BytesMut,
+    max_out: u32,
+) -> Result<(), EncodeError> {
     let prop_len = var_int_len_from_size(max_out);
     write_variable_length(prop_len, buf)?;
+    encode_property(&alias.map(OutboundTopicAlias::alias), pt::TOPIC_ALIAS, buf)?;
     encode_property(&props.correlation_data, pt::CORR_DATA, buf)?;
     encode_property(&props.message_expiry_interval, pt::MSG_EXPIRY_INT, buf)?;
     encode_property(&props.content_type, pt::CONTENT_TYPE, buf)?;
@@ -62,18 +97,27 @@ fn encode_canonical_props(props: &PublishProperties, buf: &mut BytesMut, max_out
 impl WireBodyEncode for V5PublishBody<'_> {
     fn encoded_body_len(&self, _max_out: u32) -> Result<usize, EncodeError> {
         let packet_id_size = if self.delivery.qos == QoS::AtMostOnce { 0 } else { 2 };
-        let property_size = if self.message.properties.is_wire_empty() {
+        let property_size = if self.message.properties.is_wire_empty() && self.alias.is_none() {
             1
         } else {
-            canonical_props_len(&self.message.properties)?
+            canonical_props_len(&self.message.properties, self.alias)?
         };
-        Ok(self.message.topic.encoded_size() + packet_id_size + property_size + self.message.payload.len())
+        let topic_size = if self.alias.is_some_and(OutboundTopicAlias::omits_topic) {
+            2
+        } else {
+            self.message.topic.encoded_size()
+        };
+        Ok(topic_size + packet_id_size + property_size + self.message.payload.len())
     }
 
     fn encode_body(&self, buf: &mut BytesMut, max_out: u32) -> Result<(), EncodeError> {
         // Topic / QoS0 delivery rules are enforced in `publish_wire_plan` before any header bytes.
         let start_len = buf.len();
-        self.message.topic.encode(buf)?;
+        if self.alias.is_some_and(OutboundTopicAlias::omits_topic) {
+            buf.put_u16(0); // zero-length Topic Name: the alias stands in ([MQTT-3.3.2-12])
+        } else {
+            self.message.topic.encode(buf)?;
+        }
         if self.delivery.qos != QoS::AtMostOnce {
             self.delivery
                 .packet_id
@@ -81,7 +125,7 @@ impl WireBodyEncode for V5PublishBody<'_> {
                 .encode(buf)?;
         }
         let property_budget = max_out.saturating_sub((buf.len() - start_len + self.message.payload.len()) as u32);
-        if self.message.properties.is_wire_empty() {
+        if self.message.properties.is_wire_empty() && self.alias.is_none() {
             if property_budget == 0 {
                 return Err(EncodeError::OverMaxPacketSize {
                     size: max_out + 1,
@@ -90,7 +134,7 @@ impl WireBodyEncode for V5PublishBody<'_> {
             }
             buf.put_u8(0);
         } else {
-            encode_canonical_props(&self.message.properties, buf, property_budget)?;
+            encode_canonical_props(&self.message.properties, self.alias, buf, property_budget)?;
         }
         buf.put(self.message.payload.as_ref());
         Ok(())
@@ -103,7 +147,7 @@ pub(crate) fn publish_wire_len(
     delivery: PublishDelivery,
     max_packet_size: u32,
 ) -> Result<usize, EncodeError> {
-    Ok(publish_wire_plan(message, delivery, max_packet_size)?.wire_len)
+    Ok(publish_wire_plan(message, delivery, None, max_packet_size)?.wire_len)
 }
 
 struct PublishWirePlan<'a> {
@@ -115,6 +159,7 @@ struct PublishWirePlan<'a> {
 fn publish_wire_plan(
     message: &PublishMessage,
     delivery: PublishDelivery,
+    alias: Option<OutboundTopicAlias>,
     max_packet_size: u32,
 ) -> Result<PublishWirePlan<'_>, EncodeError> {
     if delivery.qos == QoS::AtMostOnce && (delivery.dup || delivery.packet_id.is_some()) {
@@ -136,7 +181,11 @@ fn publish_wire_plan(
     {
         return Err(EncodeError::MalformedPacket);
     }
-    let body = V5PublishBody { message, delivery };
+    let body = V5PublishBody {
+        message,
+        delivery,
+        alias,
+    };
     let body_len = body.encoded_body_len(max_packet_size)?;
     // Bodies beyond the Remaining Length ceiling (§2.1.4) cannot be framed at all;
     // reject before the u32 cast below can truncate (e.g. multi-GiB payloads).
@@ -163,13 +212,30 @@ fn publish_wire_plan(
 /// Does not clear `buf` — safe for writer batching. Callers that replace a single-frame buffer
 /// must `clear()` first. On encode failure, `buf` is truncated back to its pre-call length so
 /// a rejected publish cannot leave a partial frame for a later flush.
+#[inline]
 pub fn encode_publish(
     message: &PublishMessage,
     delivery: PublishDelivery,
     max_packet_size: u32,
     buf: &mut BytesMut,
 ) -> Result<(), EncodeError> {
-    let plan = publish_wire_plan(message, delivery, max_packet_size)?;
+    encode_publish_with_alias(message, delivery, None, max_packet_size, buf)
+}
+
+/// [`encode_publish`] with an optional outbound Topic Alias.
+///
+/// The Topic Name rules are still checked against `message.topic` with
+/// [`OutboundTopicAlias::Reuse`], which only leaves it off the wire. Choosing valid aliases
+/// (non-zero, within the broker's maximum, bound before reuse on this connection) is the
+/// caller's job.
+pub fn encode_publish_with_alias(
+    message: &PublishMessage,
+    delivery: PublishDelivery,
+    alias: Option<OutboundTopicAlias>,
+    max_packet_size: u32,
+    buf: &mut BytesMut,
+) -> Result<(), EncodeError> {
+    let plan = publish_wire_plan(message, delivery, alias, max_packet_size)?;
     let start_len = buf.len();
     buf.reserve(plan.wire_len);
     buf.put_u8(
@@ -683,6 +749,87 @@ mod tests {
         let mut buf = BytesMut::new();
         encode_publish(&message, delivery, u32::MAX, &mut buf).expect("encode");
         assert_eq!(buf.len(), wire_len);
+    }
+
+    /// Assign sends topic + alias; Reuse sends a zero-length topic + alias; both decode back
+    /// to the alias, and only Assign carries the Topic Name.
+    #[test]
+    fn encode_publish_with_alias_assign_and_reuse_roundtrip() {
+        use bytes::BytesMut;
+        use tokio_util::codec::Decoder;
+
+        let message = PublishMessage::new("telemetry/device/status", "on")
+            .properties(PublishProperties::default().user_property("k", "v"));
+        let delivery = PublishDelivery {
+            dup: false,
+            retain: false,
+            qos: QoS::AtLeastOnce,
+            packet_id: NonZeroU16::new(3),
+        };
+        let alias = NonZeroU16::new(2).expect("nz");
+        for (mode, expect_topic) in [
+            (OutboundTopicAlias::Assign(alias), "telemetry/device/status"),
+            (OutboundTopicAlias::Reuse(alias), ""),
+        ] {
+            let mut buf = BytesMut::new();
+            encode_publish_with_alias(&message, delivery, Some(mode), u32::MAX, &mut buf).expect("encode");
+            let wire_len = buf.len();
+            let mut codec = crate::codec::V5Codec::with_max_packet_size(0);
+            let (frame, _) = codec.decode(&mut buf).expect("decode").expect("one frame");
+            let crate::codec::DecodedFrame::Publish(packet) = frame else {
+                panic!("expected PUBLISH, got {frame:?}");
+            };
+            assert_eq!(&*packet.message.topic, expect_topic, "{mode:?}");
+            assert_eq!(packet.wire_topic_alias, Some(alias), "{mode:?}");
+            assert_eq!(packet.message.payload, message.payload);
+            assert_eq!(
+                packet.message.properties.user_properties,
+                message.properties.user_properties
+            );
+            assert_eq!(
+                publish_wire_len(&message, delivery, u32::MAX).expect("len") + 3
+                    - if mode == OutboundTopicAlias::Reuse(alias) {
+                        message.topic.len()
+                    } else {
+                        0
+                    },
+                wire_len,
+                "{mode:?}: alias adds 3 bytes, Reuse drops the topic bytes"
+            );
+        }
+    }
+
+    /// A message without properties still gets a property section for the alias.
+    #[test]
+    fn encode_publish_with_alias_without_other_properties() {
+        use bytes::BytesMut;
+        use tokio_util::codec::Decoder;
+
+        let message = PublishMessage::new("a/b", "x");
+        let delivery = PublishDelivery {
+            dup: false,
+            retain: false,
+            qos: QoS::AtMostOnce,
+            packet_id: None,
+        };
+        let alias = NonZeroU16::new(1).expect("nz");
+        let mut buf = BytesMut::new();
+        encode_publish_with_alias(
+            &message,
+            delivery,
+            Some(OutboundTopicAlias::Reuse(alias)),
+            u32::MAX,
+            &mut buf,
+        )
+        .expect("encode");
+        let mut codec = crate::codec::V5Codec::with_max_packet_size(0);
+        let (frame, _) = codec.decode(&mut buf).expect("decode").expect("frame");
+        let crate::codec::DecodedFrame::Publish(packet) = frame else {
+            panic!("expected PUBLISH");
+        };
+        assert!(packet.message.topic.is_empty());
+        assert_eq!(packet.wire_topic_alias, Some(alias));
+        assert!(packet.message.properties.is_wire_empty());
     }
 
     #[test]

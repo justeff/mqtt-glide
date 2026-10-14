@@ -402,3 +402,34 @@ async fn refused_reconnects_recover() {
         .expect("publish after recovery");
     stop(session).await;
 }
+
+/// Topic Aliases are per connection: after an RST the client must bind the alias again
+/// before reusing it (the broker would otherwise reject the PUBLISH), including for the
+/// publishes it resends into the resumed session.
+#[tokio::test]
+async fn reset_with_topic_aliases_rebinds_on_the_new_connection() {
+    let Some((_broker, broker_port)) = helpers::start_mosquitto().await else {
+        return;
+    };
+    let watcher = observer(broker_port, "faults/alias").await;
+    let proxy = FaultProxy::start(broker_port).await;
+    let session = start(
+        options(proxy.port())
+            .client_id(ClientId::try_new("faults-alias").expect("client id"))
+            .clean_start(false)
+            .session_expiry(Some(Duration::from_secs(60)))
+            .outbound_topic_aliases(4),
+    )
+    .await;
+
+    let results = burst_with_fault(&session.client, "faults/alias", 1_000, 300, || proxy.reset_all()).await;
+    for (i, result) in results.iter().enumerate() {
+        assert!(result.is_ok(), "publish {i} failed across the reset: {result:?}");
+    }
+    let seen = collect_indices(&watcher.inbound, Duration::from_secs(10), |seen| seen.len() == 1_000).await;
+    assert_eq!(seen.len(), 1_000, "every aliased publish must reach the broker");
+    assert!(session.client.is_connected(), "broker must not have rejected an alias");
+
+    stop(session).await;
+    stop(watcher).await;
+}

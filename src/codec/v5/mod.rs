@@ -12,8 +12,8 @@ mod encode;
 mod packet;
 
 pub use self::codec::V5Codec;
-pub use self::encode::encode_publish;
 pub(crate) use self::encode::publish_wire_len;
+pub use self::encode::{OutboundTopicAlias, encode_publish, encode_publish_with_alias};
 pub(crate) use self::packet::property_type;
 pub use self::packet::*;
 

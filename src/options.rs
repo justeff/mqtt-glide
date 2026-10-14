@@ -113,6 +113,14 @@ pub struct ConnectOptions {
     /// ([MQTT-3.1.2-24]). Default: [`DEFAULT_MAX_PACKET_SIZE`] (1 MiB). Broker CONNACK limits
     /// still apply only to outbound encode.
     pub max_packet_size: NonZeroU32,
+    /// Inbound **Topic Alias Maximum** advertised in CONNECT: how many Topic Aliases the
+    /// broker may use towards this client (§3.1.2.11.5). Default 0 (none). Aliases are
+    /// resolved before delivery, so the application always sees the full topic.
+    pub topic_alias_maximum: u16,
+    /// Outbound Topic Aliases this client uses at most, further capped by the broker's
+    /// CONNACK Topic Alias Maximum. Default 0 (off). The least recently used topic is
+    /// rebound when all are taken; worth it for long topics published often.
+    pub outbound_topic_aliases: u16,
     /// Reject commands with [`crate::AppError::NotConnected`] while no connection is up
     /// (connecting, reconnect backoff) instead of queueing them for the next connection.
     ///
@@ -150,8 +158,22 @@ impl ConnectOptions {
             will_message: None,
             max_packet_size: NonZeroU32::new(DEFAULT_MAX_PACKET_SIZE).expect("DEFAULT_MAX_PACKET_SIZE non-zero"),
             fail_fast_when_disconnected: false,
+            topic_alias_maximum: 0,
+            outbound_topic_aliases: 0,
             bench_inbound_publish_ack_counter: None,
         }
+    }
+
+    /// Sets [`Self::topic_alias_maximum`] (inbound aliases the broker may use).
+    pub fn topic_alias_maximum(mut self, maximum: u16) -> Self {
+        self.topic_alias_maximum = maximum;
+        self
+    }
+
+    /// Sets [`Self::outbound_topic_aliases`] (aliases this client may use when publishing).
+    pub fn outbound_topic_aliases(mut self, count: u16) -> Self {
+        self.outbound_topic_aliases = count;
+        self
     }
 
     /// Sets [`Self::fail_fast_when_disconnected`].

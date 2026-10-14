@@ -112,7 +112,7 @@ pub(crate) async fn resubscribe_pending<H: InboundSink, R, W>(
     filters: Vec<(ByteString, SubscriptionOptions)>,
     deadline: Duration,
     cancel: &CancellationToken,
-    handoff: &H,
+    inbound: ResubscribeInbound<'_, H>,
 ) -> Result<(), ConnectionOutcome>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -143,7 +143,7 @@ where
         }
         result = timeout(
             deadline,
-            read_suback_for_id(framed_read, framed_write, packet_id, handoff),
+            read_suback_for_id(framed_read, framed_write, packet_id, inbound),
         ) => {
             match result {
                 Ok(Ok(ack)) => {
@@ -163,6 +163,13 @@ where
             }
         }
     }
+}
+
+/// Where PUBLISHes that arrive during the resubscribe wait go: the application sink, after
+/// resolving Topic Aliases with the connection's alias state.
+pub(crate) struct ResubscribeInbound<'a, H> {
+    pub(crate) handoff: &'a H,
+    pub(crate) topic_aliases: &'a mut super::topic_alias::InboundTopicAliases,
 }
 
 /// Whether prior filters must be re-issued on a fresh session.
@@ -224,7 +231,7 @@ async fn read_suback_for_id<H: InboundSink, R, W>(
     framed_read: &mut FramedRead<R, V5Codec>,
     framed_write: &mut FramedWrite<W, V5Codec>,
     expected_id: NonZeroU16,
-    handoff: &H,
+    inbound: ResubscribeInbound<'_, H>,
 ) -> Result<SubscribeAck, ConnectionOutcome>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -237,7 +244,8 @@ where
             }
             Some(Ok((DecodedFrame::Control(Packet::SubscribeAck(_)), _))) => {}
             Some(Ok((DecodedFrame::Publish(packet), _))) => {
-                deliver_publish_during_resubscribe(framed_write, handoff, packet).await?;
+                deliver_publish_during_resubscribe(framed_write, inbound.handoff, inbound.topic_aliases, packet)
+                    .await?;
             }
             Some(Ok((DecodedFrame::Control(other), _))) => {
                 return Err(ConnectionOutcome::Protocol(ProtocolError::Violation(format!(
@@ -265,11 +273,15 @@ where
 async fn deliver_publish_during_resubscribe<H: InboundSink, W>(
     framed_write: &mut FramedWrite<W, V5Codec>,
     handoff: &H,
-    packet: crate::codec::PublishPacket,
+    topic_aliases: &mut super::topic_alias::InboundTopicAliases,
+    mut packet: crate::codec::PublishPacket,
 ) -> Result<(), ConnectionOutcome>
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    topic_aliases
+        .resolve(&mut packet)
+        .map_err(ConnectionOutcome::Protocol)?;
     let puback_id = inbound_publish_policy(&packet).map_err(ConnectionOutcome::Protocol)?;
     if handoff.send(crate::codec::InboundMessage::from(packet)).await.is_err() {
         return Err(ConnectionOutcome::Application(AppError::InboundSinkClosed));

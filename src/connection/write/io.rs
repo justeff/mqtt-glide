@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::codec::{
     Disconnect, DisconnectReasonCode, EncodeError, Packet, PublishDelivery, PublishMessage, V5Codec, encode_publish,
-    encode_publish_ack,
+    encode_publish_ack, encode_publish_with_alias,
 };
 use crate::connection::packet_id::InflightPots;
 use crate::connection::subscriptions::SubscriptionRegistry;
@@ -494,8 +494,11 @@ where
 ///
 /// Topic / delivery checks live in [`encode_publish`]; map failures with
 /// [`finish_publish_encode_error`] so bad topics stay `InvalidRequest` (session alive).
+/// Encodes a PUBLISH into the write buffer, using a Topic Alias when this connection has
+/// aliasing enabled. The alias binding is recorded only after a successful encode.
 pub(super) fn feed_publish<W>(
     framed: &mut FramedWrite<W, V5Codec>,
+    aliases: &mut crate::connection::topic_alias::OutboundTopicAliases,
     message: &PublishMessage,
     delivery: PublishDelivery,
 ) -> Result<(), EncodeError>
@@ -503,7 +506,15 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let max_out = framed.encoder().max_outbound_size();
-    encode_publish(message, delivery, max_out, framed.write_buffer_mut())
+    if !aliases.enabled() {
+        return encode_publish(message, delivery, max_out, framed.write_buffer_mut());
+    }
+    let alias = aliases.choose(&message.topic);
+    encode_publish_with_alias(message, delivery, alias, max_out, framed.write_buffer_mut())?;
+    if let Some(alias) = alias {
+        aliases.commit(&message.topic, alias);
+    }
+    Ok(())
 }
 
 pub(super) fn map_encode_error(error: EncodeError) -> WriteOutcome {

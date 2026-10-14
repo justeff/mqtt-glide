@@ -202,3 +202,78 @@ async fn hivemq_shutdown_drains_outbound() {
     }
     let _ = timeout(Duration::from_secs(5), publisher.run).await;
 }
+
+/// Outbound Topic Aliases against brokers with small alias limits (HiveMQ: 5): eight topics
+/// in rotation force rebinding; a plain subscriber must still see every message under its
+/// own topic.
+pub(crate) async fn outbound_aliases_roundtrip(port: u16, topic_prefix: &str) {
+    let subscriber = client(port).await;
+    subscriber
+        .client
+        .subscribe([(format!("{topic_prefix}/#"), QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe");
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let (tx, _rx) = flume::bounded::<InboundMessage>(16);
+    let (publisher, connection, mut phase) = connect(
+        ConnectOptions::new(url).outbound_topic_aliases(64),
+        static_credentials(),
+        NoReconnect,
+        tx,
+        NoopLifecycle,
+    )
+    .expect("connect");
+    let run = tokio::spawn(connection.run());
+    let SessionPhase::Connected { session, .. } = wait_for_phase(&mut phase, Duration::from_secs(15), |p| {
+        matches!(p, SessionPhase::Connected { .. })
+    })
+    .await
+    else {
+        unreachable!("waited for Connected");
+    };
+    assert!(
+        session.server_topic_alias_maximum > 0,
+        "broker must accept aliases for this test"
+    );
+
+    let mut expected = Vec::new();
+    for round in 0..5 {
+        for topic in 0..8 {
+            let topic = format!("{topic_prefix}/device-{topic}/telemetry");
+            let payload = format!("{round}");
+            publisher
+                .publish(topic.clone(), payload.clone())
+                .qos(QoS::AtLeastOnce)
+                .await
+                .expect("aliased publish accepted");
+            expected.push((topic, payload));
+        }
+    }
+    for (topic, payload) in expected {
+        let message = timeout(Duration::from_secs(5), subscriber.inbound.recv_async())
+            .await
+            .expect("delivery")
+            .expect("open");
+        assert_eq!(
+            (&*message.topic, &*message.payload),
+            (topic.as_str(), payload.as_bytes())
+        );
+    }
+    assert!(
+        publisher.is_connected(),
+        "broker must not have dropped the aliasing client"
+    );
+
+    publisher.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+    stop(subscriber).await;
+}
+
+#[tokio::test]
+async fn hivemq_outbound_topic_aliases() {
+    let Some((_broker, port)) = start_hivemq().await else {
+        return;
+    };
+    outbound_aliases_roundtrip(port, "interop/alias").await;
+}

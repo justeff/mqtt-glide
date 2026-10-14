@@ -143,7 +143,7 @@ When a full application queue blocks the same loop that sends `PINGREQ`, a slow 
 
 ### What it costs
 
-No MQTT 3.1.1, no QoS 2, no WebSockets, and Topic Alias are out of scope, not pending. If you need any of those, rumqttc remains the better fit. Unacknowledged QoS 1 publishes are kept in memory only: they are resent after a reconnect into a resumed session (see [No session](#no-session)), but not after a process restart. Cross-process session resume needs a stable client ID (`.client_id("…")?` or `ClientId::try_new`) plus `clean_start(false)` and a non-zero `session_expiry`. rumqttc is also the far more widely deployed crate; this one is 0.2.x, and the API can still move.
+No MQTT 3.1.1 and no QoS 2: both are out of scope, not pending. If you need either, rumqttc remains the better fit. Unacknowledged QoS 1 publishes are kept in memory only: they are resent after a reconnect into a resumed session (see [No session](#no-session)), but not after a process restart. Cross-process session resume needs a stable client ID (`.client_id("…")?` or `ClientId::try_new`) plus `clean_start(false)` and a non-zero `session_expiry`. rumqttc is also the far more widely deployed crate; this one is 0.2.x, and the API can still move.
 
 ## Architecture
 
@@ -210,6 +210,7 @@ A caller that stops waiting earlier (its `ack_timeout` ran out during a long rec
 | reconnect policy | `NoReconnect` | the process must outlive a broker restart |
 | `client_id` | random UUID | you need session resume across restarts (`.client_id("…")?`) |
 | `clean_start` / `session_expiry` | `true` / unset | same (needs the stable `client_id` too) |
+| `topic_alias_maximum` / `outbound_topic_aliases` | `0` / `0` | long topics published or received often: aliases replace the topic bytes after the first message per connection |
 | `fail_fast_when_disconnected` | `false` (queue) | a publish that cannot go out now is worthless, or you buffer yourself: commands then fail with `AppError::NotConnected` during reconnects; check `client.is_connected()` for a snapshot |
 | `command_channel_capacity` | `32` | you keep more than ~32 publishes in flight |
 | `receive_maximum` | `32` | inbound QoS 1 rate is high and workers are fast |
@@ -364,7 +365,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | Optional `SO_SNDBUF` / `SO_RCVBUF` | ⚠️ | OS defaults today |
 | Enhanced AUTH | ❌ | |
 | WebSockets | ❌ | TCP (+ TLS) only |
-| Topic Alias | ❌ | Maximum = 0; inbound alias → protocol error (no alias state across reconnects) |
+| Topic Alias | ✅ opt-in | Inbound: `topic_alias_maximum(n)`, resolved before delivery. Outbound: `outbound_topic_aliases(n)`, capped by the broker's maximum, LRU rebinding. Per connection, reset on reconnect |
 | QoS 2 | ❌ | Rejected at the API (no 4-way handshake / store-and-forward) |
 | Persistent sessions / DUP redelivery | ✅ in process | Resumed sessions resend unacknowledged QoS 1 with `DUP` and original ids ([MQTT-4.4.0-1]); state is in memory, not persisted across restarts. Needs a stable client ID (`.client_id("…")?` / `ClientId::try_new`; `ClientId::from_prefix` always mints a fresh UUID), `clean_start(false)` and a non-zero `session_expiry` |
 
