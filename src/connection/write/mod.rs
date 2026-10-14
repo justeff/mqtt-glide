@@ -385,7 +385,7 @@ pub(crate) struct WriteSession {
 /// Control messages are prioritized over application commands.
 /// Biased `select!` order: `shutdown_notify` and session `cancel` before the keep-alive
 /// tick so graceful DISCONNECT / cancel are not displaced by a PINGRESP watchdog kill.
-/// Encode + flush use the write half's dedicated [`crate::V5Codec`].
+/// Encode + flush use the write half's dedicated [`crate::codec::V5Codec`].
 ///
 /// `read_done` completes when the paired read task exits; graceful shutdown drains inbound
 /// PUBACKs until then, then sends DISCONNECT.

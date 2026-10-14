@@ -11,8 +11,9 @@ use common::{
     CountingInvalidate, NoReconnect, join_peer, spawn_connack_then_disconnect, spawn_peer_broker, static_credentials,
     wait_for_phase, wait_until,
 };
+use mqtt_glide::codec::ConnectAck;
 use mqtt_glide::{
-    AuthError, BrokerUrl, ClientId, ConnectAck, ConnectOptions, ConnectionOutcome, DisconnectReasonCode, NoopLifecycle,
+    AuthError, BrokerUrl, ClientId, ConnectOptions, ConnectionOutcome, DisconnectReasonCode, NoopLifecycle,
     ProtocolError, Publish, PublishMessage, QoS, SessionPhase, StandardReconnectPolicy, connect,
 };
 use secrecy::SecretString;

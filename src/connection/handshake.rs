@@ -180,13 +180,16 @@ pub(crate) fn resolve_client_id_str(options: &ConnectOptions) -> String {
         .unwrap_or_default()
 }
 
-/// Builds the distinct [`crate::V5Codec`] instances for each `Framed` half after
+/// Builds the distinct [`crate::codec::V5Codec`] instances for each `Framed` half after
 /// `TcpStream::into_split()` — never a shared `Arc`.
 ///
 /// `inbound_max` is the client Maximum Packet Size from CONNECT (0 = unlimited).
 /// The write half starts with unlimited outbound until CONNACK applies the broker limit.
-pub(crate) fn distinct_v5_codecs_for_framed_halves(inbound_max: u32) -> (crate::V5Codec, crate::V5Codec) {
-    (crate::V5Codec::new(inbound_max, 0), crate::V5Codec::new(0, 0))
+pub(crate) fn distinct_v5_codecs_for_framed_halves(inbound_max: u32) -> (crate::codec::V5Codec, crate::codec::V5Codec) {
+    (
+        crate::codec::V5Codec::new(inbound_max, 0),
+        crate::codec::V5Codec::new(0, 0),
+    )
 }
 
 /// Auth path: invalidate credentials on broker rejection only.

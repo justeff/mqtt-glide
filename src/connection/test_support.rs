@@ -20,9 +20,9 @@ use crate::options::ConnectOptions;
 use crate::util::BrokerUrl;
 
 /// Framed write half used by mock brokers in unit tests.
-pub(crate) type MockFramedWrite = FramedWrite<tokio::net::tcp::OwnedWriteHalf, crate::V5Codec>;
+pub(crate) type MockFramedWrite = FramedWrite<tokio::net::tcp::OwnedWriteHalf, crate::codec::V5Codec>;
 /// Framed read half used by mock brokers in unit tests.
-pub(crate) type MockFramedRead = FramedRead<tokio::net::tcp::OwnedReadHalf, crate::V5Codec>;
+pub(crate) type MockFramedRead = FramedRead<tokio::net::tcp::OwnedReadHalf, crate::codec::V5Codec>;
 
 /// Default mock-broker username/password (`user` / `pass`).
 pub(crate) fn static_test_credentials() -> StaticCredentials {

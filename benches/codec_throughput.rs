@@ -15,9 +15,8 @@ use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
 use bytestring::ByteString;
-use mqtt_glide::{
-    Packet, PublishAck, PublishDelivery, PublishMessage, PublishProperties, QoS, V5Codec, encode_publish,
-};
+use mqtt_glide::codec::{Packet, PublishAck, PublishDelivery, V5Codec, encode_publish};
+use mqtt_glide::{PublishMessage, PublishProperties, QoS};
 
 const ITERS: u32 = 200_000;
 const PAYLOAD_LEN: usize = 256;

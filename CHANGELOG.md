@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `shutdown()` drains before it disconnects, bounded by `graceful_disconnect_timeout`: commands already queued are sent, outbound QoS 1 publishes get their `PUBACK`s instead of failing at once, and the read task keeps delivering and acknowledging inbound messages meanwhile, so they are no longer dropped with the socket buffer. Only what is still unacknowledged when the budget runs out fails with `AppError::ConnectionLost`. Every command issued after `shutdown()` fails with the new `AppError::ShuttingDown`
 - `AppError` is `#[non_exhaustive]`
 
+- Removed from the public API: `Connection::state` / `Connection::generation` (`run` consumes the `Connection`, so they could only ever report the initial state) together with the `ConnectionState` / `Generation` re-exports, and the test-only `TlsMode` / `resolve_tls_mode`. Observe the session through `SessionPhase`, a `LifecycleHook` or `MqttClient::is_connected`
+
+- Wire-level codec items are no longer re-exported at the crate root: `Connect`, `ConnectAck`, `Disconnect`, `Packet`, `DecodedFrame`, `V5Codec`, `PublishPacket`, `PublishPacketMeta`, `PublishDelivery`, `PublishAck`, `Subscribe`, `SubscribeAck`, `Unsubscribe`, `UnsubscribeAck`, `DecodeError`, `EncodeError`, `RECEIVE_MAX_DEFAULT`, `encode_publish`, `ensure_publish_wire_fits`. Import them from `mqtt_glide::codec`. Message, option and reason-code types stay at the root
+
 ### Added
 
 - `MqttClient::is_connected` and `ConnectOptions::fail_fast_when_disconnected`: with it, publish / subscribe / unsubscribe fail at once with the new `AppError::NotConnected` while no connection is up, instead of queueing for the next connection (the default, still bounded by `ack_timeout`)

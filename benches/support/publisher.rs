@@ -7,10 +7,8 @@ use std::time::Duration;
 use bytes::BytesMut;
 use bytestring::ByteString;
 use futures_util::{SinkExt, StreamExt};
-use mqtt_glide::{
-    Connect, ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, DecodedFrame, Disconnect, Packet, PublishDelivery,
-    PublishMessage, PublishProperties, QoS, V5Codec, encode_publish,
-};
+use mqtt_glide::codec::{Connect, DecodedFrame, Disconnect, Packet, PublishDelivery, V5Codec, encode_publish};
+use mqtt_glide::{ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, PublishMessage, PublishProperties, QoS};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -18,8 +16,8 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::compare::harness::BenchQos;
 
-type FramedRd = FramedRead<tokio::net::tcp::OwnedReadHalf, mqtt_glide::V5Codec>;
-type FramedWr = FramedWrite<tokio::net::tcp::OwnedWriteHalf, mqtt_glide::V5Codec>;
+type FramedRd = FramedRead<tokio::net::tcp::OwnedReadHalf, mqtt_glide::codec::V5Codec>;
+type FramedWr = FramedWrite<tokio::net::tcp::OwnedWriteHalf, mqtt_glide::codec::V5Codec>;
 
 /// Long-lived publisher session used for latency + sustained-load ingress.
 pub struct PersistentPublisher {

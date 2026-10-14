@@ -38,12 +38,13 @@ pub(crate) use channels::{
     ClientCommand, CommandReceiver, CommandSender, ControlMessage, ControlReceiver, PublishReply, SubscribeReply,
     UnsubscribeReply,
 };
+pub use handshake::SessionParams;
 pub(crate) use handshake::validate_will_message;
-pub use handshake::{SessionParams, TlsMode, resolve_tls_mode};
+pub(crate) use handshake::{TlsMode, resolve_tls_mode};
 pub(crate) use io_batch::effective_io_batch;
 pub use lifecycle::{LifecycleHook, NoopLifecycle, SessionPhase};
 pub(crate) use session_policy::{inbound_publish_policy, validate_publish_against_broker_limits};
-pub use state::{ConnectionState, Generation};
+pub(crate) use state::{ConnectionState, Generation};
 pub(crate) use subscriptions::SubscriptionRegistry;
 
 use self::read::ReadOutcome;
@@ -210,16 +211,6 @@ impl<H: InboundSink> Connection<H> {
         for entry in unacked {
             let _ = entry.reply.send(Err(AppError::ConnectionLost));
         }
-    }
-
-    /// Returns the active connection generation.
-    pub fn generation(&self) -> Generation {
-        self.generation
-    }
-
-    /// Returns the current lifecycle state.
-    pub fn state(&self) -> ConnectionState {
-        self.state
     }
 
     /// Returns a clone of the read-stub exit signal sender (test/supervision hook).

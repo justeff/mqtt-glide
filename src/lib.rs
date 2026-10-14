@@ -1,6 +1,7 @@
 //! MQTT 5 Tokio client.
 //!
-//! The wire codec API is re-exported at the crate root. Connection options, error
+//! Application-facing types live at the crate root; the wire codec (packet types, framing,
+//! encode helpers) is under [`codec`]. Connection options, error
 //! types, credential/reconnect hooks, and the [`connect`] entry point define the
 //! public application contract. For a higher-level connect path with defaults, see
 //! [`ClientBuilder`]. Session I/O is driven by [`Connection::run`], backed by the
@@ -45,16 +46,14 @@ pub use client::{
     AnonymousCredentials, ClientBuilder, CredentialsProvider, MqttClient, NoReconnect, Publish, PublishBuilder,
     PublishCompletion, PublishWindow, ReconnectPolicy, StaticCredentials, Subscription, connect,
 };
+// Application-facing message and option types. Wire-level packet types, the codec and the
+// encode helpers stay under [`codec`].
 pub use codec::{
-    Connect, ConnectAck, ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, DecodeError, DecodedFrame, Disconnect,
-    DisconnectReasonCode, EncodeError, Packet, PublishAck, PublishAckReason, PublishDelivery, PublishMessage,
-    PublishPacket, PublishPacketMeta, PublishProperties, QoS, RECEIVE_MAX_DEFAULT, RetainHandling, Subscribe,
-    SubscribeAck, SubscribeAckReason, SubscriptionOptions, Unsubscribe, UnsubscribeAck, UnsubscribeAckReason,
-    UserProperties, UserProperty, V5Codec, WillMessage, encode_publish, ensure_publish_wire_fits,
+    ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, DisconnectReasonCode, PublishAckReason, PublishMessage,
+    PublishProperties, QoS, RetainHandling, SubscribeAckReason, SubscriptionOptions, UnsubscribeAckReason,
+    UserProperties, UserProperty, WillMessage,
 };
-pub use connection::{
-    Connection, ConnectionState, Generation, LifecycleHook, NoopLifecycle, SessionParams, SessionPhase, TlsMode,
-};
+pub use connection::{Connection, LifecycleHook, NoopLifecycle, SessionParams, SessionPhase};
 pub use error::{AppError, AuthError, ConnectError, ConnectionOutcome, ProtocolError, ShutdownError, TransportError};
 pub use inbound_sink::{InboundSink, InboundSinkClosed, InboundTrySendError, OnInboundSink};
 pub use options::{
@@ -71,6 +70,3 @@ pub use util::{
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 mod readme_doctests {}
-
-// Re-export TLS decision hook for callers / structure tests.
-pub use connection::resolve_tls_mode;

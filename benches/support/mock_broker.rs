@@ -24,16 +24,18 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
+use mqtt_glide::codec::{
+    ConnectAck, DecodedFrame, Packet, PublishAck, PublishDelivery, PublishPacket, SubscribeAck, V5Codec, encode_publish,
+};
 use mqtt_glide::{
-    ConnectAck, ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, DecodedFrame, Packet, PublishAck, PublishAckReason,
-    PublishDelivery, PublishMessage, PublishPacket, QoS, SubscribeAck, SubscribeAckReason, V5Codec, encode_publish,
+    ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, PublishAckReason, PublishMessage, QoS, SubscribeAckReason,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-type FramedWr = FramedWrite<tokio::net::tcp::OwnedWriteHalf, mqtt_glide::V5Codec>;
+type FramedWr = FramedWrite<tokio::net::tcp::OwnedWriteHalf, mqtt_glide::codec::V5Codec>;
 
 /// Ready line printed to stdout by the child (`MQTT_COMPARE_ROLE=mock_broker`).
 ///

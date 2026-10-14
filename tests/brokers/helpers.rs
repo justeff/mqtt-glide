@@ -14,10 +14,8 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use bytestring::ByteString;
 use futures_util::{SinkExt, StreamExt};
-use mqtt_glide::{
-    Connect, ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, DecodedFrame, Disconnect, Packet, PublishDelivery,
-    PublishMessage, PublishProperties, QoS, V5Codec, encode_publish,
-};
+use mqtt_glide::codec::{Connect, DecodedFrame, Disconnect, Packet, PublishDelivery, V5Codec, encode_publish};
+use mqtt_glide::{ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, PublishMessage, PublishProperties, QoS};
 use testcontainers::ContainerAsync;
 use testcontainers::ContainerRequest;
 use testcontainers::GenericImage;
