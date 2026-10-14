@@ -30,7 +30,8 @@ use crate::codec::{Disconnect, DisconnectReasonCode, Packet, PublishMessage, QoS
 use crate::connection::packet_id::InflightPots;
 use crate::connection::subscriptions::SubscriptionRegistry;
 use crate::connection::{
-    CommandReceiver, ControlMessage, ControlReceiver, Generation, PublishReply, SubscribeReply, UnsubscribeReply,
+    ClientCommand, CommandReceiver, ControlMessage, ControlReceiver, Generation, PublishReply, SubscribeReply,
+    UnsubscribeReply,
 };
 use crate::error::{ProtocolError, TransportError};
 
@@ -59,9 +60,6 @@ use self::commands::{
 #[cfg(test)]
 #[allow(unused_imports)]
 use crate::codec::PublishAck;
-#[cfg(test)]
-#[allow(unused_imports)]
-use crate::connection::ClientCommand;
 #[cfg(test)]
 #[allow(unused_imports)]
 use crate::error::AppError;
@@ -141,13 +139,15 @@ impl SubUnsubWaiters {
 /// [`MAX_PARKED_PUBLISHES`] does the write task stop reading commands, so backpressure
 /// reaches the bounded command channel instead of growing memory.
 ///
-/// With a resumable session (`carry` set) each in-flight entry also keeps its message, so
-/// that a connection loss can hand it to the next connection for resending.
+/// With a resumable session each in-flight entry also keeps its message, so that a
+/// connection loss can hand it to the next connection for resending.
 #[derive(Debug, Default)]
 pub(crate) struct PublishWaiters {
     pub(super) by_id: HashMap<NonZeroU16, InflightPublish>,
     pub(super) parked: VecDeque<PendingOutboundPublish>,
     pub(super) carry: Option<SessionCarry>,
+    /// Keep each in-flight message for a resend (resumable session).
+    keep_messages: bool,
     /// Send order of in-flight publishes, for ordered resend after reconnect.
     next_seq: u64,
 }
@@ -174,10 +174,101 @@ pub(crate) struct CarriedPublish {
     pub(crate) seq: u64,
 }
 
-/// Hand-over slot between connections of one resumable session, owned by the
-/// [`Connection`](crate::Connection). The write task fills it on connection loss and drains
-/// it (resending) at the start of the next connection.
-pub(crate) type SessionCarry = Arc<std::sync::Mutex<Vec<CarriedPublish>>>;
+/// Hand-over slot between connections, owned by the [`Connection`](crate::Connection).
+///
+/// On connection loss the write task moves what it still owes the application into it; the
+/// next connection's write task sends that first, before any new command.
+pub(crate) type SessionCarry = Arc<std::sync::Mutex<Carry>>;
+
+/// Contents of a [`SessionCarry`].
+#[derive(Debug, Default)]
+pub(crate) struct Carry {
+    /// Session outlives the connection (Clean Start 0, Session Expiry > 0): unacknowledged
+    /// QoS-1 publishes are session state and get resent ([MQTT-4.4.0-1]).
+    pub(crate) resumable: bool,
+    /// Unacknowledged QoS-1 publishes (resumable sessions only), resent with DUP.
+    pub(crate) unacked: Vec<CarriedPublish>,
+    /// Publishes never put on the wire (parked or still queued), sent like new ones.
+    pub(crate) unsent: VecDeque<PendingOutboundPublish>,
+    /// Set on a connection loss; tells [`CommandRx`] to move queued publishes into `unsent`.
+    collect_queued: bool,
+}
+
+impl Carry {
+    pub(crate) fn new(resumable: bool) -> Self {
+        Self {
+            resumable,
+            ..Self::default()
+        }
+    }
+
+    /// Lets the dropping [`CommandRx`] move still-queued publishes into `unsent`.
+    pub(super) fn mark_collect_queued(&mut self) {
+        self.collect_queued = true;
+    }
+
+    /// Takes everything out, failing nothing (caller decides).
+    pub(crate) fn take_all(&mut self) -> (Vec<CarriedPublish>, VecDeque<PendingOutboundPublish>) {
+        (std::mem::take(&mut self.unacked), std::mem::take(&mut self.unsent))
+    }
+}
+
+/// Write-task command receiver; on a connection loss its drop hands queued publishes to the
+/// [`SessionCarry`] so the next connection sends them (instead of dropping them with the
+/// channel). Derefs to the [`CommandReceiver`].
+struct CommandRx {
+    rx: CommandReceiver,
+    carry: Option<SessionCarry>,
+}
+
+impl std::ops::Deref for CommandRx {
+    type Target = CommandReceiver;
+
+    fn deref(&self) -> &CommandReceiver {
+        &self.rx
+    }
+}
+
+impl std::ops::DerefMut for CommandRx {
+    fn deref_mut(&mut self) -> &mut CommandReceiver {
+        &mut self.rx
+    }
+}
+
+impl Drop for CommandRx {
+    fn drop(&mut self) {
+        let Some(carry) = &self.carry else {
+            return;
+        };
+        let mut carry = carry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !std::mem::take(&mut carry.collect_queued) {
+            return;
+        }
+        while let Ok(command) = self.rx.try_recv() {
+            match command {
+                ClientCommand::Publish {
+                    message,
+                    qos,
+                    retain,
+                    reply,
+                } => carry.unsent.push_back(PendingOutboundPublish {
+                    message,
+                    qos,
+                    retain,
+                    reply,
+                }),
+                ClientCommand::Subscribe { reply, .. } => {
+                    let _ = reply.send(Err(crate::error::AppError::ConnectionLost));
+                }
+                ClientCommand::Unsubscribe { reply, .. } => {
+                    let _ = reply.send(Err(crate::error::AppError::ConnectionLost));
+                }
+                #[allow(unreachable_patterns)] // test-only commands
+                _ => {}
+            }
+        }
+    }
+}
 
 impl PublishWaiters {
     #[cfg(test)]
@@ -186,15 +277,22 @@ impl PublishWaiters {
     }
 
     fn with_carry(carry: Option<SessionCarry>) -> Self {
+        let keep_messages = carry.as_ref().is_some_and(|carry| {
+            carry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .resumable
+        });
         Self {
             carry,
+            keep_messages,
             ..Self::default()
         }
     }
 
     /// Registers an encoded QoS-1 publish; keeps the message when the session is resumable.
     pub(super) fn insert_sent(&mut self, packet_id: NonZeroU16, publish: PendingOutboundPublish) {
-        let resend = self.carry.is_some().then_some((publish.message, publish.retain));
+        let resend = self.keep_messages.then_some((publish.message, publish.retain));
         let seq = self.next_seq;
         self.next_seq += 1;
         self.by_id.insert(
@@ -276,8 +374,7 @@ pub(crate) struct WriteSession {
     pub inbound_activity: Arc<AtomicBool>,
     /// Optional bench hook — incremented per inbound QoS-1 PUBACK fed to the write buffer.
     pub bench_inbound_publish_ack_counter: Option<Arc<AtomicUsize>>,
-    /// Resumable session hand-over ([`SessionCarry`]); `None` when the session ends with
-    /// the connection (Clean Start, or Session Expiry 0).
+    /// Hand-over to the next connection ([`SessionCarry`]); `None` only in unit tests.
     pub session_carry: Option<SessionCarry>,
     /// Stops the paired read task; cancelled by graceful shutdown after the outbound drain.
     pub read_stop: CancellationToken,
@@ -294,7 +391,7 @@ pub(crate) struct WriteSession {
 /// PUBACKs until then, then sends DISCONNECT.
 pub(crate) async fn run<W>(
     mut control_rx: ControlReceiver,
-    mut command_rx: CommandReceiver,
+    command_rx: CommandReceiver,
     #[cfg(test)] mut stub_exit_rx: mpsc::Receiver<()>,
     mut framed: FramedWrite<W, V5Codec>,
     session: WriteSession,
@@ -309,6 +406,10 @@ where
     let shutdown_notify = session.shutdown_notify;
     let graceful_disconnect_timeout = session.graceful_disconnect_timeout;
     let mut waiters = SubUnsubWaiters::new();
+    let mut command_rx = CommandRx {
+        rx: command_rx,
+        carry: session.session_carry.clone(),
+    };
     let mut publish_waiters = PublishWaiters::with_carry(session.session_carry);
     let mut ping_timer = keep_alive_ping_timer(session.keep_alive);
     let keep_alive = session.keep_alive;
@@ -329,9 +430,17 @@ where
         shutdown_notify: &shutdown_notify,
     };
 
-    // Resumed session: resend the previous connection's unacknowledged QoS-1 PUBLISHes
-    // first, with their original Packet Identifiers and DUP set ([MQTT-4.4.0-1]).
-    if let Err(outcome) = resend_carried(&mut framed, &mut inflight, &mut publish_waiters, flush_abort).await {
+    // What the previous connection still owed: unacknowledged QoS-1 PUBLISHes first (resumed
+    // session; original ids, DUP set, [MQTT-4.4.0-1]), then publishes it never sent.
+    if let Err(outcome) = resend_carried(
+        &mut framed,
+        &mut inflight,
+        &mut publish_waiters,
+        publish_limits,
+        flush_abort,
+    )
+    .await
+    {
         return finish_hot_path_write_outcome(
             &mut framed,
             GracefulDisconnectCtx {

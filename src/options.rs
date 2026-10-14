@@ -182,6 +182,10 @@ impl ConnectOptions {
     }
 
     /// Sets the MQTT v5 **Clean Start** flag.
+    ///
+    /// `false` together with a non-zero [`Self::session_expiry`] makes the session outlive the
+    /// connection: unacknowledged QoS 1 publishes are resent after a reconnect into it
+    /// ([MQTT-4.4.0-1]). Needs a stable [`Self::client_id`].
     pub fn clean_start(mut self, clean_start: bool) -> Self {
         self.clean_start = clean_start;
         self
@@ -206,6 +210,10 @@ impl ConnectOptions {
     }
 
     /// Sets the PUBACK / SUBACK / UNSUBACK await deadline (default: [`DEFAULT_ACK_TIMEOUT`]).
+    ///
+    /// Also bounds waiting for command-channel room. The deadline ends the caller's wait, not
+    /// the publish: during a reconnect an unacknowledged publish of a resumed session is still
+    /// resent after it, so keep it above the reconnect delay when duplicates matter.
     pub fn ack_timeout(mut self, ack_timeout: Duration) -> Self {
         self.ack_timeout = ack_timeout;
         self

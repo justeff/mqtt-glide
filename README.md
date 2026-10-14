@@ -143,7 +143,7 @@ When a full application queue blocks the same loop that sends `PINGREQ`, a slow 
 
 ### What it costs
 
-No MQTT 3.1.1, no QoS 2, no WebSockets, and Topic Alias are out of scope, not pending. If you need any of those, rumqttc remains the better fit. There is no local store-and-forward, so redelivery after an unclean disconnect is entirely the broker's job. Cross-process session resume needs a stable client ID (`.client_id("…")?` or `ClientId::try_new`) plus `clean_start(false)` and a non-zero `session_expiry`. rumqttc is also the far more widely deployed crate; this one is 0.2.x, and the API can still move.
+No MQTT 3.1.1, no QoS 2, no WebSockets, and Topic Alias are out of scope, not pending. If you need any of those, rumqttc remains the better fit. Unacknowledged QoS 1 publishes are kept in memory only: they are resent after a reconnect into a resumed session (see [No session](#no-session)), but not after a process restart. Cross-process session resume needs a stable client ID (`.client_id("…")?` or `ClientId::try_new`) plus `clean_start(false)` and a non-zero `session_expiry`. rumqttc is also the far more widely deployed crate; this one is 0.2.x, and the API can still move.
 
 ## Architecture
 
@@ -191,6 +191,15 @@ Without an explicit `client_id`, the builder mints a fresh UUID (`ClientId::from
 ### No session
 
 `clean_start` is `true` and `session_expiry` is unset (property omitted; MQTT default 0 s), so the broker drops your subscriptions and anything queued for you as soon as the connection ends. Resuming within the process needs `clean_start(false)` plus a non-zero `session_expiry`; re-subscribe whenever CONNACK reports `session_present = false`.
+
+What happens to your publishes when the connection drops and the client reconnects:
+
+| Publish state at the drop | Clean Start (`true`) | Resumed session (`clean_start(false)`, `session_expiry` > 0) |
+|---|---|---|
+| Never sent (parked behind Receive Maximum, or still queued) | sent on the next connection | sent on the next connection |
+| QoS 1 sent, `PUBACK` missing | fails with `AppError::ConnectionLost` | resent in order with its original packet id and `DUP` set ([MQTT-4.4.0-1]); fails with `ConnectionLost` if CONNACK reports no session |
+
+A caller that stops waiting earlier (its `ack_timeout` ran out during a long reconnect backoff) gets `PublishAckTimeout`, but the publish is not withdrawn: a never-sent one is dropped, an unacknowledged one in a resumed session is still resent. Retrying on that timeout can therefore deliver twice, as usual for QoS 1. Keep `ack_timeout` above your reconnect delay, or wait on a `PublishCompletion` yourself, if that matters.
 
 ### Capacities sized for a few connections, not a pipeline
 
@@ -352,7 +361,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | WebSockets | ❌ | TCP (+ TLS) only |
 | Topic Alias | ❌ | Maximum = 0; inbound alias → protocol error (no alias state across reconnects) |
 | QoS 2 | ❌ | Rejected at the API (no 4-way handshake / store-and-forward) |
-| Persistent sessions / DUP redelivery | ❌ | No local store-and-forward; outbound `dup` always false. `clean_start = false` resumes a broker session across reconnects when the same client ID is reused (re-SUBSCRIBE when `session_present = false`). Builder: `.client_id("…")?`; options: `ClientId::try_new`. `ClientId::from_prefix` always mints a fresh UUID |
+| Persistent sessions / DUP redelivery | ✅ in process | Resumed sessions resend unacknowledged QoS 1 with `DUP` and original ids ([MQTT-4.4.0-1]); state is in memory, not persisted across restarts. Needs a stable client ID (`.client_id("…")?` / `ClientId::try_new`; `ClientId::from_prefix` always mints a fresh UUID), `clean_start(false)` and a non-zero `session_expiry` |
 
 Broker-dependent: Message Expiry *drop after interval* (property round-trip is tested), shared-sub rebalancing under handoff stall, redelivery after unclean disconnect (client guarantees enqueue-before-ack only).
 

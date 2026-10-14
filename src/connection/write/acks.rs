@@ -135,8 +135,9 @@ pub(super) fn fail_waiters_for_outcome(
     inflight: &mut InflightPots,
     outcome: &WriteOutcome,
 ) {
-    // Connection loss in a resumable session: unacknowledged QoS-1 publishes are session
-    // state ([MQTT-4.1]) and move to the next connection instead of failing.
+    // Connection loss: hand over what is still owed to the next connection. Unacknowledged
+    // QoS-1 publishes are session state only when the session is resumable ([MQTT-4.1]);
+    // never-sent publishes always go (like ones issued during the reconnect backoff).
     if matches!(
         outcome,
         WriteOutcome::Transport(_) | WriteOutcome::Protocol(_) | WriteOutcome::Cancelled
@@ -155,7 +156,7 @@ pub(super) fn fail_waiters_for_outcome(
             };
             inflight.release_publish(id);
             let (message, retain) = entry.resend.expect("filtered on resend");
-            slot.push(CarriedPublish {
+            slot.unacked.push(CarriedPublish {
                 packet_id: id,
                 message,
                 retain,
@@ -163,6 +164,8 @@ pub(super) fn fail_waiters_for_outcome(
                 seq: entry.seq,
             });
         }
+        slot.unsent.extend(publish_waiters.parked.drain(..));
+        slot.mark_collect_queued();
     }
     let error = app_error_from_write_outcome(outcome);
     fail_all_waiters(waiters, publish_waiters, inflight, &error);

@@ -137,9 +137,9 @@ pub struct Connection<H: InboundSink = flume::Sender<crate::codec::PublishMessag
     /// Whether this process has established a resumeable MQTT session (`clean_start = false`
     /// past a successful CONNACK). Used for [MQTT-3.2.2-4]; independent of subscription count.
     session_affinity: subscriptions::SessionAffinity,
-    /// Unacknowledged QoS-1 publishes handed from one connection to the next when the
-    /// session outlives the connection (Clean Start 0 and Session Expiry > 0).
-    session_carry: Option<write::SessionCarry>,
+    /// What one connection still owes the application, handed to the next connection
+    /// (never-sent publishes always; unacknowledged QoS 1 when the session is resumable).
+    session_carry: write::SessionCarry,
 }
 
 impl<H: InboundSink> std::fmt::Debug for Connection<H> {
@@ -164,7 +164,7 @@ impl<H: InboundSink> Connection<H> {
     ) -> Self {
         let inflight = packet_id::InflightPots::new(options.receive_maximum);
         let resumable = !options.clean_start && handshake::session_expiry_secs(options.session_expiry) > 0;
-        let session_carry = resumable.then(write::SessionCarry::default);
+        let session_carry = Arc::new(std::sync::Mutex::new(write::Carry::new(resumable)));
         Self {
             options,
             credentials,
@@ -181,13 +181,32 @@ impl<H: InboundSink> Connection<H> {
         }
     }
 
-    /// Fails publishes still carried for a resend (session discarded or driver stopping).
+    /// Fails everything still carried (driver stopping).
     fn fail_carried(&self) {
-        if let Some(carry) = &self.session_carry {
-            let carried = std::mem::take(&mut *carry.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
-            for entry in carried {
-                let _ = entry.reply.send(Err(AppError::ConnectionLost));
-            }
+        let (unacked, unsent) = self
+            .session_carry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_all();
+        for entry in unacked {
+            let _ = entry.reply.send(Err(AppError::ConnectionLost));
+        }
+        for publish in unsent {
+            let _ = publish.reply.send(Err(AppError::ConnectionLost));
+        }
+    }
+
+    /// Fails carried *unacknowledged* publishes: the broker has no session to resend into.
+    fn fail_carried_unacked(&self) {
+        let unacked = std::mem::take(
+            &mut self
+                .session_carry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unacked,
+        );
+        for entry in unacked {
+            let _ = entry.reply.send(Err(AppError::ConnectionLost));
         }
     }
 
@@ -402,9 +421,9 @@ impl<H: InboundSink> Connection<H> {
         };
 
         // No session on the broker: the client MUST discard its own state too
-        // ([MQTT-3.2.2-5]), so carried publishes are not resent.
+        // ([MQTT-3.2.2-5]), so unacknowledged publishes are not resent. Never-sent ones still go.
         if !session.session_present {
-            self.fail_carried();
+            self.fail_carried_unacked();
         }
 
         // Clean Start discards broker-side state; a broker answering `session_present = false`
@@ -507,7 +526,7 @@ impl<H: InboundSink> Connection<H> {
                 handoff_stalled,
                 inbound_activity,
                 bench_inbound_publish_ack_counter: self.options.bench_inbound_publish_ack_counter.clone(),
-                session_carry: self.session_carry.clone(),
+                session_carry: Some(Arc::clone(&self.session_carry)),
                 read_stop,
             },
             inflight,

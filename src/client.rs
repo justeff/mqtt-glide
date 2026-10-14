@@ -2478,4 +2478,98 @@ mod tests {
         );
         assert_eq!(drain_events(&events, 2).await, ["publish", "disconnect"]);
     }
+
+    /// Publishes that never reached the wire (parked behind a full Receive Maximum window, or
+    /// still queued in the command channel) survive a connection loss and go out on the next
+    /// connection; only the one already sent fails in a Clean Start session.
+    #[tokio::test]
+    async fn unsent_publishes_are_sent_after_reconnect() {
+        let seen: SeenPublishes = Arc::default();
+        let seen_broker = Arc::clone(&seen);
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port = crate::connection::test_support::spawn_broker_loop(move |mut framed_read, mut framed_write| {
+            let seen = Arc::clone(&seen_broker);
+            let connections = Arc::clone(&connections);
+            async move {
+                let index = connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut ack = ConnectAck::default();
+                ack.receive_max = NonZeroU16::new(1).expect("nz");
+                if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
+                    return;
+                }
+                while let Some(Ok(frame)) = framed_read.next().await {
+                    let (DecodedFrame::Publish(packet), _) = frame else {
+                        continue;
+                    };
+                    let id = packet.meta.packet_id.expect("QoS 1 packet id");
+                    seen.lock()
+                        .await
+                        .push((index, id, packet.meta.dup, packet.message.payload.clone()));
+                    if index == 0 {
+                        // Let the client park / queue the rest, then drop with no PUBACK.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        return;
+                    }
+                    let _ = framed_write
+                        .send(Packet::PublishAck(PublishAck {
+                            packet_id: id,
+                            reason_code: crate::codec::PublishAckReason::Success,
+                            properties: Vec::new(),
+                            reason_string: None,
+                        }))
+                        .await;
+                }
+            }
+        })
+        .await;
+
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let options = ConnectOptions::new(url).command_channel_capacity(NonZeroUsize::new(64).expect("nz"));
+        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (client, connection, mut phase) = connect(
+            options,
+            static_test_credentials(),
+            ImmediateReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let completions: Vec<_> = (0..40u8)
+            .map(|i| {
+                client
+                    .start_publish(Publish::new("t/unsent", Bytes::from(vec![i])).qos(QoS::AtLeastOnce))
+                    .expect("enqueue")
+            })
+            .collect();
+        let mut results = Vec::new();
+        for completion in completions {
+            results.push(
+                timeout(Duration::from_secs(5), completion.wait())
+                    .await
+                    .expect("resolves"),
+            );
+        }
+
+        assert!(
+            matches!(results[0], Err(AppError::ConnectionLost)),
+            "the publish sent on the lost connection fails in a Clean Start session: {:?}",
+            results[0]
+        );
+        for (i, result) in results.iter().enumerate().skip(1) {
+            assert!(
+                result.is_ok(),
+                "publish {i} was never sent and must go out after reconnect: {result:?}"
+            );
+        }
+        let frames = seen.lock().await.clone();
+        let resent: Vec<u8> = frames.iter().filter(|f| f.0 == 1).map(|f| f.3[0]).collect();
+        assert_eq!(resent, (1..40u8).collect::<Vec<_>>(), "sent once each, in order");
+        assert!(frames.iter().all(|f| !f.2), "never-sent publishes are new, not DUP");
+
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
 }

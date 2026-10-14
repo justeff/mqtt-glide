@@ -346,15 +346,19 @@ where
     Ok(())
 }
 
-/// Resends a resumed session's carried QoS-1 PUBLISHes (DUP = 1, original ids) and flushes.
+/// Sends what the previous connection still owed, then flushes. Called once at write-task
+/// start, before any new command:
 ///
-/// Called once at write-task start. Only as many as the new Receive Maximum allows go out
-/// ([MQTT-4.9.0-2]); the rest fail with [`AppError::ConnectionLost`] rather than overrun
-/// the broker window.
+/// 1. Unacknowledged QoS-1 PUBLISHes of a resumed session: DUP = 1, original ids, original
+///    order. Only as many as the new Receive Maximum allows go out ([MQTT-4.9.0-2]); the rest
+///    fail with [`AppError::ConnectionLost`] rather than overrun the broker window.
+/// 2. Publishes that were never sent, in their original order, like new ones (closed
+///    replies — callers that gave up — are skipped).
 pub(super) async fn resend_carried<W>(
     framed: &mut FramedWrite<W, V5Codec>,
     inflight: &mut InflightPots,
     publish_waiters: &mut PublishWaiters,
+    limits: BrokerPublishLimits,
     flush_abort: FlushAbort<'_>,
 ) -> Result<(), WriteOutcome>
 where
@@ -363,8 +367,11 @@ where
     let Some(carry) = publish_waiters.carry.clone() else {
         return Ok(());
     };
-    let mut carried = std::mem::take(&mut *carry.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
-    if carried.is_empty() {
+    let (mut carried, unsent) = carry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take_all();
+    if carried.is_empty() && unsent.is_empty() {
         return Ok(());
     }
     // Resend in the original send order ([MQTT-4.6.0-1]); ids are reused round-robin,
@@ -395,6 +402,9 @@ where
                 reply: entry.reply,
             },
         );
+    }
+    for publish in unsent {
+        handle_publish(framed, inflight, publish_waiters, publish, limits).await?;
     }
     flush_writes(framed, flush_abort).await
 }
