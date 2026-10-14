@@ -116,6 +116,11 @@ Read and write run as separate tasks on a split socket. While the read task wait
 | QoS 1 ingress | enqueue-before-ack: `PUBACK` only after the sink accepts |
 | Keep-alive under load | Write keeps sending `PINGREQ` while read waits on a full sink; liveness treats that stall as self-induced |
 | Shutdown | Graceful drain, then `DISCONNECT` |
+| Testing your service | In-process test broker and fault proxy (`testing` feature) |
+
+### Your MQTT code gets tests, not mocks
+
+Mocking the client only proves your code called a function. With the `testing` feature, a test starts a real MQTT 5 broker inside the test process in milliseconds, one per test, with no container. Your code connects to it as it would in production. The test then checks what the code published, plays the devices or services on the other side, and cuts the network, refuses connections or rejects publishes to see how the code copes. See [Testing your application](#testing-your-application).
 
 ## Design goals
 
@@ -358,6 +363,55 @@ Custom `InboundSink` cancel safety: built-ins (`flume`, `tokio::mpsc`, `OnInboun
 
 Spec **SHOULD**s this client adopts: `CONNACK` within `connect_timeout`; `PINGRESP` watchdog (~1× Keep Alive) with handoff-stall exemption.
 
+## Testing your application
+
+The `testing` feature (meant for `[dev-dependencies]`, no extra dependencies) lets the tests of a service built on mqtt-glide run against real MQTT, without a broker container and without mocking the client. Such a test can answer three questions:
+
+- **Does the service publish the right thing?** Topic, payload, QoS, retain flag and properties of everything it sent.
+- **Does it react to what arrives?** The test publishes as a device or another service would, so the service's subscriptions and wildcards are exercised too.
+- **Does it survive trouble?** A dropped network, a broker that refuses connections or rejects publishes (as a wrong ACL would), latency, a silent stall, or packets cut at arbitrary bytes.
+
+```toml
+[dev-dependencies]
+mqtt-glide = { version = "0.3", features = ["testing"] }
+```
+
+A test for a service that switches lights on command and reports their state:
+
+```rust,no_run
+# #[cfg(feature = "testing")]
+# async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+# async fn start_light_service(_broker_url: String) {}
+use std::time::Duration;
+use mqtt_glide::{Publish, QoS, testing::TestBroker};
+
+const WAIT: Duration = Duration::from_secs(2);
+
+let broker = TestBroker::start().await?;
+start_light_service(broker.url()).await; // your code, connecting as client ID "lights"
+assert!(broker.wait_for_subscription("lights", "cmd/+", WAIT).await);
+
+// A wall switch sends a command; the service must report the new state, retained.
+broker.publish(Publish::new("cmd/kitchen", "on").qos(QoS::AtLeastOnce));
+let sent = broker.wait_for_publishes(1, WAIT).await;
+assert_eq!((&*sent[0].topic, &sent[0].payload[..]), ("state/kitchen", &b"on"[..]));
+assert!(sent[0].retain);
+
+// The network drops: the service must reconnect and subscribe again on its own.
+broker.drop_client("lights");
+assert!(broker.wait_for_connects(2, WAIT).await);
+assert!(broker.wait_for_subscription("lights", "cmd/+", WAIT).await);
+# Ok(())
+# }
+```
+
+The two helpers:
+
+- `testing::TestBroker`: an in-process MQTT 5 broker on a free local port. It routes between its clients (wildcards, retained messages, Wills, `$share` groups, No Local), records what clients publish (`received`, `wait_for_publishes`), shows who is connected and subscribed (`connected_clients`, `subscriptions`, `wait_for_connects`, `wait_for_subscription`), injects messages (`publish`), and simulates trouble: `drop_client` / `drop_connections` (network cut), `disconnect_all(reason)`, `refuse_connections(reason)`, `reject_publishes(reason)`. It is a test double, not a broker to run: no persistence, authentication, QoS 2 or session resumption.
+- `testing::FaultProxy`: a TCP proxy in front of any broker (the `TestBroker` or a real one) that adds latency, stalls silently, splits packets at arbitrary bytes, resets connections or refuses new ones, switched at runtime.
+
+The `TestBroker` checks your service, not mqtt-glide: it shares the crate's codec, so it cannot catch the crate's own misreadings of the spec. That is what the tests against real brokers and [`CONFORMANCE.md`](CONFORMANCE.md) are for.
+
 ## Feature matrix
 
 The authoritative answer to "does it do X?", including the things it deliberately does not do.
@@ -381,6 +435,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | Will message (`CONNECT`) | ✅ | `.will(topic, payload)` (+ `.will_qos` / `.will_retain`); QoS 0\|1; power: `WillMessage` |
 | Optional `SO_SNDBUF` / `SO_RCVBUF` | ⚠️ | OS defaults today |
 | Broker diagnostics (Reason String, User Properties) | ✅ | Passed through on `PUBACK` rejections (`PublishRejection`), `SUBACK` / `UNSUBACK` (`SubscribeResponse` / `UnsubscribeResponse`), and in the outcome of a broker `DISCONNECT` / refused `CONNACK`. The client's own outbound `DISCONNECT` carries no reason string |
+| Test helpers (`TestBroker`, `FaultProxy`) | ✅ opt-in | `testing` feature; see [Testing your application](#testing-your-application) |
 | HTTP proxy (`CONNECT` tunnel) | ✅ opt-in | `ConnectOptions::http_proxy(HttpProxy::parse("http://user:pass@proxy:3128")?)`; TLS / WebSocket run end to end through the tunnel; Basic auth optional. Not read from `HTTP(S)_PROXY`. SOCKS not supported |
 | Server redirection (§4.11) | ✅ opt-in | `follow_server_redirects(true)`: CONNACK / DISCONNECT 0x9C (Use another server, next connection only) or 0x9D (Server moved, for good) with a Server Reference reconnects there at once; scheme, TLS and WebSocket path stay, at most five redirects in a row. Off: reported in the outcome |
 | Enhanced AUTH (`AUTH` packets, re-authentication) | ❌ | Not implemented; `CredentialsProvider` covers username/password only |

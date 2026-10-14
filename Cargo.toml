@@ -25,6 +25,19 @@ exclude = [
 [lints.rust]
 unsafe_code = "deny"
 
+[package.metadata.docs.rs]
+features = ["websocket", "testing"]
+
+[[test]]
+name = "faults"
+path = "tests/faults/main.rs"
+required-features = ["testing"]
+
+[[test]]
+name = "testing"
+path = "tests/testing.rs"
+required-features = ["testing"]
+
 [[bench]]
 name = "codec_throughput"
 path = "benches/codec_throughput.rs"
@@ -44,6 +57,9 @@ tls-rustls-ring = ["rustls/ring", "tokio-rustls/ring"]
 # MQTT over WebSocket (`ws://` / `wss://` broker URLs). `wss` reuses the client's own rustls
 # setup; tokio-tungstenite only does the WebSocket handshake and framing.
 websocket = ["dep:tokio-tungstenite"]
+# Test helpers for applications: in-process `testing::TestBroker` and `testing::FaultProxy`.
+# Meant for `[dev-dependencies]`; adds no dependencies.
+testing = []
 
 [dependencies]
 arc-swap = "1.9"

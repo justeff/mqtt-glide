@@ -1,5 +1,5 @@
 //! Fault-injection tests: mqtt-glide against a real Mosquitto behind an in-process TCP
-//! fault proxy ([`proxy::FaultProxy`]).
+//! fault proxy ([`mqtt_glide::testing::FaultProxy`]).
 //!
 //! An observer client connects to the broker directly (not through the proxy) and records
 //! what actually reached it, so delivery claims are checked end to end. Needs Docker /
@@ -11,8 +11,6 @@ mod helpers;
 
 #[path = "../common/mod.rs"]
 mod common;
-
-mod proxy;
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
@@ -28,7 +26,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use proxy::FaultProxy;
+use mqtt_glide::testing::FaultProxy;
 
 /// Reconnect fast on transport / protocol loss; stop otherwise.
 struct FastReconnect;
@@ -161,7 +159,9 @@ async fn reset_mid_burst_resumed_session_delivers_everything() {
         return;
     };
     let watcher = observer(broker_port, "faults/resume").await;
-    let proxy = FaultProxy::start(broker_port).await;
+    let proxy = FaultProxy::start(([127, 0, 0, 1], broker_port).into())
+        .await
+        .expect("fault proxy");
     let session = start(
         options(proxy.port())
             .client_id(ClientId::try_new("faults-resume").expect("client id"))
@@ -198,7 +198,9 @@ async fn reset_mid_burst_clean_session_reports_truthfully() {
         return;
     };
     let watcher = observer(broker_port, "faults/clean").await;
-    let proxy = FaultProxy::start(broker_port).await;
+    let proxy = FaultProxy::start(([127, 0, 0, 1], broker_port).into())
+        .await
+        .expect("fault proxy");
     let session = start(options(proxy.port())).await;
 
     let results = timeout(
@@ -244,7 +246,9 @@ async fn stalled_link_is_detected_by_keep_alive() {
     let Some((_broker, broker_port)) = helpers::start_mosquitto().await else {
         return;
     };
-    let proxy = FaultProxy::start(broker_port).await;
+    let proxy = FaultProxy::start(([127, 0, 0, 1], broker_port).into())
+        .await
+        .expect("fault proxy");
     let mut session = start(options(proxy.port()).keep_alive(Duration::from_secs(1))).await;
 
     let stalled_at = Instant::now();
@@ -280,7 +284,9 @@ async fn byte_by_byte_link_round_trips() {
     let Some((_broker, broker_port)) = helpers::start_mosquitto().await else {
         return;
     };
-    let proxy = FaultProxy::start(broker_port).await;
+    let proxy = FaultProxy::start(([127, 0, 0, 1], broker_port).into())
+        .await
+        .expect("fault proxy");
     proxy.set_slice(Some(1));
     let session = start(options(proxy.port())).await;
     session
@@ -319,7 +325,9 @@ async fn pipelined_burst_overlaps_round_trips_on_slow_link() {
     let Some((_broker, broker_port)) = helpers::start_mosquitto().await else {
         return;
     };
-    let proxy = FaultProxy::start(broker_port).await;
+    let proxy = FaultProxy::start(([127, 0, 0, 1], broker_port).into())
+        .await
+        .expect("fault proxy");
     proxy.set_latency(Duration::from_millis(25));
     let session = start(options(proxy.port())).await;
 
@@ -345,7 +353,9 @@ async fn shutdown_on_stalled_link_respects_budget() {
     let Some((_broker, broker_port)) = helpers::start_mosquitto().await else {
         return;
     };
-    let proxy = FaultProxy::start(broker_port).await;
+    let proxy = FaultProxy::start(([127, 0, 0, 1], broker_port).into())
+        .await
+        .expect("fault proxy");
     let session = start(options(proxy.port()).graceful_disconnect_timeout(Duration::from_millis(300))).await;
 
     proxy.set_stalled(true);
@@ -374,7 +384,9 @@ async fn refused_reconnects_recover() {
     let Some((_broker, broker_port)) = helpers::start_mosquitto().await else {
         return;
     };
-    let proxy = FaultProxy::start(broker_port).await;
+    let proxy = FaultProxy::start(([127, 0, 0, 1], broker_port).into())
+        .await
+        .expect("fault proxy");
     let mut session = start(options(proxy.port())).await;
 
     proxy.set_refusing(true);
@@ -412,7 +424,9 @@ async fn reset_with_topic_aliases_rebinds_on_the_new_connection() {
         return;
     };
     let watcher = observer(broker_port, "faults/alias").await;
-    let proxy = FaultProxy::start(broker_port).await;
+    let proxy = FaultProxy::start(([127, 0, 0, 1], broker_port).into())
+        .await
+        .expect("fault proxy");
     let session = start(
         options(proxy.port())
             .client_id(ClientId::try_new("faults-alias").expect("client id"))
@@ -478,7 +492,9 @@ async fn websocket_byte_by_byte_link_round_trips_hivemq() {
     let Some((_broker, _tcp_port, ws_port)) = helpers::start_hivemq_with_websocket().await else {
         return;
     };
-    let proxy = FaultProxy::start(ws_port).await;
+    let proxy = FaultProxy::start(([127, 0, 0, 1], ws_port).into())
+        .await
+        .expect("fault proxy");
     let url = format!("ws://127.0.0.1:{}/mqtt", proxy.port());
     websocket_roundtrip_over_sliced_link(url, &proxy, |proxy| proxy.set_slice(Some(1))).await;
 }
@@ -491,7 +507,9 @@ async fn websocket_byte_by_byte_link_round_trips_mosquitto() {
     let Some((_broker, _tcp_port, ws_port)) = helpers::start_mosquitto_websockets().await else {
         return;
     };
-    let proxy = FaultProxy::start(ws_port).await;
+    let proxy = FaultProxy::start(([127, 0, 0, 1], ws_port).into())
+        .await
+        .expect("fault proxy");
     let url = format!("ws://127.0.0.1:{}/mqtt", proxy.port());
     websocket_roundtrip_over_sliced_link(url, &proxy, |proxy| proxy.set_slice(Some(1))).await;
 }
@@ -505,7 +523,9 @@ async fn websocket_reset_mid_burst_resumed_session_delivers_everything() {
         return;
     };
     let watcher = observer(tcp_port, "faults/wsresume").await;
-    let proxy = FaultProxy::start(ws_port).await;
+    let proxy = FaultProxy::start(([127, 0, 0, 1], ws_port).into())
+        .await
+        .expect("fault proxy");
     let url = BrokerUrl::parse(&format!("ws://127.0.0.1:{}/mqtt", proxy.port())).expect("ws url");
     let session = start(
         ConnectOptions::new(url)

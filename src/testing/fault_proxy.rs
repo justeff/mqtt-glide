@@ -1,15 +1,6 @@
-//! In-process TCP fault proxy between the client under test and a real broker.
-//!
-//! Faults are switched at runtime from the test, so they can be injected at a precise
-//! point (mid-burst, while waiting for an ack) instead of on a timer:
-//!
-//! - [`FaultProxy::set_latency`]: delay every forwarded chunk (both directions).
-//! - [`FaultProxy::set_stalled`]: stop forwarding without closing — a silent dead link.
-//! - [`FaultProxy::set_slice`]: forward in writes of at most `n` bytes, so MQTT packets
-//!   arrive split at arbitrary byte boundaries.
-//! - [`FaultProxy::reset_all`]: abort every open connection with an RST.
-//! - [`FaultProxy::set_refusing`]: accept and immediately drop new connections.
+//! In-process TCP fault proxy between a client under test and a broker.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -33,7 +24,34 @@ struct Faults {
     accepted: AtomicUsize,
 }
 
-/// Running proxy; dropping it stops accepting (open connections end with their pumps).
+/// TCP proxy between a client and a broker that injects network faults on demand.
+///
+/// Faults are switched at runtime, so a test can inject them at a precise point (mid-burst,
+/// while a publish waits for its ack) instead of on a timer:
+///
+/// - [`Self::set_latency`]: delay every forwarded chunk (both directions).
+/// - [`Self::set_stalled`]: stop forwarding without closing, a silent dead link.
+/// - [`Self::set_slice`]: forward in writes of at most `n` bytes, so MQTT packets arrive split
+///   at arbitrary byte boundaries.
+/// - [`Self::reset_all`]: abort every open connection with an RST.
+/// - [`Self::set_refusing`]: accept and immediately drop new connections.
+///
+/// Point the client at [`Self::url`] instead of the broker. Dropping the proxy stops it and
+/// resets its connections.
+///
+/// # Examples
+///
+/// ```no_run
+/// use mqtt_glide::testing::{FaultProxy, TestBroker};
+///
+/// # async fn demo() -> std::io::Result<()> {
+/// let broker = TestBroker::start().await?;
+/// let proxy = FaultProxy::start(([127, 0, 0, 1], broker.port()).into()).await?;
+/// // ... connect a client to `proxy.url()`, then:
+/// proxy.reset_all(); // the client sees a connection reset and reconnects
+/// # Ok(())
+/// # }
+/// ```
 pub struct FaultProxy {
     port: u16,
     faults: Arc<Faults>,
@@ -41,10 +59,10 @@ pub struct FaultProxy {
 }
 
 impl FaultProxy {
-    /// Listens on an ephemeral local port and forwards to `127.0.0.1:upstream_port`.
-    pub async fn start(upstream_port: u16) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fault proxy");
-        let port = listener.local_addr().expect("proxy addr").port();
+    /// Listens on an ephemeral port on `127.0.0.1` and forwards every connection to `upstream`.
+    pub async fn start(upstream: SocketAddr) -> std::io::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
         let faults = Arc::new(Faults::default());
         let accept_faults = Arc::clone(&faults);
         let accept_task = tokio::spawn(async move {
@@ -59,18 +77,23 @@ impl FaultProxy {
                 }
                 let faults = Arc::clone(&accept_faults);
                 tokio::spawn(async move {
-                    let Ok(upstream) = TcpStream::connect(("127.0.0.1", upstream_port)).await else {
+                    let Ok(upstream) = TcpStream::connect(upstream).await else {
                         return;
                     };
                     serve(client, upstream, faults).await;
                 });
             }
         });
-        Self {
+        Ok(Self {
             port,
             faults,
             accept_task,
-        }
+        })
+    }
+
+    /// URL to connect the client to, e.g. `mqtt://127.0.0.1:41235`.
+    pub fn url(&self) -> String {
+        format!("mqtt://127.0.0.1:{}", self.port)
     }
 
     /// Port the client should connect to.
@@ -83,29 +106,34 @@ impl FaultProxy {
         self.faults.accepted.load(Ordering::SeqCst)
     }
 
+    /// Delays every forwarded chunk by `latency` (zero: no delay).
     pub fn set_latency(&self, latency: Duration) {
-        let ms = u64::try_from(latency.as_millis()).expect("latency fits u64");
+        let ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
         self.faults.latency_ms.store(ms, Ordering::SeqCst);
     }
 
+    /// Holds back all traffic without closing anything while `stalled`.
     pub fn set_stalled(&self, stalled: bool) {
         self.faults.stalled.store(stalled, Ordering::SeqCst);
     }
 
-    /// Slices both directions.
+    /// Forwards in writes of at most `bytes` in both directions (`None`: as read).
     pub fn set_slice(&self, bytes: Option<usize>) {
         self.set_slice_towards_broker(bytes);
         self.set_slice_towards_client(bytes);
     }
 
+    /// Like [`Self::set_slice`], client → broker only.
     pub fn set_slice_towards_broker(&self, bytes: Option<usize>) {
         self.faults.slice_up.store(bytes.unwrap_or(0), Ordering::SeqCst);
     }
 
+    /// Like [`Self::set_slice`], broker → client only.
     pub fn set_slice_towards_client(&self, bytes: Option<usize>) {
         self.faults.slice_down.store(bytes.unwrap_or(0), Ordering::SeqCst);
     }
 
+    /// Accepts and immediately drops new connections while `refusing`.
     pub fn set_refusing(&self, refusing: bool) {
         self.faults.refusing.store(refusing, Ordering::SeqCst);
     }
@@ -129,7 +157,7 @@ async fn serve(client: TcpStream, upstream: TcpStream, faults: Arc<Faults>) {
     let _ = upstream.set_nodelay(true);
     let epoch = faults.epoch.load(Ordering::SeqCst);
     // Linger 0 → dropping the socket sends RST instead of FIN, like a crashed peer.
-    #[allow(deprecated)] // tokio marks set_linger deprecated (blocking close); fine in tests
+    #[allow(deprecated)] // tokio marks set_linger deprecated (blocking close); the RST is the point
     let _ = client.set_linger(Some(Duration::ZERO));
     let (client_read, client_write) = client.into_split();
     let (upstream_read, upstream_write) = upstream.into_split();
@@ -183,5 +211,13 @@ async fn pump(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, faults: Arc<Fault
                 tokio::task::yield_now().await;
             }
         }
+    }
+}
+
+impl std::fmt::Debug for FaultProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FaultProxy")
+            .field("port", &self.port)
+            .finish_non_exhaustive()
     }
 }

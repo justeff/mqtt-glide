@@ -41,6 +41,8 @@ pub mod policies;
 pub mod publish;
 pub mod publish_window;
 pub mod request;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod util;
 
 pub use client::{

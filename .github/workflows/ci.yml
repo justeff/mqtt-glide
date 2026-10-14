@@ -41,7 +41,7 @@ jobs:
         with:
           key: clippy-${{ matrix.name }}
       - name: clippy (${{ matrix.name }})
-        run: cargo clippy --all-targets ${{ matrix.args }} -- -D warnings
+        run: cargo clippy --all-targets --features testing ${{ matrix.args }} -- -D warnings
 
   test:
     name: test
@@ -63,13 +63,15 @@ jobs:
         with:
           key: test-${{ matrix.name }}
       - name: lib (${{ matrix.name }})
-        run: cargo test --lib ${{ matrix.args }}
-      - name: connection (${{ matrix.name }})
-        run: cargo test --test connection ${{ matrix.args }}
+        run: cargo test --lib --features testing ${{ matrix.args }}
+      - name: connection, redirect, proxy, codec properties (${{ matrix.name }})
+        run: cargo test --test connection --test redirect --test proxy --test codec_proptest ${{ matrix.args }}
+      - name: testing helpers (${{ matrix.name }})
+        run: cargo test --test testing --features testing ${{ matrix.args }}
       - name: brokers (${{ matrix.name }})
         run: cargo test --test brokers ${{ matrix.args }}
       - name: faults (${{ matrix.name }})
-        run: cargo test --test faults ${{ matrix.args }}
+        run: cargo test --test faults --features testing ${{ matrix.args }}
 
   doc:
     name: doc
@@ -81,7 +83,7 @@ jobs:
         with:
           key: doc
       - name: cargo doc
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps --features websocket,testing
         env:
           RUSTDOCFLAGS: -D warnings
 
