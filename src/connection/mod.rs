@@ -71,6 +71,8 @@ pub(crate) struct ConnectionChannels<H: InboundSink> {
     pub lifecycle: Arc<dyn LifecycleHook>,
     /// Shared with [`crate::MqttClient::is_connected`]; true between Connected and Disconnected.
     pub connected: Arc<std::sync::atomic::AtomicBool>,
+    /// Routes request/response replies to waiting [`crate::Requester`] requests.
+    pub response_router: Arc<crate::request::ResponseRouter>,
     /// Test/supervision hooks: clone senders before [`Connection::run`].
     #[cfg(test)]
     #[allow(dead_code)]
@@ -448,6 +450,7 @@ impl<H: InboundSink> Connection<H> {
                     handoff: &self.channels.handoff,
                     topic_aliases: &mut inbound_topic_aliases,
                     subscription_identifiers_available,
+                    response_router: &self.channels.response_router,
                 },
             )
             .await
@@ -510,6 +513,7 @@ impl<H: InboundSink> Connection<H> {
                 handoff_stalled: Arc::clone(&handoff_stalled),
                 inbound_activity: Arc::clone(&inbound_activity),
                 topic_aliases: inbound_topic_aliases,
+                response_router: Arc::clone(&self.channels.response_router),
             },
             #[cfg(test)]
             read_stub_exit_rx,

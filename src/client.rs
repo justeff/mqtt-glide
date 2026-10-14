@@ -283,6 +283,21 @@ pub struct MqttClient {
     fail_fast_when_disconnected: bool,
     /// Session phase watch (the same one [`connect`] returns), for [`Self::session_phase`].
     phase: watch::Receiver<SessionPhase>,
+    /// Response routing for [`crate::Requester`] (shared with the driver's read path).
+    router: Arc<crate::request::ResponseRouter>,
+}
+
+/// The [`ConnectOptions`] a client handle needs after the options moved into the driver.
+struct ClientOptions {
+    ack_timeout: Duration,
+    fail_fast_when_disconnected: bool,
+}
+
+/// State the driver shares with every client handle.
+struct DriverShared {
+    connected: Arc<AtomicBool>,
+    phase: watch::Receiver<SessionPhase>,
+    router: Arc<crate::request::ResponseRouter>,
 }
 
 impl MqttClient {
@@ -291,21 +306,35 @@ impl MqttClient {
         command_tx: Arc<ArcSwap<CommandSender>>,
         cancel: CancellationToken,
         shutdown_notify: CancellationToken,
-        ack_timeout: Duration,
-        fail_fast_when_disconnected: bool,
-        connected: Arc<AtomicBool>,
-        phase: watch::Receiver<SessionPhase>,
+        options: &ClientOptions,
+        shared: DriverShared,
     ) -> Self {
         Self {
             command_tx,
             cancel,
             shutdown_notify,
-            ack_timeout,
-            connected,
+            ack_timeout: options.ack_timeout,
+            connected: shared.connected,
             shutting_down: Arc::default(),
-            fail_fast_when_disconnected,
-            phase,
+            fail_fast_when_disconnected: options.fail_fast_when_disconnected,
+            phase: shared.phase,
+            router: shared.router,
         }
+    }
+
+    /// Subscribes to `response_topic` (QoS 1) and returns a [`crate::Requester`] that sends
+    /// requests and awaits their responses there (MQTT 5 request / response, §4.10).
+    ///
+    /// Pick a topic only this client uses (for example including its client id) that the
+    /// broker's ACLs allow it to subscribe to; no wildcards. Responses on it are routed to
+    /// the waiting requests and never reach the inbound sink. The subscription is restored
+    /// on reconnect like any other.
+    pub async fn requester(&self, response_topic: impl Into<ByteString>) -> Result<crate::Requester, AppError> {
+        crate::Requester::subscribe(self, response_topic.into()).await
+    }
+
+    pub(crate) fn response_router(&self) -> Arc<crate::request::ResponseRouter> {
+        Arc::clone(&self.router)
     }
 
     /// A receiver for the session phase: the current value plus every change.
@@ -801,8 +830,11 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
     let cancel = CancellationToken::new();
     let shutdown_notify = CancellationToken::new();
     let connected = Arc::new(AtomicBool::new(false));
-    let ack_timeout = options.ack_timeout;
-    let fail_fast_when_disconnected = options.fail_fast_when_disconnected;
+    let router = Arc::new(crate::request::ResponseRouter::default());
+    let client_options = ClientOptions {
+        ack_timeout: options.ack_timeout,
+        fail_fast_when_disconnected: options.fail_fast_when_disconnected,
+    };
 
     let handoff_anchor = inbound.clone();
     let channels = ConnectionChannels {
@@ -815,6 +847,7 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
         phase_tx,
         lifecycle,
         connected: Arc::clone(&connected),
+        response_router: Arc::clone(&router),
         #[cfg(test)]
         read_stub_exit_tx,
         #[cfg(test)]
@@ -839,10 +872,12 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
             command_tx,
             cancel,
             shutdown_notify,
-            ack_timeout,
-            fail_fast_when_disconnected,
-            connected,
-            phase_rx.clone(),
+            &client_options,
+            DriverShared {
+                connected,
+                phase: phase_rx.clone(),
+                router,
+            },
         ),
         connection,
         phase_rx,

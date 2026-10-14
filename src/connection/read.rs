@@ -53,6 +53,8 @@ pub(crate) struct ReadSession {
     pub inbound_activity: Arc<AtomicBool>,
     /// Inbound Topic Alias bindings of this connection (continued from the resubscribe wait).
     pub topic_aliases: crate::connection::topic_alias::InboundTopicAliases,
+    /// Request/response routing (responses bypass the inbound sink).
+    pub response_router: Arc<crate::request::ResponseRouter>,
 }
 
 /// Drop-guard: signals the write task that the read task has fully exited.
@@ -113,6 +115,7 @@ where
     let handoff_stalled = session.handoff_stalled;
     let inbound_activity = session.inbound_activity;
     let mut topic_aliases = session.topic_aliases;
+    let response_router = session.response_router;
 
     loop {
         // Do not put `#[cfg(test)]` on a `tokio::select!` arm — the macro rejects it.
@@ -152,6 +155,7 @@ where
                             }
                             if let Some(outcome) = handle_inbound_publish(
                                 packet,
+                                &response_router,
                                 &handoff,
                                 &control_tx,
                                 &cancel,
@@ -190,8 +194,10 @@ where
 }
 
 /// `packet` must already have its Topic Alias resolved.
+#[allow(clippy::too_many_arguments)]
 async fn handle_inbound_publish<H: InboundSink>(
     packet: PublishPacket,
+    response_router: &crate::request::ResponseRouter,
     handoff: &H,
     control_tx: &mpsc::Sender<ControlMessage>,
     cancel: &CancellationToken,
@@ -203,20 +209,23 @@ async fn handle_inbound_publish<H: InboundSink>(
         Ok(id) => id,
         Err(error) => return Some(protocol_error_disconnect(control_tx, error).await),
     };
-    // Await handoff accept before PUBACK; the write task stays independent.
-    match accept_publish_preferring_completed_push(
-        handoff,
-        InboundMessage::from(packet),
-        cancel,
-        shutdown_notify,
-        handoff_stalled,
-        inbound_activity,
-    )
-    .await
-    {
-        PublishAccept::Accepted => {}
-        PublishAccept::CutOff => return Some(ReadOutcome::Cancelled),
-        PublishAccept::Closed => return Some(ReadOutcome::InboundSinkClosed),
+    // A response to a pending request goes to that request; everything else awaits handoff
+    // accept before PUBACK, while the write task stays independent.
+    if let Some(message) = response_router.route(InboundMessage::from(packet)) {
+        match accept_publish_preferring_completed_push(
+            handoff,
+            message,
+            cancel,
+            shutdown_notify,
+            handoff_stalled,
+            inbound_activity,
+        )
+        .await
+        {
+            PublishAccept::Accepted => {}
+            PublishAccept::CutOff => return Some(ReadOutcome::Cancelled),
+            PublishAccept::Closed => return Some(ReadOutcome::InboundSinkClosed),
+        }
     }
     // PUBACK only after successful handoff accept (enqueue-before-ack).
     if let Some(packet_id) = puback_id

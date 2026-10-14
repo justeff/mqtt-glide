@@ -41,6 +41,7 @@ pub mod options;
 pub mod policies;
 pub mod publish;
 pub mod publish_window;
+pub mod request;
 pub mod util;
 
 pub use client::{
@@ -63,6 +64,7 @@ pub use options::{
     DEFAULT_GRACEFUL_DISCONNECT_TIMEOUT, DEFAULT_RECEIVE_MAXIMUM, TlsConfig,
 };
 pub use policies::{DEFAULT_AUTH_FAILURE_THRESHOLD, StandardReconnectPolicy};
+pub use request::{DEFAULT_REQUEST_TIMEOUT, RequestBuilder, Requester};
 pub use util::{
     BrokerUrl, BrokerUrlError, ClientId, ClientIdError, ShareNameError, is_shared_subscription_filter, shared_filter,
     validate_share_name,

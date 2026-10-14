@@ -327,7 +327,7 @@ Broader flows live under [`examples/`](examples/) and are the better starting po
 | [`on_inbound.rs`](examples/on_inbound.rs) | Inline `.on_inbound` handler (read-task; keep short) |
 | [`publish.rs`](examples/publish.rs) | `publish`, `Publish::new` + `send`, `publish_batch`, Will Message, shared filter |
 | [`pipeline.rs`](examples/pipeline.rs) | `publish_window` + `.push(Publish::new(..))` / `.drain()` (mixed topics) |
-| [`request_response.rs`](examples/request_response.rs) | Properties R/R by hand (no RPC helper yet) |
+| [`request_response.rs`](examples/request_response.rs) | `client.requester(topic)` + `request(..).await`, answering with `Publish::reply_to` |
 | [`tls.rs`](examples/tls.rs) | `mqtts://`, rustls system roots, `connect_timeout` / `ack_timeout` |
 | [`hooks.rs`](examples/hooks.rs) | `CredentialsProvider`, `LifecycleHook`, `mark_live()` |
 
@@ -368,7 +368,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | Inbound Maximum Packet Size | ✅ | CONNECT advertises [`DEFAULT_MAX_PACKET_SIZE`](https://docs.rs/mqtt-glide/latest/mqtt_glide/codec/constant.DEFAULT_MAX_PACKET_SIZE.html) (1 MiB) by default; override via `ConnectOptions::max_packet_size`. Broker CONNACK limit applies outbound only |
 | Graceful `shutdown` | ✅ | Budget via `graceful_disconnect_timeout` |
 | Subscription identifiers | ✅ | `subscribe_with_id(id, filters)`; inbound `InboundMessage::subscription_ids`; kept across resubscribe; refused when CONNACK says unsupported |
-| Request/response *helper* / CONNECT negotiation | ⚠️ | Properties ✅ (`response_topic` / `correlation_data`); no inbox RPC API; `request_response_info` deferred |
+| Request/response | ✅ | `client.requester(response_topic)` → `request(topic, payload).await` resolves with the response (correlation handled, responses bypass the inbound sink, `ResponseTimeout`); `Publish::reply_to(&request, payload)` on the answering side. CONNECT Request Response Information not requested |
 | Will message (`CONNECT`) | ✅ | `.will(topic, payload)` (+ `.will_qos` / `.will_retain`); QoS 0\|1; power: `WillMessage` |
 | Optional `SO_SNDBUF` / `SO_RCVBUF` | ⚠️ | OS defaults today |
 | Enhanced AUTH | ❌ | |

@@ -1306,3 +1306,98 @@ async fn mosquitto_subscription_identifiers_tag_deliveries() {
     client.shutdown().await.expect("shutdown");
     join_run_after_shutdown(run).await;
 }
+
+/// Request / response end to end: a responder answers with `Publish::reply_to`, concurrent
+/// requests each get their own response (correlation), responses never reach the
+/// requester's inbound sink, and an unanswered request times out.
+#[tokio::test]
+async fn mosquitto_request_response() {
+    use mqtt_glide::{AppError, MqttClient};
+
+    let Some((_container, port)) = start_mosquitto().await else {
+        return;
+    };
+    async fn start(
+        port: u16,
+    ) -> (
+        MqttClient,
+        flume::Receiver<InboundMessage>,
+        tokio::task::JoinHandle<Result<(), ConnectionOutcome>>,
+    ) {
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let (tx, rx) = flume::bounded::<InboundMessage>(64);
+        let (client, connection, mut phase) = connect(
+            ConnectOptions::new(url),
+            static_credentials(),
+            NoReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect");
+        let run = tokio::spawn(connection.run());
+        wait_for_phase(&mut phase, Duration::from_secs(10), |p| {
+            matches!(p, SessionPhase::Connected { .. })
+        })
+        .await;
+        (client, rx, run)
+    }
+
+    let (responder, requests, responder_run) = start(port).await;
+    responder
+        .subscribe([("rr/echo", QoS::AtLeastOnce)])
+        .await
+        .expect("responder subscribe");
+    let answering = tokio::spawn({
+        let responder = responder.clone();
+        async move {
+            while let Ok(request) = requests.recv_async().await {
+                let mut answer = b"re:".to_vec();
+                answer.extend_from_slice(&request.payload);
+                let reply = Publish::reply_to(&request, answer).expect("request carries a response topic");
+                responder.send(reply.qos(QoS::AtLeastOnce)).await.expect("reply");
+            }
+        }
+    });
+
+    let (requester_client, requester_inbound, requester_run) = start(port).await;
+    let requester = requester_client
+        .requester("rr/replies/client-a")
+        .await
+        .expect("requester");
+    let mut asks = tokio::task::JoinSet::new();
+    for i in 0..20 {
+        let requester = requester.clone();
+        asks.spawn(async move {
+            let reply = requester
+                .request("rr/echo", format!("q{i}"))
+                .qos(QoS::AtLeastOnce)
+                .await
+                .expect("response");
+            assert_eq!(
+                &*reply.payload,
+                format!("re:q{i}").as_bytes(),
+                "each request gets its own response"
+            );
+        });
+    }
+    while let Some(done) = asks.join_next().await {
+        done.expect("request task");
+    }
+    assert!(
+        requester_inbound.is_empty(),
+        "responses must not reach the inbound sink"
+    );
+
+    let err = requester
+        .request("rr/nobody-listens", "hello?")
+        .timeout(Duration::from_millis(300))
+        .await
+        .expect_err("no responder");
+    assert!(matches!(err, AppError::ResponseTimeout(_)), "{err:?}");
+
+    answering.abort();
+    requester_client.shutdown().await.expect("shutdown");
+    responder.shutdown().await.expect("shutdown");
+    join_run_after_shutdown(requester_run).await;
+    join_run_after_shutdown(responder_run).await;
+}

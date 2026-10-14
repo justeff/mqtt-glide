@@ -129,6 +129,14 @@ pub enum SubscribeAckReason {
     WildcardSubscriptionsNotSupported = 162,
 }
 
+impl SubscribeAckReason {
+    /// Whether the broker granted the subscription (any `GrantedQos*`, i.e. code below 0x80).
+    #[inline]
+    pub fn is_granted(self) -> bool {
+        (self as u8) < 0x80
+    }
+}
+
 impl TryFrom<u8> for SubscribeAckReason {
     type Error = DecodeError;
 

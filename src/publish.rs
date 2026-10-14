@@ -188,6 +188,20 @@ impl Publish {
     }
 }
 
+impl Publish {
+    /// The response to a request (§4.10): published to the request's Response Topic, with its
+    /// Correlation Data copied, QoS 0 unless set. `None` when `request` carries no Response
+    /// Topic (it does not expect an answer).
+    pub fn reply_to(request: &InboundMessage, payload: impl Into<Bytes>) -> Option<Self> {
+        let topic = request.properties.response_topic.clone()?;
+        let mut reply = Self::new(topic, payload);
+        if let Some(correlation) = request.properties.correlation_data.clone() {
+            reply = reply.correlation_data(correlation);
+        }
+        Some(reply)
+    }
+}
+
 impl From<InboundMessage> for Publish {
     /// Republish an inbound message: topic, payload and properties are kept; QoS 0 and
     /// retain `false` like [`Publish::new`] (set them explicitly to forward the flags).

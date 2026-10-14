@@ -169,6 +169,7 @@ where
                 handoff: inbound.handoff,
                 topic_aliases: &mut *inbound.topic_aliases,
                 subscription_identifiers_available: inbound.subscription_identifiers_available,
+                response_router: inbound.response_router,
             },
         )
         .await?;
@@ -245,6 +246,8 @@ pub(crate) struct ResubscribeInbound<'a, H> {
     pub(crate) topic_aliases: &'a mut super::topic_alias::InboundTopicAliases,
     /// CONNACK Subscription Identifiers Available.
     pub(crate) subscription_identifiers_available: bool,
+    /// Request/response routing (responses bypass the inbound sink).
+    pub(crate) response_router: &'a crate::request::ResponseRouter,
 }
 
 /// Whether prior filters must be re-issued on a fresh session.
@@ -306,7 +309,7 @@ async fn read_suback_for_id<H: InboundSink, R, W>(
     framed_read: &mut FramedRead<R, V5Codec>,
     framed_write: &mut FramedWrite<W, V5Codec>,
     expected_id: NonZeroU16,
-    inbound: ResubscribeInbound<'_, H>,
+    mut inbound: ResubscribeInbound<'_, H>,
 ) -> Result<SubscribeAck, ConnectionOutcome>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -319,8 +322,7 @@ where
             }
             Some(Ok((DecodedFrame::Control(Packet::SubscribeAck(_)), _))) => {}
             Some(Ok((DecodedFrame::Publish(packet), _))) => {
-                deliver_publish_during_resubscribe(framed_write, inbound.handoff, inbound.topic_aliases, packet)
-                    .await?;
+                deliver_publish_during_resubscribe(framed_write, &mut inbound, packet).await?;
             }
             Some(Ok((DecodedFrame::Control(other), _))) => {
                 return Err(ConnectionOutcome::Protocol(ProtocolError::Violation(format!(
@@ -347,18 +349,22 @@ where
 /// start — there is no write task to consume `AckInboundPublish`.
 async fn deliver_publish_during_resubscribe<H: InboundSink, W>(
     framed_write: &mut FramedWrite<W, V5Codec>,
-    handoff: &H,
-    topic_aliases: &mut super::topic_alias::InboundTopicAliases,
+    inbound: &mut ResubscribeInbound<'_, H>,
     mut packet: crate::codec::PublishPacket,
 ) -> Result<(), ConnectionOutcome>
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    topic_aliases
+    inbound
+        .topic_aliases
         .resolve(&mut packet)
         .map_err(ConnectionOutcome::Protocol)?;
     let puback_id = inbound_publish_policy(&packet).map_err(ConnectionOutcome::Protocol)?;
-    if handoff.send(crate::codec::InboundMessage::from(packet)).await.is_err() {
+    if let Some(message) = inbound
+        .response_router
+        .route(crate::codec::InboundMessage::from(packet))
+        && inbound.handoff.send(message).await.is_err()
+    {
         return Err(ConnectionOutcome::Application(AppError::InboundSinkClosed));
     }
     // PUBACK only after successful handoff accept (enqueue-before-ack).

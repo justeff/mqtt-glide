@@ -103,6 +103,9 @@ pub enum AppError {
     /// carries the broker's Reason String and User Properties).
     #[error("publish rejected by broker: {0}")]
     PublishRejected(Box<crate::ack::PublishRejection>),
+    /// A [`Requester`](crate::Requester) request got no response within its timeout.
+    #[error("no response within {0:?}")]
+    ResponseTimeout(Duration),
     /// No connection is up and [`ConnectOptions::fail_fast_when_disconnected`](crate::ConnectOptions::fail_fast_when_disconnected)
     /// is set, so the command was not queued for the next connection.
     #[error("not connected")]

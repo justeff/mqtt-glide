@@ -85,6 +85,7 @@ where
             cancel: cancel.clone(),
             stop: CancellationToken::new(),
             topic_aliases: crate::connection::topic_alias::InboundTopicAliases::new(0),
+            response_router: Arc::default(),
             generation: Generation(1),
             receive_maximum: nonzero!(8u16),
             handoff_stalled: Arc::clone(&handoff_stalled),
