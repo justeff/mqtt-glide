@@ -37,13 +37,13 @@ pub mod error;
 pub mod inbound_sink;
 pub mod options;
 pub mod policies;
-pub mod publish_builder;
+pub mod publish;
 pub mod publish_window;
 pub mod util;
 
 pub use client::{
-    AnonymousCredentials, ClientBuilder, CredentialsProvider, MqttClient, NoReconnect, PublishCompletion,
-    PublishWindow, PublishWith, ReconnectPolicy, StaticCredentials, Subscription, WindowPublishWith, connect,
+    AnonymousCredentials, ClientBuilder, CredentialsProvider, MqttClient, NoReconnect, Publish, PublishBuilder,
+    PublishCompletion, PublishWindow, ReconnectPolicy, StaticCredentials, Subscription, connect,
 };
 pub use codec::{
     Connect, ConnectAck, ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, DecodeError, DecodedFrame, Disconnect,

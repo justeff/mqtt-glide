@@ -79,9 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     policy.mark_live();
 
     client
-        .publish_with()
-        .topic("sensors/room1/temp")
-        .payload("22.5")
+        .publish("sensors/room1/temp", "22.5")
         .qos(QoS::AtLeastOnce)
         .send()
         .await?;

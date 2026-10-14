@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- New publish API. `Publish` is an owned value carrying topic, payload, QoS, retain and properties (`Publish::new(topic, payload).qos(..).retain(..)`; `From<PublishMessage>` as QoS 0). Migration:
+
+  | 0.2 | 0.3 |
+  |---|---|
+  | `client.publish_with().topic(t).payload(p).qos(q).send().await` | `client.publish(t, p).qos(q).await` |
+  | `client.publish(msg, qos, retain).await` | `client.send(Publish::from(msg).qos(qos).retain(retain)).await` |
+  | `client.start_publish(msg, qos, retain)` | `client.start_publish(Publish::from(msg).qos(qos).retain(retain))` |
+  | `pipe.publish_with().topic(t).payload(p).push_retry().await` | `pipe.push(Publish::new(t, p)).await` |
+  | `pipe.push(msg, qos, retain)` / `pipe.push_retry(..)` | `pipe.push(Publish::from(msg).qos(qos).retain(retain))` |
+  | `client.publish_batch(msgs, qos, retain, n)` | `client.publish_batch(publishes, n)` (QoS / retain per message) |
+  | loop of `.user_property(k, v)` | `.user_properties(iter)` |
+
+  Removed: `MqttClient::publish_with`, `PublishWith`, `WindowPublishWith`, `PublishWindow::push_retry`, the type-state markers and the `publish_builder` module (now `publish`)
+- Awaited publishes (`publish(..).await`, `send`, `PublishWindow::push`, `publish_batch`) and `subscribe` / `unsubscribe` now wait for room in the command channel (bounded by `ack_timeout`, then `AppError::Backpressure`) instead of failing at once on a full channel. `start_publish` stays non-blocking; `enqueue_publish` is its waiting counterpart. A sender swapped by a reconnect while waiting is retried on the new session channel
+
+### Added
+
+- `Publish` setters for Content Type, Response Topic and Correlation Data; read accessors (`topic`, `payload`, `qos_level`, `is_retained`, `publish_properties`, `into_parts`)
+- `PublishBuilder::start` (enqueue without waiting) and `PublishBuilder::into_publish`
+
 ### Fixed
 
 - QoS 1 publishes beyond the broker's CONNACK Receive Maximum now wait for a free slot (FIFO, sent as `PUBACK`s arrive) instead of failing with `AppError::Backpressure("publish inflight at capacity")`. A `publish_window` / `publish_batch` wider than the broker window (e.g. 64 against a default mosquitto, which allows 20) used to fail in `drain()`. SUBSCRIBE / UNSUBSCRIBE still pass parked publishes; a parked publish whose caller gave up (ack timeout / drop) is never sent

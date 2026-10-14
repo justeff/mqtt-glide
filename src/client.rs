@@ -1,10 +1,9 @@
 //! [`MqttClient`] handle and [`connect`] entry point.
 //!
 //! Subscribe / unsubscribe await SUBACK / UNSUBACK with per-filter reason codes.
-//! Publish: QoS 0 fire-and-forget; QoS 1 awaits PUBACK.
-//! Prefer [`MqttClient::publish_with`] for the fluent builder, [`MqttClient::publish_window`] for
-//! pipelined sliding-window publish, or [`MqttClient::publish`] with a ready
-//! [`PublishMessage`].
+//! Publish: QoS 0 completes on encode; QoS 1 awaits PUBACK.
+//! [`MqttClient::publish`] is the fluent entry point; [`MqttClient::send`] takes a ready
+//! [`Publish`]; [`MqttClient::publish_window`] pipelines bursts.
 //!
 //! For a higher-level entry point that applies defaults and connects (spawns the driver), see
 //! [`ClientBuilder`].
@@ -16,14 +15,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use bytestring::ByteString;
 use secrecy::SecretString;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
-use crate::codec::{
-    PublishMessage, QoS, RetainHandling, SubscribeAckReason, SubscriptionOptions, UnsubscribeAckReason,
-};
+use crate::codec::{QoS, RetainHandling, SubscribeAckReason, SubscriptionOptions, UnsubscribeAckReason};
 use crate::connection::{
     ClientCommand, CommandSender, Connection, ConnectionChannels, LifecycleHook, SessionPhase, control_channel_capacity,
 };
@@ -35,9 +33,8 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 pub use crate::builder::ClientBuilder;
-pub use crate::publish_builder::PublishWith;
-use crate::publish_builder::{PayloadUnset, TopicUnset};
-pub use crate::publish_window::{PublishWindow, WindowPublishWith};
+pub use crate::publish::{Publish, PublishBuilder};
+pub use crate::publish_window::PublishWindow;
 
 /// One topic filter + options for [`MqttClient::subscribe`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,7 +291,7 @@ impl MqttClient {
         }
     }
 
-    /// Sends a command, mapping a full channel to [`AppError::Backpressure`].
+    /// Sends a command without waiting, mapping a full channel to [`AppError::Backpressure`].
     #[inline]
     fn try_send_command(&self, command: ClientCommand) -> Result<(), AppError> {
         // ArcSwap load — no lock across await; sender is only swapped on reconnect.
@@ -304,66 +301,62 @@ impl MqttClient {
         })
     }
 
-    /// Publishes an application message.
+    /// Sends a command, waiting up to [`ConnectOptions::ack_timeout`] for channel room.
     ///
-    /// - **QoS 0:** no packet identifier, no publish-inflight permit, no PUBACK wait — completes
-    ///   after the PUBLISH is encoded into the connection write buffer (not necessarily flushed
-    ///   to the socket or received by the broker).
-    /// - **QoS 1:** allocates a publish packet id (capped by CONNACK `server_receive_maximum`) and
-    ///   resolves only after a matching PUBACK.
-    ///
-    /// `packet_id` / `dup` are assigned by the connection driver, not the caller.
-    /// Full command channel → [`AppError::Backpressure`].
-    ///
-    /// QoS 1 awaits PUBACK until [`ConnectOptions::ack_timeout`] elapses, then
-    /// returns [`AppError::PublishAckTimeout`]. QoS 0 uses the same deadline for encode
-    /// completion.
-    pub async fn publish(&self, message: PublishMessage, qos: QoS, retain: bool) -> Result<(), AppError> {
-        self.start_publish(message, qos, retain)?.wait().await
-    }
-
-    /// Enqueues an application PUBLISH and returns its completion handle without waiting.
-    ///
-    /// - **QoS 0:** completion resolves after the PUBLISH is encoded into the connection write
-    ///   buffer (not necessarily flushed or broker-received).
-    /// - **QoS 1:** completion resolves after the matching PUBACK.
-    ///
-    /// `packet_id` / `dup` are assigned by the connection driver, not the caller.
-    /// QoS 2 returns [`AppError::InvalidRequest`]. A full command channel returns
-    /// [`AppError::Backpressure`] without creating a completion handle.
-    ///
-    /// Call [`PublishCompletion::wait`] to observe write/PUBACK errors and enforce
-    /// [`ConnectOptions::ack_timeout`].
-    #[inline]
-    pub fn start_publish(
-        &self,
-        message: PublishMessage,
-        qos: QoS,
-        retain: bool,
-    ) -> Result<PublishCompletion, AppError> {
-        if qos == QoS::ExactlyOnce {
-            return Err(AppError::InvalidRequest("QoS 2 publish is not supported".into()));
+    /// Fast path is a plain `try_send`. When full, reserves a slot on the current sender;
+    /// if that sender closes because the driver swapped it on reconnect, retries on the
+    /// new one. Times out with [`AppError::Backpressure`].
+    async fn send_command(&self, command: ClientCommand) -> Result<(), AppError> {
+        match self.try_send_or_return(command)? {
+            None => Ok(()),
+            // Boxed so the rare wait state (timer + reserve) does not inflate every
+            // publish future on the hot path.
+            Some(command) => Box::pin(self.wait_for_room(command)).await,
         }
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.try_send_command(ClientCommand::Publish {
-            message,
-            qos,
-            retain,
-            reply: reply_tx,
-        })?;
-        Ok(PublishCompletion {
-            reply_rx,
-            ack_timeout: self.ack_timeout,
-        })
     }
 
-    /// Starts a fluent PUBLISH builder.
+    /// `try_send`, handing the command back when the channel is full.
+    #[inline]
+    fn try_send_or_return(&self, command: ClientCommand) -> Result<Option<ClientCommand>, AppError> {
+        match self.command_tx.load().try_send(command) {
+            Ok(()) => Ok(None),
+            Err(TrySendError::Full(command)) => Ok(Some(command)),
+            Err(TrySendError::Closed(_)) => Err(AppError::CommandChannelClosed),
+        }
+    }
+
+    #[cold]
+    async fn wait_for_room(&self, command: ClientCommand) -> Result<(), AppError> {
+        let deadline = tokio::time::Instant::now() + self.ack_timeout;
+        loop {
+            let sender = self.command_tx.load_full();
+            match tokio::time::timeout_at(deadline, sender.reserve()).await {
+                Ok(Ok(permit)) => {
+                    permit.send(command);
+                    return Ok(());
+                }
+                Ok(Err(_closed)) if !Arc::ptr_eq(&sender, &self.command_tx.load_full()) => continue,
+                Ok(Err(_closed)) => return Err(AppError::CommandChannelClosed),
+                Err(_elapsed) => {
+                    return Err(AppError::Backpressure(format!(
+                        "command channel full for {:?}",
+                        self.ack_timeout
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Starts a fluent PUBLISH of `payload` to `topic`; `.await` it to send.
     ///
-    /// Default QoS is [`QoS::AtMostOnce`]; retain defaults to `false`. Topic and payload are
-    /// required before [`.send`](PublishWith::send) / `.await` (type-state). See [`PublishWith`].
+    /// Defaults: QoS 0, retain `false`, no properties. Awaiting waits for room in the
+    /// command channel, then for completion — encoded into the write buffer for QoS 0
+    /// (not necessarily flushed or broker-received), the matching `PUBACK` for QoS 1.
+    /// QoS 1 publishes beyond the broker's Receive Maximum wait for a free slot.
+    /// Both waits are bounded by [`ConnectOptions::ack_timeout`]
+    /// ([`AppError::Backpressure`] / [`AppError::PublishAckTimeout`]).
     ///
-    /// Prefer [`.send()`](PublishWith::send).await; bare `.await` boxes via
-    /// [`IntoFuture`].
+    /// `topic` / `payload` take the same types as [`Publish::new`].
     ///
     /// # Examples
     ///
@@ -371,41 +364,92 @@ impl MqttClient {
     /// use mqtt_glide::QoS;
     ///
     /// # async fn demo(client: mqtt_glide::MqttClient) -> Result<(), mqtt_glide::AppError> {
+    /// client.publish("t/example", "hello").await?;
     /// client
-    ///     .publish_with()
-    ///     .topic("t/example")
-    ///     .payload("hello")
+    ///     .publish("t/status", "online")
     ///     .qos(QoS::AtLeastOnce)
-    ///     .send()
+    ///     .retain(true)
+    ///     .user_property("source", "edge-01")
     ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
     #[inline]
-    pub fn publish_with(&self) -> PublishWith<'_, TopicUnset, PayloadUnset> {
-        PublishWith::new(self)
+    pub fn publish(&self, topic: impl Into<ByteString>, payload: impl Into<Bytes>) -> PublishBuilder<'_> {
+        PublishBuilder::new(self, Publish::new(topic, payload))
     }
 
-    /// Starts a sliding-window pipeline over [`Self::start_publish`] (no task per message).
+    /// Sends a ready [`Publish`] (or a [`PublishMessage`](crate::PublishMessage) as QoS 0) and waits for completion.
     ///
-    /// Use [`PublishWindow::push`] / [`PublishWindow::publish_with`] to enqueue, then
-    /// [`PublishWindow::drain`] after the burst. See [`PublishWindow`].
+    /// Same waiting and errors as awaiting [`Self::publish`].
+    pub async fn send(&self, publish: impl Into<Publish>) -> Result<(), AppError> {
+        // Flat on purpose: one future layer and a sync `try_send` on the hot path.
+        let (command, completion) = self.publish_command(publish.into())?;
+        if let Some(command) = self.try_send_or_return(command)? {
+            Box::pin(self.wait_for_room(command)).await?;
+        }
+        completion.wait().await
+    }
+
+    /// Enqueues a PUBLISH without waiting and returns its completion handle.
+    ///
+    /// A full command channel returns [`AppError::Backpressure`] immediately (no handle is
+    /// created) — use [`Self::enqueue_publish`] to wait for room instead. QoS 2 returns
+    /// [`AppError::InvalidRequest`]. Call [`PublishCompletion::wait`] to observe the
+    /// result; `packet_id` / `dup` are assigned by the connection driver.
+    #[inline]
+    pub fn start_publish(&self, publish: impl Into<Publish>) -> Result<PublishCompletion, AppError> {
+        let (command, completion) = self.publish_command(publish.into())?;
+        self.try_send_command(command)?;
+        Ok(completion)
+    }
+
+    /// Like [`Self::start_publish`], but waits up to [`ConnectOptions::ack_timeout`] for
+    /// room in the command channel instead of failing on a full one.
+    pub async fn enqueue_publish(&self, publish: impl Into<Publish>) -> Result<PublishCompletion, AppError> {
+        let (command, completion) = self.publish_command(publish.into())?;
+        if let Some(command) = self.try_send_or_return(command)? {
+            Box::pin(self.wait_for_room(command)).await?;
+        }
+        Ok(completion)
+    }
+
+    fn publish_command(&self, publish: Publish) -> Result<(ClientCommand, PublishCompletion), AppError> {
+        if publish.qos == QoS::ExactlyOnce {
+            return Err(AppError::InvalidRequest("QoS 2 publish is not supported".into()));
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let command = ClientCommand::Publish {
+            message: publish.message,
+            qos: publish.qos,
+            retain: publish.retain,
+            reply: reply_tx,
+        };
+        Ok((
+            command,
+            PublishCompletion {
+                reply_rx,
+                ack_timeout: self.ack_timeout,
+            },
+        ))
+    }
+
+    /// Starts a sliding-window pipeline over [`Self::enqueue_publish`] (no task per message).
+    ///
+    /// [`PublishWindow::push`] enqueues, then [`PublishWindow::drain`] after the burst.
     ///
     /// # Examples
     ///
     /// ```no_run
     /// use std::num::NonZeroUsize;
     ///
-    /// use mqtt_glide::QoS;
+    /// use mqtt_glide::{Publish, QoS};
     ///
     /// # async fn demo(client: mqtt_glide::MqttClient) -> Result<(), mqtt_glide::AppError> {
     /// let mut pipe = client.publish_window(NonZeroUsize::new(64).expect("nz"));
-    /// pipe.publish_with()
-    ///     .topic("t/example")
-    ///     .payload("hello")
-    ///     .qos(QoS::AtLeastOnce)
-    ///     .push()
-    ///     .await?;
+    /// for i in 0..1_000 {
+    ///     pipe.push(Publish::new(format!("out/{i}"), "x").qos(QoS::AtLeastOnce)).await?;
+    /// }
     /// pipe.drain().await?;
     /// # Ok(())
     /// # }
@@ -415,47 +459,33 @@ impl MqttClient {
         PublishWindow::new(self, capacity)
     }
 
-    /// Publishes every message with the same `qos` / `retain` through an internal
-    /// [`PublishWindow`] of `window` capacity ([`PublishWindow::push_retry`] +
-    /// [`PublishWindow::drain`]).
+    /// Publishes every message through an internal [`PublishWindow`] of `window` capacity.
     ///
-    /// Prefer [`Self::publish_window`] when messages need mixed QoS/retain or custom
-    /// wait ordering. An empty iterator completes immediately. Stops at the first
-    /// error (same as [`PublishWindow::drain`]); QoS 2 → [`AppError::InvalidRequest`].
+    /// Each item carries its own QoS / retain / properties ([`Publish`]; a bare
+    /// [`PublishMessage`](crate::PublishMessage) is QoS 0). An empty iterator completes immediately. Stops at the
+    /// first error (same as [`PublishWindow::drain`]).
     ///
     /// # Examples
     ///
     /// ```no_run
     /// use std::num::NonZeroUsize;
     ///
-    /// use mqtt_glide::{PublishMessage, QoS};
+    /// use mqtt_glide::{Publish, QoS};
     ///
     /// # async fn demo(client: mqtt_glide::MqttClient) -> Result<(), mqtt_glide::AppError> {
-    /// let messages = [
-    ///     PublishMessage::new("out/1", "a"),
-    ///     PublishMessage::new("out/2", "b"),
-    /// ];
-    /// client
-    ///     .publish_batch(
-    ///         messages,
-    ///         QoS::AtLeastOnce,
-    ///         false,
-    ///         NonZeroUsize::new(64).expect("nz"),
-    ///     )
-    ///     .await?;
+    /// let messages = ["a", "b"].map(|p| Publish::new("out", p).qos(QoS::AtLeastOnce));
+    /// client.publish_batch(messages, NonZeroUsize::new(64).expect("nz")).await?;
     /// # Ok(())
     /// # }
     /// ```
     pub async fn publish_batch(
         &self,
-        messages: impl IntoIterator<Item = PublishMessage>,
-        qos: QoS,
-        retain: bool,
+        messages: impl IntoIterator<Item = impl Into<Publish>>,
         window: NonZeroUsize,
     ) -> Result<(), AppError> {
         let mut pipe = self.publish_window(window);
         for message in messages {
-            pipe.push_retry(message, qos, retain).await?;
+            pipe.push(message).await?;
         }
         pipe.drain().await
     }
@@ -486,10 +516,11 @@ impl MqttClient {
             })
             .collect();
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.try_send_command(ClientCommand::Subscribe {
+        self.send_command(ClientCommand::Subscribe {
             filters,
             reply: reply_tx,
-        })?;
+        })
+        .await?;
         await_ack(self.ack_timeout, reply_rx, AckKind::Subscribe).await
     }
 
@@ -509,10 +540,11 @@ impl MqttClient {
     ) -> Result<Vec<UnsubscribeAckReason>, AppError> {
         let filters: Vec<_> = filters.into_iter().map(Into::into).collect();
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.try_send_command(ClientCommand::Unsubscribe {
+        self.send_command(ClientCommand::Unsubscribe {
             filters,
             reply: reply_tx,
-        })?;
+        })
+        .await?;
         await_ack(self.ack_timeout, reply_rx, AckKind::Unsubscribe).await
     }
 
@@ -720,8 +752,8 @@ mod tests {
 
     use super::*;
     use crate::codec::{
-        ConnectAck, DecodedFrame, Packet, PublishAck, PublishProperties, SubscribeAck, SubscribeAckReason,
-        UnsubscribeAck, UnsubscribeAckReason,
+        ConnectAck, DecodedFrame, Packet, PublishAck, PublishMessage, PublishProperties, QoS, SubscribeAck,
+        SubscribeAckReason, UnsubscribeAck, UnsubscribeAckReason,
     };
     use crate::connection::test_support::{
         NoReconnect, accept_connect_send_connack, accept_connect_send_connack_with, await_connected, spawn_broker_once,
@@ -1120,7 +1152,7 @@ mod tests {
 
         timeout(
             Duration::from_secs(2),
-            client.publish(sample_message("t/qos0", b"fire"), QoS::AtMostOnce, false),
+            client.send(Publish::from(sample_message("t/qos0", b"fire"))),
         )
         .await
         .expect("QoS 0 publish must not hang waiting for PUBACK")
@@ -1159,7 +1191,7 @@ mod tests {
         await_connected(&mut phase).await;
 
         client
-            .publish(sample_message("t/qos1", b"need-ack"), QoS::AtLeastOnce, false)
+            .send(Publish::from(sample_message("t/qos1", b"need-ack")).qos(QoS::AtLeastOnce))
             .await
             .expect("QoS 1 publish must complete after PUBACK");
 
@@ -1183,7 +1215,7 @@ mod tests {
         await_connected(&mut phase).await;
 
         client
-            .start_publish(sample_message("t/qos1-start", b"need-ack"), QoS::AtLeastOnce, false)
+            .start_publish(Publish::from(sample_message("t/qos1-start", b"need-ack")).qos(QoS::AtLeastOnce))
             .expect("QoS 1 publish must enqueue")
             .wait()
             .await
@@ -1253,7 +1285,7 @@ mod tests {
         let client_shutdown = client.clone();
         let publish_task = tokio::spawn(async move {
             client
-                .publish(sample_message("t/barrier", b"wait"), QoS::AtLeastOnce, false)
+                .send(Publish::from(sample_message("t/barrier", b"wait")).qos(QoS::AtLeastOnce))
                 .await
         });
 
@@ -1364,7 +1396,7 @@ mod tests {
         let client_shutdown = client.clone();
         let publish_task = tokio::spawn(async move {
             client
-                .publish(sample_message("t/wrong-id", b"wait"), QoS::AtLeastOnce, false)
+                .send(Publish::from(sample_message("t/wrong-id", b"wait")).qos(QoS::AtLeastOnce))
                 .await
         });
 
@@ -1440,7 +1472,7 @@ mod tests {
         let client_qos0 = client.clone();
         let qos1 = tokio::spawn(async move {
             client
-                .publish(sample_message("t/qos1-hold", b"hold"), QoS::AtLeastOnce, false)
+                .send(Publish::from(sample_message("t/qos1-hold", b"hold")).qos(QoS::AtLeastOnce))
                 .await
         });
 
@@ -1459,7 +1491,7 @@ mod tests {
 
         timeout(
             Duration::from_secs(2),
-            client_qos0.publish(sample_message("t/qos0-free", b"free"), QoS::AtMostOnce, false),
+            client_qos0.send(Publish::from(sample_message("t/qos0-free", b"free"))),
         )
         .await
         .expect("QoS 0 must not block on publish permits")
@@ -1492,7 +1524,7 @@ mod tests {
         let _ = run.await;
     }
 
-    /// Full command queue → `AppError::Backpressure` on publish (no unbounded growth).
+    /// Full command queue → immediate `AppError::Backpressure` on `start_publish` (no unbounded growth).
     #[tokio::test]
     async fn publish_returns_backpressure_when_command_queue_full() {
         let url = BrokerUrl::parse("mqtt://localhost").expect("valid url");
@@ -1512,8 +1544,7 @@ mod tests {
         }
 
         let err = client
-            .publish(sample_message("t/bp", b"x"), QoS::AtMostOnce, false)
-            .await
+            .start_publish(Publish::from(sample_message("t/bp", b"x")))
             .expect_err("full command channel must backpressure publish");
         assert!(
             matches!(err, AppError::Backpressure(_)),
@@ -1544,8 +1575,7 @@ mod tests {
         }
 
         let err = client
-            .publish(sample_message("t/bp-custom", b"x"), QoS::AtMostOnce, false)
-            .await
+            .start_publish(Publish::from(sample_message("t/bp-custom", b"x")))
             .expect_err("full custom command channel must backpressure publish");
         assert!(
             matches!(err, AppError::Backpressure(_)),
@@ -1592,13 +1622,13 @@ mod tests {
         let client2 = client.clone();
         let first = tokio::spawn(async move {
             client
-                .publish(sample_message("t/a", b"1"), QoS::AtLeastOnce, false)
+                .send(Publish::from(sample_message("t/a", b"1")).qos(QoS::AtLeastOnce))
                 .await
         });
         tokio::task::yield_now().await;
         let second = tokio::spawn(async move {
             client2
-                .publish(sample_message("t/b", b"2"), QoS::AtLeastOnce, false)
+                .send(Publish::from(sample_message("t/b", b"2")).qos(QoS::AtLeastOnce))
                 .await
         });
 
@@ -1654,7 +1684,7 @@ mod tests {
             let client = client.clone();
             async move {
                 client
-                    .publish(sample_message("t/a", b"1"), QoS::AtLeastOnce, false)
+                    .send(Publish::from(sample_message("t/a", b"1")).qos(QoS::AtLeastOnce))
                     .await
             }
         });
@@ -1665,7 +1695,7 @@ mod tests {
 
         let second = timeout(
             Duration::from_millis(300),
-            client.publish(sample_message("t/b", b"2"), QoS::AtLeastOnce, false),
+            client.send(Publish::from(sample_message("t/b", b"2")).qos(QoS::AtLeastOnce)),
         )
         .await;
         assert!(
@@ -1737,7 +1767,7 @@ mod tests {
             let client = client.clone();
             async move {
                 client
-                    .publish(sample_message("t/inflight", b"1"), QoS::AtLeastOnce, false)
+                    .send(Publish::from(sample_message("t/inflight", b"1")).qos(QoS::AtLeastOnce))
                     .await
             }
         });
@@ -1748,7 +1778,7 @@ mod tests {
             let client = client.clone();
             async move {
                 client
-                    .publish(sample_message("t/parked", b"2"), QoS::AtLeastOnce, false)
+                    .send(Publish::from(sample_message("t/parked", b"2")).qos(QoS::AtLeastOnce))
                     .await
             }
         });
@@ -1832,13 +1862,13 @@ mod tests {
             }
             AckKind::Publish => {
                 client
-                    .publish(sample_message("t/dup", b"once"), QoS::AtLeastOnce, false)
+                    .send(Publish::from(sample_message("t/dup", b"once")).qos(QoS::AtLeastOnce))
                     .await
                     .expect("first PUBACK completes publish");
 
                 // Second publish must still work (id freed after definitive completion; duplicate ignored).
                 client
-                    .publish(sample_message("t/dup2", b"twice"), QoS::AtLeastOnce, false)
+                    .send(Publish::from(sample_message("t/dup2", b"twice")).qos(QoS::AtLeastOnce))
                     .await
                     .expect("packet id must be reusable after completion despite duplicate PUBACK");
             }
@@ -1980,7 +2010,7 @@ mod tests {
 
         let err = timeout(
             Duration::from_secs(3),
-            client.publish(sample_message("t/lost", b"x"), QoS::AtLeastOnce, false),
+            client.send(Publish::from(sample_message("t/lost", b"x")).qos(QoS::AtLeastOnce)),
         )
         .await
         .expect("QoS 1 waiter must not hang after connection loss")
@@ -2027,7 +2057,7 @@ mod tests {
             let client = client.clone();
             async move {
                 client
-                    .publish(sample_message("t/shutdown", b"x"), QoS::AtLeastOnce, false)
+                    .send(Publish::from(sample_message("t/shutdown", b"x")).qos(QoS::AtLeastOnce))
                     .await
             }
         });

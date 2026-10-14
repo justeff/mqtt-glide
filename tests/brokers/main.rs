@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use common::{CountingInvalidate, NoReconnect, static_credentials, wait_for_phase};
 use mqtt_glide::{
-    AuthError, BrokerUrl, ClientId, ConnectOptions, ConnectionOutcome, CredentialsProvider, NoopLifecycle,
+    AuthError, BrokerUrl, ClientId, ConnectOptions, ConnectionOutcome, CredentialsProvider, NoopLifecycle, Publish,
     PublishMessage, QoS, ReconnectPolicy, SessionParams, SessionPhase, SubscribeAckReason, Subscription, connect,
     shared_filter,
 };
@@ -292,7 +292,6 @@ async fn mosquitto_shared_subscription_delivers_to_handoff() {
 #[tokio::test]
 async fn mosquitto_qos1_publish_awaits_puback() {
     use bytes::Bytes;
-    use bytestring::ByteString;
     use mqtt_glide::PublishMessage;
 
     let Some((_container, port)) = start_mosquitto().await else {
@@ -326,15 +325,7 @@ async fn mosquitto_qos1_publish_awaits_puback() {
 
     timeout(
         Duration::from_secs(10),
-        client.publish(
-            PublishMessage {
-                topic: ByteString::from_static("qos1/demo"),
-                payload: Bytes::from_static(b"await-me"),
-                properties: mqtt_glide::PublishProperties::default(),
-            },
-            QoS::AtLeastOnce,
-            false,
-        ),
+        client.send(Publish::new("qos1/demo", Bytes::from_static(b"await-me")).qos(QoS::AtLeastOnce)),
     )
     .await
     .expect("QoS 1 publish must not hang")
@@ -382,10 +373,10 @@ async fn mosquitto_qos1_window_wider_than_receive_maximum() {
         session.server_receive_maximum
     );
 
-    let messages = (0..500).map(|i| PublishMessage::new("qos1/window", format!("m{i}")));
+    let messages = (0..500).map(|i| Publish::new("qos1/window", format!("m{i}")).qos(QoS::AtLeastOnce));
     timeout(
         Duration::from_secs(20),
-        client.publish_batch(messages, QoS::AtLeastOnce, false, NonZeroUsize::new(64).expect("nz")),
+        client.publish_batch(messages, NonZeroUsize::new(64).expect("nz")),
     )
     .await
     .expect("publish_batch must not hang")
@@ -401,7 +392,6 @@ async fn mosquitto_publish_properties_roundtrip() {
     use std::num::NonZeroU32;
 
     use bytes::Bytes;
-    use bytestring::ByteString;
     use mqtt_glide::{PublishMessage, PublishProperties};
 
     let Some((_container, port)) = start_mosquitto().await else {
@@ -448,18 +438,14 @@ async fn mosquitto_publish_properties_roundtrip() {
 
     let expiry = NonZeroU32::new(60).expect("nz");
     client
-        .publish(
-            PublishMessage {
-                topic: ByteString::from(topic),
-                payload: Bytes::from_static(b"props-body"),
-                properties: PublishProperties {
+        .send(
+            Publish::new(topic, Bytes::from_static(b"props-body"))
+                .qos(QoS::AtLeastOnce)
+                .properties(PublishProperties {
                     message_expiry_interval: Some(expiry),
                     user_properties: vec![("k1", "v1").into(), ("ts", "1").into()],
                     ..PublishProperties::default()
-                },
-            },
-            QoS::AtLeastOnce,
-            false,
+                }),
         )
         .await
         .expect("publish with properties");

@@ -7,7 +7,7 @@ use tokio::time::timeout;
 
 use super::test_support::*;
 use super::*;
-use crate::QoS;
+use crate::Publish;
 use crate::client::connect;
 use crate::codec::{DecodedFrame, Packet, PublishMessage};
 use crate::error::{AuthError, ProtocolError};
@@ -1256,9 +1256,7 @@ async fn resubscribe_fails_when_suback_not_granted() {
 /// (session start is not blocked by lifecycle consumers).
 #[tokio::test]
 async fn session_start_sets_watch_connected_and_allows_qos0() {
-    use crate::codec::{PublishMessage, PublishProperties};
     use bytes::Bytes;
-    use bytestring::ByteString;
 
     let (client, connection, mut phase) = test_connect().await;
     let run = tokio::spawn(connection.run());
@@ -1274,15 +1272,7 @@ async fn session_start_sets_watch_connected_and_allows_qos0() {
 
     let published = timeout(
         Duration::from_secs(3),
-        client.publish(
-            PublishMessage {
-                topic: ByteString::from_static("f10/go"),
-                payload: Bytes::from_static(b"go"),
-                properties: PublishProperties::default(),
-            },
-            QoS::AtMostOnce,
-            false,
-        ),
+        client.send(Publish::new("f10/go", Bytes::from_static(b"go"))),
     )
     .await
     .expect("session start must not block QoS 0 publish (watch Connected is non-blocking)");

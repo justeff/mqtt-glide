@@ -31,13 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("SUBACK: {reasons:?}");
 
     // Self-publish so the example works without an external publisher.
-    client
-        .publish_with()
-        .topic(filter)
-        .payload("ping")
-        .qos(QoS::AtLeastOnce)
-        .send()
-        .await?;
+    client.publish(filter, "ping").qos(QoS::AtLeastOnce).send().await?;
 
     // App-level bound only: ack/connect timeouts do not cover waiting on the inbound sink.
     let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv_async())

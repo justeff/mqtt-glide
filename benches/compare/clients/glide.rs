@@ -10,8 +10,8 @@ use bytes::Bytes;
 use bytestring::ByteString;
 use mqtt_glide::{
     AuthError, BrokerUrl, ClientId as GlideClientId, ConnectOptions, ConnectionOutcome, CredentialsProvider,
-    MqttClient, NoopLifecycle, PublishMessage, PublishProperties, QoS, ReconnectPolicy, SessionParams, SessionPhase,
-    connect,
+    MqttClient, NoopLifecycle, Publish, PublishMessage, PublishProperties, QoS, ReconnectPolicy, SessionParams,
+    SessionPhase, connect,
 };
 use secrecy::SecretString;
 use tokio::task::JoinHandle;
@@ -219,7 +219,7 @@ fn wire_qos(qos: BenchQos) -> QoS {
 impl OutboundSession for GlideOutbound {
     async fn publish_serial(&self, payload: &[u8]) {
         self.client
-            .publish(publish_message(payload), wire_qos(self.qos), false)
+            .send(Publish::from(publish_message(payload)).qos(wire_qos(self.qos)))
             .await
             .expect("glide outbound publish");
     }
@@ -229,7 +229,7 @@ impl OutboundSession for GlideOutbound {
         let capacity = NonZeroUsize::new(window).expect("pipeline window > 0");
         let mut pipe = self.client.publish_window(capacity);
         for _ in 0..n {
-            pipe.push_retry(publish_message(payload), qos, false)
+            pipe.push(Publish::from(publish_message(payload)).qos(qos))
                 .await
                 .expect("glide pipelined publish");
         }

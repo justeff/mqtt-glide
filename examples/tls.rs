@@ -30,9 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     client
-        .publish_with()
-        .topic("demo/glide/tls")
-        .payload("hello over tls")
+        .publish("demo/glide/tls", "hello over tls")
         .qos(QoS::AtLeastOnce)
         .send()
         .await?;

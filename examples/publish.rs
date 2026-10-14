@@ -1,9 +1,9 @@
 //! Fluent publish paths, MQTT 5 properties, `publish_batch`, shared filter, and Will Message.
 //!
-//! Prefer [`MqttClient::publish_with`](mqtt_glide::MqttClient::publish_with) for one-shots.
-//! Use [`PublishMessage::new`](mqtt_glide::PublishMessage::new) when the message is built
+//! Prefer [`MqttClient::publish`](mqtt_glide::MqttClient::publish) for one-shots.
+//! Use [`Publish::new`](mqtt_glide::Publish::new) when the message is built
 //! ahead of time (workers, reuse). Use [`publish_batch`](mqtt_glide::MqttClient::publish_batch)
-//! when every message shares the same QoS/retain — otherwise prefer [`pipeline.rs`](pipeline.rs).
+//! for a burst through a sliding window — see also [`pipeline.rs`](pipeline.rs).
 //! Auth / reconnect hooks: see [`hooks.rs`](hooks.rs).
 //!
 //! ```shell
@@ -12,7 +12,7 @@
 
 use std::num::NonZeroUsize;
 
-use mqtt_glide::{ClientBuilder, PublishMessage, PublishProperties, QoS, shared_filter};
+use mqtt_glide::{ClientBuilder, Publish, PublishProperties, QoS, shared_filter};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,32 +30,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Fluent one-shot (default path).
     client
-        .publish_with()
-        .topic("sensors/room1/temp")
-        .payload("22.5")
+        .publish("sensors/room1/temp", "22.5")
         .qos(QoS::AtLeastOnce)
         .message_expiry(3600)
         .user_property("unit", "celsius")
         .send()
         .await?;
 
-    // Pre-built message + power `publish` (same Into contract as publish_with payload).
-    let message = PublishMessage::new("sensors/room1/humidity", "48").properties(
-        PublishProperties::default()
-            .content_type("text/plain")
-            .user_property("unit", "percent")
-            .message_expiry(3600),
-    );
-    client.publish(message, QoS::AtLeastOnce, false).await?;
+    // Pre-built `Publish` value, sent later.
+    let message = Publish::new("sensors/room1/humidity", "48")
+        .qos(QoS::AtLeastOnce)
+        .properties(
+            PublishProperties::default()
+                .content_type("text/plain")
+                .user_property("unit", "percent")
+                .message_expiry(3600),
+        );
+    client.send(message).await?;
 
-    // Same QoS/retain for the whole burst — simpler than a manual window loop.
+    // A whole burst through a sliding window — simpler than a manual window loop.
     let batch = [
-        PublishMessage::new("sensors/room1/batch/0", "a"),
-        PublishMessage::new("sensors/room1/batch/1", "b"),
-        PublishMessage::new("sensors/room1/batch/2", "c"),
+        Publish::new("sensors/room1/batch/0", "a").qos(QoS::AtLeastOnce),
+        Publish::new("sensors/room1/batch/1", "b").qos(QoS::AtLeastOnce),
+        Publish::new("sensors/room1/batch/2", "c").qos(QoS::AtLeastOnce),
     ];
     client
-        .publish_batch(batch, QoS::AtLeastOnce, false, NonZeroUsize::new(8).expect("window"))
+        .publish_batch(batch, NonZeroUsize::new(8).expect("window"))
         .await?;
 
     let filter = shared_filter("workers", "jobs/inbox")?;

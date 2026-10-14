@@ -40,9 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await?;
 
     client
-        .publish_with()
-        .topic("sensors/room1/temp")
-        .payload("22.5")
+        .publish("sensors/room1/temp", "22.5")
         .qos(QoS::AtLeastOnce)
         .send()
         .await?;
@@ -219,7 +217,7 @@ Three limits, easy to confuse, only two of them yours to set.
 
 ### Command channel capacity
 
-`ConnectOptions::command_channel_capacity`, default `32`: how many commands may queue up for the write task. Full means `publish` returns `AppError::Backpressure` rather than blocking, so set it to at least the number of publishes you keep in flight.
+`ConnectOptions::command_channel_capacity`, default `32`: how many commands may queue up for the write task. When it is full, `publish` / `send` / `subscribe` / `unsubscribe` and `PublishWindow::push` wait up to `ack_timeout` for room (then `AppError::Backpressure`), while `start_publish` fails fast with `AppError::Backpressure`. Set it to at least the number of publishes you keep in flight.
 
 ### Receive Maximum
 
@@ -248,23 +246,23 @@ Prefer convenience (zero extra cost vs. the primitives underneath):
 | Goal | API |
 |------|-----|
 | Connect | [`ClientBuilder`](https://docs.rs/mqtt-glide/latest/mqtt_glide/builder/struct.ClientBuilder.html): `.inbound_sink` / `.on_inbound` / `.discard_inbound` before `connect` |
-| One publish | [`publish_with`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.publish_with) → `.send().await` |
-| Many publishes in flight | [`publish_window`](https://docs.rs/mqtt-glide/latest/mqtt_glide/publish_window/struct.PublishWindow.html) → `.push_retry().await` … `.drain().await` |
-| Same-QoS burst | [`publish_batch`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.publish_batch) → one call (`push_retry` + `drain` under the hood) |
+| One publish | [`publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.publish) → `.await` (or `.send().await`) |
+| Many publishes in flight | [`publish_window`](https://docs.rs/mqtt-glide/latest/mqtt_glide/publish_window/struct.PublishWindow.html) → `.push(Publish::new(..)).await` … `.drain().await` |
+| Burst | [`publish_batch`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.publish_batch) → one call (`push` + `drain` under the hood) |
 | Receive + workers | `.inbound_sink(flume/mpsc)` + your `recv` loop |
 | Tiny sync inbound work | `.on_inbound(\|msg\| …)` (runs on the read task; keep it short) |
 
-Power (same semantics, more control): [`connect`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/fn.connect.html), custom [`InboundSink`](https://docs.rs/mqtt-glide/latest/mqtt_glide/inbound_sink/trait.InboundSink.html), [`publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.publish) / [`start_publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.start_publish) + [`PublishCompletion`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.PublishCompletion.html).
+Power (same semantics, more control): [`connect`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/fn.connect.html), custom [`InboundSink`](https://docs.rs/mqtt-glide/latest/mqtt_glide/inbound_sink/trait.InboundSink.html), [`send`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.send) / [`start_publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.start_publish) + [`PublishCompletion`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.PublishCompletion.html).
 
 ### Publish paths
 
 | Method | Role | Notes |
 |--------|------|-------|
-| `publish_with()` | Convenience one-shot | `.send().await` (= `publish`). Type-state topic/payload; default QoS 0. Helpers: `.message_expiry(secs)`, `.user_property(name, value)`. `.properties(...)` replaces the whole struct; call it before those helpers. |
-| `publish_window(n)` | Convenience pipeline | Sliding window over `start_publish` (no task per message). `.push()` = one attempt; `.push_retry()` yields on `Backpressure`. Always `.drain()` after the burst. |
-| `publish_batch(msgs, qos, retain, n)` | Convenience same-QoS burst | Internal window of capacity `n`; all messages share `qos` / `retain`. Prefer `publish_window` for mixed QoS. |
-| `publish(msg, qos, retain)` | Power one-shot | Ready [`PublishMessage`](https://docs.rs/mqtt-glide/latest/mqtt_glide/codec/publish/struct.PublishMessage.html). |
-| `start_publish` + `PublishCompletion` | Power pipeline | Custom windowing / wait order. Full command channel → `AppError::Backpressure`. |
+| `publish(topic, payload)` | Convenience one-shot | `.await` or `.send().await`; `.start()` enqueues without waiting. Default QoS 0. Setters: `.qos()`, `.retain()`, `.message_expiry(secs)`, `.user_property(name, value)`, `.content_type()`, `.response_topic()`, `.correlation_data()`. `.properties(...)` replaces the whole struct; call it before the other property setters. |
+| `publish_window(n)` | Convenience pipeline | Sliding window over `enqueue_publish` (no task per message). `.push(impl Into<Publish>)` waits for command-channel room. Always `.drain()` after the burst. |
+| `publish_batch(msgs, n)` | Convenience burst | Internal window of capacity `n`; each message is an `impl Into<Publish>` carrying its own QoS / retain. |
+| `send(publish)` | Power one-shot | Ready [`Publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/publish/struct.Publish.html) value (also converts from a `PublishMessage`). |
+| `start_publish` + `PublishCompletion` | Power pipeline | Custom windowing / wait order. Full command channel → immediate `AppError::Backpressure`. `enqueue_publish` waits for room instead. |
 
 QoS 2 is rejected (`AppError::InvalidRequest`). Packet ID / `dup` are assigned by the driver.
 
@@ -304,8 +302,8 @@ Broader flows live under [`examples/`](examples/) and are the better starting po
 |---------|--------|
 | [`subscribe.rs`](examples/subscribe.rs) | `inbound_sink`, `Subscription` options, receive, `unsubscribe`, `shutdown` |
 | [`on_inbound.rs`](examples/on_inbound.rs) | Inline `.on_inbound` handler (read-task; keep short) |
-| [`publish.rs`](examples/publish.rs) | `publish_with`, `PublishMessage::new` + `publish`, `publish_batch`, Will Message, shared filter |
-| [`pipeline.rs`](examples/pipeline.rs) | `publish_window` + fluent `.push_retry()` / `.drain()` (mixed topics) |
+| [`publish.rs`](examples/publish.rs) | `publish`, `Publish::new` + `send`, `publish_batch`, Will Message, shared filter |
+| [`pipeline.rs`](examples/pipeline.rs) | `publish_window` + `.push(Publish::new(..))` / `.drain()` (mixed topics) |
 | [`request_response.rs`](examples/request_response.rs) | Properties R/R by hand (no RPC helper yet) |
 | [`tls.rs`](examples/tls.rs) | `mqtts://`, rustls system roots, `connect_timeout` / `ack_timeout` |
 | [`hooks.rs`](examples/hooks.rs) | `CredentialsProvider`, `LifecycleHook`, `mark_live()` |

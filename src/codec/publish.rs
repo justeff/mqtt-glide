@@ -117,7 +117,7 @@ impl PublishMessage {
     /// Byte-string literals (`b"..."`) are `&[u8; N]` and do **not** implement [`Into<Bytes>`];
     /// use `"..."` for text or [`Bytes::from_static`] for binary.
     ///
-    /// Same contract as [`crate::PublishWith::payload`].
+    /// Same contract as [`crate::Publish::new`].
     #[inline]
     pub fn new(topic: impl Into<ByteString>, payload: impl Into<Bytes>) -> Self {
         Self {

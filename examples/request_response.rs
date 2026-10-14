@@ -46,9 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .clone()
             .unwrap_or_else(|| correlation_expected.clone());
         responder_client
-            .publish_with()
-            .topic(reply_to)
-            .payload("pong")
+            .publish(reply_to, "pong")
             .qos(QoS::AtLeastOnce)
             .properties(
                 PublishProperties::default()
@@ -61,9 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     requester
-        .publish_with()
-        .topic(request_topic)
-        .payload("ping")
+        .publish(request_topic, "ping")
         .qos(QoS::AtLeastOnce)
         .properties(
             PublishProperties::default()

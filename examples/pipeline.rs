@@ -10,7 +10,7 @@
 
 use std::num::NonZeroUsize;
 
-use mqtt_glide::{ClientBuilder, QoS};
+use mqtt_glide::{ClientBuilder, Publish, QoS};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,11 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut pipe = client.publish_window(NonZeroUsize::new(64).expect("window"));
     for i in 0..1_000 {
-        pipe.publish_with()
-            .topic(format!("out/{i}"))
-            .payload("x")
-            .qos(QoS::AtLeastOnce)
-            .push_retry()
+        pipe.push(Publish::new(format!("out/{i}"), "x").qos(QoS::AtLeastOnce))
             .await?;
     }
     pipe.drain().await?;

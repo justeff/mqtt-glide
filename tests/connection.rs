@@ -13,7 +13,7 @@ use common::{
 };
 use mqtt_glide::{
     AuthError, BrokerUrl, ClientId, ConnectAck, ConnectOptions, ConnectionOutcome, DisconnectReasonCode, NoopLifecycle,
-    ProtocolError, PublishMessage, QoS, SessionPhase, StandardReconnectPolicy, connect,
+    ProtocolError, Publish, PublishMessage, QoS, SessionPhase, StandardReconnectPolicy, connect,
 };
 use secrecy::SecretString;
 use tokio::net::TcpListener;
@@ -224,7 +224,7 @@ async fn auth_failure_reconnect_replenishes_channel_before_invalidate() {
 
     // While the credentials provider is refreshing, the replenished command channel must
     // accept application work (not AppError::CommandChannelClosed).
-    let queued = client.start_publish(PublishMessage::new("invalidate/order", "x"), QoS::AtMostOnce, false);
+    let queued = client.start_publish(Publish::new("invalidate/order", "x"));
     assert!(
         queued.is_ok(),
         "command channel must stay open during invalidation, got {queued:?}"

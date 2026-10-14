@@ -21,9 +21,7 @@
 //!     .connect()
 //!     .await?;
 //! client
-//!     .publish_with()
-//!     .topic("topic/a")
-//!     .payload("hello")
+//!     .publish("topic/a", "hello")
 //!     .qos(QoS::AtLeastOnce)
 //!     .send()
 //!     .await?;
@@ -435,7 +433,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    /// Minimal publisher: `discard_inbound` + `connect` + `publish_with` QoS 1.
+    /// Minimal publisher: `discard_inbound` + `connect` + `publish` QoS 1.
     #[tokio::test]
     async fn builder_discard_inbound_publish_qos_at_least_once_roundtrip() {
         let observed = Arc::new(Mutex::new(Vec::new()));
@@ -486,9 +484,7 @@ mod tests {
             .expect("connect");
 
         client
-            .publish_with()
-            .topic("t/discard-pub")
-            .payload("minimal-publisher")
+            .publish("t/discard-pub", "minimal-publisher")
             .qos(QoS::AtLeastOnce)
             .send()
             .await
@@ -503,7 +499,7 @@ mod tests {
         client.shutdown().await.expect("shutdown");
     }
 
-    /// Explicit handoff + `publish_with` QoS 1 roundtrip through the builder.
+    /// Explicit handoff + `publish` QoS 1 roundtrip through the builder.
     #[tokio::test]
     async fn builder_publish_with_qos_at_least_once_roundtrip() {
         let observed = Arc::new(Mutex::new(Vec::new()));
@@ -555,18 +551,14 @@ mod tests {
             .expect("connect");
 
         client
-            .publish_with()
-            .topic("t/builder")
-            .payload("need-ack")
+            .publish("t/builder", "need-ack")
             .qos(QoS::AtLeastOnce)
             .send()
             .await
             .expect("publish qos1");
 
         client
-            .publish_with()
-            .topic("t/builder-props")
-            .payload("with-props")
+            .publish("t/builder-props", "with-props")
             .qos(QoS::AtLeastOnce)
             .user_property("k", "v")
             .send()
@@ -619,9 +611,7 @@ mod tests {
         let run = tokio::spawn(connection.run());
         await_connected(&mut phase).await;
         client
-            .publish_with()
-            .topic("t/q0")
-            .payload("fire")
+            .publish("t/q0", "fire")
             .send()
             .await
             .expect("publish qos0 default");
