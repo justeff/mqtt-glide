@@ -230,7 +230,8 @@ impl ConnectOptions {
         self
     }
 
-    /// Sets the MQTT keep-alive interval.
+    /// Sets the MQTT keep-alive interval: whole seconds, fractions dropped (under one second
+    /// turns keep-alive off), at most 65 535 s.
     pub fn keep_alive(mut self, keep_alive: Duration) -> Self {
         self.keep_alive = keep_alive;
         self

@@ -64,7 +64,7 @@ pub(crate) struct ConnectCredentials {
 /// Caller **MUST** have validated [`ConnectOptions::will_message`] via [`validate_will_message`]
 /// when present (Topic Name / QoS rules).
 pub(crate) fn build_connect(options: &ConnectOptions, client_id: &str, credentials: &ConnectCredentials) -> Connect {
-    let keep_alive = u16::try_from(options.keep_alive.as_secs()).unwrap_or(u16::MAX);
+    let keep_alive = keep_alive_secs(options.keep_alive);
     let username = if credentials.username.is_empty() {
         None
     } else {
@@ -124,8 +124,16 @@ pub(crate) fn topic_name_invalid_reason(topic: &str) -> Option<&'static str> {
     }
 }
 
+/// The Keep Alive CONNECT carries: whole seconds, at most `u16::MAX` (§3.1.2.10).
+fn keep_alive_secs(keep_alive: Duration) -> u16 {
+    u16::try_from(keep_alive.as_secs()).unwrap_or(u16::MAX)
+}
+
 /// Applies CONNACK properties onto local session parameters.
 pub(crate) fn apply_connack(client_keep_alive: Duration, ack: &ConnectAck) -> Result<SessionParams, ConnectionOutcome> {
+    // Ping on the interval the broker was told, not the unrounded option: 1.9 s goes out as
+    // 1 s, and pinging every 1.9 s would let the broker drop an idle client.
+    let client_keep_alive = Duration::from_secs(u64::from(keep_alive_secs(client_keep_alive)));
     if ack.reason_code != ConnectAckReason::Success {
         return Err(connack_failure_outcome(
             ack.reason_code,
@@ -428,6 +436,19 @@ mod tests {
     }
 
     /// Absent Server Keep Alive leaves client keep-alive unchanged.
+    #[test]
+    fn apply_connack_pings_on_the_interval_sent_in_connect() {
+        let ack = ConnectAck::default();
+        for (configured, effective) in [
+            (Duration::from_millis(1900), Duration::from_secs(1)),
+            (Duration::from_millis(500), Duration::ZERO),
+            (Duration::from_secs(100_000), Duration::from_secs(u64::from(u16::MAX))),
+        ] {
+            let session = apply_connack(configured, &ack).expect("success CONNACK");
+            assert_eq!(session.keep_alive, effective, "keep_alive({configured:?})");
+        }
+    }
+
     #[test]
     fn apply_connack_keeps_client_keep_alive_when_server_absent() {
         let mut ack = sample_connack();
