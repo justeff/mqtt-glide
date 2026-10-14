@@ -317,7 +317,7 @@ where
     Ok(())
 }
 
-/// Allocates a publish packet id, registers the waiter, and feeds the QoS-1 PUBLISH.
+/// Allocates a publish packet id, feeds the QoS-1 PUBLISH, and registers its waiter.
 fn encode_qos1_publish<W>(
     framed: &mut FramedWrite<W, V5Codec>,
     inflight: &mut InflightPots,
@@ -334,7 +334,6 @@ where
             return Ok(());
         }
     };
-    publish_waiters.insert(packet_id, publish.reply);
     let delivery = PublishDelivery {
         dup: false,
         retain: publish.retain,
@@ -342,12 +341,64 @@ where
         packet_id: Some(packet_id),
     };
     if let Err(error) = feed_publish(framed, &publish.message, delivery) {
-        // Always free the id — even if the caller already dropped the oneshot.
         inflight.release_publish(packet_id);
-        let reply = publish_waiters.by_id.remove(&packet_id);
-        return finish_publish_encode_error(reply, &publish.message, error);
+        return finish_publish_encode_error(Some(publish.reply), &publish.message, error);
     }
+    publish_waiters.insert_sent(packet_id, publish);
     Ok(())
+}
+
+/// Resends a resumed session's carried QoS-1 PUBLISHes (DUP = 1, original ids) and flushes.
+///
+/// Called once at write-task start. Only as many as the new Receive Maximum allows go out
+/// ([MQTT-4.9.0-2]); the rest fail with [`AppError::ConnectionLost`] rather than overrun
+/// the broker window.
+pub(super) async fn resend_carried<W>(
+    framed: &mut FramedWrite<W, V5Codec>,
+    inflight: &mut InflightPots,
+    publish_waiters: &mut PublishWaiters,
+    flush_abort: FlushAbort<'_>,
+) -> Result<(), WriteOutcome>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let Some(carry) = publish_waiters.carry.clone() else {
+        return Ok(());
+    };
+    let mut carried = std::mem::take(&mut *carry.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    if carried.is_empty() {
+        return Ok(());
+    }
+    // Resend in the original send order ([MQTT-4.6.0-1]); ids are reused round-robin,
+    // so they do not encode it.
+    carried.sort_by_key(|entry| entry.seq);
+    for entry in carried {
+        if !inflight.has_publish_capacity() || !inflight.reserve_publish(entry.packet_id) {
+            let _ = entry.reply.send(Err(AppError::ConnectionLost));
+            continue;
+        }
+        let delivery = PublishDelivery {
+            dup: true,
+            retain: entry.retain,
+            qos: QoS::AtLeastOnce,
+            packet_id: Some(entry.packet_id),
+        };
+        if let Err(error) = feed_publish(framed, &entry.message, delivery) {
+            inflight.release_publish(entry.packet_id);
+            finish_publish_encode_error(Some(entry.reply), &entry.message, error)?;
+            continue;
+        }
+        publish_waiters.insert_sent(
+            entry.packet_id,
+            PendingOutboundPublish {
+                message: entry.message,
+                qos: QoS::AtLeastOnce,
+                retain: entry.retain,
+                reply: entry.reply,
+            },
+        );
+    }
+    flush_writes(framed, flush_abort).await
 }
 
 pub(super) async fn handle_subscribe<W>(

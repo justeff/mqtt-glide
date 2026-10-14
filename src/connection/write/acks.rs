@@ -10,7 +10,7 @@ use crate::connection::subscriptions::{
 };
 use crate::error::AppError;
 
-use super::{PublishWaiters, SubUnsubWaiters, WriteOutcome};
+use super::{CarriedPublish, PublishWaiters, SubUnsubWaiters, WriteOutcome};
 
 /// Returns whether an ACK bound to `ack_generation` should complete waiters for `current`.
 ///
@@ -35,11 +35,11 @@ pub(crate) fn complete_publish_ack(
     if !ack_generation_applies(write_generation, ack_generation) {
         return;
     }
-    let Some(reply) = waiters.by_id.remove(&ack.packet_id) else {
+    let Some(entry) = waiters.by_id.remove(&ack.packet_id) else {
         return;
     };
     inflight.release_publish(ack.packet_id);
-    let _ = reply.send(publish_ack_to_result(ack.reason_code));
+    let _ = entry.reply.send(publish_ack_to_result(ack.reason_code));
 }
 
 pub(super) fn publish_ack_to_result(reason: PublishAckReason) -> Result<(), AppError> {
@@ -119,9 +119,9 @@ pub(super) fn fail_all_waiters(
         inflight.release_subscribe(id);
         let _ = pending.reply.send(Err(error.clone()));
     }
-    for (id, reply) in publish_waiters.by_id.drain() {
+    for (id, entry) in publish_waiters.by_id.drain() {
         inflight.release_publish(id);
-        let _ = reply.send(Err(error.clone()));
+        let _ = entry.reply.send(Err(error.clone()));
     }
     for parked in publish_waiters.parked.drain(..) {
         let _ = parked.reply.send(Err(error.clone()));
@@ -135,6 +135,35 @@ pub(super) fn fail_waiters_for_outcome(
     inflight: &mut InflightPots,
     outcome: &WriteOutcome,
 ) {
+    // Connection loss in a resumable session: unacknowledged QoS-1 publishes are session
+    // state ([MQTT-4.1]) and move to the next connection instead of failing.
+    if matches!(
+        outcome,
+        WriteOutcome::Transport(_) | WriteOutcome::Protocol(_) | WriteOutcome::Cancelled
+    ) && let Some(carry) = publish_waiters.carry.clone()
+    {
+        let mut slot = carry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ids: Vec<_> = publish_waiters
+            .by_id
+            .iter()
+            .filter(|(_, entry)| entry.resend.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let Some(entry) = publish_waiters.by_id.remove(&id) else {
+                continue;
+            };
+            inflight.release_publish(id);
+            let (message, retain) = entry.resend.expect("filtered on resend");
+            slot.push(CarriedPublish {
+                packet_id: id,
+                message,
+                retain,
+                reply: entry.reply,
+                seq: entry.seq,
+            });
+        }
+    }
     let error = app_error_from_write_outcome(outcome);
     fail_all_waiters(waiters, publish_waiters, inflight, &error);
 }

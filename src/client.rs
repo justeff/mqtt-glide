@@ -2084,4 +2084,184 @@ mod tests {
 
         let _ = run.await;
     }
+
+    // --- [MQTT-4.4.0-1] resend of unacknowledged QoS 1 on session resume ---
+
+    /// Frames a resume-test broker saw: `(connection index, packet id, dup, payload)`.
+    type SeenPublishes = Arc<tokio::sync::Mutex<Vec<(usize, NonZeroU16, bool, Bytes)>>>;
+
+    /// Connection 0: CONNACK without session, swallow two QoS 1 PUBLISHes, then drop TCP.
+    /// Connection 1: CONNACK with `second_session_present`, PUBACK everything.
+    async fn spawn_resume_broker(seen: SeenPublishes, second_session_present: bool) -> u16 {
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        crate::connection::test_support::spawn_broker_loop(move |mut framed_read, mut framed_write| {
+            let seen = Arc::clone(&seen);
+            let connections = Arc::clone(&connections);
+            async move {
+                let index = connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut ack = ConnectAck::default();
+                ack.session_present = index > 0 && second_session_present;
+                if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
+                    return;
+                }
+                let mut swallowed = 0;
+                while let Some(Ok(frame)) = framed_read.next().await {
+                    let (DecodedFrame::Publish(packet), _) = frame else {
+                        continue;
+                    };
+                    let id = packet.meta.packet_id.expect("QoS 1 packet id");
+                    seen.lock()
+                        .await
+                        .push((index, id, packet.meta.dup, packet.message.payload.clone()));
+                    if index == 0 {
+                        swallowed += 1;
+                        if swallowed == 2 {
+                            return; // drop the connection with both PUBACKs outstanding
+                        }
+                        continue;
+                    }
+                    let _ = framed_write
+                        .send(Packet::PublishAck(PublishAck {
+                            packet_id: id,
+                            reason_code: crate::codec::PublishAckReason::Success,
+                            properties: Vec::new(),
+                            reason_string: None,
+                        }))
+                        .await;
+                }
+            }
+        })
+        .await
+    }
+
+    fn resumable_options(port: u16) -> ConnectOptions {
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        ConnectOptions::new(url)
+            .client_id(crate::ClientId::try_new("resume-test").expect("client id"))
+            .clean_start(false)
+            .session_expiry(Some(Duration::from_secs(60)))
+    }
+
+    /// Session Present after reconnect: both PUBLISHes are resent in order, with their
+    /// original ids and DUP set, and the callers' completions resolve on the new PUBACKs.
+    #[tokio::test]
+    async fn unacked_qos1_is_resent_with_dup_on_session_resume() {
+        let seen: SeenPublishes = Arc::default();
+        let port = spawn_resume_broker(Arc::clone(&seen), true).await;
+        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (client, connection, mut phase) = connect(
+            resumable_options(port),
+            static_test_credentials(),
+            ImmediateReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let first = client
+            .start_publish(Publish::new("t/resume", "a").qos(QoS::AtLeastOnce))
+            .expect("enqueue a");
+        let second = client
+            .start_publish(Publish::new("t/resume", "b").qos(QoS::AtLeastOnce))
+            .expect("enqueue b");
+        timeout(Duration::from_secs(3), async {
+            first.wait().await?;
+            second.wait().await
+        })
+        .await
+        .expect("completions must resolve after resend")
+        .expect("resent publishes must be acknowledged");
+
+        let frames = seen.lock().await.clone();
+        let first_conn: Vec<_> = frames.iter().filter(|f| f.0 == 0).collect();
+        let second_conn: Vec<_> = frames.iter().filter(|f| f.0 == 1).collect();
+        assert_eq!(first_conn.len(), 2);
+        assert_eq!(second_conn.len(), 2, "both unacknowledged publishes must be resent");
+        for (original, resent) in first_conn.iter().zip(&second_conn) {
+            assert!(!original.2, "first transmission must not set DUP");
+            assert!(resent.2, "resend must set DUP ([MQTT-3.3.1-1])");
+            assert_eq!(original.1, resent.1, "resend must reuse the original packet id");
+            assert_eq!(original.3, resent.3, "resend keeps send order ([MQTT-4.6.0-1])");
+        }
+
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
+
+    /// No session on the broker after reconnect: the client discards its own state
+    /// ([MQTT-3.2.2-5]) — nothing is resent and the callers see `ConnectionLost`.
+    #[tokio::test]
+    async fn unacked_qos1_fails_when_broker_lost_the_session() {
+        let seen: SeenPublishes = Arc::default();
+        let port = spawn_resume_broker(Arc::clone(&seen), false).await;
+        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (client, connection, mut phase) = connect(
+            resumable_options(port),
+            static_test_credentials(),
+            ImmediateReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let first = client
+            .start_publish(Publish::new("t/resume", "a").qos(QoS::AtLeastOnce))
+            .expect("enqueue a");
+        let second = client
+            .start_publish(Publish::new("t/resume", "b").qos(QoS::AtLeastOnce))
+            .expect("enqueue b");
+        for completion in [first, second] {
+            let err = timeout(Duration::from_secs(3), completion.wait())
+                .await
+                .expect("completion must resolve")
+                .expect_err("publish from a discarded session must fail");
+            assert!(matches!(err, AppError::ConnectionLost), "got {err:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            seen.lock().await.iter().all(|f| f.0 == 0),
+            "nothing may be resent into a fresh session"
+        );
+
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
+
+    /// Clean Start sessions keep the old behaviour: connection loss fails in-flight QoS 1.
+    #[tokio::test]
+    async fn unacked_qos1_fails_on_connection_loss_with_clean_start() {
+        let seen: SeenPublishes = Arc::default();
+        let port = spawn_resume_broker(Arc::clone(&seen), false).await;
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let (tx, _rx) = flume::bounded::<PublishMessage>(4);
+        let (client, connection, mut phase) = connect(
+            ConnectOptions::new(url),
+            static_test_credentials(),
+            ImmediateReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let first = client
+            .start_publish(Publish::new("t/clean", "a").qos(QoS::AtLeastOnce))
+            .expect("enqueue a");
+        let _second = client
+            .start_publish(Publish::new("t/clean", "b").qos(QoS::AtLeastOnce))
+            .expect("enqueue b");
+        let err = timeout(Duration::from_secs(3), first.wait())
+            .await
+            .expect("completion must resolve")
+            .expect_err("clean session loss must fail the publish");
+        assert!(matches!(err, AppError::ConnectionLost), "got {err:?}");
+
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
 }

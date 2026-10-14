@@ -35,7 +35,9 @@ use crate::connection::{
 use crate::error::{ProtocolError, TransportError};
 
 use self::acks::{complete_subscribe_ack, complete_unsubscribe_ack, fail_waiters_for_outcome};
-use self::commands::{CommandDispatch, CommandDispatchCtx, dispatch_client_command, send_parked_publishes};
+use self::commands::{
+    CommandDispatch, CommandDispatchCtx, dispatch_client_command, resend_carried, send_parked_publishes,
+};
 use self::io::{
     ControlCoalesceCtx, FlushAbort, GracefulDisconnectCtx, drain_ready_control_coalesce, feed_inbound_publish_ack,
     flush_writes, graceful_disconnect, handle_deferred_control, send_packet,
@@ -138,15 +140,71 @@ impl SubUnsubWaiters {
 /// SUBSCRIBE / UNSUBSCRIBE keep flowing past them; only when the queue reaches
 /// [`MAX_PARKED_PUBLISHES`] does the write task stop reading commands, so backpressure
 /// reaches the bounded command channel instead of growing memory.
+///
+/// With a resumable session (`carry` set) each in-flight entry also keeps its message, so
+/// that a connection loss can hand it to the next connection for resending.
 #[derive(Debug, Default)]
 pub(crate) struct PublishWaiters {
-    pub(super) by_id: HashMap<NonZeroU16, PublishReply>,
+    pub(super) by_id: HashMap<NonZeroU16, InflightPublish>,
     pub(super) parked: VecDeque<PendingOutboundPublish>,
+    pub(super) carry: Option<SessionCarry>,
+    /// Send order of in-flight publishes, for ordered resend after reconnect.
+    next_seq: u64,
 }
 
+/// One QoS-1 PUBLISH on the wire awaiting its PUBACK.
+#[derive(Debug)]
+pub(crate) struct InflightPublish {
+    pub(super) reply: PublishReply,
+    /// Message + retain flag, kept only for resumable sessions.
+    pub(super) resend: Option<(PublishMessage, bool)>,
+    /// Position in send order (see [`PublishWaiters`]).
+    pub(super) seq: u64,
+}
+
+/// Unacknowledged QoS-1 PUBLISH carried from one connection to the next of a resumed
+/// session ([MQTT-4.4.0-1]); the caller's completion stays attached.
+#[derive(Debug)]
+pub(crate) struct CarriedPublish {
+    pub(crate) packet_id: NonZeroU16,
+    pub(crate) message: PublishMessage,
+    pub(crate) retain: bool,
+    pub(crate) reply: PublishReply,
+    /// Original send order ([MQTT-4.6.0-1]).
+    pub(crate) seq: u64,
+}
+
+/// Hand-over slot between connections of one resumable session, owned by the
+/// [`Connection`](crate::Connection). The write task fills it on connection loss and drains
+/// it (resending) at the start of the next connection.
+pub(crate) type SessionCarry = Arc<std::sync::Mutex<Vec<CarriedPublish>>>;
+
 impl PublishWaiters {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
         Self::default()
+    }
+
+    fn with_carry(carry: Option<SessionCarry>) -> Self {
+        Self {
+            carry,
+            ..Self::default()
+        }
+    }
+
+    /// Registers an encoded QoS-1 publish; keeps the message when the session is resumable.
+    pub(super) fn insert_sent(&mut self, packet_id: NonZeroU16, publish: PendingOutboundPublish) {
+        let resend = self.carry.is_some().then_some((publish.message, publish.retain));
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.by_id.insert(
+            packet_id,
+            InflightPublish {
+                reply: publish.reply,
+                resend,
+                seq,
+            },
+        );
     }
 
     /// Whether the parked queue is full (the write task must stop reading commands).
@@ -155,8 +213,18 @@ impl PublishWaiters {
         self.parked.len() >= MAX_PARKED_PUBLISHES
     }
 
+    #[cfg(test)]
     pub(super) fn insert(&mut self, packet_id: NonZeroU16, reply: PublishReply) {
-        self.by_id.insert(packet_id, reply);
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.by_id.insert(
+            packet_id,
+            InflightPublish {
+                reply,
+                resend: None,
+                seq,
+            },
+        );
     }
 
     #[cfg(test)]
@@ -208,6 +276,9 @@ pub(crate) struct WriteSession {
     pub inbound_activity: Arc<AtomicBool>,
     /// Optional bench hook — incremented per inbound QoS-1 PUBACK fed to the write buffer.
     pub bench_inbound_publish_ack_counter: Option<Arc<AtomicUsize>>,
+    /// Resumable session hand-over ([`SessionCarry`]); `None` when the session ends with
+    /// the connection (Clean Start, or Session Expiry 0).
+    pub session_carry: Option<SessionCarry>,
 }
 
 /// Runs the write task until cancelled, shut down, or signalled to exit.
@@ -236,7 +307,7 @@ where
     let shutdown_notify = session.shutdown_notify;
     let graceful_disconnect_timeout = session.graceful_disconnect_timeout;
     let mut waiters = SubUnsubWaiters::new();
-    let mut publish_waiters = PublishWaiters::new();
+    let mut publish_waiters = PublishWaiters::with_carry(session.session_carry);
     let mut ping_timer = keep_alive_ping_timer(session.keep_alive);
     let keep_alive = session.keep_alive;
     let handoff_stalled = session.handoff_stalled;
@@ -254,6 +325,24 @@ where
         cancel: &cancel,
         shutdown_notify: &shutdown_notify,
     };
+
+    // Resumed session: resend the previous connection's unacknowledged QoS-1 PUBLISHes
+    // first, with their original Packet Identifiers and DUP set ([MQTT-4.4.0-1]).
+    if let Err(outcome) = resend_carried(&mut framed, &mut inflight, &mut publish_waiters, flush_abort).await {
+        return finish_hot_path_write_outcome(
+            &mut framed,
+            GracefulDisconnectCtx {
+                control_rx: &mut control_rx,
+                waiters: &mut waiters,
+                publish_waiters: &mut publish_waiters,
+                inflight: &mut inflight,
+                flush_budget: graceful_disconnect_timeout,
+            },
+            read_done,
+            outcome,
+        )
+        .await;
+    }
 
     loop {
         // A PUBACK handled in the previous iteration may have freed window slots.

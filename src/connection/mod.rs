@@ -137,6 +137,9 @@ pub struct Connection<H: InboundSink = flume::Sender<crate::codec::PublishMessag
     /// Whether this process has established a resumeable MQTT session (`clean_start = false`
     /// past a successful CONNACK). Used for [MQTT-3.2.2-4]; independent of subscription count.
     session_affinity: subscriptions::SessionAffinity,
+    /// Unacknowledged QoS-1 publishes handed from one connection to the next when the
+    /// session outlives the connection (Clean Start 0 and Session Expiry > 0).
+    session_carry: Option<write::SessionCarry>,
 }
 
 impl<H: InboundSink> std::fmt::Debug for Connection<H> {
@@ -160,6 +163,8 @@ impl<H: InboundSink> Connection<H> {
         shutdown_notify: CancellationToken,
     ) -> Self {
         let inflight = packet_id::InflightPots::new(options.receive_maximum);
+        let resumable = !options.clean_start && handshake::session_expiry_secs(options.session_expiry) > 0;
+        let session_carry = resumable.then(write::SessionCarry::default);
         Self {
             options,
             credentials,
@@ -172,6 +177,17 @@ impl<H: InboundSink> Connection<H> {
             inflight,
             subscription_registry: std::sync::Arc::new(std::sync::RwLock::new(SubscriptionRegistry::default())),
             session_affinity: subscriptions::SessionAffinity::None,
+            session_carry,
+        }
+    }
+
+    /// Fails publishes still carried for a resend (session discarded or driver stopping).
+    fn fail_carried(&self) {
+        if let Some(carry) = &self.session_carry {
+            let carried = std::mem::take(&mut *carry.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+            for entry in carried {
+                let _ = entry.reply.send(Err(AppError::ConnectionLost));
+            }
         }
     }
 
@@ -227,6 +243,7 @@ impl<H: InboundSink> Connection<H> {
         loop {
             if self.cancel.is_cancelled() {
                 self.state = ConnectionState::Stopped;
+                self.fail_carried();
                 return Err(ConnectionOutcome::Shutdown(ShutdownError::Cancelled));
             }
 
@@ -235,7 +252,10 @@ impl<H: InboundSink> Connection<H> {
             // sender stays live across the reconnect/backoff gap.
             match self.run_one_session().await {
                 SessionDisposition::Retry => continue,
-                SessionDisposition::Stop(result) => return result,
+                SessionDisposition::Stop(result) => {
+                    self.fail_carried();
+                    return result;
+                }
             }
         }
     }
@@ -381,6 +401,12 @@ impl<H: InboundSink> Connection<H> {
             subscriptions::SessionAffinity::Held
         };
 
+        // No session on the broker: the client MUST discard its own state too
+        // ([MQTT-3.2.2-5]), so carried publishes are not resent.
+        if !session.session_present {
+            self.fail_carried();
+        }
+
         // Clean Start discards broker-side state; a broker answering `session_present = false`
         // to a resume attempt proves it holds none — rebuild the subscriptions in both cases.
         if subscriptions::needs_resubscribe(self.options.clean_start, session.session_present)
@@ -479,6 +505,7 @@ impl<H: InboundSink> Connection<H> {
                 handoff_stalled,
                 inbound_activity,
                 bench_inbound_publish_ack_counter: self.options.bench_inbound_publish_ack_counter.clone(),
+                session_carry: self.session_carry.clone(),
             },
             inflight,
             read_done_rx,

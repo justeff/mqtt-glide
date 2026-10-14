@@ -144,6 +144,7 @@ where
             handoff_stalled: Arc::new(AtomicBool::new(false)),
             inbound_activity: Arc::new(AtomicBool::new(false)),
             bench_inbound_publish_ack_counter: None,
+            session_carry: None,
         },
         InflightPots::new(NonZeroU16::new(4).expect("nz")),
         read_done_rx,

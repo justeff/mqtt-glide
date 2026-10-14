@@ -95,6 +95,7 @@ where
             handoff_stalled: Arc::new(AtomicBool::new(false)),
             inbound_activity: Arc::new(AtomicBool::new(false)),
             bench_inbound_publish_ack_counter: None,
+            session_carry: None,
         },
         InflightPots::new(overrides.inflight_capacity),
         read_done_rx,

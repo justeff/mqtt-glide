@@ -84,6 +84,22 @@ impl InflightPots {
         ))
     }
 
+    /// Claims a specific publish ID carried over from the previous connection of a resumed
+    /// session ([MQTT-4.4.0-1]: resend with the original Packet Identifier).
+    ///
+    /// The ID may lie above the current window when the broker lowered its Receive
+    /// Maximum; it still counts towards [`Self::has_publish_capacity`]. Returns `false`
+    /// when the ID is already in use.
+    pub(crate) fn reserve_publish(&mut self, id: NonZeroU16) -> bool {
+        if self.in_use(id) {
+            return false;
+        }
+        self.ensure_slot_len(usize::from(id.get()) + 1);
+        self.slots[usize::from(id.get())] = Slot::Publish;
+        self.publish_count += 1;
+        true
+    }
+
     /// Whether [`Self::alloc_publish`] can hand out another publish ID right now.
     #[inline]
     pub(crate) fn has_publish_capacity(&self) -> bool {
