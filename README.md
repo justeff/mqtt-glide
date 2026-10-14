@@ -115,7 +115,7 @@ Read and write run as separate tasks on a split socket. While the read task wait
 | Inbound | Injectable `InboundSink` (e.g. `flume` / `tokio::mpsc`) |
 | QoS 1 ingress | enqueue-before-ack: `PUBACK` only after the sink accepts |
 | Keep-alive under load | Write keeps sending `PINGREQ` while read waits on a full sink; liveness treats that stall as self-induced |
-| Shutdown | Graceful `DISCONNECT` + join |
+| Shutdown | Graceful drain, then `DISCONNECT` |
 
 ## Design goals
 
@@ -146,8 +146,10 @@ When a full application queue blocks the same loop that sends `PINGREQ`, a slow 
 | `EventLoop::poll()` in a task you own | Driver task spawned by `connect()` |
 | `Event::Incoming(Packet::Publish(..))` from the poll loop | Messages arrive in the `InboundSink` you injected |
 | `manual_acks` plus an explicit `ack(..)` call | `PUBACK` follows sink acceptance; nothing to call |
-| Connection state inferred from polled events | `LifecycleHook`, or the `SessionPhase` watch from the low-level `connect` |
+| Connection state inferred from polled events | `LifecycleHook`, or the `SessionPhase` watch (`client.session_phase()`) |
 | `publish(..)` resolves when the request is queued for the event loop | `publish(..)` resolves when the frame is encoded into the write buffer (QoS 0; not necessarily flushed) or when `PUBACK` arrives (QoS 1) |
+| A refused publish shows up as a polled `PubAck` you must match yourself | `AppError::PublishRejected` with the reason code, Reason String and User Properties |
+| Request/response: match your own correlation data in the poll loop | `client.requester(topic)` then `request(..).await` |
 
 ### What it costs
 
@@ -268,6 +270,8 @@ Prefer convenience (zero extra cost vs. the primitives underneath):
 | One publish | [`publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.publish) → `.await` (or `.send().await`) |
 | Many publishes in flight | [`publish_window`](https://docs.rs/mqtt-glide/latest/mqtt_glide/publish_window/struct.PublishWindow.html) → `.push(Publish::new(..)).await` … `.drain().await` |
 | Burst | [`publish_batch`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.publish_batch) → one call (`push` + `drain` under the hood) |
+| Subscribe | [`subscribe`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.subscribe) / `subscribe_with_id` → per-filter reason codes plus the broker's Reason String and User Properties |
+| Request / response | `client.requester(response_topic).await?` → `.request(topic, payload).await` resolves with the response |
 | Receive + workers | `.inbound_sink(flume/mpsc)` + your `recv` loop |
 | Tiny sync inbound work | `.on_inbound(\|msg\| …)` (runs on the read task; keep it short) |
 
@@ -277,13 +281,15 @@ Power (same semantics, more control): [`connect`](https://docs.rs/mqtt-glide/lat
 
 | Method | Role | Notes |
 |--------|------|-------|
-| `publish(topic, payload)` | Convenience one-shot | `.await` or `.send().await`; `.start()` enqueues without waiting. Default QoS 0. Setters: `.qos()`, `.retain()`, `.message_expiry(secs)`, `.user_property(name, value)`, `.content_type()`, `.response_topic()`, `.correlation_data()`. `.properties(...)` replaces the whole struct; call it before the other property setters. |
+| `publish(topic, payload)` | Convenience one-shot | `.await` or `.send().await`; `.start()` enqueues without waiting. Default QoS 0. Setters: `.qos()`, `.retain()`, `.message_expiry(secs)`, `.user_property(name, value)` / `.user_properties(iter)`, `.content_type()`, `.response_topic()`, `.correlation_data()`. `.properties(...)` replaces the whole struct; call it before the other property setters. |
 | `publish_window(n)` | Convenience pipeline | Sliding window over `enqueue_publish` (no task per message). `.push(impl Into<Publish>)` waits for command-channel room. Always `.drain()` after the burst. |
 | `publish_batch(msgs, n)` | Convenience burst | Internal window of capacity `n`; each message is an `impl Into<Publish>` carrying its own QoS / retain. |
 | `send(publish)` | Power one-shot | Ready [`Publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/publish/struct.Publish.html) value (also converts from a `PublishMessage`). |
 | `start_publish` + `PublishCompletion` | Power pipeline | Custom windowing / wait order. Full command channel → immediate `AppError::Backpressure`. `enqueue_publish` waits for room instead. |
+| `client.requester(topic)` → `request(topic, payload)` | Request / response | Subscribes once to `topic` (QoS 1, restored on reconnect); each request carries it as Response Topic with fresh Correlation Data and resolves with the matching `InboundMessage`. Setters: `.qos()`, `.timeout()` (default 10 s, then `AppError::ResponseTimeout`), `.user_property()`, `.content_type()`, `.message_expiry()`. Responses never reach the inbound sink. |
+| `Publish::reply_to(&request, payload)` | Answering side | `Some(Publish)` addressed to the request's Response Topic with its Correlation Data copied; `None` if the request carried no Response Topic. |
 
-QoS 2 is rejected (`AppError::InvalidRequest`). Packet ID / `dup` are assigned by the driver.
+QoS 2 is rejected (`AppError::InvalidRequest`). Packet ID / `dup` are assigned by the driver. A QoS 1 publish the broker refuses (PUBACK reason 0x80+) fails with `AppError::PublishRejected(PublishRejection)`: `reason`, `reason_string` and `user_properties` as the broker sent them.
 
 ### Inbound handoff
 
@@ -294,15 +300,16 @@ QoS 2 is rejected (`AppError::InvalidRequest`). Packet ID / `dup` are assigned b
 | `.discard_inbound()` | Outbound-only / ignore inbound |
 | Custom `InboundSink` | Special buffers, existing systems |
 
-Each delivery is an `InboundMessage`: `topic`, `payload`, `properties`, plus `retain` (a retained message the broker sent because you subscribed, as opposed to a live one), `dup` (possible QoS 1 redelivery, e.g. after a reconnect into a resumed session) and the delivered `qos`. `Publish::from(msg)` republishes one.
+Each delivery is an `InboundMessage`: `topic`, `payload`, `properties`, plus `retain` (a retained message the broker sent because you subscribed, as opposed to a live one), `dup` (possible QoS 1 redelivery, e.g. after a reconnect into a resumed session) the delivered `qos`, and `subscription_ids` (the identifiers of the `subscribe_with_id` subscriptions it matched; empty otherwise). `Publish::from(msg)` republishes one.
 
 ### Subscribe, unsubscribe, shutdown
 
 | Method | Notes |
 |--------|-------|
-| `subscribe(filters)` | Per-filter `SUBACK` reason codes. Accepts `[("topic", QoS)]`, `[Subscription::new(...).no_local(true)]`, or a `Vec`. |
-| `unsubscribe(filters)` | Per-filter `UNSUBACK` reason codes. Accepts `["topic"]` / `Vec` / any `IntoIterator`. |
-| `shutdown()` | Graceful drain, then `DISCONNECT`: queued commands are sent, outbound QoS 1 waits for its `PUBACK`s, inbound keeps being delivered and acknowledged meanwhile. New commands fail with `AppError::ShuttingDown`. Bounded by `graceful_disconnect_timeout`. |
+| `subscribe(filters)` | `SubscribeResponse`: per-filter `SUBACK` reason codes (`reasons`, also via deref / `as_slice`) plus `reason_string` and `user_properties`. Accepts `[("topic", QoS)]`, `[Subscription::new(...).no_local(true)]`, or a `Vec`. QoS 2 filters are rejected (`InvalidRequest`). |
+| `subscribe_with_id(id, filters)` | Same, tagging the filters with a Subscription Identifier (`1..=268_435_455`); matching inbound messages report it in `subscription_ids`. Kept across reconnects; `InvalidRequest` if the broker announced no support. |
+| `unsubscribe(filters)` | `UnsubscribeResponse`: per-filter `UNSUBACK` reason codes plus `reason_string` and `user_properties`. Accepts `["topic"]` / `Vec` / any `IntoIterator`. |
+| `shutdown()` | Graceful drain, then `DISCONNECT`: queued commands are sent, outbound QoS 1 waits for its `PUBACK`s, inbound keeps being delivered and acknowledged meanwhile. New commands fail with `AppError::ShuttingDown`. Bounded by `graceful_disconnect_timeout`; `shutdown()` itself returns once shutdown is requested. |
 
 Shared filters: build with `shared_filter(group, topic)` (validates ShareName).
 
@@ -313,7 +320,7 @@ Granted subscriptions are remembered and restored on reconnect whenever the brok
 | Trait / helper | Role |
 |----------------|------|
 | `CredentialsProvider` | Async `credentials()` before each `CONNECT`; `invalidate()` on CONNECT-level `NotAuthorized` only |
-| `ReconnectPolicy` | `delay_after(outcome) -> Option<Duration>` (`None` = stop). Ready-made: `StandardReconnectPolicy` + `mark_live()` |
+| `ReconnectPolicy` | `delay_after(outcome) -> Option<Duration>` (`None` = stop). The outcome of a broker `DISCONNECT` or refused `CONNACK` includes the broker's Reason String (and Server Reference). Ready-made: `StandardReconnectPolicy` + `mark_live()` |
 | `LifecycleHook` | Sync `Connected` / `Disconnected` side effects on the driver task; keep short (no await). `ClientBuilder` already waits for the first `Connected`. For async waits use the [`SessionPhase`](https://docs.rs/mqtt-glide/latest/mqtt_glide/connection/enum.SessionPhase.html) watch (`client.session_phase()`, any client) and `client.is_connected()` for a snapshot |
 | `InboundSink` | Injectable inbound handoff; built-ins: `flume`, `tokio::mpsc`, `OnInboundSink` (`.on_inbound`). Custom sinks **MUST** be cancel-safe |
 
@@ -336,6 +343,7 @@ Broader flows live under [`examples/`](examples/) and are the better starting po
 | Knob | Default | Notes |
 |------|--------:|-------|
 | `ack_timeout` | 5 s | Shared `PUBACK` / `SUBACK` / `UNSUBACK` await |
+| Request timeout | 10 s | `DEFAULT_REQUEST_TIMEOUT`; per request via `.timeout(..)` |
 | `connect_timeout` | 5 s | Shared TCP + TLS + `CONNACK` budget |
 | `graceful_disconnect_timeout` | 2 s | Caps the whole `shutdown` drain: queued sends, outbound `PUBACK` wait, inbound delivery + `PUBACK` flush, `DISCONNECT` |
 | Packet IDs | n/a | Reserved until matching ACK or session teardown (no reap-on-cancel) |
@@ -360,7 +368,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | MQTT 5 wire (`CONNECT`…`DISCONNECT`, QoS 0/1) | ✅ | MQTT 3.1.1 out of scope |
 | Shared subscriptions (`$share/…`) | ✅ | Caller builds the filter; `shared_filter` validates ShareName |
 | Topic filter wildcards | ✅ | Client validates `+` / `#` placement before encode |
-| Publish properties (expiry, user props, `response_topic`, `correlation_data`) | ✅ | On `PublishProperties` |
+| Publish properties (expiry, user props, content type, `response_topic`, `correlation_data`) | ✅ | On `PublishProperties`; setters on `Publish` |
 | TLS (rustls + system roots) | ✅ | Feature-selected crypto provider |
 | Reconnect / credentials hooks | ✅ | Traits + optional helpers |
 | Enqueue-before-ack + `InboundSink` | ✅ | Product backpressure policy |
@@ -371,7 +379,8 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | Request/response | ✅ | `client.requester(response_topic)` → `request(topic, payload).await` resolves with the response (correlation handled, responses bypass the inbound sink, `ResponseTimeout`); `Publish::reply_to(&request, payload)` on the answering side. CONNECT Request Response Information not requested |
 | Will message (`CONNECT`) | ✅ | `.will(topic, payload)` (+ `.will_qos` / `.will_retain`); QoS 0\|1; power: `WillMessage` |
 | Optional `SO_SNDBUF` / `SO_RCVBUF` | ⚠️ | OS defaults today |
-| Enhanced AUTH | ❌ | |
+| Broker diagnostics (Reason String, User Properties) | ✅ | Passed through on `PUBACK` rejections (`PublishRejection`), `SUBACK` / `UNSUBACK` (`SubscribeResponse` / `UnsubscribeResponse`), and in the outcome of a broker `DISCONNECT` / refused `CONNACK`. The client's own outbound `DISCONNECT` carries no reason string |
+| Enhanced AUTH (`AUTH` packets, re-authentication) | ❌ | Not implemented; `CredentialsProvider` covers username/password only |
 | WebSockets | ✅ opt-in | `websocket` feature: `ws://host[:port]/path` / `wss://…` (subprotocol `mqtt`, binary frames, §6). `wss` uses the same rustls setup as `mqtts`. Without the feature such URLs fail to parse |
 | Topic Alias | ✅ opt-in | Inbound: `topic_alias_maximum(n)`, resolved before delivery. Outbound: `outbound_topic_aliases(n)`, capped by the broker's maximum, LRU rebinding. Per connection, reset on reconnect |
 | QoS 2 | ❌ | Rejected at the API (no 4-way handshake / store-and-forward) |
@@ -387,11 +396,11 @@ Headline at 256 B, QoS 1, tuned Mosquitto `2.1.2-alpine`, median of 5 runs, 50 0
 
 | Scenario | glide (main) | rumqttc-v5-next 0.33.3 | mqtt5 0.48.0 |
 |----------|------:|--------:|------:|
-| 64 callers sharing one client | **272 531** · **4 128** | 209 668 · 4 673 | 169 067 · 6 323 |
-| 512 callers sharing one client | **311 459** · **3 687** | 224 353 · 4 401 | 177 379 · 6 340 |
-| Pipelined, window 64 | **304 930** · **3 768** | 216 711 · 4 463 | 169 280 · 7 374 |
+| 64 callers sharing one client | **293 160** · **3 600** | 206 252 · 4 782 | 171 652 · 7 590 |
+| 512 callers sharing one client | **316 591** · **3 430** | 220 438 · 4 540 | 215 616 · 6 810 |
+| Pipelined, window 64 | **298 327** · **3 691** | 216 274 · 4 527 | 180 156 · 8 513 |
 
-These are absolute numbers on one host and broker setup, not paired comparisons. Against a stock-limit Mosquitto (Receive Maximum 20) all clients lose throughput at high concurrency, and peers lead some cells (for example idle QoS 0 outbound latency and QoS 0 ingress load on the mock broker). Per-publish p50/p99/p99.9 latency, a task-per-message burst, fixed-rate load, ingress, and the pinning and fairness details are in [`BENCHMARKS.md`](BENCHMARKS.md). Wire-only `encode_publish` costs about 27 ns/msg (`codec_throughput`).
+These are absolute numbers on one host and broker setup, not paired comparisons. Against a stock-limit Mosquitto (Receive Maximum 20) glide and mqtt5 lose throughput at high concurrency, and peers lead some cells (for example idle QoS 0 outbound latency and QoS 0 ingress load on the mock broker, and mqtt5's idle QoS 1 latency on tuned Mosquitto). rumqttc is pinned to 0.33.3 because 0.34.0 scans its whole outgoing table on every flush; against a broker without a Receive Maximum that table has 65 535 slots and throughput falls to a few thousand msg/s. Per-publish p50/p99/p99.9 latency, a task-per-message burst, fixed-rate load, ingress, and the pinning and fairness details are in [`BENCHMARKS.md`](BENCHMARKS.md). Wire-only `encode_publish` costs about 27 ns/msg (`codec_throughput`).
 
 Throughput knobs live under [Flow control](#flow-control); the `MQTT_COMPARE_*` variables configure the bench harness and have no effect on the library.
 

@@ -117,6 +117,7 @@ Pin the client, broker and publisher to disjoint cores when you can; on hybrid C
 
 - Shared fixtures: broker, payload pattern, window 64, receive_max 1024 (mock), 50 000-message bursts.
 - Client adapters use idiomatic APIs (not a lowest-common-denominator path).
+- **rumqttc version:** pinned to 0.33.3 because 0.34.0 scans its whole outgoing table on every flush. Against a broker without a Receive Maximum (tuned Mosquitto) that table has 65 535 slots and throughput falls to a few thousand msg/s.
 - Unsupported caps are `n/a`: no fake queues / fake manual ack.
 - **Ingress is always handoff:** every ingress cell uses decode, bounded app queue (flume), drain. QoS 1 `after_enqueue` vs `before` only moves PUBACK relative to that handoff. See [`BENCHMARKS.md`](../BENCHMARKS.md).
 - **CPU ns/msg** is `getrusage` of the whole bench process (client, runtime and harness tasks). Ingress load excludes the publisher child.

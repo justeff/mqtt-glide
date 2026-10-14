@@ -123,7 +123,7 @@ Per-publish latency in `outbound_concurrent` and `outbound_rate` is the time to 
 
 ### Other notes
 
-- Client adapters use idiomatic APIs, not a lowest-common-denominator path. Pipelined uses `publish_window` (glide), notices (rumqttc), and spawns (mqtt5).
+- Client adapters use idiomatic APIs, not a lowest-common-denominator path. Pipelined uses `publish_window` (glide), notices (rumqttc), and spawns (mqtt5). rumqttc is pinned to 0.33.3; see Observations for why.
 - `outbound_spawn` is an extreme shape: 50 000 tasks wait on the client at once.
 - Serial latency rows are broker round trips; small differences between clients there are within what a single idle probe can resolve.
 
@@ -131,11 +131,13 @@ Per-publish latency in `outbound_concurrent` and `outbound_rate` is the time to 
 
 Facts read off the tables below, on this host and pinning only.
 
-- QoS 1 on tuned Mosquitto: at 64 and 512 callers, glide has the highest msg/s and lowest CPU/msg in this run; at 8 callers all three are within about 6% of each other (the broker round trip dominates). Against stock Mosquitto (Receive Maximum 20) every client loses throughput at higher concurrency compared with the tuned broker, and the CPU/msg ordering at 64 and 512 callers is no longer glide first (rumqttc is lower there).
-- `outbound_spawn`: rumqttc reaches about 23-25k msg/s at about 44-48 µs CPU/msg, versus roughly 150-520k msg/s for the others. It slows sharply when tens of thousands of tasks wait on its request channel at once; this burst shape is extreme.
-- Peers win some cells: rumqttc and mqtt5 have lower idle `outbound_serial_latency` at QoS 0 on the mock (about 14-15 µs p50 versus 20 µs), mqtt5 is lowest on idle QoS 1 latency on tuned Mosquitto, and rumqttc is ahead on mock `ingress_load` at QoS 0.
+- QoS 1 on tuned Mosquitto: glide has the highest msg/s and lowest CPU/msg at 8, 64 and 512 callers (8 callers: 156k against 148k and 138k, the broker round trip dominates there). Against stock Mosquitto (Receive Maximum 20) glide and mqtt5 lose throughput at 64 and 512 callers compared with the tuned broker (glide about 293k to 244k at 64 and 317k to 237k at 512; mqtt5 about 172k to 144k and 216k to 145k), while rumqttc barely does (about 206k to 201k at 64 and 220k to 211k at 512). Glide still leads msg/s on the stock broker, but at 64 and 512 callers and pipelined rumqttc has the lower CPU/msg (about 4.5k against 4.6-4.7k at 64 and 512 callers; 3.9k against 4.2k pipelined).
+- rumqttc is pinned to 0.33.3 because 0.34.0 scans its whole outgoing table on every flush. Against a broker without a Receive Maximum that table has 65 535 slots and throughput falls to a few thousand msg/s.
+- `outbound_spawn`: rumqttc reaches about 23-25k msg/s at about 44-48 µs CPU/msg, versus roughly 129-512k msg/s for the others. It slows sharply when tens of thousands of tasks wait on its request channel at once; this burst shape is extreme.
+- Peers win some cells: rumqttc and mqtt5 have lower idle `outbound_serial_latency` at QoS 0 on the mock (about 14-15 µs p50 versus 20 µs), mqtt5 is lowest on idle QoS 1 latency on the mock and on tuned Mosquitto (24-26 µs versus 27-29 µs; on stock Mosquitto glide and rumqttc are within 1 µs and ahead of mqtt5), and rumqttc is ahead on mock `ingress_load` at QoS 0 (422k versus 367k msg/s).
+- Idle p99 values (serial latency, especially ingress) move by tens of µs between refreshes for every client; only the p50 columns are stable enough to compare. Throughput can move too: mqtt5 at 512 callers on tuned Mosquitto has been 204k, 216k and 230k across refreshes.
 - `outbound_rate`: all clients keep up with 10k and 50k msg/s offered; the differences are CPU/msg and the tail (p99.9), not throughput.
-- Ingress load on Mosquitto is about 154k msg/s for every client, which is the broker/publisher pace, not a client limit.
+- Ingress load on Mosquitto is about 153-155k msg/s for every client, which is the broker/publisher pace, not a client limit.
 
 <!-- benchmarks:generated:start -->
 
@@ -145,11 +147,11 @@ Facts read off the tables below, on this host and pinning only.
 
 | Scenario | glide | rumqttc | mqtt5 |
 |---|---:|---:|---:|
-| Outbound concurrent, 64 callers | **272 531** · **4 128** · **243** / **311** / **505** µs | 209 668 · 4 673 · 298 / 506 / 1 828 µs | 169 067 · 6 323 · 377 / 488 / 993 µs |
-| Outbound concurrent, 512 callers | **311 459** · **3 687** · **1 661** / **2 022** / **2 378** µs | 224 353 · 4 401 · 2 371 / 3 778 / 4 392 µs | 177 379 · 6 340 · 2 883 / 4 312 / 4 624 µs |
-| Outbound spawn | **313 104** · **5 140** | 22 626 · 48 117 | 156 195 · 9 091 |
-| Outbound rate, 50 000 msg/s offered | 49 616 · **5 311** · **425** / **912** / **1 063** µs | **49 625** · 5 926 · 669 / 1 005 / 1 498 µs | 49 616 · 7 911 · 511 / 973 / 2 558 µs |
-| Outbound pipelined | **304 930** · **3 768** | 216 711 · 4 463 | 169 280 · 7 374 |
+| Outbound concurrent, 64 callers | **293 160** · **3 600** · **216** / **290** / 635 µs | 206 252 · 4 782 · 306 / 513 / **554** µs | 171 652 · 7 590 · 386 / 536 / 1 363 µs |
+| Outbound concurrent, 512 callers | **316 591** · **3 430** · **1 655** / **2 007** / **2 083** µs | 220 438 · 4 540 · 2 359 / 3 777 / 4 052 µs | 215 616 · 6 810 · 2 152 / 3 613 / 3 825 µs |
+| Outbound spawn | **321 036** · **4 949** | 23 763 · 46 088 | 179 119 · 9 554 |
+| Outbound rate, 50 000 msg/s offered | 49 611 · **5 014** · **331** / **875** / **1 213** µs | 49 614 · 5 930 · 617 / 938 / 1 646 µs | **49 621** · 8 248 · 622 / 1 030 / 2 261 µs |
+| Outbound pipelined | **298 327** · **3 691** | 216 274 · 4 527 | 180 156 · 8 513 |
 
 ---
 
@@ -169,9 +171,9 @@ Units: msg/s · CPU ns/msg · p50 / p99 / p99.9 µs per publish.
 
 | Level | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 8 callers | **153 186** · **5 004** · **51.7** / **75.5** / **85.0** µs | 151 899 · 5 203 · 52.4 / 79.0 / 89.1 µs | 144 617 · 6 608 · 54.1 / 87.2 / 116 µs |
-| 64 callers | **272 531** · **4 128** · **243** / **311** / **505** µs | 209 668 · 4 673 · 298 / 506 / 1 828 µs | 169 067 · 6 323 · 377 / 488 / 993 µs |
-| 512 callers | **311 459** · **3 687** · **1 661** / **2 022** / **2 378** µs | 224 353 · 4 401 · 2 371 / 3 778 / 4 392 µs | 177 379 · 6 340 · 2 883 / 4 312 / 4 624 µs |
+| 8 callers | **155 716** · **4 329** · **51.0** / **71.7** / **83.6** µs | 148 347 · 5 223 · 53.3 / 79.1 / 93.5 µs | 138 263 · 8 185 · 57.3 / 89.1 / 105 µs |
+| 64 callers | **293 160** · **3 600** · **216** / **290** / 635 µs | 206 252 · 4 782 · 306 / 513 / **554** µs | 171 652 · 7 590 · 386 / 536 / 1 363 µs |
+| 512 callers | **316 591** · **3 430** · **1 655** / **2 007** / **2 083** µs | 220 438 · 4 540 · 2 359 / 3 777 / 4 052 µs | 215 616 · 6 810 · 2 152 / 3 613 / 3 825 µs |
 
 ### Outbound spawn (one task per message, 50k at once)
 
@@ -181,7 +183,7 @@ Units: msg/s · CPU ns/msg (no latency: all tasks start at once).
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | **313 104** · **5 140** | 22 626 · 48 117 | 156 195 · 9 091 |
+| 256 B | **321 036** · **4 949** | 23 763 · 46 088 | 179 119 · 9 554 |
 
 ### Outbound rate (open loop, offered msg/s)
 
@@ -191,8 +193,8 @@ Units: msg/s · CPU ns/msg · p50 / p99 / p99.9 µs per publish.
 
 | Level | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 10 000 msg/s offered | 9 979 · **7 456** · 123 / **201** / **288** µs | 9 982 · 8 752 · 126 / 219 / 923 µs | **9 982** · 9 258 · **123** / 204 / 712 µs |
-| 50 000 msg/s offered | 49 616 · **5 311** · **425** / **912** / **1 063** µs | **49 625** · 5 926 · 669 / 1 005 / 1 498 µs | 49 616 · 7 911 · 511 / 973 / 2 558 µs |
+| 10 000 msg/s offered | 9 981 · **7 037** · **121** / **171** / **324** µs | **9 981** · 8 760 · 127 / 224 / 770 µs | 9 981 · 11 013 · 129 / 233 / 788 µs |
+| 50 000 msg/s offered | 49 611 · **5 014** · **331** / **875** / **1 213** µs | 49 614 · 5 930 · 617 / 938 / 1 646 µs | **49 621** · 8 248 · 622 / 1 030 / 2 261 µs |
 
 ### Outbound pipelined (window 64, one task)
 
@@ -202,7 +204,7 @@ Units: msg/s · CPU ns/msg.
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | **304 930** · **3 768** | 216 711 · 4 463 | 169 280 · 7 374 |
+| 256 B | **298 327** · **3 691** | 216 274 · 4 527 | 180 156 · 8 513 |
 
 ### Outbound serial latency (idle round trip)
 
@@ -212,7 +214,7 @@ Units: p50 / p99 µs.
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | 27.8 / 32.4 | 27.4 / 34.7 | **23.4** / **30.1** |
+| 256 B | 27.4 / 32.5 | 27.2 / 34.0 | **24.1** / **30.4** |
 
 ### Ingress load
 
@@ -222,13 +224,13 @@ Units: msg/s · CPU ns/msg.
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | 154 187 · **4 171** | **154 622** · 4 817 | n/a (`no_manual_ack`) |
+| 256 B | **153 020** · **3 823** | 153 019 · 4 778 | n/a (`no_manual_ack`) |
 
 #### QoS 1 · `before`
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | n/a (`no_auto_ack`) | **154 183** · **4 101** | 152 254 · 5 013 |
+| 256 B | n/a (`no_auto_ack`) | 154 250 · **4 052** | **154 287** · 4 768 |
 
 ### Ingress serial latency (idle)
 
@@ -238,13 +240,13 @@ Units: p50 / p99 µs.
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | 32.7 / 42.9 | **31.1** / **39.5** | n/a (`no_manual_ack`) |
+| 256 B | 32.9 / 44.6 | **31.8** / **41.3** | n/a (`no_manual_ack`) |
 
 #### QoS 1 · `before`
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | n/a (`no_auto_ack`) | **27.0** / 60.8 | 27.6 / **59.4** |
+| 256 B | n/a (`no_auto_ack`) | **25.6** / 43.5 | 27.5 / **42.0** |
 
 
 ---
@@ -263,9 +265,9 @@ Units: msg/s · CPU ns/msg · p50 / p99 / p99.9 µs per publish.
 
 | Level | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 8 callers | **150 763** · **4 983** · **52.4** / **75.5** / **87.7** µs | 149 622 · 5 247 · 52.8 / 78.7 / 89.9 µs | 144 593 · 6 638 · 54.2 / 86.8 / 110 µs |
-| 64 callers | **215 191** · 4 973 · **298** / **379** / **497** µs | 210 991 · **4 517** · 302 / 379 / 614 µs | 170 234 · 6 404 · 373 / 514 / 1 030 µs |
-| 512 callers | **228 761** · 5 074 · **2 229** / 2 659 / **2 699** µs | 211 660 · **4 609** · 2 412 / **2 650** / 2 699 µs | 176 810 · 6 267 · 2 859 / 4 333 / 4 677 µs |
+| 8 callers | **167 137** · **4 277** · **47.9** / **70.7** / **81.0** µs | 141 913 · 5 227 · 55.9 / 80.4 / 108 µs | 139 489 · 8 092 · 57.2 / 89.0 / 107 µs |
+| 64 callers | **244 055** · 4 675 · **261** / **336** / 760 µs | 201 163 · **4 546** · 317 / 393 / **418** µs | 143 570 · 7 730 · 447 / 574 / 1 181 µs |
+| 512 callers | **236 897** · 4 612 · **2 127** / **2 576** / **2 682** µs | 211 109 · **4 500** · 2 409 / 2 652 / 2 687 µs | 145 476 · 7 758 · 3 519 / 4 193 / 4 527 µs |
 
 ### Outbound spawn (one task per message, 50k at once)
 
@@ -275,7 +277,7 @@ Units: msg/s · CPU ns/msg (no latency: all tasks start at once).
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | **183 165** · **7 627** | 22 590 · 48 719 | 156 934 · 9 011 |
+| 256 B | **196 379** · **7 050** | 22 727 · 48 265 | 129 008 · 10 558 |
 
 ### Outbound rate (open loop, offered msg/s)
 
@@ -285,8 +287,8 @@ Units: msg/s · CPU ns/msg · p50 / p99 / p99.9 µs per publish.
 
 | Level | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 10 000 msg/s offered | 9 980 · **7 575** · 123 / 208 / 870 µs | 9 980 · 8 792 · 125 / 221 / 689 µs | **9 980** · 9 280 · **123** / **207** / **651** µs |
-| 50 000 msg/s offered | 49 617 · 6 480 · 405 / **910** / **1 322** µs | **49 621** · **6 366** · **395** / 950 / 1 721 µs | 49 613 · 7 794 · 508 / 987 / 2 370 µs |
+| 10 000 msg/s offered | **9 982** · **7 233** · **121** / **187** / **581** µs | 9 980 · 8 807 · 126 / 213 / 822 µs | 9 981 · 10 825 · 128 / 226 / 1 354 µs |
+| 50 000 msg/s offered | 49 608 · **5 923** · **346** / **902** / 1 448 µs | **49 630** · 6 433 · 409 / 910 / **1 110** µs | 49 619 · 9 532 · 505 / 1 045 / 1 622 µs |
 
 ### Outbound pipelined (window 64, one task)
 
@@ -296,7 +298,7 @@ Units: msg/s · CPU ns/msg.
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | **226 648** · 4 474 | 213 620 · **3 969** | 170 700 · 7 510 |
+| 256 B | **235 225** · 4 207 | 217 023 · **3 923** | 150 935 · 9 831 |
 
 ### Outbound serial latency (idle round trip)
 
@@ -306,7 +308,7 @@ Units: p50 / p99 µs.
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | 27.9 / 32.8 | **27.0** / **32.3** | 33.8 / 37.5 |
+| 256 B | 27.9 / 34.0 | **27.3** / **32.2** | 34.3 / 37.6 |
 
 ### Ingress load
 
@@ -316,13 +318,13 @@ Units: msg/s · CPU ns/msg.
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | 154 368 · **4 143** | **154 997** · 4 879 | n/a (`no_manual_ack`) |
+| 256 B | **155 446** · **3 800** | 155 190 · 4 823 | n/a (`no_manual_ack`) |
 
 #### QoS 1 · `before`
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | n/a (`no_auto_ack`) | **153 771** · **4 128** | 153 059 · 4 992 |
+| 256 B | n/a (`no_auto_ack`) | 153 498 · **4 081** | **154 066** · 4 784 |
 
 ### Ingress serial latency (idle)
 
@@ -332,13 +334,13 @@ Units: p50 / p99 µs.
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | 33.0 / 68.0 | **32.0** / **40.7** | n/a (`no_manual_ack`) |
+| 256 B | 31.7 / 41.5 | **31.6** / **39.6** | n/a (`no_manual_ack`) |
 
 #### QoS 1 · `before`
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | n/a (`no_auto_ack`) | **25.7** / **37.6** | 28.1 / 37.9 |
+| 256 B | n/a (`no_auto_ack`) | **25.7** / **36.7** | 27.3 / 40.0 |
 
 
 ---
@@ -358,17 +360,17 @@ Units: msg/s · CPU ns/msg · p50 / p99 / p99.9 µs per publish.
 
 | Level | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 8 callers | **1 162 328** · **1 447** · **6.3** / **17.5** / 55.9 µs | 275 261 · 4 310 · 28.9 / 32.1 / 162 µs | 309 121 · 2 239 · 25.8 / 29.5 / **35.5** µs |
-| 64 callers | **1 342 928** · **1 247** · **42.7** / **67.7** / **117** µs | 284 203 · 4 626 · 218 / 282 / 450 µs | 303 998 · 2 350 · 209 / 236 / 800 µs |
-| 512 callers | **1 411 507** · **1 232** · **261** / **1 771** / 3 227 µs | 268 771 · 4 823 · 1 837 / 2 082 / **2 143** µs | 302 374 · 2 307 · 1 666 / 1 943 / 2 981 µs |
+| 8 callers | **1 161 399** · **1 443** · **6.4** / **18.3** / 52.2 µs | 278 889 · 4 338 · 28.5 / 32.2 / 95.6 µs | 275 926 · 2 605 · 28.9 / 32.8 / **50.6** µs |
+| 64 callers | **1 362 772** · **1 217** · **42.0** / **67.3** / **155** µs | 282 217 · 4 406 · 224 / 248 / 450 µs | 262 371 · 2 745 · 243 / 263 / 1 270 µs |
+| 512 callers | **1 386 700** · **1 271** · **270** / **1 585** / **2 439** µs | 266 748 · 4 860 · 1 851 / 2 107 / 2 715 µs | 260 646 · 2 785 · 1 955 / 2 128 / 3 489 µs |
 
 #### QoS 1
 
 | Level | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 8 callers | **332 024** · **4 069** · **23.0** / **38.4** / **54.4** µs | 232 811 · 4 688 · 30.2 / 58.2 / 65.8 µs | 222 294 · 5 900 · 35.3 / 61.3 / 139 µs |
-| 64 callers | **415 881** · **3 667** · **154** / **177** / **196** µs | 224 850 · 5 362 · 282 / 374 / 479 µs | 216 907 · 5 852 · 286 / 497 / 1 313 µs |
-| 512 callers | **418 046** · **3 523** · **1 221** / **1 895** / **2 376** µs | 235 208 · 5 334 · 2 197 / 2 830 / 3 562 µs | 209 771 · 6 134 · 2 369 / 3 718 / 3 994 µs |
+| 8 callers | **342 969** · **3 875** · **22.4** / **41.7** / **53.1** µs | 230 625 · 4 647 · 30.6 / 59.0 / 65.7 µs | 165 838 · 7 635 · 50.0 / 67.3 / 81.3 µs |
+| 64 callers | **403 895** · **3 591** · **159** / **182** / **199** µs | 224 151 · 5 448 · 283 / 378 / 491 µs | 169 128 · 7 906 · 393 / 474 / 541 µs |
+| 512 callers | **452 228** · **3 393** · **1 125** / **1 169** / **1 213** µs | 231 758 · 5 470 · 2 256 / 2 729 / 3 267 µs | 176 927 · 7 640 · 2 920 / 3 405 / 3 480 µs |
 
 ### Outbound spawn (one task per message, 50k at once)
 
@@ -378,13 +380,13 @@ Units: msg/s · CPU ns/msg (no latency: all tasks start at once).
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | **524 973** · **3 335** | 24 855 · 44 274 | 213 726 · 5 227 |
+| 256 B | **512 106** · **3 446** | 24 480 · 44 841 | 197 093 · 6 213 |
 
 #### QoS 1
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | **399 561** · **4 429** | 25 053 · 43 929 | 169 307 · 8 821 |
+| 256 B | **396 043** · **4 362** | 25 160 · 43 946 | 170 145 · 9 622 |
 
 ### Outbound rate (open loop, offered msg/s)
 
@@ -394,15 +396,15 @@ Units: msg/s · CPU ns/msg · p50 / p99 / p99.9 µs per publish.
 
 | Level | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 10 000 msg/s offered | **9 982** · **5 881** · 24.8 / **53.9** / **63.1** µs | 9 981 · 6 372 · **18.6** / 59.3 / 87.3 µs | 9 980 · 6 578 · 31.4 / 62.0 / 788 µs |
-| 50 000 msg/s offered | 49 622 · 3 463 · **91.5** / 232 / 582 µs | 49 632 · 3 633 · 92.7 / 236 / **327** µs | **49 642** · **3 388** · 98.7 / **218** / 367 µs |
+| 10 000 msg/s offered | 9 980 · **5 624** · 24.3 / **51.2** / **73.9** µs | **9 982** · 6 276 · **18.1** / 58.6 / 277 µs | 9 981 · 6 896 · 33.2 / 62.0 / 83.0 µs |
+| 50 000 msg/s offered | 49 628 · **3 198** · **87.0** / **210** / 328 µs | **49 645** · 3 508 · 91.2 / 232 / **268** µs | 49 634 · 3 664 · 118 / 237 / 355 µs |
 
 #### QoS 1
 
 | Level | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 10 000 msg/s offered | **9 982** · **7 450** · **70.8** / **102** / **220** µs | 9 980 · 8 790 · 76.9 / 124 / 863 µs | 9 978 · 9 627 · 76.1 / 137 / 477 µs |
-| 50 000 msg/s offered | 49 628 · **4 321** · 261 / **334** / **799** µs | 49 627 · 5 174 · **250** / 364 / 1 334 µs | **49 629** · 5 429 · 302 / 495 / 2 397 µs |
+| 10 000 msg/s offered | 9 979 · **7 292** · **69.9** / **106** / **486** µs | 9 980 · 8 717 · 76.0 / 115 / 677 µs | **9 981** · 10 523 · 82.5 / 120 / 622 µs |
+| 50 000 msg/s offered | **49 632** · **3 998** · **235** / **297** / 982 µs | 49 625 · 5 018 · 247 / 330 / **454** µs | 49 624 · 6 182 · 374 / 600 / 1 258 µs |
 
 ### Outbound pipelined (window 64, one task)
 
@@ -412,13 +414,13 @@ Units: msg/s · CPU ns/msg.
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | **1 897 562** · **937** | 262 258 · 5 850 | 253 378 · 4 717 |
+| 256 B | **1 922 414** · **952** | 266 640 · 5 870 | 241 208 · 5 034 |
 
 #### QoS 1
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | **436 053** · **3 509** | 236 235 · 4 965 | 192 680 · 7 095 |
+| 256 B | **430 189** · **3 417** | 238 051 · 4 954 | 212 098 · 7 781 |
 
 ### Outbound serial latency (idle round trip)
 
@@ -428,13 +430,13 @@ Units: p50 / p99 µs.
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | 20.0 / 22.1 | 14.8 / 18.9 | **14.3** / **17.5** |
+| 256 B | 19.7 / 23.2 | 14.9 / 19.2 | **14.3** / **17.7** |
 
 #### QoS 1
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | 29.3 / 32.5 | 29.1 / 33.5 | **24.7** / **29.9** |
+| 256 B | 29.4 / 32.9 | 29.0 / 32.2 | **25.9** / **28.9** |
 
 ### Ingress load
 
@@ -444,19 +446,19 @@ Units: msg/s · CPU ns/msg.
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | 356 246 · 2 698 | **385 952** · **2 289** | 249 962 · 4 241 |
+| 256 B | 366 516 · 2 450 | **422 390** · **2 212** | 302 788 · 3 138 |
 
 #### QoS 1 · `after_enqueue`
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | **242 350** · **2 209** | 225 490 · 2 964 | n/a (`no_manual_ack`) |
+| 256 B | **241 566** · **2 257** | 222 105 · 2 814 | n/a (`no_manual_ack`) |
 
 #### QoS 1 · `before`
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | n/a (`no_auto_ack`) | **213 044** · **2 162** | 196 341 · 5 160 |
+| 256 B | n/a (`no_auto_ack`) | **206 510** · **2 146** | 196 746 · 3 855 |
 
 ### Ingress serial latency (idle)
 
@@ -466,19 +468,19 @@ Units: p50 / p99 µs.
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | **12.6** / **14.3** | 14.5 / 16.9 | 15.9 / 18.5 |
+| 256 B | **12.3** / **13.9** | 14.2 / 16.7 | 15.7 / 17.7 |
 
 #### QoS 1 · `after_enqueue`
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | **12.2** / **15.3** | 14.7 / 17.6 | n/a (`no_manual_ack`) |
+| 256 B | **11.9** / **15.3** | 14.8 / 16.7 | n/a (`no_manual_ack`) |
 
 #### QoS 1 · `before`
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | n/a (`no_auto_ack`) | **15.6** / **18.7** | 16.5 / 20.5 |
+| 256 B | n/a (`no_auto_ack`) | 16.6 / **18.7** | **16.6** / 20.2 |
 
 
 ---
