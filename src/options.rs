@@ -8,7 +8,7 @@ use std::time::Duration;
 use nonzero_ext::nonzero;
 
 use crate::codec::{DEFAULT_MAX_PACKET_SIZE, QoS, WillMessage};
-use crate::util::{BrokerUrl, ClientId};
+use crate::util::{BrokerUrl, ClientId, HttpProxy};
 
 /// Default capacity of the bounded application command/data path to the write task.
 ///
@@ -141,6 +141,10 @@ pub struct ConnectOptions {
     /// Default `false`: a redirect is then reported like any other refusal or disconnect (its
     /// Server Reference is in the error text).
     pub follow_server_redirects: bool,
+    /// Reach the broker through an HTTP proxy (`CONNECT` tunnel); see [`HttpProxy`].
+    ///
+    /// Default `None`: connect directly. Not read from `HTTP(S)_PROXY`; set it explicitly.
+    pub http_proxy: Option<HttpProxy>,
     /// Optional counter incremented when the write task feeds an inbound QoS-1 PUBACK.
     ///
     /// Bench / diagnostic hook only (`None` in production). Does not change enqueue-before-ack semantics.
@@ -172,6 +176,7 @@ impl ConnectOptions {
             max_packet_size: NonZeroU32::new(DEFAULT_MAX_PACKET_SIZE).expect("DEFAULT_MAX_PACKET_SIZE non-zero"),
             fail_fast_when_disconnected: false,
             follow_server_redirects: false,
+            http_proxy: None,
             topic_alias_maximum: 0,
             outbound_topic_aliases: 0,
             bench_inbound_publish_ack_counter: None,
@@ -199,6 +204,12 @@ impl ConnectOptions {
     /// Sets [`Self::follow_server_redirects`].
     pub fn follow_server_redirects(mut self, follow: bool) -> Self {
         self.follow_server_redirects = follow;
+        self
+    }
+
+    /// Sets [`Self::http_proxy`].
+    pub fn http_proxy(mut self, proxy: HttpProxy) -> Self {
+        self.http_proxy = Some(proxy);
         self
     }
 

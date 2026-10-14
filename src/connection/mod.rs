@@ -5,6 +5,7 @@ mod handshake;
 mod io_batch;
 mod lifecycle;
 pub(crate) mod packet_id;
+mod proxy;
 pub(crate) mod read;
 mod redirect;
 pub(crate) mod session_policy;

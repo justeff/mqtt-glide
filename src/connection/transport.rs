@@ -94,9 +94,14 @@ fn map_connect_send_error(error: crate::codec::EncodeError) -> ConnectionOutcome
     }
 }
 
+/// TCP to the broker, or through [`ConnectOptions::http_proxy`] to it.
 pub(crate) async fn open_tcp(options: &ConnectOptions, deadline: Instant) -> Result<TcpStream, ConnectionOutcome> {
-    let addr = (options.broker_url.host(), options.broker_url.port());
-    let stream = match timeout_at(tokio::time::Instant::from_std(deadline), TcpStream::connect(addr)).await {
+    let (host, port) = (options.broker_url.host(), options.broker_url.port());
+    let addr = match &options.http_proxy {
+        Some(proxy) => (proxy.host(), proxy.port()),
+        None => (host, port),
+    };
+    let mut stream = match timeout_at(tokio::time::Instant::from_std(deadline), TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {
             return Err(ConnectionOutcome::Transport(TransportError::Connection(
@@ -115,6 +120,20 @@ pub(crate) async fn open_tcp(options: &ConnectOptions, deadline: Instant) -> Res
         return Err(ConnectionOutcome::Transport(TransportError::Connection(
             error.to_string(),
         )));
+    }
+
+    if let Some(proxy) = &options.http_proxy {
+        let tunnel = super::proxy::tunnel(&mut stream, proxy, host, port);
+        match timeout_at(tokio::time::Instant::from_std(deadline), tunnel).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(ConnectionOutcome::Transport(error)),
+            Err(_) => {
+                return Err(ConnectionOutcome::Transport(TransportError::Connection(format!(
+                    "HTTP proxy tunnel timed out after {:?}",
+                    options.connect_timeout
+                ))));
+            }
+        }
     }
 
     Ok(stream)

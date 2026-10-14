@@ -381,6 +381,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | Will message (`CONNECT`) | ✅ | `.will(topic, payload)` (+ `.will_qos` / `.will_retain`); QoS 0\|1; power: `WillMessage` |
 | Optional `SO_SNDBUF` / `SO_RCVBUF` | ⚠️ | OS defaults today |
 | Broker diagnostics (Reason String, User Properties) | ✅ | Passed through on `PUBACK` rejections (`PublishRejection`), `SUBACK` / `UNSUBACK` (`SubscribeResponse` / `UnsubscribeResponse`), and in the outcome of a broker `DISCONNECT` / refused `CONNACK`. The client's own outbound `DISCONNECT` carries no reason string |
+| HTTP proxy (`CONNECT` tunnel) | ✅ opt-in | `ConnectOptions::http_proxy(HttpProxy::parse("http://user:pass@proxy:3128")?)`; TLS / WebSocket run end to end through the tunnel; Basic auth optional. Not read from `HTTP(S)_PROXY`. SOCKS not supported |
 | Server redirection (§4.11) | ✅ opt-in | `follow_server_redirects(true)`: CONNACK / DISCONNECT 0x9C (Use another server, next connection only) or 0x9D (Server moved, for good) with a Server Reference reconnects there at once; scheme, TLS and WebSocket path stay, at most five redirects in a row. Off: reported in the outcome |
 | Enhanced AUTH (`AUTH` packets, re-authentication) | ❌ | Not implemented; `CredentialsProvider` covers username/password only |
 | WebSockets | ✅ opt-in | `websocket` feature: `ws://host[:port]/path` / `wss://…` (subprotocol `mqtt`, binary frames, §6). `wss` uses the same rustls setup as `mqtts`. Without the feature such URLs fail to parse |

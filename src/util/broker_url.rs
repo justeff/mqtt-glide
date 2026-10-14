@@ -38,6 +38,9 @@ pub enum BrokerUrlError {
     /// `ws://` / `wss://` URL, but the crate was built without the `websocket` feature.
     #[error("MQTT over WebSocket needs the `websocket` feature of mqtt-glide")]
     WebSocketUnsupported,
+    /// A proxy URL with a scheme other than `http://` (see [`crate::HttpProxy::parse`]).
+    #[error("proxy URL must start with http://")]
+    UnsupportedProxyScheme,
 }
 
 impl BrokerUrl {
@@ -139,7 +142,7 @@ impl BrokerUrl {
 }
 
 /// Splits `host[:port]` or `[v6][:port]`, falling back to `default_port`.
-fn split_host_port(host_port: &str, default_port: u16) -> Result<(String, u16), BrokerUrlError> {
+pub(crate) fn split_host_port(host_port: &str, default_port: u16) -> Result<(String, u16), BrokerUrlError> {
     let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
         // Bracketed IPv6 literal: `[::1]` or `[::1]:1883`. The stored host keeps the
         // bare address (no brackets) so TCP connect and TLS server-name parsing work.
