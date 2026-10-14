@@ -5,7 +5,9 @@ use std::num::NonZeroU16;
 use bytestring::ByteString;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::codec::{PublishAck, PublishMessage, QoS, SubscribeAck, SubscriptionOptions, UnsubscribeAck};
+use crate::codec::{
+    DisconnectReasonCode, PublishAck, PublishMessage, QoS, SubscribeAck, SubscriptionOptions, UnsubscribeAck,
+};
 use crate::error::AppError;
 
 use super::Generation;
@@ -44,8 +46,9 @@ pub(crate) enum ControlMessage {
     #[doc(hidden)]
     #[expect(dead_code, reason = "test-only variant; production uses Shutdown / notify")]
     Disconnect,
-    /// Protocol-error disconnect (Reason Code 0x82) queued by the read task.
-    ProtocolDisconnect,
+    /// DISCONNECT with this reason (Malformed Packet, Protocol Error, …) queued by the read
+    /// task before it stops on a bad inbound packet.
+    ProtocolDisconnect(DisconnectReasonCode),
     /// Broker SUBACK — completes a subscribe waiter in the write task.
     ///
     /// `generation` is the read-task connection generation that observed the frame;

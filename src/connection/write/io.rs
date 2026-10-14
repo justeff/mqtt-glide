@@ -12,8 +12,8 @@ use tokio_util::codec::FramedWrite;
 use tokio_util::sync::CancellationToken;
 
 use crate::codec::{
-    Disconnect, DisconnectReasonCode, EncodeError, Packet, PublishDelivery, PublishMessage, V5Codec, encode_publish,
-    encode_publish_ack, encode_publish_with_alias,
+    Disconnect, EncodeError, Packet, PublishDelivery, PublishMessage, V5Codec, encode_publish, encode_publish_ack,
+    encode_publish_with_alias,
 };
 use crate::connection::packet_id::InflightPots;
 use crate::connection::subscriptions::SubscriptionRegistry;
@@ -125,7 +125,7 @@ where
                         complete_unsubscribe_ack(waiters, inflight, subscription_registry, generation, ack_generation, ack);
                     }
                     // The read task saw a protocol violation: nothing more will be acknowledged.
-                    Some(ControlMessage::ProtocolDisconnect) | None => break,
+                    Some(ControlMessage::ProtocolDisconnect(_)) | None => break,
                     #[allow(unreachable_patterns)] // test-only control variants
                     Some(_) => {}
                 },
@@ -403,14 +403,8 @@ where
                 Err(outcome) => Some(outcome),
             }
         }
-        ControlMessage::ProtocolDisconnect => {
-            if let Err(outcome) = send_packet(
-                framed,
-                Packet::Disconnect(Disconnect::new(DisconnectReasonCode::ProtocolError)),
-                flush_abort,
-            )
-            .await
-            {
+        ControlMessage::ProtocolDisconnect(reason) => {
+            if let Err(outcome) = send_packet(framed, Packet::Disconnect(Disconnect::new(reason)), flush_abort).await {
                 return Some(outcome);
             }
             let _ = framed.close().await;

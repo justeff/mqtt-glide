@@ -9,7 +9,8 @@ use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 use tokio_util::codec::FramedRead;
 
-use crate::codec::{DecodeError, DecodedFrame, InboundMessage, Packet, PublishPacket, V5Codec};
+use crate::codec::v5::ToReasonCode;
+use crate::codec::{DecodeError, DecodedFrame, DisconnectReasonCode, InboundMessage, Packet, PublishPacket, V5Codec};
 use crate::connection::{ControlMessage, Generation, StopSignal, effective_io_batch, inbound_publish_policy};
 use crate::error::{ProtocolError, TransportError};
 use crate::inbound_sink::{InboundSink, InboundTrySendError};
@@ -151,11 +152,13 @@ where
                 for burst_idx in 0..read_burst {
                     match pending {
                         None => return ReadOutcome::PeerClosed,
-                        Some(Err(error)) => return map_decode_error(error),
+                        Some(Err(error)) => return decode_error_disconnect(&control_tx, error).await,
                         Some(Ok((DecodedFrame::Publish(mut packet), _wire_len))) => {
                             inbound_activity.store(true, Ordering::Release);
                             if let Err(error) = topic_aliases.resolve(&mut packet) {
-                                return protocol_error_disconnect(&control_tx, error).await;
+                                // §3.3.2.3.4: an unknown or out-of-range alias is answered with 0x94.
+                                return protocol_error_disconnect(&control_tx, error, DisconnectReasonCode::TopicAliasInvalid)
+                                    .await;
                             }
                             if let Some(outcome) = handle_inbound_publish(
                                 packet,
@@ -211,7 +214,9 @@ async fn handle_inbound_publish<H: InboundSink>(
 ) -> Option<ReadOutcome> {
     let puback_id = match inbound_publish_policy(&packet) {
         Ok(id) => id,
-        Err(error) => return Some(protocol_error_disconnect(control_tx, error).await),
+        Err(error) => {
+            return Some(protocol_error_disconnect(control_tx, error, DisconnectReasonCode::ProtocolError).await);
+        }
     };
     // A response to a pending request goes to that request; everything else awaits handoff
     // accept before PUBACK, while the write task stays independent.
@@ -364,9 +369,24 @@ async fn dispatch_control(
 }
 
 /// Queues a protocol-error DISCONNECT on the control path, then surfaces the typed error.
-async fn protocol_error_disconnect(control_tx: &mpsc::Sender<ControlMessage>, error: ProtocolError) -> ReadOutcome {
-    let _ = control_tx.send(ControlMessage::ProtocolDisconnect).await;
+async fn protocol_error_disconnect(
+    control_tx: &mpsc::Sender<ControlMessage>,
+    error: ProtocolError,
+    reason: DisconnectReasonCode,
+) -> ReadOutcome {
+    let _ = control_tx.send(ControlMessage::ProtocolDisconnect(reason)).await;
     ReadOutcome::Protocol(error)
+}
+
+/// A packet the codec rejected: tell the broker why (Malformed Packet, Packet too large, …)
+/// before closing ([MQTT-3.14.1-1], §4.13). A broken socket gets no DISCONNECT.
+async fn decode_error_disconnect(control_tx: &mpsc::Sender<ControlMessage>, error: DecodeError) -> ReadOutcome {
+    if !matches!(error, DecodeError::Io(_)) {
+        let _ = control_tx
+            .send(ControlMessage::ProtocolDisconnect(error.to_reason_code()))
+            .await;
+    }
+    map_decode_error(error)
 }
 
 fn map_decode_error(error: DecodeError) -> ReadOutcome {

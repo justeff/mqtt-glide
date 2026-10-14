@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use bytestring::ByteString;
 
-use crate::codec::{Disconnect, DisconnectReasonCode, Packet, PublishMessage, QoS, SubscriptionOptions, V5Codec};
+use crate::codec::{Disconnect, Packet, PublishMessage, QoS, SubscriptionOptions, V5Codec};
 use crate::connection::packet_id::{InflightPots, PacketIdMap};
 use crate::connection::subscriptions::SubscriptionRegistry;
 use crate::connection::{
@@ -679,11 +679,11 @@ where
                             WriteOutcome::Shutdown,
                         );
                     }
-                    Some(ControlMessage::ProtocolDisconnect) => {
+                    Some(ControlMessage::ProtocolDisconnect(reason)) => {
                         // DISCONNECT is terminal ([MQTT-3.14.4-1/2]) — do not process further control.
                         if let Err(outcome) = send_packet(
                             &mut framed,
-                            Packet::Disconnect(Disconnect::new(DisconnectReasonCode::ProtocolError)),
+                            Packet::Disconnect(Disconnect::new(reason)),
                             flush_abort,
                         )
                         .await

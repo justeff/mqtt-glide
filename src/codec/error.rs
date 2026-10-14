@@ -48,9 +48,11 @@ impl ToReasonCode for DecodeError {
             DecodeError::InvalidLength => DisconnectReasonCode::MalformedPacket,
             DecodeError::MalformedPacket(_) => DisconnectReasonCode::MalformedPacket,
             DecodeError::UnsupportedProtocolLevel => DisconnectReasonCode::ImplementationSpecificError,
-            DecodeError::ConnectReservedFlagSet => DisconnectReasonCode::ProtocolError,
-            DecodeError::ConnectAckReservedFlagSet => DisconnectReasonCode::ProtocolError,
-            DecodeError::UnsupportedPacketType => DisconnectReasonCode::ImplementationSpecificError,
+            // A set reserved bit, and the forbidden packet type 0, make a Malformed Packet
+            // (§2.1.2, §2.1.3, [MQTT-3.1.2-3]).
+            DecodeError::ConnectReservedFlagSet => DisconnectReasonCode::MalformedPacket,
+            DecodeError::ConnectAckReservedFlagSet => DisconnectReasonCode::MalformedPacket,
+            DecodeError::UnsupportedPacketType => DisconnectReasonCode::MalformedPacket,
             DecodeError::PacketIdRequired => DisconnectReasonCode::ProtocolError,
             DecodeError::MaxSizeExceeded { .. } => DisconnectReasonCode::PacketTooLarge,
             DecodeError::Io(_) => DisconnectReasonCode::UnspecifiedError,

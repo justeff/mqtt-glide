@@ -24,8 +24,8 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
 use crate::codec::{
-    DecodedFrame, InboundMessage, Packet, PublishDelivery, PublishMessage, PublishProperties, QoS, V5Codec,
-    encode_publish,
+    DecodedFrame, DisconnectReasonCode, InboundMessage, Packet, PublishDelivery, PublishMessage, PublishProperties,
+    QoS, V5Codec, encode_publish,
 };
 use crate::connection::packet_id::InflightPots;
 use crate::connection::read::{ReadDoneSignal, ReadOutcome, ReadSession};
@@ -57,6 +57,7 @@ struct ReadTaskHandle {
     inbound_activity: Arc<AtomicBool>,
     handoff_stalled: Arc<AtomicBool>,
     handoff_rx: flume::Receiver<InboundMessage>,
+    control_rx: mpsc::Receiver<ControlMessage>,
     join: JoinHandle<ReadOutcome>,
     _stub_tx: mpsc::Sender<()>,
 }
@@ -72,7 +73,7 @@ fn spawn_read_task_with_handoff_cap<R>(framed: FramedRead<R, V5Codec>, handoff_c
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let (control_tx, _control_rx) = mpsc::channel(8);
+    let (control_tx, control_rx) = mpsc::channel(8);
     let (stub_tx, stub_rx) = mpsc::channel(1);
     let (handoff_tx, handoff_rx) = flume::bounded(handoff_cap);
     let cancel = StopSignal::new();
@@ -103,6 +104,7 @@ where
         inbound_activity,
         handoff_stalled,
         handoff_rx,
+        control_rx,
         join,
         _stub_tx: stub_tx,
     }
@@ -473,19 +475,29 @@ async fn write_task_io_error_on_nth_poll(#[case] fail_on: FailOn) {
 }
 
 /// Truncated / illegal inbound bytes: read task surfaces protocol or transport without hanging (table #2).
+///
+/// A packet the codec rejects is answered with a DISCONNECT carrying the matching reason before
+/// the connection closes ([MQTT-3.14.1-1], §4.13); a stream that merely ends gets none.
 #[rstest]
-#[case::reserved_packet_type(&[0x00, 0x00], true)]
-#[case::malformed_publish_qos3(&[0x36, 0x00], true)]
-#[case::truncated_then_eof(&[0x30, 0x80], false)]
+// Packet type 0 is forbidden (§2.1.2).
+#[case::reserved_packet_type(&[0x00, 0x00], Some(DisconnectReasonCode::MalformedPacket))]
+// [MQTT-3.3.1-4] PUBLISH with both QoS bits set is a protocol error and delivers nothing
+#[case::malformed_publish_qos3(&[0x36, 0x00], Some(DisconnectReasonCode::MalformedPacket))]
+// [MQTT-3.14.1-1] DISCONNECT with a reserved fixed-header bit set.
+#[case::disconnect_reserved_bit(&[0xE1, 0x00], Some(DisconnectReasonCode::MalformedPacket))]
+#[case::truncated_then_eof(&[0x30, 0x80], None)]
 #[tokio::test]
-async fn read_task_malformed_or_truncated_inbound(#[case] bytes: &[u8], #[case] expect_protocol: bool) {
+async fn read_task_malformed_or_truncated_inbound(
+    #[case] bytes: &[u8],
+    #[case] disconnect: Option<DisconnectReasonCode>,
+) {
     let (task_end, mut peer) = tokio::io::duplex(256);
     let framed = FramedRead::new(task_end, V5Codec::with_max_packet_size(0));
-    let harness = spawn_read_task(framed);
+    let mut harness = spawn_read_task(framed);
 
     peer.write_all(bytes).await.expect("inject bytes");
     peer.flush().await.expect("flush inject");
-    if !expect_protocol {
+    if disconnect.is_none() {
         peer.shutdown().await.expect("eof after truncated");
         drop(peer);
     }
@@ -494,7 +506,7 @@ async fn read_task_malformed_or_truncated_inbound(#[case] bytes: &[u8], #[case] 
         .await
         .expect("join timeout")
         .expect("join");
-    if expect_protocol {
+    if disconnect.is_some() {
         assert!(
             matches!(outcome, ReadOutcome::Protocol(ProtocolError::Decode(_))),
             "illegal MQTT bytes must yield Protocol(Decode), got {outcome:?}"
@@ -508,6 +520,12 @@ async fn read_task_malformed_or_truncated_inbound(#[case] bytes: &[u8], #[case] 
             "truncated frame + EOF must yield transport/peer-closed, got {outcome:?}"
         );
     }
+    let queued = harness.control_rx.try_recv().ok();
+    assert_eq!(
+        queued,
+        disconnect.map(ControlMessage::ProtocolDisconnect),
+        "DISCONNECT the read task asked the write task to send"
+    );
     assert!(harness.handoff_rx.is_empty(), "bad inbound must not deliver a publish");
 }
 

@@ -1,6 +1,7 @@
 use super::*;
 use crate::codec::{
-    PublishAckReason, PublishDelivery, PublishMessage, PublishProperties, QoS, V5Codec, encode_publish,
+    DisconnectReasonCode, PublishAckReason, PublishDelivery, PublishMessage, PublishProperties, QoS, V5Codec,
+    encode_publish,
 };
 use crate::connection::{ControlMessage, Generation};
 use bytes::Bytes;
@@ -546,7 +547,7 @@ async fn protocol_disconnect_is_terminal_no_frames_after() {
 
     harness
         .control_tx
-        .send(ControlMessage::ProtocolDisconnect)
+        .send(ControlMessage::ProtocolDisconnect(DisconnectReasonCode::ProtocolError))
         .await
         .expect("protocol disconnect");
     harness
