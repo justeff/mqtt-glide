@@ -97,7 +97,7 @@ pub struct ConnectOptions {
     ///
     /// When full, awaited calls ([`crate::MqttClient::publish`], `send`, `subscribe`,
     /// `unsubscribe`, `PublishWindow::push`) wait up to [`Self::ack_timeout`] for room, then
-    /// return [`crate::AppError::Backpressure`]; [`crate::MqttClient::start_publish`] fails at
+    /// return [`crate::AppError::Backpressure`]; [`crate::MqttClient::try_start_publish`] fails at
     /// once. This queue is independent of MQTT **Receive Maximum** (inbound QoS-1 pipelining)
     /// and outbound publish inflight limits.
     ///

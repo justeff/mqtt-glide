@@ -142,7 +142,7 @@ async fn burst_with_fault(
             inject();
         }
         let publish = Publish::new(topic.to_owned(), index_payload(i)).qos(QoS::AtLeastOnce);
-        completions.push(client.enqueue_publish(publish).await.expect("enqueue"));
+        completions.push(client.start_publish(publish).await.expect("enqueue"));
     }
     let mut results = Vec::with_capacity(completions.len());
     for completion in completions {
@@ -361,7 +361,7 @@ async fn shutdown_on_stalled_link_respects_budget() {
     proxy.set_stalled(true);
     let completion = session
         .client
-        .start_publish(Publish::new("faults/shutdown", "x").qos(QoS::AtLeastOnce))
+        .try_start_publish(Publish::new("faults/shutdown", "x").qos(QoS::AtLeastOnce))
         .expect("enqueue");
     let started = Instant::now();
     session.client.shutdown().await.expect("shutdown");

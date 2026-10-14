@@ -244,7 +244,7 @@ Three limits, easy to confuse, only two of them yours to set.
 
 ### Command channel capacity
 
-`ConnectOptions::command_channel_capacity`, default `32`: how many commands may queue up for the write task. When it is full, `publish` / `send` / `subscribe` / `unsubscribe` and `PublishWindow::push` wait up to `ack_timeout` for room (then `AppError::Backpressure`), while `start_publish` fails fast with `AppError::Backpressure`. Set it to at least the number of publishes you keep in flight.
+`ConnectOptions::command_channel_capacity`, default `32`: how many commands may queue up for the write task. When it is full, `publish` / `send` / `subscribe` / `unsubscribe` and `PublishWindow::push` and `start_publish` wait up to `ack_timeout` for room (then `AppError::Backpressure`), while `try_start_publish` fails fast with `AppError::Backpressure`. Set it to at least the number of publishes you keep in flight.
 
 ### Receive Maximum
 
@@ -281,17 +281,17 @@ Prefer convenience (zero extra cost vs. the primitives underneath):
 | Receive + workers | `.inbound_sink(flume/mpsc)` + your `recv` loop |
 | Tiny sync inbound work | `.on_inbound(\|msg\| …)` (runs on the read task; keep it short) |
 
-Power (same semantics, more control): [`connect`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/fn.connect.html), custom [`InboundSink`](https://docs.rs/mqtt-glide/latest/mqtt_glide/inbound_sink/trait.InboundSink.html), [`send`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.send) / [`start_publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.start_publish) + [`PublishCompletion`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.PublishCompletion.html).
+Power (same semantics, more control): [`connect`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/fn.connect.html), custom [`InboundSink`](https://docs.rs/mqtt-glide/latest/mqtt_glide/inbound_sink/trait.InboundSink.html), [`send`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.send) / [`start_publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.start_publish) / [`try_start_publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.try_start_publish) + [`PublishCompletion`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.PublishCompletion.html).
 
 ### Publish paths
 
 | Method | Role | Notes |
 |--------|------|-------|
-| `publish(topic, payload)` | Convenience one-shot | `.await` or `.send().await`; `.start()` enqueues without waiting. Default QoS 0. Setters: `.qos()`, `.retain()`, `.message_expiry(secs)`, `.user_property(name, value)` / `.user_properties(iter)`, `.content_type()`, `.response_topic()`, `.correlation_data()`. `.properties(...)` replaces the whole struct; call it before the other property setters. |
-| `publish_window(n)` | Convenience pipeline | Sliding window over `enqueue_publish` (no task per message). `.push(impl Into<Publish>)` waits for command-channel room. Always `.drain()` after the burst. |
+| `publish(topic, payload)` | Convenience one-shot | `.await` or `.send().await`; `.start().await` returns a `PublishCompletion` once queued, `.try_start()` without waiting at all. Default QoS 0. Setters: `.qos()`, `.retain()`, `.message_expiry(secs)`, `.user_property(name, value)` / `.user_properties(iter)`, `.content_type()`, `.response_topic()`, `.correlation_data()`. `.properties(...)` replaces the whole struct; call it before the other property setters. |
+| `publish_window(n)` | Convenience pipeline | Sliding window over `start_publish` (no task per message). `.push(impl Into<Publish>)` waits for command-channel room. Always `.drain()` after the burst. |
 | `publish_batch(msgs, n)` | Convenience burst | Internal window of capacity `n`; each message is an `impl Into<Publish>` carrying its own QoS / retain. |
 | `send(publish)` | Power one-shot | Ready [`Publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/publish/struct.Publish.html) value (also converts from a `PublishMessage`). |
-| `start_publish` + `PublishCompletion` | Power pipeline | Custom windowing / wait order. Full command channel → immediate `AppError::Backpressure`. `enqueue_publish` waits for room instead. |
+| `start_publish` / `try_start_publish` + `PublishCompletion` | Power pipeline | Custom windowing / wait order. `start_publish` waits for command-channel room (up to `ack_timeout`); `try_start_publish` fails at once with `AppError::Backpressure` on a full channel, like `try_send` on a channel. |
 | `client.requester(topic)` → `request(topic, payload)` | Request / response | Subscribes once to `topic` (QoS 1, restored on reconnect); each request carries it as Response Topic with fresh Correlation Data and resolves with the matching `InboundMessage`. Setters: `.qos()`, `.timeout()` (default 10 s, then `AppError::ResponseTimeout`), `.user_property()`, `.content_type()`, `.message_expiry()`. Responses never reach the inbound sink. |
 | `Publish::reply_to(&request, payload)` | Answering side | `Some(Publish)` addressed to the request's Response Topic with its Correlation Data copied; `None` if the request carried no Response Topic. |
 

@@ -229,7 +229,7 @@ async fn auth_failure_reconnect_replenishes_channel_before_invalidate() {
 
     // While the credentials provider is refreshing, the replenished command channel must
     // accept application work (not AppError::CommandChannelClosed).
-    let queued = client.start_publish(Publish::new("invalidate/order", "x"));
+    let queued = client.try_start_publish(Publish::new("invalidate/order", "x"));
     assert!(
         queued.is_ok(),
         "command channel must stay open during invalidation, got {queued:?}"

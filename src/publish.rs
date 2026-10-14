@@ -3,7 +3,7 @@
 //!
 //! A [`Publish`] carries everything one PUBLISH needs — topic, payload, QoS, retain and
 //! MQTT 5 properties — so it can be built once and handed to
-//! [`MqttClient::send`](crate::MqttClient::send), [`MqttClient::start_publish`](crate::MqttClient::start_publish),
+//! [`MqttClient::send`](crate::MqttClient::send), [`MqttClient::try_start_publish`](crate::MqttClient::try_start_publish),
 //! [`PublishWindow::push`](crate::PublishWindow::push) or
 //! [`MqttClient::publish_batch`](crate::MqttClient::publish_batch).
 //! Defaults: QoS 0, retain `false`, no properties.
@@ -229,7 +229,8 @@ impl From<PublishMessage> for Publish {
 /// Awaiting waits for room in the command channel, then for completion: encode into the
 /// write buffer for QoS 0, the matching `PUBACK` for QoS 1. Both waits are bounded by
 /// [`ConnectOptions::ack_timeout`](crate::ConnectOptions::ack_timeout).
-/// [`.start()`](Self::start) enqueues without waiting and returns a [`PublishCompletion`].
+/// [`.start()`](Self::start) waits only for room in the command channel and returns a
+/// [`PublishCompletion`]; [`.try_start()`](Self::try_start) does not wait at all.
 ///
 /// Bare `.await` boxes the future ([`IntoFuture`]); `.send().await` does not.
 #[derive(Debug)]
@@ -258,10 +259,18 @@ impl<'a> PublishBuilder<'a> {
         self.client.send(self.publish)
     }
 
-    /// Enqueues without waiting; see [`MqttClient::start_publish`](crate::MqttClient::start_publish).
+    /// Enqueues, waiting for room in the command channel, and returns the completion without
+    /// waiting for it; see [`MqttClient::start_publish`](crate::MqttClient::start_publish).
     #[inline]
-    pub fn start(self) -> Result<PublishCompletion, AppError> {
+    pub fn start(self) -> impl Future<Output = Result<PublishCompletion, AppError>> + Send + 'a {
         self.client.start_publish(self.publish)
+    }
+
+    /// Enqueues without waiting at all; see
+    /// [`MqttClient::try_start_publish`](crate::MqttClient::try_start_publish).
+    #[inline]
+    pub fn try_start(self) -> Result<PublishCompletion, AppError> {
+        self.client.try_start_publish(self.publish)
     }
 
     /// Returns the built [`Publish`] without sending it.

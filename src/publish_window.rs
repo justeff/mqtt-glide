@@ -1,6 +1,6 @@
 //! Sliding-window outbound publish helper ([`PublishWindow`]).
 //!
-//! Wraps [`MqttClient::enqueue_publish`](crate::MqttClient::enqueue_publish) +
+//! Wraps [`MqttClient::start_publish`](crate::MqttClient::start_publish) +
 //! [`PublishCompletion`] without spawning a task per message. Call
 //! [`PublishWindow::drain`] after the burst. For a one-shot burst, see
 //! [`MqttClient::publish_batch`](crate::MqttClient::publish_batch).
@@ -35,7 +35,7 @@ use crate::client::{MqttClient, PublishCompletion};
 use crate::error::AppError;
 use crate::publish::Publish;
 
-/// Bounded in-flight window over [`MqttClient::enqueue_publish`](crate::MqttClient::enqueue_publish).
+/// Bounded in-flight window over [`MqttClient::start_publish`](crate::MqttClient::start_publish).
 ///
 /// Keeps at most `capacity` [`PublishCompletion`]s open. [`Self::push`] waits on the oldest
 /// completion when full, then enqueues (waiting for command-channel room). After the
@@ -90,7 +90,7 @@ impl<'a> PublishWindow<'a> {
     pub async fn push(&mut self, publish: impl Into<Publish>) -> Result<(), AppError> {
         let publish = publish.into();
         self.ensure_slot().await?;
-        let completion = self.client.enqueue_publish(publish).await?;
+        let completion = self.client.start_publish(publish).await?;
         self.in_flight.push_back(completion);
         Ok(())
     }

@@ -78,7 +78,7 @@ async fn queued_publish_survives_a_failed_reconnect_attempt() {
     await_disconnected(&mut phase).await;
 
     let published = client
-        .start_publish(Publish::new("t/q", "x").qos(QoS::AtLeastOnce))
+        .try_start_publish(Publish::new("t/q", "x").qos(QoS::AtLeastOnce))
         .expect("queued while disconnected");
     let result = timeout(Duration::from_secs(8), published.wait())
         .await
@@ -124,7 +124,7 @@ async fn broker_that_stops_reading_ends_the_session() {
     let payload = bytes::Bytes::from(vec![0u8; 60 * 1024]);
     let mut pending = Vec::new();
     for _ in 0..2000 {
-        if let Ok(completion) = client.start_publish(Publish::new("t/big", payload.clone())) {
+        if let Ok(completion) = client.try_start_publish(Publish::new("t/big", payload.clone())) {
             pending.push(completion);
         }
         tokio::task::yield_now().await;

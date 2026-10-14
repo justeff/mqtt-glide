@@ -15,14 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   |---|---|
   | `client.publish_with().topic(t).payload(p).qos(q).send().await` | `client.publish(t, p).qos(q).await` |
   | `client.publish(msg, qos, retain).await` | `client.send(Publish::from(msg).qos(qos).retain(retain)).await` |
-  | `client.start_publish(msg, qos, retain)` | `client.start_publish(Publish::from(msg).qos(qos).retain(retain))` |
+  | `client.start_publish(msg, qos, retain)` (fails on a full channel) | `client.try_start_publish(Publish::from(msg).qos(qos).retain(retain))`, or `client.start_publish(publish).await` to wait for room |
   | `pipe.publish_with().topic(t).payload(p).push_retry().await` | `pipe.push(Publish::new(t, p)).await` |
   | `pipe.push(msg, qos, retain)` / `pipe.push_retry(..)` | `pipe.push(Publish::from(msg).qos(qos).retain(retain))` |
   | `client.publish_batch(msgs, qos, retain, n)` | `client.publish_batch(publishes, n)` (QoS / retain per message) |
   | loop of `.user_property(k, v)` | `.user_properties(iter)` |
 
   Removed: `MqttClient::publish_with`, `PublishWith`, `WindowPublishWith`, `PublishWindow::push_retry`, the type-state markers and the `publish_builder` module (now `publish`)
-- Awaited publishes (`publish(..).await`, `send`, `PublishWindow::push`, `publish_batch`) and `subscribe` / `unsubscribe` now wait for room in the command channel (bounded by `ack_timeout`, then `AppError::Backpressure`) instead of failing at once on a full channel. `start_publish` stays non-blocking; `enqueue_publish` is its waiting counterpart. A sender swapped by a reconnect while waiting is retried on the new session channel
+- Awaited publishes (`publish(..).await`, `send`, `PublishWindow::push`, `publish_batch`) and `subscribe` / `unsubscribe` now wait for room in the command channel (bounded by `ack_timeout`, then `AppError::Backpressure`) instead of failing at once on a full channel. The non-blocking enqueue is renamed `try_start_publish` (`PublishBuilder::try_start`); `start_publish` (`PublishBuilder::start`) now waits for room, following `try_send` / `send` on a channel. A sender swapped by a reconnect while waiting is retried on the new session channel
 
 - Publishes that were never sent (parked behind the broker's Receive Maximum, or still in the command channel) no longer fail when the connection drops; they go out on the next connection, as publishes issued during the reconnect backoff already did. The command channel now lives as long as the client, so the same holds for subscribe / unsubscribe still queued, and for everything issued while disconnected, however many reconnect attempts fail before a session is up (each failed attempt used to drop the queue, failing it with `AppError::CommandChannelClosed`)
 - `shutdown()` drains before it disconnects, bounded by `graceful_disconnect_timeout`: commands already queued are sent, outbound QoS 1 publishes get their `PUBACK`s instead of failing at once, and the read task keeps delivering and acknowledging inbound messages meanwhile, so they are no longer dropped with the socket buffer. Only what is still unacknowledged when the budget runs out fails with `AppError::ConnectionLost`. Every command issued after `shutdown()` fails with the new `AppError::ShuttingDown`

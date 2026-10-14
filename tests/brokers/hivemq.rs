@@ -191,7 +191,7 @@ async fn hivemq_shutdown_drains_outbound() {
     let mut completions = Vec::new();
     for i in 0..50u32 {
         let publish = Publish::new("interop/drain", i.to_string()).qos(QoS::AtLeastOnce);
-        completions.push(publisher.client.enqueue_publish(publish).await.expect("enqueue"));
+        completions.push(publisher.client.start_publish(publish).await.expect("enqueue"));
     }
     publisher.client.shutdown().await.expect("shutdown");
     for completion in completions {

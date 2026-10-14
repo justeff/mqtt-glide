@@ -230,7 +230,7 @@ impl SharedCredentials {
     }
 }
 
-/// Completion handle for an outbound PUBLISH started by [`MqttClient::start_publish`].
+/// Completion handle for an outbound PUBLISH started by [`MqttClient::try_start_publish`].
 ///
 /// [`Self::wait`] completes after the frame is **encoded into the connection write buffer**
 /// for QoS 0 (not necessarily flushed to the socket or received by the broker), or after
@@ -513,22 +513,26 @@ impl MqttClient {
         completion.wait().await
     }
 
-    /// Enqueues a PUBLISH without waiting and returns its completion handle.
+    /// Enqueues a PUBLISH without waiting at all and returns its completion handle; the
+    /// non-blocking form of [`Self::start_publish`] (like `try_send` and `send` on a channel).
     ///
     /// A full command channel returns [`AppError::Backpressure`] immediately (no handle is
-    /// created) — use [`Self::enqueue_publish`] to wait for room instead. QoS 2 returns
+    /// created). QoS 2 returns
     /// [`AppError::InvalidRequest`]. Call [`PublishCompletion::wait`] to observe the
     /// result; `packet_id` / `dup` are assigned by the connection driver.
     #[inline]
-    pub fn start_publish(&self, publish: impl Into<Publish>) -> Result<PublishCompletion, AppError> {
+    pub fn try_start_publish(&self, publish: impl Into<Publish>) -> Result<PublishCompletion, AppError> {
         let (command, completion) = self.publish_command(publish.into())?;
         self.try_send_command(command)?;
         Ok(completion)
     }
 
-    /// Like [`Self::start_publish`], but waits up to [`ConnectOptions::ack_timeout`] for
-    /// room in the command channel instead of failing on a full one.
-    pub async fn enqueue_publish(&self, publish: impl Into<Publish>) -> Result<PublishCompletion, AppError> {
+    /// Enqueues a PUBLISH and returns its completion handle without waiting for the
+    /// completion itself: waits up to [`ConnectOptions::ack_timeout`] for room in the command
+    /// channel ([`AppError::Backpressure`] after that), then returns. Call
+    /// [`PublishCompletion::wait`] to observe the result. [`Self::try_start_publish`] fails at
+    /// once on a full channel instead.
+    pub async fn start_publish(&self, publish: impl Into<Publish>) -> Result<PublishCompletion, AppError> {
         let (command, completion) = self.publish_command(publish.into())?;
         if let Some(command) = self.try_send_or_return(command)? {
             Box::pin(self.wait_for_room(command)).await?;
@@ -556,7 +560,7 @@ impl MqttClient {
         ))
     }
 
-    /// Starts a sliding-window pipeline over [`Self::enqueue_publish`] (no task per message).
+    /// Starts a sliding-window pipeline over [`Self::start_publish`] (no task per message).
     ///
     /// [`PublishWindow::push`] enqueues, then [`PublishWindow::drain`] after the burst.
     ///
@@ -1404,7 +1408,7 @@ mod tests {
         let _ = run.await;
     }
 
-    /// QoS 1: `start_publish` enqueues immediately and its completion waits for PUBACK.
+    /// QoS 1: `try_start_publish` enqueues immediately and its completion waits for PUBACK.
     #[tokio::test]
     async fn qos1_start_publish_completion_awaits_matching_puback() {
         let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -1415,7 +1419,7 @@ mod tests {
         await_connected(&mut phase).await;
 
         client
-            .start_publish(Publish::from(sample_message("t/qos1-start", b"need-ack")).qos(QoS::AtLeastOnce))
+            .try_start_publish(Publish::from(sample_message("t/qos1-start", b"need-ack")).qos(QoS::AtLeastOnce))
             .expect("QoS 1 publish must enqueue")
             .wait()
             .await
@@ -1726,7 +1730,7 @@ mod tests {
         let _ = run.await;
     }
 
-    /// Full command queue → immediate `AppError::Backpressure` on `start_publish` (no unbounded growth).
+    /// Full command queue → immediate `AppError::Backpressure` on `try_start_publish` (no unbounded growth).
     #[tokio::test]
     async fn publish_returns_backpressure_when_command_queue_full() {
         let url = BrokerUrl::parse("mqtt://localhost").expect("valid url");
@@ -1746,7 +1750,7 @@ mod tests {
         }
 
         let err = client
-            .start_publish(Publish::from(sample_message("t/bp", b"x")))
+            .try_start_publish(Publish::from(sample_message("t/bp", b"x")))
             .expect_err("full command channel must backpressure publish");
         assert!(
             matches!(err, AppError::Backpressure(_)),
@@ -1777,7 +1781,7 @@ mod tests {
         }
 
         let err = client
-            .start_publish(Publish::from(sample_message("t/bp-custom", b"x")))
+            .try_start_publish(Publish::from(sample_message("t/bp-custom", b"x")))
             .expect_err("full custom command channel must backpressure publish");
         assert!(
             matches!(err, AppError::Backpressure(_)),
@@ -2376,10 +2380,10 @@ mod tests {
         await_connected(&mut phase).await;
 
         let first = client
-            .start_publish(Publish::new("t/resume", "a").qos(QoS::AtLeastOnce))
+            .try_start_publish(Publish::new("t/resume", "a").qos(QoS::AtLeastOnce))
             .expect("enqueue a");
         let second = client
-            .start_publish(Publish::new("t/resume", "b").qos(QoS::AtLeastOnce))
+            .try_start_publish(Publish::new("t/resume", "b").qos(QoS::AtLeastOnce))
             .expect("enqueue b");
         timeout(Duration::from_secs(3), async {
             first.wait().await?;
@@ -2485,7 +2489,7 @@ mod tests {
             .into_iter()
             .map(|payload| {
                 client
-                    .start_publish(Publish::new("t/resume", payload).qos(QoS::AtLeastOnce))
+                    .try_start_publish(Publish::new("t/resume", payload).qos(QoS::AtLeastOnce))
                     .expect("enqueue")
             })
             .collect();
@@ -2529,10 +2533,10 @@ mod tests {
         await_connected(&mut phase).await;
 
         let first = client
-            .start_publish(Publish::new("t/resume", "a").qos(QoS::AtLeastOnce))
+            .try_start_publish(Publish::new("t/resume", "a").qos(QoS::AtLeastOnce))
             .expect("enqueue a");
         let second = client
-            .start_publish(Publish::new("t/resume", "b").qos(QoS::AtLeastOnce))
+            .try_start_publish(Publish::new("t/resume", "b").qos(QoS::AtLeastOnce))
             .expect("enqueue b");
         for completion in [first, second] {
             let err = timeout(Duration::from_secs(3), completion.wait())
@@ -2571,10 +2575,10 @@ mod tests {
         await_connected(&mut phase).await;
 
         let first = client
-            .start_publish(Publish::new("t/clean", "a").qos(QoS::AtLeastOnce))
+            .try_start_publish(Publish::new("t/clean", "a").qos(QoS::AtLeastOnce))
             .expect("enqueue a");
         let _second = client
-            .start_publish(Publish::new("t/clean", "b").qos(QoS::AtLeastOnce))
+            .try_start_publish(Publish::new("t/clean", "b").qos(QoS::AtLeastOnce))
             .expect("enqueue b");
         let err = timeout(Duration::from_secs(3), first.wait())
             .await
@@ -2785,7 +2789,7 @@ mod tests {
         await_connected(&mut phase).await;
 
         let completion = client
-            .start_publish(Publish::new("t/drain", "x").qos(QoS::AtLeastOnce))
+            .try_start_publish(Publish::new("t/drain", "x").qos(QoS::AtLeastOnce))
             .expect("enqueue");
         client.shutdown().await.expect("shutdown");
         completion
@@ -2816,7 +2820,7 @@ mod tests {
         await_connected(&mut phase).await;
 
         let completion = client
-            .start_publish(Publish::new("t/drain", "x").qos(QoS::AtLeastOnce))
+            .try_start_publish(Publish::new("t/drain", "x").qos(QoS::AtLeastOnce))
             .expect("enqueue");
         client.shutdown().await.expect("shutdown");
         completion.wait().await.expect("PUBACK during drain");
@@ -2841,7 +2845,7 @@ mod tests {
         let completions: Vec<_> = (0..5u8)
             .map(|i| {
                 client
-                    .start_publish(Publish::new("t/queued", Bytes::from(vec![i])).qos(QoS::AtLeastOnce))
+                    .try_start_publish(Publish::new("t/queued", Bytes::from(vec![i])).qos(QoS::AtLeastOnce))
                     .expect("enqueue")
             })
             .collect();
@@ -2873,7 +2877,7 @@ mod tests {
         await_connected(&mut phase).await;
 
         let completion = client
-            .start_publish(Publish::new("t/drain", "x").qos(QoS::AtLeastOnce))
+            .try_start_publish(Publish::new("t/drain", "x").qos(QoS::AtLeastOnce))
             .expect("enqueue");
         let started = std::time::Instant::now();
         client.shutdown().await.expect("shutdown");
@@ -2948,7 +2952,7 @@ mod tests {
         let completions: Vec<_> = (0..40u8)
             .map(|i| {
                 client
-                    .start_publish(Publish::new("t/unsent", Bytes::from(vec![i])).qos(QoS::AtLeastOnce))
+                    .try_start_publish(Publish::new("t/unsent", Bytes::from(vec![i])).qos(QoS::AtLeastOnce))
                     .expect("enqueue")
             })
             .collect();
@@ -3083,7 +3087,7 @@ mod tests {
         let run = tokio::spawn(connection.run());
 
         let _queued = client
-            .start_publish(Publish::new("t/w", "fills the channel"))
+            .try_start_publish(Publish::new("t/w", "fills the channel"))
             .expect("first fits");
         let waiter = tokio::spawn({
             let client = client.clone();

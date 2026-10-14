@@ -132,7 +132,7 @@ async fn shows_publishes_waiting_for_their_ack() {
     proxy.set_stalled(true);
     let pending: Vec<_> = (0..3)
         .map(|_| {
-            app.start_publish(Publish::new("t", "x").qos(QoS::AtLeastOnce))
+            app.try_start_publish(Publish::new("t", "x").qos(QoS::AtLeastOnce))
                 .expect("queued")
         })
         .collect();
