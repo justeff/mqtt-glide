@@ -1,11 +1,13 @@
+use std::num::NonZeroU16;
+
 use bytes::{Buf, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-use super::{DecodedFrame, Packet, decode::decode_packet};
+use super::{DecodedFrame, Packet, PublishAck, decode::decode_packet};
 use crate::codec::error::{DecodeError, EncodeError};
 use crate::codec::properties::var_int_len_u32;
-use crate::codec::types::MAX_PACKET_SIZE;
-use crate::codec::utils::{MAX_VARIABLE_LENGTH, decode_variable_length};
+use crate::codec::types::{MAX_PACKET_SIZE, packet_type};
+use crate::codec::utils::{MAX_VARIABLE_LENGTH, MINIMAL_PACKET_ID_ACK_WIRE_LEN, decode_variable_length};
 
 /// Worst-case fixed-header overhead: 1 type byte + 4-byte Remaining Length varint (§2.1.4).
 const WIRE_HEADER_BUDGET: u32 = 5;
@@ -125,8 +127,14 @@ impl Decoder for V5Codec {
             return Ok(None);
         }
         let first_byte = src[0];
-        let Some((remaining_length, varint_len)) = decode_variable_length(&src[1..])? else {
-            return Ok(None);
+        // Most frames are small enough for a one-byte Remaining Length.
+        let (remaining_length, varint_len) = if src[1] & 0x80 == 0 {
+            (u32::from(src[1]), 1)
+        } else {
+            match decode_variable_length(&src[1..])? {
+                Some(length) => length,
+                None => return Ok(None),
+            }
         };
         let header_len = 1 + varint_len;
         let wire_size = header_len + remaining_length as usize;
@@ -139,6 +147,19 @@ impl Decoder for V5Codec {
         if src.len() < wire_size {
             src.reserve(wire_size - src.len());
             return Ok(None);
+        }
+
+        // Success PUBACK without reason code or properties (§3.4.2.1), one per outbound QoS 1
+        // publish: read the Packet Identifier in place instead of splitting off a frame.
+        if first_byte == packet_type::PUBACK && remaining_length == 2 {
+            let packet_id = NonZeroU16::new(u16::from_be_bytes([src[2], src[3]]))
+                .ok_or(DecodeError::MalformedPacket("invalid encoding"))?; // §2.2.1
+            src.advance(MINIMAL_PACKET_ID_ACK_WIRE_LEN);
+            let ack = PublishAck {
+                packet_id,
+                ..PublishAck::default()
+            };
+            return Ok(Some((DecodedFrame::Control(Packet::PublishAck(ack)), remaining_length)));
         }
 
         let mut frame = src.split_to(wire_size);
@@ -338,6 +359,41 @@ mod tests {
     fn v5_codec_decode_rejects_non_minimal_remaining_length() {
         let mut codec = V5Codec::new(0, 0);
         let mut buf = BytesMut::from(&[0xC0, 0x80, 0x00][..]);
+        assert!(matches!(codec.decode(&mut buf), Err(DecodeError::MalformedPacket(_))));
+    }
+
+    #[test]
+    fn minimal_puback_fast_path_matches_general_decode() {
+        let mut codec = V5Codec::default();
+        let mut buf = BytesMut::from(&[0x40, 0x02, 0x12, 0x34, 0x40, 0x03, 0x12, 0x35, 0x10][..]);
+        let (fast, len) = codec.decode(&mut buf).unwrap().expect("minimal PUBACK");
+        assert_eq!(len, 2);
+        assert_eq!(
+            fast,
+            DecodedFrame::Control(Packet::PublishAck(crate::codec::v5::PublishAck {
+                packet_id: NonZeroU16::new(0x1234).unwrap(),
+                ..Default::default()
+            }))
+        );
+        // Next frame (reason code 0x10, general path) is untouched by the fast path.
+        let (general, _) = codec.decode(&mut buf).unwrap().expect("PUBACK with reason");
+        let DecodedFrame::Control(Packet::PublishAck(ack)) = general else {
+            panic!("expected PUBACK, got {general:?}");
+        };
+        assert_eq!(ack.packet_id.get(), 0x1235);
+        assert_eq!(
+            ack.reason_code,
+            crate::codec::v5::PublishAckReason::NoMatchingSubscribers
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn minimal_puback_fast_path_rejects_zero_packet_id_and_waits_for_bytes() {
+        let mut codec = V5Codec::default();
+        let mut buf = BytesMut::from(&[0x40, 0x02, 0x00][..]);
+        assert_eq!(codec.decode(&mut buf).unwrap(), None, "incomplete frame waits");
+        buf.extend_from_slice(&[0x00]);
         assert!(matches!(codec.decode(&mut buf), Err(DecodeError::MalformedPacket(_))));
     }
 
