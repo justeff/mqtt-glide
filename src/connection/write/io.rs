@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use futures_util::SinkExt;
+use futures_util::{FutureExt, SinkExt};
 use tokio::io::AsyncWrite;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::FramedWrite;
@@ -35,6 +35,9 @@ pub(super) enum FlushAbort<'a> {
     Hot {
         cancel: &'a StopSignal,
         shutdown_notify: &'a CancellationToken,
+        /// A flush that has not finished after this long means the broker stopped reading:
+        /// the connection is dead even though it is open (`None`: Keep Alive off).
+        stall_limit: Option<Duration>,
     },
     /// Graceful DISCONNECT path: do not race already-cancelled tokens; caller bounds with timeout.
     Graceful,
@@ -446,15 +449,32 @@ where
         FlushAbort::Hot {
             cancel,
             shutdown_notify,
+            stall_limit,
         } => {
-            // Flush first: it is almost always ready at once, and then the token futures are
-            // never polled (polling one locks the token's mutex). A flush stuck on a full
-            // socket still loses to cancel / shutdown.
+            // Flush first: it is almost always ready at once, and then neither the token
+            // futures (polling one locks the token's mutex) nor a stall timer are touched.
+            let flush = framed.flush();
+            tokio::pin!(flush);
+            if let Some(result) = flush.as_mut().now_or_never() {
+                return result.map_err(map_encode_error);
+            }
+            // The socket is full. Keep-alive pings come from this task, so a broker that stops
+            // reading but keeps the connection open is only noticed here.
+            let stalled = async {
+                match stall_limit {
+                    Some(limit) => tokio::time::sleep(limit).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 biased;
-                result = framed.flush() => result.map_err(map_encode_error),
+                result = flush => result.map_err(map_encode_error),
                 _ = shutdown_notify.cancelled() => Err(WriteOutcome::Shutdown),
                 _ = cancel.cancelled() => Err(WriteOutcome::Cancelled),
+                () = stalled => Err(WriteOutcome::Transport(TransportError::Connection(format!(
+                    "broker stopped reading: write blocked for {:?}",
+                    stall_limit.unwrap_or_default()
+                )))),
             }
         }
         FlushAbort::Graceful => framed.flush().await.map_err(map_encode_error),

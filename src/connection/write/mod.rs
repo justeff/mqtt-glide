@@ -375,10 +375,13 @@ where
         max_qos: session.max_qos,
         retain_available: session.retain_available,
     };
-    // Hot-path flushes race both tokens so stuck poll_write cannot block cancel/shutdown.
+    // Hot-path flushes race both tokens so stuck poll_write cannot block cancel/shutdown, and
+    // give up after 1.5 x Keep Alive, the span after which a broker gives up on a silent
+    // client (§3.1.2.10).
     let flush_abort = FlushAbort::Hot {
         cancel: &cancel,
         shutdown_notify: &shutdown_notify,
+        stall_limit: (!keep_alive.is_zero()).then(|| keep_alive * 3 / 2),
     };
 
     // What the previous connection still owed: unacknowledged QoS-1 PUBLISHes first (resumed

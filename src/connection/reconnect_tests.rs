@@ -84,8 +84,58 @@ async fn queued_publish_survives_a_failed_reconnect_attempt() {
         .await
         .expect("publish resolves");
     assert!(result.is_ok(), "queued publish lost: {result:?}");
-    assert!(connections.load(Ordering::SeqCst) >= 3, "went through the failed attempt");
+    assert!(
+        connections.load(Ordering::SeqCst) >= 3,
+        "went through the failed attempt"
+    );
 
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(3), run).await;
+}
+
+/// A broker that stops reading but keeps the connection open: once the socket is full the
+/// write task cannot send PINGREQ either, so the blocked write itself ends the session after
+/// 1.5 x Keep Alive.
+#[tokio::test]
+async fn broker_that_stops_reading_ends_the_session() {
+    let port = spawn_broker_once(|mut framed_read, mut framed_write| async move {
+        if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        drop((framed_read, framed_write));
+    })
+    .await;
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("url");
+    let options = ConnectOptions::new(url).keep_alive(Duration::from_secs(1));
+    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (client, connection, mut phase) = connect(
+        options,
+        static_test_credentials(),
+        crate::NoReconnect,
+        tx,
+        NoopLifecycle,
+    )
+    .expect("wiring");
+    let run = tokio::spawn(connection.run());
+    await_connected(&mut phase).await;
+
+    // Fill the socket buffers in both directions' kernels.
+    let payload = bytes::Bytes::from(vec![0u8; 60 * 1024]);
+    let mut pending = Vec::new();
+    for _ in 0..2000 {
+        if let Ok(completion) = client.start_publish(Publish::new("t/big", payload.clone())) {
+            pending.push(completion);
+        }
+        tokio::task::yield_now().await;
+    }
+    let ended = timeout(Duration::from_secs(8), await_disconnected(&mut phase)).await;
+    match ended {
+        Ok(crate::SessionPhase::Disconnected(crate::ConnectionOutcome::Transport(error))) => {
+            assert!(error.to_string().contains("stopped reading"), "{error}");
+        }
+        other => panic!("expected a transport loss within 8 s, got {other:?}"),
+    }
     client.shutdown().await.expect("shutdown");
     let _ = timeout(Duration::from_secs(3), run).await;
 }
