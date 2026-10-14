@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn malformed_packet_decode_error_maps_to_malformed_packet_reason() {
-        // [MQTT-1.5.4-1], [MQTT-1.5.4-2] — ill-formed UTF-8 / U+0000 use MalformedPacket.
+        // Ill-formed UTF-8 and U+0000 are reported as MalformedPacket.
         assert_eq!(
             DecodeError::MalformedPacket("utf-8").to_reason_code(),
             DisconnectReasonCode::MalformedPacket

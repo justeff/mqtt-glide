@@ -24,8 +24,8 @@ covered by the statement that binds the client.
 
 | Statement | Status | Evidence |
 |---|---|---|
-| **[MQTT-1.5.4-1]** The character data in a UTF-8 Encoded String MUST be well-formed UTF-8 as defined by the Unicode specification [Unicode] and restated in RFC 3629 [RFC3629]. In particular, the character data MUST NOT include encodings of code points between U+D800 and U+DFFF. | ✅ tested | `malformed_packet_decode_error_maps_to_malformed_packet_reason` (src/codec/error.rs) |
-| **[MQTT-1.5.4-2]** A UTF-8 Encoded String MUST NOT include an encoding of the null character U+0000. | ✅ tested | `malformed_packet_decode_error_maps_to_malformed_packet_reason` (src/codec/error.rs)<br>`encode_publish_rejects_nul_in_utf8_properties` (src/codec/v5/encode.rs)<br>`connect_encode_rejects_invalid_will_topics` (src/codec/v5/packet/connect.rs) |
+| **[MQTT-1.5.4-1]** The character data in a UTF-8 Encoded String MUST be well-formed UTF-8 as defined by the Unicode specification [Unicode] and restated in RFC 3629 [RFC3629]. In particular, the character data MUST NOT include encodings of code points between U+D800 and U+DFFF. | ✅ tested | `decode_bytestring_rejects_ill_formed_utf8_and_surrogates` (src/codec/utils/primitives.rs) |
+| **[MQTT-1.5.4-2]** A UTF-8 Encoded String MUST NOT include an encoding of the null character U+0000. | ✅ tested | `encode_publish_rejects_nul_in_utf8_properties` (src/codec/v5/encode.rs)<br>`connect_encode_rejects_invalid_will_topics` (src/codec/v5/packet/connect.rs) |
 | **[MQTT-1.5.4-3]** A UTF-8 encoded sequence 0xEF 0xBB 0xBF is always interpreted as U+FEFF ("ZERO WIDTH NO-BREAK SPACE") wherever it appears in a string and MUST NOT be skipped over or stripped off by a packet receiver. | ✅ tested | `decode_mqtt_utf8_string_preserves_bom` (src/codec/utils/primitives.rs) |
 | **[MQTT-1.5.5-1]** The encoded value MUST use the minimum number of bytes necessary to represent the value. | ✅ tested | `variable_length_rejects_non_minimal_encoding` (src/codec/utils/framing.rs) |
 | **[MQTT-1.5.7-1]** Both strings MUST comply with the requirements for UTF-8 Encoded Strings. | ✅ tested | `user_property_decode_rejects_invalid_utf8` (src/codec/v5/decode.rs) |
@@ -124,8 +124,8 @@ covered by the statement that binds the client.
 | **[MQTT-3.2.2-14]** A Client receiving Retain Available set to 0 from the Server MUST NOT send a PUBLISH packet with the RETAIN flag set to 1. | ✅ tested | `validate_publish_rejects_retain_when_unavailable` (src/connection/session_policy.rs)<br>`handle_publish_rejects_above_broker_limits_without_wire_publish` (src/connection/write/tests.rs) |
 | **[MQTT-3.2.2-15]** The Client MUST NOT send packets exceeding Maximum Packet Size to the Server. | ✅ tested | `connack_max_packet_size_applied_to_codecs` (src/connection/transport.rs) |
 | **[MQTT-3.2.2-16]** If the Client connects using a zero length Client Identifier, the Server MUST respond with a CONNACK containing an Assigned Client Identifier. The Assigned Client Identifier MUST be a new Client Identifier not used by any other Session currently in the Server. | — server obligation |  |
-| **[MQTT-3.2.2-17]** The Client MUST NOT send a Topic Alias in a PUBLISH packet to the Server greater than this value. | ✅ tested | `encode_publish_never_writes_topic_alias_property` (src/codec/v5/encode.rs) |
-| **[MQTT-3.2.2-18]** Topic Alias Maximum is absent, the Client MUST NOT send any Topic Aliases on to the Server. | ✅ tested | `encode_publish_never_writes_topic_alias_property` (src/codec/v5/encode.rs) |
+| **[MQTT-3.2.2-17]** The Client MUST NOT send a Topic Alias in a PUBLISH packet to the Server greater than this value. | ✅ tested | `outbound_topic_aliases_bind_reuse_and_rebind` (src/client.rs) |
+| **[MQTT-3.2.2-18]** Topic Alias Maximum is absent, the Client MUST NOT send any Topic Aliases on to the Server. | ✅ tested | `no_outbound_topic_aliases_when_the_broker_offers_none` (src/client.rs) |
 | **[MQTT-3.2.2-19]** The Server MUST NOT send this property if it would increase the size of the CONNACK packet beyond the Maximum Packet Size specified by the Client. | — server obligation |  |
 | **[MQTT-3.2.2-20]** The Server MUST NOT send this property if it would increase the size of the CONNACK packet beyond the Maximum Packet Size specified by the Client. | — server obligation |  |
 | **[MQTT-3.2.2-21]** If the Server sends a Server Keep Alive on the CONNACK packet, the Client MUST use this value instead of the Keep Alive value the Client sent on CONNECT. | ✅ tested | `server_keep_alive_from_connack_drives_pingreq_interval` (src/connection/tests.rs) |
@@ -364,7 +364,7 @@ covered by the statement that binds the client.
 | **[MQTT-4.7.2-1]** The Server MUST NOT match Topic Filters starting with a wildcard character (# or +) with Topic Names beginning with a $ character. | — server obligation | src/testing/broker.rs |
 | **[MQTT-4.7.3-1]** All Topic Names and Topic Filters MUST be at least one character long. | ✅ tested | `validate_request_rejects_empty_filter_string` (src/connection/write/tests.rs) |
 | **[MQTT-4.7.3-2]** Topic Names and Topic Filters MUST NOT include the null character (Unicode U+0000). | ✅ tested | `encode_publish_rejects_wildcard_and_nul_topic_names` (src/codec/v5/encode.rs)<br>`validate_subscribe_request_rejects_invalid_share_name` (src/connection/write/tests.rs) |
-| **[MQTT-4.7.3-3]** Topic Names and Topic Filters are UTF-8 Encoded Strings; they MUST NOT encode to more than 65,535 bytes. | ✅ tested | `decode_topic_accepts_max_length_65535_bytes` (src/codec/utils/primitives.rs) |
+| **[MQTT-4.7.3-3]** Topic Names and Topic Filters are UTF-8 Encoded Strings; they MUST NOT encode to more than 65,535 bytes. | ✅ tested | `publish_refuses_a_topic_longer_than_65535_bytes` (src/client.rs)<br>`decode_topic_accepts_max_length_65535_bytes` (src/codec/utils/primitives.rs)<br>`encode_topic_rejects_length_65536_bytes` (src/codec/utils/primitives.rs) |
 | **[MQTT-4.7.3-4]** When it performs subscription matching the Server MUST NOT perform any normalization of Topic Names or Topic Filters, or any modification or substitution of unrecognized characters. | — server obligation |  |
 
 ## 4.8

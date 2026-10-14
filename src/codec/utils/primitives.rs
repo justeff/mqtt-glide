@@ -480,6 +480,23 @@ mod tests {
         ));
     }
 
+    /// [MQTT-1.5.4-1]: ill-formed UTF-8, including an encoded UTF-16 surrogate (U+D800 as
+    /// `ED A0 80`), is rejected when a string is decoded.
+    #[test]
+    fn decode_bytestring_rejects_ill_formed_utf8_and_surrogates() {
+        for bytes in [
+            &[0x00, 0x03, 0xED, 0xA0, 0x80][..],
+            &[0x00, 0x02, 0xC3, 0x28],
+            &[0x00, 0x01, 0xFF],
+        ] {
+            let mut src = Bytes::copy_from_slice(bytes);
+            assert!(
+                matches!(ByteString::decode(&mut src), Err(DecodeError::MalformedPacket(_))),
+                "{bytes:02X?}"
+            );
+        }
+    }
+
     #[test]
     fn decode_bytestring_accepts_valid_without_nul() {
         let mut src = Bytes::from_static(&[0x00, 0x03, b'a', b'b', b'c']);
@@ -498,6 +515,7 @@ mod tests {
         assert_eq!(decoded.len(), 65535);
     }
 
+    /// [MQTT-4.7.3-3]: a string longer than 65535 bytes is never encoded.
     #[test]
     fn encode_topic_rejects_length_65536_bytes() {
         let oversized = vec![b'a'; 65536];

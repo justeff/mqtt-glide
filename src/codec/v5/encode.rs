@@ -1007,7 +1007,7 @@ mod tests {
 
     #[test]
     fn encode_publish_never_writes_topic_alias_property() {
-        // [MQTT-3.2.2-17], [MQTT-3.2.2-18] outbound path never encodes Topic Alias (product max=0)
+        // Without an alias, `encode_publish` writes no Topic Alias property.
         let message = PublishMessage {
             topic: ByteString::from_static("telemetry/device/status"),
             payload: Bytes::from_static(b"data"),

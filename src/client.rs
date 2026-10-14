@@ -3367,6 +3367,54 @@ mod tests {
         let _ = run.await;
     }
 
+    /// A broker whose CONNACK carries no Topic Alias Maximum gets no Topic Alias, even with
+    /// outbound aliases configured ([MQTT-3.2.2-18]).
+    #[tokio::test]
+    async fn no_outbound_topic_aliases_when_the_broker_offers_none() {
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::<(String, Option<u16>)>::new()));
+        let seen_broker = Arc::clone(&seen);
+        let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+            if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ConnectAck::default()).await {
+                return;
+            }
+            while let Some(Ok((frame, _))) = framed_read.next().await {
+                if let DecodedFrame::Publish(packet) = frame {
+                    seen_broker.lock().await.push((
+                        packet.message.topic.to_string(),
+                        packet.wire_topic_alias.map(|a| a.get()),
+                    ));
+                }
+            }
+        })
+        .await;
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+        let options = ConnectOptions::new(url).outbound_topic_aliases(8);
+        let (client, connection, mut phase) =
+            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        for _ in 0..2 {
+            client.publish("dev/a", "x").await.expect("publish");
+        }
+        let frames = timeout(Duration::from_secs(2), async {
+            loop {
+                let frames = seen.lock().await.clone();
+                if frames.len() == 2 {
+                    return frames;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both frames");
+        assert_eq!(frames, [("dev/a".to_owned(), None), ("dev/a".to_owned(), None)]);
+
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
+
     /// [MQTT-4.7.3-3]: a Topic Name over 65535 bytes is refused before it reaches the wire,
     /// and the session stays up.
     #[tokio::test]
