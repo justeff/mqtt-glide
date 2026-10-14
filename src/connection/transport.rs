@@ -16,6 +16,7 @@ use super::handshake::{
     ConnectCredentials, SessionParams, apply_connack, build_connect, distinct_v5_codecs_for_framed_halves,
     on_auth_failure, resolve_client_id_str,
 };
+use super::redirect::ServerRedirect;
 use crate::client::SharedCredentials;
 use crate::codec::{ConnectAck, DecodedFrame, Packet, V5Codec};
 use crate::error::{ConnectionOutcome, ProtocolError, TransportError};
@@ -26,12 +27,15 @@ type TlsIo = TlsStream<TcpStream>;
 type WsIo<S> = super::websocket::WsByteStream<S>;
 
 /// CONNECT/CONNACK on already-split transport halves.
+///
+/// A CONNACK that redirects (§4.11) leaves its target in `redirect`.
 pub(crate) async fn establish_session_on<R, W>(
     read_half: R,
     write_half: W,
     options: &ConnectOptions,
     credentials: &SharedCredentials,
     deadline: Instant,
+    redirect: &mut Option<ServerRedirect>,
 ) -> Result<(FramedRead<R, V5Codec>, FramedWrite<W, V5Codec>, SessionParams), ConnectionOutcome>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -64,7 +68,10 @@ where
             apply_session_limits_to_codecs(&mut framed_write, &session);
             Ok((framed_read, framed_write, session))
         }
-        Err(outcome) => Err(on_auth_failure(credentials, outcome).await),
+        Err(outcome) => {
+            *redirect = ServerRedirect::from_connack(&ack);
+            Err(on_auth_failure(credentials, outcome).await)
+        }
     }
 }
 
@@ -373,7 +380,7 @@ mod tests {
         let deadline = Instant::now() + options.connect_timeout;
         let tcp_stream = open_tcp(&options, deadline).await.expect("tcp");
         let (read_half, write_half) = tcp_stream.into_split();
-        establish_session_on(read_half, write_half, &options, &credentials, deadline)
+        establish_session_on(read_half, write_half, &options, &credentials, deadline, &mut None)
             .await
             .expect("handshake");
 
@@ -415,7 +422,7 @@ mod tests {
         let deadline = Instant::now() + options.connect_timeout;
         let tcp_stream = open_tcp(&options, deadline).await.expect("tcp");
         let (read_half, write_half) = tcp_stream.into_split();
-        let err = match establish_session_on(read_half, write_half, &options, &credentials, deadline).await {
+        let err = match establish_session_on(read_half, write_half, &options, &credentials, deadline, &mut None).await {
             Err(outcome) => outcome,
             Ok(_) => panic!("CONNACK must time out"),
         };

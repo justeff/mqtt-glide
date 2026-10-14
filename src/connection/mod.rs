@@ -6,6 +6,7 @@ mod io_batch;
 mod lifecycle;
 pub(crate) mod packet_id;
 pub(crate) mod read;
+mod redirect;
 pub(crate) mod session_policy;
 mod state;
 mod stop;
@@ -150,6 +151,10 @@ pub struct Connection<H: InboundSink = flume::Sender<crate::codec::InboundMessag
     /// What one connection still owes the application, handed to the next connection
     /// (never-sent publishes always; unacknowledged QoS 1 when the session is resumable).
     session_carry: write::SessionCarry,
+    /// Where the next connection goes after a 0x9C redirect (one connection only).
+    redirect_once: Option<crate::util::broker_url::BrokerUrl>,
+    /// Redirects followed since a connection last ended without one.
+    redirects_in_row: u8,
 }
 
 impl<H: InboundSink> std::fmt::Debug for Connection<H> {
@@ -188,6 +193,8 @@ impl<H: InboundSink> Connection<H> {
             subscription_registry: std::sync::Arc::new(std::sync::RwLock::new(SubscriptionRegistry::default())),
             session_affinity: subscriptions::SessionAffinity::None,
             session_carry,
+            redirect_once: None,
+            redirects_in_row: 0,
         }
     }
 
@@ -290,26 +297,32 @@ impl<H: InboundSink> Connection<H> {
         self.state = ConnectionState::Connecting;
         let deadline = Instant::now() + self.options.connect_timeout;
 
-        // Dial under `select!` with borrowed `options` (no per-attempt `ConnectOptions` clone);
-        // the borrow ends before `&mut self` resumes in `session_after_dial`.
-        let websocket = self.options.broker_url.websocket_path().is_some();
-        match (resolve_tls_mode(&self.options), websocket) {
+        // Dial under `select!` with borrowed `options` (no per-attempt `ConnectOptions` clone,
+        // except towards a one-off redirect target); the borrow ends before `&mut self` resumes
+        // in `session_after_dial`.
+        let redirected = self.redirect_once.take().map(|broker_url| ConnectOptions {
+            broker_url,
+            ..self.options.clone()
+        });
+        let options = redirected.as_ref().unwrap_or(&self.options);
+        let websocket = options.broker_url.websocket_path().is_some();
+        match (resolve_tls_mode(options), websocket) {
             (TlsMode::PlainTcp, false) => {
-                let dialed = dial_or_cancel(&self.cancel, transport::dial_tcp(&self.options, deadline)).await;
+                let dialed = dial_or_cancel(&self.cancel, transport::dial_tcp(options, deadline)).await;
                 self.session_after_dial(dialed, deadline).await
             }
             (TlsMode::RustlsSystemRoots, false) => {
-                let dialed = dial_or_cancel(&self.cancel, transport::dial_tls(&self.options, deadline)).await;
+                let dialed = dial_or_cancel(&self.cancel, transport::dial_tls(options, deadline)).await;
                 self.session_after_dial(dialed, deadline).await
             }
             #[cfg(feature = "websocket")]
             (TlsMode::PlainTcp, true) => {
-                let dialed = dial_or_cancel(&self.cancel, transport::dial_ws(&self.options, deadline)).await;
+                let dialed = dial_or_cancel(&self.cancel, transport::dial_ws(options, deadline)).await;
                 self.session_after_dial(dialed, deadline).await
             }
             #[cfg(feature = "websocket")]
             (TlsMode::RustlsSystemRoots, true) => {
-                let dialed = dial_or_cancel(&self.cancel, transport::dial_wss(&self.options, deadline)).await;
+                let dialed = dial_or_cancel(&self.cancel, transport::dial_wss(options, deadline)).await;
                 self.session_after_dial(dialed, deadline).await
             }
             // `BrokerUrl::parse` rejects ws:// / wss:// without the feature.
@@ -351,17 +364,24 @@ impl<H: InboundSink> Connection<H> {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let establish =
-            transport::establish_session_on(read_half, write_half, &self.options, &self.credentials, deadline);
+        let mut redirect = None;
+        let establish = transport::establish_session_on(
+            read_half,
+            write_half,
+            &self.options,
+            &self.credentials,
+            deadline,
+            &mut redirect,
+        );
 
-        let (framed_read, framed_write, session) = tokio::select! {
-            result = establish => {
-                match result {
-                    Ok(established) => established,
-                    Err(outcome) => return self.finish_session(outcome, false).await,
-                }
-            }
-            () = self.cancel.cancelled() => {
+        let established = tokio::select! {
+            result = establish => Some(result),
+            () = self.cancel.cancelled() => None,
+        };
+        let (framed_read, framed_write, session) = match established {
+            Some(Ok(established)) => established,
+            Some(Err(outcome)) => return self.finish_session_or_redirect(outcome, false, redirect).await,
+            None => {
                 return self
                     .finish_session(ConnectionOutcome::Shutdown(ShutdownError::Cancelled), false)
                     .await;
@@ -552,12 +572,62 @@ impl<H: InboundSink> Connection<H> {
             read_done_rx,
         ));
 
-        let outcome = Self::supervise_tasks(read_handle, write_handle, read_cancel, write_cancel).await;
-        self.finish_session(outcome, true).await
+        let (outcome, redirect) = Self::supervise_tasks(read_handle, write_handle, read_cancel, write_cancel).await;
+        self.finish_session_or_redirect(outcome, true, redirect).await
+    }
+
+    /// Like [`Self::finish_session`], but a broker redirect that is followed starts the next
+    /// connection at once, towards the referenced server (§4.11).
+    async fn finish_session_or_redirect(
+        &mut self,
+        outcome: ConnectionOutcome,
+        from_active_session: bool,
+        redirect: Option<redirect::ServerRedirect>,
+    ) -> SessionDisposition {
+        if let Some(redirect) = redirect
+            && self.follow_redirect(&redirect)
+        {
+            self.state = ConnectionState::Draining;
+            self.notify_disconnected(outcome);
+            return self.backoff_then_retry(Duration::ZERO).await;
+        }
+        self.finish_session(outcome, from_active_session).await
+    }
+
+    /// Points the next connection (0x9C) or every later one (0x9D) at the referenced server.
+    /// `false` when following is off, the reference is unusable, or too many redirects came in
+    /// a row.
+    fn follow_redirect(&mut self, redirect: &redirect::ServerRedirect) -> bool {
+        if !self.options.follow_server_redirects {
+            return false;
+        }
+        if self.redirects_in_row >= redirect::MAX_REDIRECTS_IN_ROW {
+            tracing::warn!(reference = %redirect.reference, "too many redirects in a row; not following");
+            return false;
+        }
+        let Some(target) = self.options.broker_url.redirected(&redirect.reference) else {
+            tracing::warn!(reference = %redirect.reference, "unusable Server Reference; not following");
+            return false;
+        };
+        tracing::info!(
+            host = target.host(),
+            port = target.port(),
+            permanent = redirect.permanent,
+            "following broker redirect"
+        );
+        self.redirects_in_row += 1;
+        if redirect.permanent {
+            self.options.broker_url = target;
+            self.redirect_once = None;
+        } else {
+            self.redirect_once = Some(target);
+        }
+        true
     }
 
     /// Emits `Disconnected`, applies reconnect policy, and decides whether to retry.
     async fn finish_session(&mut self, outcome: ConnectionOutcome, from_active_session: bool) -> SessionDisposition {
+        self.redirects_in_row = 0;
         self.state = ConnectionState::Draining;
         self.notify_disconnected(outcome.clone());
 
@@ -643,7 +713,7 @@ impl<H: InboundSink> Connection<H> {
         write_handle: JoinHandle<WriteOutcome>,
         read_cancel: StopSignal,
         write_cancel: StopSignal,
-    ) -> ConnectionOutcome {
+    ) -> (ConnectionOutcome, Option<redirect::ServerRedirect>) {
         tokio::pin!(read_handle);
         tokio::pin!(write_handle);
 
@@ -657,20 +727,25 @@ impl<H: InboundSink> Connection<H> {
             write_result = write_handle.as_mut() => FirstResult::Write(write_result),
         };
 
+        let redirect_of = |result: &Result<ReadOutcome, tokio::task::JoinError>| match result {
+            Ok(ReadOutcome::BrokerDisconnect(disconnect)) => redirect::ServerRedirect::from_disconnect(disconnect),
+            _ => None,
+        };
         match first {
             FirstResult::Read(read_result) => {
                 write_cancel.cancel();
                 let write_result = write_handle.as_mut().await;
                 // Prefer write's graceful DISCONNECT over read cut-off Cancelled.
                 if matches!(&write_result, Ok(WriteOutcome::Shutdown)) {
-                    return Self::map_write_outcome(write_result);
+                    return (Self::map_write_outcome(write_result), None);
                 }
-                Self::map_read_outcome(read_result)
+                let redirect = redirect_of(&read_result);
+                (Self::map_read_outcome(read_result), redirect)
             }
             FirstResult::Write(write_result) => {
                 read_cancel.cancel();
-                let _ = read_handle.as_mut().await;
-                Self::map_write_outcome(write_result)
+                let read_result = read_handle.as_mut().await;
+                (Self::map_write_outcome(write_result), redirect_of(&read_result))
             }
         }
     }

@@ -128,6 +128,19 @@ pub struct ConnectOptions {
     /// still bounded by [`Self::ack_timeout`]. Set it when a publish that cannot go out now is
     /// worthless (live telemetry) or the application keeps its own buffer.
     pub fail_fast_when_disconnected: bool,
+    /// Follow a broker's redirect (§4.11): a CONNACK or DISCONNECT with Reason Code 0x9C
+    /// (Use another server) or 0x9D (Server moved) and a Server Reference.
+    ///
+    /// When set, the next connection goes to the referenced server at once, whatever the
+    /// [`ReconnectPolicy`](crate::ReconnectPolicy) says; 0x9D keeps the new server for good,
+    /// 0x9C only for that connection. The reference's host and port replace the configured
+    /// ones; scheme, TLS and WebSocket path stay, and TLS verifies the new host's certificate.
+    /// After five redirects in a row the client falls back to its configured broker and the
+    /// reconnect policy.
+    ///
+    /// Default `false`: a redirect is then reported like any other refusal or disconnect (its
+    /// Server Reference is in the error text).
+    pub follow_server_redirects: bool,
     /// Optional counter incremented when the write task feeds an inbound QoS-1 PUBACK.
     ///
     /// Bench / diagnostic hook only (`None` in production). Does not change enqueue-before-ack semantics.
@@ -158,6 +171,7 @@ impl ConnectOptions {
             will_message: None,
             max_packet_size: NonZeroU32::new(DEFAULT_MAX_PACKET_SIZE).expect("DEFAULT_MAX_PACKET_SIZE non-zero"),
             fail_fast_when_disconnected: false,
+            follow_server_redirects: false,
             topic_alias_maximum: 0,
             outbound_topic_aliases: 0,
             bench_inbound_publish_ack_counter: None,
@@ -179,6 +193,12 @@ impl ConnectOptions {
     /// Sets [`Self::fail_fast_when_disconnected`].
     pub fn fail_fast_when_disconnected(mut self, fail_fast: bool) -> Self {
         self.fail_fast_when_disconnected = fail_fast;
+        self
+    }
+
+    /// Sets [`Self::follow_server_redirects`].
+    pub fn follow_server_redirects(mut self, follow: bool) -> Self {
+        self.follow_server_redirects = follow;
         self
     }
 

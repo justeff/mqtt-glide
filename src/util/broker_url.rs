@@ -114,6 +114,28 @@ impl BrokerUrl {
     pub fn websocket_path(&self) -> Option<&str> {
         self.websocket_path.as_deref()
     }
+
+    /// This endpoint moved to the server named by a broker's Server Reference (§4.11).
+    ///
+    /// The reference's format is not specified; brokers send `host`, `host:port`, `[v6]:port`
+    /// or a URL, possibly as a space-separated list. The first entry's host and port are used
+    /// (port defaulting to this endpoint's); scheme, TLS and WebSocket path stay as configured,
+    /// so a redirect can never downgrade the transport. `None` if the reference names no host.
+    pub(crate) fn redirected(&self, reference: &str) -> Option<Self> {
+        let first = reference.split_whitespace().next()?;
+        let without_scheme = first.split_once("://").map_or(first, |(_, rest)| rest);
+        let host_port = match without_scheme.find('/') {
+            Some(index) => &without_scheme[..index],
+            None => without_scheme,
+        };
+        let (host, port) = split_host_port(host_port, self.port).ok()?;
+        Some(Self {
+            host,
+            port,
+            use_tls: self.use_tls,
+            websocket_path: self.websocket_path.clone(),
+        })
+    }
 }
 
 /// Splits `host[:port]` or `[v6][:port]`, falling back to `default_port`.
@@ -165,6 +187,28 @@ mod tests {
         assert_eq!(addr.host(), expected_host, "host mismatch for {input}");
         assert_eq!(addr.port(), expected_port, "port mismatch for {input}");
         assert_eq!(addr.use_tls(), expected_tls, "tls mismatch for {input}");
+    }
+
+    /// Server Reference forms seen in practice; the configured transport always stays.
+    #[rstest]
+    #[case::host_only("other.example.com", "other.example.com", 8883)]
+    #[case::host_port("other.example.com:9883", "other.example.com", 9883)]
+    #[case::ipv6("[fe80::1]:8884", "fe80::1", 8884)]
+    #[case::list_takes_first("10.0.0.2:8885 10.0.0.3:8885", "10.0.0.2", 8885)]
+    #[case::url_scheme_ignored("mqtt://other.example.com:1883/x", "other.example.com", 1883)]
+    fn redirected_keeps_transport(#[case] reference: &str, #[case] host: &str, #[case] port: u16) {
+        let base = BrokerUrl::parse("mqtts://broker.example.com").expect("valid");
+        let moved = base.redirected(reference).expect("usable reference");
+        assert_eq!((moved.host(), moved.port()), (host, port));
+        assert!(moved.use_tls(), "a redirect never downgrades TLS");
+    }
+
+    #[test]
+    fn redirected_rejects_references_without_a_host() {
+        let base = BrokerUrl::parse("mqtt://broker.example.com").expect("valid");
+        for reference in ["", "   ", ":1883", "[fe80::1"] {
+            assert!(base.redirected(reference).is_none(), "{reference:?}");
+        }
     }
 
     #[test]
