@@ -12,8 +12,8 @@ use tokio_util::codec::FramedWrite;
 use tokio_util::sync::CancellationToken;
 
 use crate::codec::{
-    Disconnect, EncodeError, Packet, PublishDelivery, PublishMessage, V5Codec, encode_publish, encode_publish_ack,
-    encode_publish_with_alias,
+    Disconnect, DisconnectReasonCode, EncodeError, Packet, PublishDelivery, PublishMessage, V5Codec, encode_publish,
+    encode_publish_ack, encode_publish_with_alias,
 };
 use crate::connection::packet_id::InflightPots;
 use crate::connection::subscriptions::SubscriptionRegistry;
@@ -103,6 +103,8 @@ where
         read_stop,
     } = ctx;
 
+    // Normal Disconnection, unless the read task reports a packet it could not accept.
+    let mut disconnect_reason = DisconnectReasonCode::NormalDisconnection;
     let drain = async {
         drain_queued_commands(framed, command_rx, inflight, publish_waiters, publish_limits).await?;
         flush_writes(framed, flush_abort).await?;
@@ -128,7 +130,11 @@ where
                         complete_unsubscribe_ack(waiters, inflight, subscription_registry, generation, ack_generation, ack);
                     }
                     // The read task saw a protocol violation: nothing more will be acknowledged.
-                    Some(ControlMessage::ProtocolDisconnect(_)) | None => break,
+                    Some(ControlMessage::ProtocolDisconnect(reason)) => {
+                        disconnect_reason = reason;
+                        break;
+                    }
+                    None => break,
                     #[allow(unreachable_patterns)] // test-only control variants
                     Some(_) => {}
                 },
@@ -143,9 +149,15 @@ where
 
         read_stop.cancel();
         let read_done = (!read_finished).then_some(&mut read_done);
-        drain_inbound_publish_acks_until_read_done(framed, control_rx, read_done, flush_abort).await?;
+        drain_inbound_publish_acks_until_read_done(framed, control_rx, read_done, flush_abort, &mut disconnect_reason)
+            .await?;
         // Best-effort DISCONNECT so the broker sees a clean close after PUBACKs.
-        send_packet(framed, Packet::Disconnect(Disconnect::default()), flush_abort).await
+        send_packet(
+            framed,
+            Packet::Disconnect(Disconnect::new(disconnect_reason)),
+            flush_abort,
+        )
+        .await
     };
 
     let drained = tokio::time::timeout(flush_budget, drain).await;
@@ -222,11 +234,13 @@ where
 }
 
 /// Drains [`ControlMessage::AckInboundPublish`] until the read task has exited, then vacuums.
+/// A [`ControlMessage::ProtocolDisconnect`] met on the way sets `disconnect_reason`.
 pub(super) async fn drain_inbound_publish_acks_until_read_done<W>(
     framed: &mut FramedWrite<W, V5Codec>,
     control_rx: &mut ControlReceiver,
     mut read_done: Option<&mut oneshot::Receiver<()>>,
     flush_abort: FlushAbort<'_>,
+    disconnect_reason: &mut DisconnectReasonCode,
 ) -> Result<(), WriteOutcome>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -244,6 +258,7 @@ where
                         dirty = true;
                         flush_if_buffer_large(framed, flush_abort).await?;
                     }
+                    Some(ControlMessage::ProtocolDisconnect(reason)) => *disconnect_reason = reason,
                     Some(_other) => {
                         // Waiters already failed; ignore non-ack control during drain.
                     }
@@ -270,6 +285,7 @@ where
                 dirty = true;
                 flush_if_buffer_large(framed, flush_abort).await?;
             }
+            Ok(ControlMessage::ProtocolDisconnect(reason)) => *disconnect_reason = reason,
             Ok(_other) => {}
             Err(mpsc::error::TryRecvError::Empty) | Err(mpsc::error::TryRecvError::Disconnected) => {
                 if dirty {
@@ -277,6 +293,32 @@ where
                 }
                 return Ok(());
             }
+        }
+    }
+}
+
+/// Time allowed for a DISCONNECT the read task asked for when the session is already being
+/// torn down; the supervisor is waiting for this task.
+const PENDING_DISCONNECT_BUDGET: Duration = Duration::from_secs(1);
+
+/// The supervisor cancelled the session after the read task ended. If that task queued a
+/// DISCONNECT reason first (a packet it could not accept, [MQTT-3.14.1-1]), send it now: the
+/// cancel can win the race against the queued message.
+pub(super) async fn send_pending_protocol_disconnect<W>(
+    framed: &mut FramedWrite<W, V5Codec>,
+    control_rx: &mut ControlReceiver,
+) where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    while let Ok(message) = control_rx.try_recv() {
+        if let ControlMessage::ProtocolDisconnect(reason) = message {
+            let disconnect = send_packet(
+                framed,
+                Packet::Disconnect(Disconnect::new(reason)),
+                FlushAbort::Graceful,
+            );
+            let _ = tokio::time::timeout(PENDING_DISCONNECT_BUDGET, disconnect).await;
+            return;
         }
     }
 }

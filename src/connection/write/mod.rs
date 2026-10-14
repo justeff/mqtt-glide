@@ -41,7 +41,7 @@ use self::commands::{
 };
 use self::io::{
     ControlCoalesceCtx, FlushAbort, GracefulDisconnectCtx, drain_ready_control_coalesce, feed_inbound_publish_ack,
-    flush_writes, graceful_disconnect, handle_deferred_control, send_packet,
+    flush_writes, graceful_disconnect, handle_deferred_control, send_packet, send_pending_protocol_disconnect,
 };
 use self::keepalive::keep_alive_ping_timer;
 
@@ -486,6 +486,7 @@ where
             () = &mut cancel_wait => {
                 // Peer close / supervisor cancel: outstanding QoS1 waiters must not hang
                 // on connection loss.
+                send_pending_protocol_disconnect(&mut framed, &mut control_rx).await;
                 return finish_write_outcome(
                     &mut waiters,
                     &mut publish_waiters,

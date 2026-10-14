@@ -139,3 +139,71 @@ async fn broker_that_stops_reading_ends_the_session() {
     client.shutdown().await.expect("shutdown");
     let _ = timeout(Duration::from_secs(3), run).await;
 }
+
+/// Runs `rounds` sessions against a broker that sends `bad_packet` after CONNACK, and returns
+/// the DISCONNECT reason the client sent in each (`None`: it closed without one).
+async fn disconnect_reasons_after(
+    bad_packet: &'static [u8],
+    rounds: usize,
+) -> Vec<Option<crate::codec::DisconnectReasonCode>> {
+    let (seen_tx, seen_rx) = flume::unbounded();
+    let port = spawn_broker_loop(move |mut framed_read, mut framed_write| {
+        let seen_tx = seen_tx.clone();
+        async move {
+            use tokio::io::AsyncWriteExt;
+            if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+                return;
+            }
+            if framed_write.get_mut().write_all(bad_packet).await.is_err() {
+                let _ = seen_tx.send(None);
+                return;
+            }
+            let mut reason = None;
+            while let Ok(Some(frame)) = timeout(Duration::from_secs(2), framed_read.next()).await {
+                if let Ok((DecodedFrame::Control(Packet::Disconnect(disconnect)), _)) = frame {
+                    reason = Some(disconnect.reason_code);
+                }
+            }
+            let _ = seen_tx.send(reason);
+        }
+    })
+    .await;
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("url");
+    let mut reasons = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+        let (_client, connection, _phase) = connect(
+            ConnectOptions::new(url.clone()),
+            static_test_credentials(),
+            crate::NoReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("wiring");
+        let _ = timeout(Duration::from_secs(5), connection.run()).await;
+        reasons.push(seen_rx.recv_async().await.expect("broker result"));
+    }
+    reasons
+}
+
+/// [MQTT-3.14.1-1]: the DISCONNECT with the reason reaches the broker every time, also on a
+/// multi-threaded runtime where the supervisor can cancel the write task before it ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_packet_disconnect_always_reaches_the_broker() {
+    // Packet type 0 is forbidden: Malformed Packet.
+    let reasons = disconnect_reasons_after(&[0x00, 0x00], 100).await;
+    let missing = reasons
+        .iter()
+        .filter(|reason| **reason != Some(crate::codec::DisconnectReasonCode::MalformedPacket))
+        .count();
+    assert_eq!(missing, 0, "DISCONNECT 0x81 missing or wrong in {missing}/100 sessions");
+}
+
+/// A packet a client must never receive (here PUBREL, part of QoS 2) is a Protocol Error and
+/// is answered with DISCONNECT 0x82 before the connection closes.
+#[tokio::test]
+async fn unexpected_control_packet_gets_protocol_error_disconnect() {
+    // PUBREL, packet id 1.
+    let reasons = disconnect_reasons_after(&[0x62, 0x02, 0x00, 0x01], 1).await;
+    assert_eq!(reasons, [Some(crate::codec::DisconnectReasonCode::ProtocolError)]);
+}

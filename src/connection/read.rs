@@ -362,18 +362,25 @@ async fn dispatch_control(
             }
             None
         }
-        // QoS 2 handshake packets are out of scope — treat as protocol violation.
-        Packet::PublishReceived(_) | Packet::PublishRelease(_) | Packet::PublishComplete(_) => {
-            Some(ReadOutcome::Protocol(ProtocolError::Violation(
-                "QoS 2 control packets are not supported".into(),
-            )))
-        }
+        // QoS 2 handshake packets are out of scope: this client never sends or grants QoS 2,
+        // so they are a protocol violation, answered with DISCONNECT 0x82 like any other.
+        Packet::PublishReceived(_) | Packet::PublishRelease(_) | Packet::PublishComplete(_) => Some(
+            protocol_error_disconnect(
+                control_tx,
+                ProtocolError::Violation("QoS 2 control packets are not supported".into()),
+                DisconnectReasonCode::ProtocolError,
+            )
+            .await,
+        ),
         // Extended AUTH (re-auth) is out of scope — ignore until authenticated sessions land.
         Packet::Auth(_) => None,
-        other => Some(ReadOutcome::Protocol(ProtocolError::Violation(format!(
-            "unexpected control packet on connected session: {:?}",
-            other.packet_type()
-        )))),
+        other => {
+            let error = ProtocolError::Violation(format!(
+                "unexpected control packet on connected session: {:?}",
+                other.packet_type()
+            ));
+            Some(protocol_error_disconnect(control_tx, error, DisconnectReasonCode::ProtocolError).await)
+        }
     }
 }
 
