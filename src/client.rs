@@ -2405,6 +2405,110 @@ mod tests {
         let _ = run.await;
     }
 
+    /// The resumed connection allows fewer publishes in flight than are unacknowledged: all of
+    /// them are still resent ([MQTT-4.4.0-1]) with DUP and their original ids, but never more
+    /// at once than the new Receive Maximum ([MQTT-4.9.0-2]); the next goes out after a PUBACK.
+    #[tokio::test]
+    async fn unacked_qos1_beyond_a_smaller_receive_maximum_waits_and_is_resent() {
+        let seen: SeenPublishes = Arc::default();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port = crate::connection::test_support::spawn_broker_loop({
+            let seen = Arc::clone(&seen);
+            move |mut framed_read, mut framed_write| {
+                let seen = Arc::clone(&seen);
+                let connections = Arc::clone(&connections);
+                async move {
+                    let index = connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut ack = ConnectAck::default();
+                    if index > 0 {
+                        ack.session_present = true;
+                        ack.receive_max = NonZeroU16::new(1).expect("nz");
+                    }
+                    if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
+                        return;
+                    }
+                    let mut swallowed = 0;
+                    loop {
+                        // On the resumed connection a second PUBLISH before our PUBACK would
+                        // overrun Receive Maximum 1.
+                        let next = if index > 0 {
+                            match timeout(Duration::from_millis(100), framed_read.next()).await {
+                                Ok(next) => next,
+                                Err(_) => continue,
+                            }
+                        } else {
+                            framed_read.next().await
+                        };
+                        let Some(Ok((DecodedFrame::Publish(packet), _))) = next else {
+                            return;
+                        };
+                        let id = packet.meta.packet_id.expect("QoS 1 packet id");
+                        seen.lock()
+                            .await
+                            .push((index, id, packet.meta.dup, packet.message.payload.clone()));
+                        if index == 0 {
+                            swallowed += 1;
+                            if swallowed == 3 {
+                                return;
+                            }
+                            continue;
+                        }
+                        // Hold the PUBACK: nothing else may arrive meanwhile.
+                        let early = timeout(Duration::from_millis(100), framed_read.next()).await;
+                        assert!(early.is_err(), "PUBLISH beyond Receive Maximum 1: {early:?}");
+                        let _ = framed_write
+                            .send(Packet::PublishAck(PublishAck {
+                                packet_id: id,
+                                reason_code: crate::codec::PublishAckReason::Success,
+                                properties: Vec::new(),
+                                reason_string: None,
+                            }))
+                            .await;
+                    }
+                }
+            }
+        })
+        .await;
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+        let (client, connection, mut phase) = connect(
+            resumable_options(port),
+            static_test_credentials(),
+            ImmediateReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let completions: Vec<_> = ["a", "b", "c"]
+            .into_iter()
+            .map(|payload| {
+                client
+                    .start_publish(Publish::new("t/resume", payload).qos(QoS::AtLeastOnce))
+                    .expect("enqueue")
+            })
+            .collect();
+        for completion in completions {
+            timeout(Duration::from_secs(5), completion.wait())
+                .await
+                .expect("completion resolves")
+                .expect("resent and acknowledged");
+        }
+
+        let frames = seen.lock().await.clone();
+        let original: Vec<_> = frames.iter().filter(|f| f.0 == 0).collect();
+        let resent: Vec<_> = frames.iter().filter(|f| f.0 == 1).collect();
+        assert_eq!(resent.len(), 3, "every unacknowledged publish is resent: {frames:?}");
+        for (original, resent) in original.iter().zip(&resent) {
+            assert!(resent.2, "DUP set");
+            assert_eq!((original.1, &original.3), (resent.1, &resent.3), "same id and order");
+        }
+
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
+
     /// No session on the broker after reconnect: the client discards its own state
     /// ([MQTT-3.2.2-5]) — nothing is resent ([MQTT-4.4.0-1]: no resend at any other time) and the
     /// callers see `ConnectionLost`.

@@ -110,7 +110,7 @@ where
         flush_writes(framed, flush_abort).await?;
 
         let mut read_finished = false;
-        while !publish_waiters.by_id.is_empty() || !publish_waiters.parked.is_empty() {
+        while !publish_waiters.by_id.is_empty() || publish_waiters.waiting_for_window() > 0 {
             tokio::select! {
                 biased;
                 msg = control_rx.recv() => match msg {

@@ -139,6 +139,9 @@ pub(super) fn fail_all_waiters(
     for parked in publish_waiters.parked.drain(..) {
         let _ = parked.reply.send(Err(error.clone()));
     }
+    for carried in publish_waiters.resend_parked.drain(..) {
+        let _ = carried.reply.send(Err(error.clone()));
+    }
 }
 
 /// Fail outstanding waiters with the [`AppError`] class that matches `outcome`.
@@ -177,6 +180,7 @@ pub(super) fn fail_waiters_for_outcome(
                 seq: entry.seq,
             });
         }
+        slot.unacked.extend(publish_waiters.resend_parked.drain(..));
         slot.unsent.extend(publish_waiters.parked.drain(..));
     }
     let error = waiter_error_for_outcome(outcome);

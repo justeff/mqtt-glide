@@ -142,11 +142,14 @@ impl SubUnsubWaiters {
 /// reaches the bounded command channel instead of growing memory.
 ///
 /// With a resumable session each in-flight entry also keeps its message, so that a
-/// connection loss can hand it to the next connection for resending.
+/// connection loss can hand it to the next connection for resending. Carried ones that do not
+/// fit the new connection's Receive Maximum wait in `resend_parked`, ahead of `parked`.
 #[derive(Debug, Default)]
 pub(crate) struct PublishWaiters {
     pub(super) by_id: PacketIdMap<InflightPublish>,
     pub(super) parked: VecDeque<PendingOutboundPublish>,
+    /// Unacknowledged publishes of a resumed session still to be resent (DUP, original id).
+    pub(super) resend_parked: VecDeque<CarriedPublish>,
     pub(super) carry: Option<SessionCarry>,
     /// Keep each in-flight message for a resend (resumable session).
     keep_messages: bool,
@@ -252,6 +255,12 @@ impl PublishWaiters {
     #[inline]
     pub(super) fn parked_full(&self) -> bool {
         self.parked.len() >= MAX_PARKED_PUBLISHES
+    }
+
+    /// Publishes waiting for a slot in the broker's Receive Maximum window (resends first).
+    #[inline]
+    pub(super) fn waiting_for_window(&self) -> usize {
+        self.resend_parked.len() + self.parked.len()
     }
 
     #[cfg(test)]
@@ -423,7 +432,7 @@ where
 
     loop {
         // A PUBACK handled in the previous iteration may have freed window slots.
-        if !publish_waiters.parked.is_empty() && inflight.has_publish_capacity() {
+        if publish_waiters.waiting_for_window() > 0 && inflight.has_publish_capacity() {
             let sent = match send_parked_publishes(&mut framed, &mut inflight, &mut publish_waiters) {
                 Ok(()) => flush_writes(&mut framed, flush_abort).await,
                 Err(outcome) => Err(outcome),
@@ -452,7 +461,7 @@ where
 
         publish_waiters
             .stats
-            .outbound_window(publish_waiters.by_id.len(), publish_waiters.parked.len());
+            .outbound_window(publish_waiters.by_id.len(), publish_waiters.waiting_for_window());
 
         // Do not put `#[cfg(test)]` on a `tokio::select!` arm — the macro rejects it.
         #[cfg(test)]

@@ -22,8 +22,8 @@ use crate::util::{is_shared_subscription_filter, validate_share_name};
 use super::acks::app_error_from_write_outcome;
 use super::io::{FlushAbort, feed_publish, flush_if_buffer_large, flush_writes, map_encode_error, send_packet};
 use super::{
-    BrokerPublishLimits, MAX_READY_DRAIN, PendingOutboundPublish, PendingSubscribe, PendingUnsubscribe, PublishWaiters,
-    SubUnsubWaiters, WriteOutcome,
+    BrokerPublishLimits, CarriedPublish, MAX_READY_DRAIN, PendingOutboundPublish, PendingSubscribe, PendingUnsubscribe,
+    PublishWaiters, SubUnsubWaiters, WriteOutcome,
 };
 
 /// Mutable state needed to dispatch one [`ClientCommand`].
@@ -302,7 +302,7 @@ where
     // QoS 1: wait for a free slot in the broker's Receive Maximum window rather than
     // failing the publish. Queue behind already-parked publishes to keep their order;
     // the write loop sends them as PUBACKs free slots.
-    if !inflight.has_publish_capacity() || !publish_waiters.parked.is_empty() {
+    if !inflight.has_publish_capacity() || publish_waiters.waiting_for_window() > 0 {
         publish_waiters.parked.push_back(publish);
         return Ok(());
     }
@@ -320,6 +320,10 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     while inflight.has_publish_capacity() {
+        if let Some(entry) = publish_waiters.resend_parked.pop_front() {
+            resend_unacked(framed, inflight, publish_waiters, entry)?;
+            continue;
+        }
         let Some(publish) = publish_waiters.parked.pop_front() else {
             break;
         };
@@ -393,39 +397,60 @@ where
         return Ok(());
     }
     // Resend in the original send order ([MQTT-4.6.0-1]); ids are reused round-robin,
-    // so they do not encode it.
+    // so they do not encode it. What does not fit the new Receive Maximum waits for PUBACKs
+    // to free slots ([MQTT-4.9.0-2]) and is resent then, still before anything new.
     carried.sort_by_key(|entry| entry.seq);
     for entry in carried {
-        if !inflight.has_publish_capacity() || !inflight.reserve_publish(entry.packet_id) {
-            let _ = entry.reply.send(Err(AppError::ConnectionLost));
-            continue;
+        if inflight.has_publish_capacity() && publish_waiters.resend_parked.is_empty() {
+            resend_unacked(framed, inflight, publish_waiters, entry)?;
+        } else {
+            publish_waiters.resend_parked.push_back(entry);
         }
-        let delivery = PublishDelivery {
-            dup: true,
-            retain: entry.retain,
-            qos: QoS::AtLeastOnce,
-            packet_id: Some(entry.packet_id),
-        };
-        if let Err(error) = feed_publish(framed, &mut publish_waiters.aliases, &entry.message, delivery) {
-            inflight.release_publish(entry.packet_id);
-            finish_publish_encode_error(Some(entry.reply), &entry.message, error)?;
-            continue;
-        }
-        publish_waiters.stats.publish_resent();
-        publish_waiters.insert_sent(
-            entry.packet_id,
-            PendingOutboundPublish {
-                message: entry.message,
-                qos: QoS::AtLeastOnce,
-                retain: entry.retain,
-                reply: entry.reply,
-            },
-        );
     }
     for publish in unsent {
         handle_publish(framed, inflight, publish_waiters, publish, limits).await?;
     }
     flush_writes(framed, flush_abort).await
+}
+
+/// Feeds one carried unacknowledged QoS-1 PUBLISH again: DUP set, original Packet Identifier
+/// ([MQTT-4.4.0-1]). Caller checked the window and flushes.
+fn resend_unacked<W>(
+    framed: &mut FramedWrite<W, V5Codec>,
+    inflight: &mut InflightPots,
+    publish_waiters: &mut PublishWaiters,
+    entry: CarriedPublish,
+) -> Result<(), WriteOutcome>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    // The id can only be taken if a SUBSCRIBE got it while this one waited: nothing to resend
+    // it under, so it is lost like a publish of a dropped connection.
+    if !inflight.reserve_publish(entry.packet_id) {
+        let _ = entry.reply.send(Err(AppError::ConnectionLost));
+        return Ok(());
+    }
+    let delivery = PublishDelivery {
+        dup: true,
+        retain: entry.retain,
+        qos: QoS::AtLeastOnce,
+        packet_id: Some(entry.packet_id),
+    };
+    if let Err(error) = feed_publish(framed, &mut publish_waiters.aliases, &entry.message, delivery) {
+        inflight.release_publish(entry.packet_id);
+        return finish_publish_encode_error(Some(entry.reply), &entry.message, error);
+    }
+    publish_waiters.stats.publish_resent();
+    publish_waiters.insert_sent(
+        entry.packet_id,
+        PendingOutboundPublish {
+            message: entry.message,
+            qos: QoS::AtLeastOnce,
+            retain: entry.retain,
+            reply: entry.reply,
+        },
+    );
+    Ok(())
 }
 
 /// One application SUBSCRIBE as handed to [`handle_subscribe`].
