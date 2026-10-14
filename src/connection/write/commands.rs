@@ -671,6 +671,16 @@ pub(super) fn finish_publish_encode_error(
             }
             Ok(())
         }
+        // A string or binary field over 65535 bytes, or a packet over the Remaining Length
+        // limit: this publish cannot be sent, the connection is fine (the encoder wrote nothing).
+        EncodeError::InvalidLength => {
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(AppError::InvalidRequest(
+                    "publish field too long: a topic, string or binary property over 65535 bytes, or a packet over 268435455 bytes".into(),
+                )));
+            }
+            Ok(())
+        }
         EncodeError::OverMaxPacketSize { size, max } => {
             if let Some(reply) = reply {
                 let _ = reply.send(Err(AppError::InvalidRequest(format!(

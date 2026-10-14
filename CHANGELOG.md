@@ -63,6 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A publish with a field too long to encode (a topic or string property over 65 535 bytes, a packet over the Remaining Length limit) fails with `AppError::InvalidRequest` and the connection stays up. It used to end the session as a protocol error and reconnect
 - A Will the encoder cannot send (U+0000 in its Content Type or User Properties, a topic, payload or Correlation Data over 65 535 bytes) is refused up front with `AppError::InvalidRequest`, like an invalid Will topic. It used to fail every CONNECT, so a retrying reconnect policy kept trying for good
 - The client pings on the Keep Alive it sent in CONNECT. A `keep_alive` with a fraction of a second (1.9 s went out as 1 s) or above 65 535 s made an idle client ping later than the broker expected, and the broker dropped it
 - `BrokerUrl::parse` (and so `ClientBuilder::new`) rejects a host with whitespace, control characters, `@`, `/`, `\`, `?`, `#` or stray brackets, and an IPv6 address without brackets (`mqtt://2001:db8::1` was read as host `2001:db8:` with port 1). Such a host reached DNS, the TLS server name and an HTTP proxy's `CONNECT` line, where CR/LF could add header lines

@@ -3308,8 +3308,8 @@ mod tests {
 
     /// Outbound aliases: the first PUBLISH per topic binds an alias (topic + alias), later
     /// ones send an empty topic + alias; with more topics than aliases the least recently
-    /// used binding is rebound. Never more aliases than the broker's maximum ([MQTT-3.3.2-9])
-    /// and never alias 0 ([MQTT-3.3.2-8]).
+    /// used binding is rebound. Never more aliases than the broker's maximum ([MQTT-3.3.2-9],
+    /// [MQTT-3.2.2-17]) and never alias 0 ([MQTT-3.3.2-8]).
     #[tokio::test]
     async fn outbound_topic_aliases_bind_reuse_and_rebind() {
         let seen = Arc::new(tokio::sync::Mutex::new(Vec::<(String, Option<u16>)>::new()));
@@ -3362,6 +3362,36 @@ mod tests {
         ];
         let frames: Vec<(&str, Option<u16>)> = frames.iter().map(|(t, a)| (t.as_str(), *a)).collect();
         assert_eq!(frames, expected);
+
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
+
+    /// [MQTT-4.7.3-3]: a Topic Name over 65535 bytes is refused before it reaches the wire,
+    /// and the session stays up.
+    #[tokio::test]
+    async fn publish_refuses_a_topic_longer_than_65535_bytes() {
+        let port = spawn_mock_broker().await;
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+        let (client, connection, mut phase) = connect(
+            ConnectOptions::new(url),
+            static_test_credentials(),
+            NoReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let error = client
+            .publish("t".repeat(65_536), "x")
+            .await
+            .expect_err("oversized topic");
+        assert!(matches!(error, AppError::InvalidRequest(_)), "{error:?}");
+        assert!(client.is_connected());
+        client.publish("t", "x").await.expect("session still usable");
 
         client.shutdown().await.expect("shutdown");
         let _ = run.await;
