@@ -51,7 +51,7 @@ impl PublishPacket {
         let wire_topic_alias = properties.as_ref().and_then(|p| p.topic_alias);
         if topic.is_empty() && wire_topic_alias.is_none() {
             // Protocol Error if Topic Name is zero length and there is no Topic Alias (§3.3.2.1).
-            return Err(DecodeError::MalformedPacket("empty topic without topic alias"));
+            return Err(DecodeError::ProtocolViolation("empty topic without topic alias"));
         }
         let payload = src;
         let mut props = properties.unwrap_or_default();
@@ -150,7 +150,15 @@ fn parse_publish_properties(src: &mut Bytes) -> Result<Option<PublishWirePropert
                     None => tracing::debug!("ignoring inbound PUBLISH Subscription Identifier 0"),
                 }
             }
-            pt::TOPIC_ALIAS => topic_alias.read_value(prop_src)?,
+            pt::TOPIC_ALIAS => {
+                let mut alias: Option<u16> = None;
+                alias.read_value(prop_src)?;
+                ensure!(
+                    topic_alias.is_none(),
+                    DecodeError::ProtocolViolation("property included more than once")
+                );
+                topic_alias = Some(NonZeroU16::new(alias.unwrap_or(0)).ok_or(DecodeError::TopicAliasInvalid)?);
+            }
             pt::USER => user_props.push(UserProperty::decode(prop_src)?),
             _ => return Err(DecodeError::MalformedPacket("unknown PUBLISH property")),
         }
@@ -171,6 +179,7 @@ fn parse_publish_properties(src: &mut Bytes) -> Result<Option<PublishWirePropert
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::v5::{DisconnectReasonCode, ToReasonCode};
     use bytes::{BufMut, BytesMut};
 
     use crate::codec::error::EncodeError;
@@ -210,6 +219,19 @@ mod tests {
             result.map_err(|e| e.to_string()),
             Err(DecodeError::MalformedPacket("PUBLISH QoS 0 with DUP").to_string())
         );
+    }
+
+    /// §3.3.2.3.4: Topic Alias 0 is not permitted; the receiver answers with DISCONNECT 0x94.
+    #[test]
+    fn publish_decode_topic_alias_zero_is_topic_alias_invalid() {
+        let mut body = BytesMut::new();
+        ByteString::from_static("t").encode(&mut body).unwrap();
+        body.put_u8(3); // Property Length
+        body.put_u8(pt::TOPIC_ALIAS);
+        body.put_u16(0);
+        let error = PublishPacket::decode(body.freeze(), QOS0_FLAGS).expect_err("alias 0");
+        assert!(matches!(error, DecodeError::TopicAliasInvalid), "{error:?}");
+        assert_eq!(error.to_reason_code(), DisconnectReasonCode::TopicAliasInvalid);
     }
 
     /// §3.3.2.3.3: the Message Expiry Interval is a plain Four Byte Integer, and a broker
@@ -323,7 +345,7 @@ mod tests {
         let src = Bytes::from_static(&[0x00, 0x00, 0x00]);
         assert!(matches!(
             PublishPacket::decode(src, 0),
-            Err(DecodeError::MalformedPacket("empty topic without topic alias"))
+            Err(DecodeError::ProtocolViolation("empty topic without topic alias"))
         ));
     }
 

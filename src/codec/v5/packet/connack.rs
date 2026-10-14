@@ -225,12 +225,33 @@ impl ConnectAck {
         while prop_src.has_remaining() {
             match prop_src.get_u8() {
                 pt::SESS_EXPIRY_INT => session_expiry_interval.read_value(prop_src)?,
-                pt::RECEIVE_MAX => receive_max.read_value(prop_src)?,
+                pt::RECEIVE_MAX => {
+                    let mut value: Option<u16> = None;
+                    value.read_value(prop_src)?;
+                    ensure!(
+                        receive_max.is_none(),
+                        DecodeError::ProtocolViolation("property included more than once")
+                    );
+                    // §3.2.2.3.3: a Receive Maximum of 0 is a Protocol Error.
+                    receive_max = Some(
+                        NonZeroU16::new(value.unwrap_or(0))
+                            .ok_or(DecodeError::ProtocolViolation("Receive Maximum 0 is not allowed"))?,
+                    );
+                }
                 pt::MAX_QOS => {
-                    // Duplicate property identifier (§2.2.2.2).
-                    ensure!(max_qos.is_none(), DecodeError::MalformedPacket("invalid encoding"));
+                    // Duplicate property identifier (§2.2.2.2); only 0 and 1 may be sent
+                    // (§3.2.2.3.4): an absent property means QoS 2.
+                    ensure!(
+                        max_qos.is_none(),
+                        DecodeError::ProtocolViolation("property included more than once")
+                    );
                     ensure!(prop_src.has_remaining(), DecodeError::InvalidLength);
-                    max_qos = Some(prop_src.get_u8().try_into()?);
+                    let qos: QoS = prop_src.get_u8().try_into()?;
+                    ensure!(
+                        qos != QoS::ExactlyOnce,
+                        DecodeError::ProtocolViolation("CONNACK Maximum QoS must be 0 or 1")
+                    );
+                    max_qos = Some(qos);
                 }
                 pt::RETAIN_AVAIL => retain_available.read_value(prop_src)?,
                 pt::MAX_PACKET_SIZE => {
@@ -353,6 +374,7 @@ impl WireBodyEncode for ConnectAck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::v5::{DisconnectReasonCode, ToReasonCode};
 
     #[test]
     fn connack_rejects_reserved_ack_flags_bits_7_through_1() {
@@ -370,6 +392,18 @@ mod tests {
         let mut src = Bytes::from_static(&[0x00, 0x8D, 0x00]);
         let ack = ConnectAck::decode(&mut src).unwrap();
         assert_eq!(ack.reason_code, ConnectAckReason::Unknown(141));
+    }
+
+    /// Well-formed CONNACKs the spec calls a Protocol Error: the client answers them with
+    /// DISCONNECT 0x82, not 0x81 Malformed Packet.
+    #[rstest::rstest]
+    #[case::receive_maximum_zero(&[0x00, 0x00, 0x03, 0x21, 0x00, 0x00])] // §3.2.2.3.3
+    #[case::maximum_qos_two(&[0x00, 0x00, 0x02, 0x24, 0x02])] // §3.2.2.3.4
+    #[case::duplicate_property(&[0x00, 0x00, 0x04, 0x25, 0x01, 0x25, 0x01])] // §2.2.2.2
+    fn connack_protocol_errors_map_to_reason_0x82(#[case] wire: &'static [u8]) {
+        let error = ConnectAck::decode(&mut Bytes::from_static(wire)).expect_err("Protocol Error");
+        assert!(matches!(error, DecodeError::ProtocolViolation(_)), "{error:?}");
+        assert_eq!(error.to_reason_code(), DisconnectReasonCode::ProtocolError);
     }
 
     #[test]

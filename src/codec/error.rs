@@ -19,6 +19,13 @@ pub enum DecodeError {
     /// Packet bytes violate MQTT framing or field rules (`reason` is ops-facing).
     #[error("Malformed packet: {0}")]
     MalformedPacket(&'static str),
+    /// Well-formed bytes the spec calls a Protocol Error, such as a property included twice
+    /// or a value it forbids (`reason` is ops-facing).
+    #[error("Protocol error: {0}")]
+    ProtocolViolation(&'static str),
+    /// A PUBLISH with Topic Alias 0 (§3.3.2.3.4).
+    #[error("Topic Alias 0 is not allowed")]
+    TopicAliasInvalid,
     #[error("Unsupported protocol level")]
     UnsupportedProtocolLevel,
     #[error("Connect frame's reserved flag is set")]
@@ -47,6 +54,8 @@ impl ToReasonCode for DecodeError {
             DecodeError::InvalidProtocol => DisconnectReasonCode::ProtocolError,
             DecodeError::InvalidLength => DisconnectReasonCode::MalformedPacket,
             DecodeError::MalformedPacket(_) => DisconnectReasonCode::MalformedPacket,
+            DecodeError::ProtocolViolation(_) => DisconnectReasonCode::ProtocolError,
+            DecodeError::TopicAliasInvalid => DisconnectReasonCode::TopicAliasInvalid,
             DecodeError::UnsupportedProtocolLevel => DisconnectReasonCode::ImplementationSpecificError,
             // A set reserved bit, and the forbidden packet type 0, make a Malformed Packet
             // (§2.1.2, §2.1.3, [MQTT-3.1.2-3]).

@@ -31,7 +31,10 @@ pub(in crate::codec) trait Property {
 
 impl<T: Decode> Property for Option<T> {
     fn read_value(&mut self, src: &mut Bytes) -> Result<(), DecodeError> {
-        ensure!(self.is_none(), DecodeError::MalformedPacket("invalid encoding"));
+        ensure!(
+            self.is_none(),
+            DecodeError::ProtocolViolation("property included more than once")
+        );
         *self = Some(T::decode(src)?);
         Ok(())
     }
