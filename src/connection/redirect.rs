@@ -5,9 +5,18 @@ use bytestring::ByteString;
 
 use crate::codec::{ConnectAck, ConnectAckReason, Disconnect, DisconnectReasonCode};
 
-/// Redirects followed in a row before the client falls back to its configured broker and
-/// reconnect policy, so two brokers pointing at each other cannot keep it bouncing.
+/// Redirects followed in a row before the client stops following and leaves the next attempt
+/// to the reconnect policy, so two brokers pointing at each other cannot keep it bouncing.
 pub(crate) const MAX_REDIRECTS_IN_ROW: u8 = 5;
+
+/// A session that lasted this long before a broker redirected it ends the streak: a cluster
+/// that moves clients now and then is followed every time.
+pub(crate) const STREAK_RESET_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether a redirect that ended a session which ran for `session_lasted` starts a new streak.
+pub(crate) fn ends_streak(session_lasted: Option<std::time::Duration>) -> bool {
+    session_lasted.is_some_and(|lasted| lasted >= STREAK_RESET_AFTER)
+}
 
 /// A broker's request to connect elsewhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,7 +57,19 @@ impl ServerRedirect {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    /// A cluster that rebalances now and then is followed every time; brokers bouncing a
+    /// client between them right after CONNACK are not.
+    #[test]
+    fn only_a_session_that_ran_for_a_while_ends_the_streak() {
+        assert!(!ends_streak(None), "a redirect before any session continues the streak");
+        assert!(!ends_streak(Some(Duration::from_millis(5))));
+        assert!(ends_streak(Some(STREAK_RESET_AFTER)));
+        assert!(ends_streak(Some(Duration::from_secs(86_400))));
+    }
 
     #[test]
     fn only_redirect_codes_with_a_reference_redirect() {

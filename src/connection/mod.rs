@@ -162,6 +162,8 @@ pub struct Connection<H: InboundSink = flume::Sender<crate::codec::InboundMessag
     redirect_once: Option<crate::util::broker_url::BrokerUrl>,
     /// Redirects followed since a connection last ended without one.
     redirects_in_row: u8,
+    /// When the current (or last) session came up.
+    session_up_since: Option<Instant>,
 }
 
 impl<H: InboundSink> std::fmt::Debug for Connection<H> {
@@ -201,6 +203,7 @@ impl<H: InboundSink> Connection<H> {
             session_carry,
             redirect_once: None,
             redirects_in_row: 0,
+            session_up_since: None,
         }
     }
 
@@ -500,6 +503,7 @@ impl<H: InboundSink> Connection<H> {
         // read/write spawn so session start cannot stall on a consumer.
         self.notify_connected(self.generation.0, session);
         self.channels.stats.session_up();
+        self.session_up_since = Some(Instant::now());
         if self.cancel.is_cancelled() {
             return self
                 .finish_session(ConnectionOutcome::Shutdown(ShutdownError::Cancelled), false)
@@ -600,6 +604,9 @@ impl<H: InboundSink> Connection<H> {
         from_active_session: bool,
         redirect: Option<redirect::ServerRedirect>,
     ) -> SessionDisposition {
+        if from_active_session && redirect::ends_streak(self.session_up_since.map(|since| since.elapsed())) {
+            self.redirects_in_row = 0;
+        }
         if let Some(redirect) = redirect
             && self.follow_redirect(&redirect)
         {

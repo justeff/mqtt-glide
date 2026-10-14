@@ -131,7 +131,12 @@ impl BrokerUrl {
             Some(index) => &without_scheme[..index],
             None => without_scheme,
         };
-        let (host, port) = split_host_port(host_port, self.port).ok()?;
+        // §4.11 allows an IPv6 address without brackets; it then cannot carry a port.
+        let (host, port) = if host_port.parse::<std::net::Ipv6Addr>().is_ok() {
+            (host_port.to_owned(), self.port)
+        } else {
+            split_host_port(host_port, self.port).ok()?
+        };
         Some(Self {
             host,
             port,
@@ -153,6 +158,9 @@ pub(crate) fn split_host_port(host_port: &str, default_port: u16) -> Result<(Str
             None => return Err(BrokerUrlError::InvalidHost),
         };
         (v6, port)
+    } else if host_port.matches(':').count() > 1 {
+        // A bare IPv6 address: which colon starts the port is ambiguous; it needs brackets.
+        return Err(BrokerUrlError::InvalidHost);
     } else if let Some((h, p)) = host_port.rsplit_once(':') {
         let port = p.parse::<u16>().map_err(|_| BrokerUrlError::InvalidPort)?;
         (h, port)
@@ -161,6 +169,13 @@ pub(crate) fn split_host_port(host_port: &str, default_port: u16) -> Result<(Str
     };
     if host.is_empty() {
         return Err(BrokerUrlError::EmptyHost);
+    }
+    // The host goes into DNS lookups, the TLS server name and an HTTP proxy's request line.
+    if host
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '@' | '/' | '\\' | '?' | '#' | '[' | ']'))
+    {
+        return Err(BrokerUrlError::InvalidHost);
     }
     Ok((host.to_owned(), port))
 }
@@ -197,6 +212,8 @@ mod tests {
     #[case::host_only("other.example.com", "other.example.com", 8883)]
     #[case::host_port("other.example.com:9883", "other.example.com", 9883)]
     #[case::ipv6("[fe80::1]:8884", "fe80::1", 8884)]
+    #[case::ipv6_without_brackets("2001:db8::1", "2001:db8::1", 8883)]
+    #[case::ipv6_short_without_brackets("fe80::10", "fe80::10", 8883)]
     #[case::list_takes_first("10.0.0.2:8885 10.0.0.3:8885", "10.0.0.2", 8885)]
     #[case::url_scheme_ignored("mqtt://other.example.com:1883/x", "other.example.com", 1883)]
     fn redirected_keeps_transport(#[case] reference: &str, #[case] host: &str, #[case] port: u16) {
@@ -209,9 +226,22 @@ mod tests {
     #[test]
     fn redirected_rejects_references_without_a_host() {
         let base = BrokerUrl::parse("mqtt://broker.example.com").expect("valid");
-        for reference in ["", "   ", ":1883", "[fe80::1"] {
+        for reference in ["", "   ", ":1883", "[fe80::1", "fe80:::1:2", "user@host:1883"] {
             assert!(base.redirected(reference).is_none(), "{reference:?}");
         }
+    }
+
+    /// A bare IPv6 address is ambiguous in a URL, and the host never carries characters that
+    /// would end up in an HTTP request line or DNS query (proxy header injection).
+    #[rstest]
+    #[case::bare_ipv6("mqtt://2001:db8::1")]
+    #[case::bare_ipv6_with_port("mqtt://2001:db8::1:1883")]
+    #[case::crlf("mqtt://a\r\nX-Injected: 1:1883")]
+    #[case::space("mqtt://a b:1883")]
+    #[case::userinfo("mqtt://user@broker:1883")]
+    #[case::control("mqtt://bro\u{0}ker")]
+    fn parse_rejects_invalid_hosts(#[case] url: &str) {
+        assert_eq!(BrokerUrl::parse(url), Err(BrokerUrlError::InvalidHost), "{url:?}");
     }
 
     #[test]

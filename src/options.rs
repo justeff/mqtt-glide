@@ -135,8 +135,9 @@ pub struct ConnectOptions {
     /// [`ReconnectPolicy`](crate::ReconnectPolicy) says; 0x9D keeps the new server for good,
     /// 0x9C only for that connection. The reference's host and port replace the configured
     /// ones; scheme, TLS and WebSocket path stay, and TLS verifies the new host's certificate.
-    /// After five redirects in a row the client falls back to its configured broker and the
-    /// reconnect policy.
+    /// After five redirects in a row (a session that ran for a minute before its redirect ends
+    /// the streak) the client stops following and leaves the next attempt to the reconnect
+    /// policy, towards the configured broker or the last 0x9D target.
     ///
     /// Default `false`: a redirect is then reported like any other refusal or disconnect (its
     /// Server Reference is in the error text).
