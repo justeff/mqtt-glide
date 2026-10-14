@@ -297,13 +297,15 @@ Each delivery is an `InboundMessage`: `topic`, `payload`, `properties`, plus `re
 
 Shared filters: build with `shared_filter(group, topic)` (validates ShareName).
 
+Granted subscriptions are remembered and restored on reconnect whenever the broker holds no session for the client (Clean Start, or CONNACK without Session Present), **before** `SessionPhase::Connected` is published. After a reconnect, `Connected` therefore means "connected and subscribed again"; on the first connect it only means "connected", and readiness is your own `subscribe` returning granted reason codes. If the broker refuses a restored filter (for example after an ACL change), the connection counts as failed and the reconnect policy decides; there is never a `Connected` with only part of the subscriptions back.
+
 ### Hooks
 
 | Trait / helper | Role |
 |----------------|------|
 | `CredentialsProvider` | Async `credentials()` before each `CONNECT`; `invalidate()` on CONNECT-level `NotAuthorized` only |
 | `ReconnectPolicy` | `delay_after(outcome) -> Option<Duration>` (`None` = stop). Ready-made: `StandardReconnectPolicy` + `mark_live()` |
-| `LifecycleHook` | Sync `Connected` / `Disconnected` side effects on the driver task; keep short (no await). `ClientBuilder` already waits for the first `Connected`; a [`SessionPhase`](https://docs.rs/mqtt-glide/latest/mqtt_glide/connection/enum.SessionPhase.html) watch receiver is only handed out by the low-level `connect` |
+| `LifecycleHook` | Sync `Connected` / `Disconnected` side effects on the driver task; keep short (no await). `ClientBuilder` already waits for the first `Connected`. For async waits use the [`SessionPhase`](https://docs.rs/mqtt-glide/latest/mqtt_glide/connection/enum.SessionPhase.html) watch (`client.session_phase()`, any client) and `client.is_connected()` for a snapshot |
 | `InboundSink` | Injectable inbound handoff; built-ins: `flume`, `tokio::mpsc`, `OnInboundSink` (`.on_inbound`). Custom sinks **MUST** be cancel-safe |
 
 ### Examples

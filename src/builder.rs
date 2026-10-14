@@ -760,4 +760,35 @@ mod tests {
             "driver must not keep reconnecting after connect returns Err (got {after_err} then {later})"
         );
     }
+
+    /// A builder-made client exposes the session phase: Connected after `connect`, then
+    /// Disconnected when the broker drops the connection.
+    #[tokio::test]
+    async fn builder_client_exposes_session_phase() {
+        let port = spawn_broker_once(|mut framed_read, mut framed_write| async move {
+            if accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ConnectAck::default()).await {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        let client = ClientBuilder::new(format!("mqtt://127.0.0.1:{port}"))
+            .expect("url")
+            .credentials(static_test_credentials())
+            .discard_inbound()
+            .connect()
+            .await
+            .expect("connect");
+
+        let mut phase = client.session_phase();
+        assert!(matches!(*phase.borrow(), SessionPhase::Connected { .. }));
+        assert!(client.is_connected());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            phase.wait_for(|p| matches!(p, SessionPhase::Disconnected(_))),
+        )
+        .await
+        .expect("phase reports the dropped connection")
+        .expect("watch open");
+        assert!(!client.is_connected());
+    }
 }

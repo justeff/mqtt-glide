@@ -281,6 +281,8 @@ pub struct MqttClient {
     shutting_down: Arc<AtomicBool>,
     /// [`ConnectOptions::fail_fast_when_disconnected`].
     fail_fast_when_disconnected: bool,
+    /// Session phase watch (the same one [`connect`] returns), for [`Self::session_phase`].
+    phase: watch::Receiver<SessionPhase>,
 }
 
 impl MqttClient {
@@ -292,6 +294,7 @@ impl MqttClient {
         ack_timeout: Duration,
         fail_fast_when_disconnected: bool,
         connected: Arc<AtomicBool>,
+        phase: watch::Receiver<SessionPhase>,
     ) -> Self {
         Self {
             command_tx,
@@ -301,7 +304,18 @@ impl MqttClient {
             connected,
             shutting_down: Arc::default(),
             fail_fast_when_disconnected,
+            phase,
         }
+    }
+
+    /// A receiver for the session phase: the current value plus every change.
+    ///
+    /// The same watch [`connect`] returns, also reachable when the client came from
+    /// [`ClientBuilder::connect`]. Wait for readiness with
+    /// `client.session_phase().wait_for(|p| matches!(p, SessionPhase::Connected { .. }))`.
+    /// For a cheap snapshot use [`Self::is_connected`].
+    pub fn session_phase(&self) -> watch::Receiver<SessionPhase> {
+        self.phase.clone()
     }
 
     /// Whether a session is currently up (between `Connected` and `Disconnected`).
@@ -782,6 +796,7 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
             ack_timeout,
             fail_fast_when_disconnected,
             connected,
+            phase_rx.clone(),
         ),
         connection,
         phase_rx,

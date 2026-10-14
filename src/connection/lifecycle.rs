@@ -21,6 +21,11 @@ pub enum SessionPhase {
     /// Watch initial value / before the first session attempt completes.
     NeverConnected,
     /// Active MQTT session after a successful CONNECT/CONNACK.
+    ///
+    /// On a reconnect where the broker holds no session (Clean Start, or no Session
+    /// Present), every previously granted subscription has already been restored and
+    /// granted again when this is published; if the broker refuses one, the connection
+    /// fails instead. A resumed session keeps the broker's subscriptions as they are.
     Connected {
         /// Connection generation for this session.
         generation: u64,
