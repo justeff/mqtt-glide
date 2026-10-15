@@ -1102,3 +1102,80 @@ async fn handle_publish_rejects_qos2_without_wire_publish() {
         .expect("peer join");
     assert_eq!(frames, 0, "a rejected QoS 2 publish must write nothing");
 }
+
+/// The PUBACK that frees the window can be handled in the same step that then runs into
+/// shutdown (coalesced with inbound PUBACKs, followed by a flush that waits for room). The
+/// publish parked behind it must still go out on the graceful path: no further PUBACK is
+/// coming to send it.
+#[tokio::test]
+async fn graceful_disconnect_sends_publishes_parked_behind_a_freed_window() {
+    use crate::codec::{DecodedFrame, Packet};
+
+    let (mut framed, peer_end) = duplex_framed_write();
+    let peer = tokio::spawn(async move {
+        let mut framed = FramedRead::new(peer_end, V5Codec::with_max_packet_size(0));
+        let mut wire = Vec::new();
+        while let Some(Ok((frame, _))) = framed.next().await {
+            match frame {
+                DecodedFrame::Publish(publish) => wire.push(publish.message.topic.to_string()),
+                DecodedFrame::Control(Packet::Disconnect(_)) => {
+                    wire.push("DISCONNECT".to_owned());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        wire
+    });
+
+    let (_control_tx, mut control_rx) = mpsc::channel(8);
+    let (_command_tx, mut command_rx) = mpsc::channel(8);
+    let mut waiters = SubUnsubWaiters::new();
+    let mut publish_waiters = PublishWaiters::new();
+    // The window has room again, yet a publish still waits in the parked queue.
+    let mut inflight = InflightPots::new(nonzero!(1u16));
+    let (reply, _reply_rx) = oneshot::channel();
+    publish_waiters.parked.push_back(PendingOutboundPublish {
+        message: PublishMessage {
+            topic: ByteString::from_static("t/parked"),
+            payload: Bytes::from_static(b"x"),
+            properties: PublishProperties::default(),
+        },
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        reply,
+    });
+    // The read task is gone: nothing more is acknowledged.
+    let (_, read_done) = oneshot::channel();
+    let registry = Arc::new(RwLock::new(SubscriptionRegistry::default()));
+    let read_stop = StopSignal::new();
+
+    let outcome = graceful_disconnect(
+        &mut framed,
+        GracefulDisconnectCtx {
+            control_rx: &mut control_rx,
+            waiters: &mut waiters,
+            publish_waiters: &mut publish_waiters,
+            inflight: &mut inflight,
+            flush_budget: Duration::from_secs(2),
+            command_rx: &mut command_rx,
+            publish_limits: BrokerPublishLimits {
+                max_qos: QoS::AtLeastOnce,
+                retain_available: true,
+            },
+            subscription_registry: &registry,
+            generation: Generation(1),
+            read_stop: &read_stop,
+        },
+        read_done,
+    )
+    .await;
+    assert_eq!(outcome, WriteOutcome::Shutdown);
+    drop(framed);
+
+    let wire = timeout(Duration::from_secs(2), peer)
+        .await
+        .expect("peer timeout")
+        .expect("peer join");
+    assert_eq!(wire, ["t/parked", "DISCONNECT"]);
+}

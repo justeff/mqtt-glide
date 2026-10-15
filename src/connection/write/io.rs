@@ -59,8 +59,9 @@ pub(super) struct GracefulDisconnectCtx<'a> {
 
 /// Graceful shutdown, bounded by `flush_budget`:
 ///
-/// 1. Close the command channel and send what is already queued (publishes are encoded or
-///    parked; subscribe / unsubscribe fail with [`AppError::ShuttingDown`]).
+/// 1. Send the parked publishes the window has room for, then close the command channel
+///    and send what is already queued (publishes are encoded or parked; subscribe /
+///    unsubscribe fail with [`AppError::ShuttingDown`]).
 /// 2. Keep processing control while outbound QoS-1 publishes (in flight or parked) await
 ///    their PUBACKs. The read task is still running, so inbound messages keep being
 ///    delivered and acknowledged instead of being dropped in the socket buffer.
@@ -106,6 +107,9 @@ where
     // Normal Disconnection, unless the read task reports a packet it could not accept.
     let mut disconnect_reason = DisconnectReasonCode::NormalDisconnection;
     let drain = async {
+        // A PUBACK handled just before shutdown may have freed slots; the publishes parked
+        // behind it are older than anything queued and no later PUBACK would send them.
+        super::commands::send_parked_publishes(framed, inflight, publish_waiters)?;
         drain_queued_commands(framed, command_rx, inflight, publish_waiters, publish_limits).await?;
         flush_writes(framed, flush_abort).await?;
 
