@@ -250,6 +250,11 @@ impl ConnectOptions {
     /// Sets the client **Maximum Packet Size** advertised in CONNECT / enforced inbound.
     ///
     /// Default: [`DEFAULT_MAX_PACKET_SIZE`] (1 MiB).
+    ///
+    /// Together with the capacity of the inbound sink this bounds the memory inbound messages
+    /// can pin. A decoded message costs about its wire size, except that every User Property
+    /// costs about 70 bytes however short it is: a PUBLISH of this size made of empty User
+    /// Properties decodes to roughly 14 times as much.
     pub fn max_packet_size(mut self, max_packet_size: NonZeroU32) -> Self {
         self.max_packet_size = max_packet_size;
         self

@@ -288,6 +288,8 @@ Three limits, easy to confuse, only two of them yours to set.
 
 `ConnectOptions::receive_maximum`, default `32`: how many inbound QoS 1 messages the broker may leave unacknowledged with this client. This is the knob that bounds memory when your sink is slow.
 
+What a slow sink can hold is bounded by its own capacity, the read task's one message in hand, and `max_packet_size` per message. A decoded message usually costs about its wire size, payload and strings share the read buffer. User Properties are the exception: each costs about 70 bytes of heap however short it is, so a broker sending a 1 MiB PUBLISH packed with empty User Properties (5 bytes each on the wire) makes it about 14 MiB once decoded. If you do not trust the broker's publishers, size `max_packet_size` and the sink with that factor in mind.
+
 ### Outbound inflight
 
 Not yours: the broker's Receive Maximum from `CONNACK` decides how many of your QoS 1 publishes can await `PUBACK` at once. Publishes beyond that window wait in order inside the write task (up to 32, then the command channel fills) and go out as `PUBACK`s free slots. They do not fail, and subscribe / unsubscribe are not held up behind them.
