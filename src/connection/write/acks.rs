@@ -8,7 +8,7 @@ use crate::connection::packet_id::InflightPots;
 use crate::connection::subscriptions::{
     SubscriptionRegistry, apply_subscribe_ack_to_registry, apply_unsubscribe_ack_to_registry,
 };
-use crate::error::AppError;
+use crate::error::{AppError, ProtocolError};
 
 use super::{CarriedPublish, PublishWaiters, SubUnsubWaiters, WriteOutcome};
 
@@ -54,11 +54,21 @@ pub(super) fn publish_ack_to_result(ack: PublishAck) -> Result<(), AppError> {
     }
 }
 
+/// A SUBACK or UNSUBACK must answer every topic filter of its request ([MQTT-3.9.3-2],
+/// [MQTT-3.11.3-2]); one that does not leaves the client unable to tell which ones the
+/// broker holds, so the connection ends with DISCONNECT 0x82.
+fn reason_count_violation(packet: &str, filters: usize, reasons: usize) -> WriteOutcome {
+    WriteOutcome::BrokerViolation(ProtocolError::Violation(format!(
+        "{packet} carries {reasons} reason codes for {filters} topic filters"
+    )))
+}
+
 /// Completes an outbound subscribe waiter when `ack_generation` matches the write task generation.
 ///
 /// Stale-generation SUBACKs are ignored (waiter left pending; packet id not released; registry untouched).
 /// Unknown / duplicate packet ids (no waiter) are ignored.
 /// A closed oneshot (app ACK timeout / cancel) still applies the registry update and frees the id.
+/// A SUBACK with the wrong number of reason codes ends the connection.
 pub(super) fn complete_subscribe_ack(
     waiters: &mut SubUnsubWaiters,
     inflight: &mut InflightPots,
@@ -66,22 +76,32 @@ pub(super) fn complete_subscribe_ack(
     write_generation: Generation,
     ack_generation: Generation,
     ack: SubscribeAck,
-) {
+) -> Result<(), WriteOutcome> {
     if !ack_generation_applies(write_generation, ack_generation) {
-        return;
+        return Ok(());
     }
     let packet_id = ack.packet_id;
     let Some(pending) = waiters.subscribe.remove(&packet_id) else {
         // Unknown / duplicate SUBACK (wrong pot or already completed) — ignore.
-        return;
+        return Ok(());
     };
     inflight.release_subscribe(packet_id);
+    if ack.status.len() != pending.filters.len() {
+        if let Some(reply) = pending.reply {
+            let _ = reply.send(Err(AppError::ConnectionLost));
+        }
+        return Err(reason_count_violation(
+            "SUBACK",
+            pending.filters.len(),
+            ack.status.len(),
+        ));
+    }
     let Some(reply) = pending.reply else {
         // The driver's retry of a refused restore: no caller, only the registry to update.
         if let Ok(mut registry) = subscription_registry.write() {
             registry.apply_restore_ack(&pending.filters, &ack.status, ack.reason_string.as_ref(), true);
         }
-        return;
+        return Ok(());
     };
     if let Ok(mut registry) = subscription_registry.write() {
         apply_subscribe_ack_to_registry(&mut registry, &pending.filters, pending.id, &ack.status);
@@ -91,6 +111,7 @@ pub(super) fn complete_subscribe_ack(
         reason_string: ack.reason_string,
         user_properties: ack.properties,
     }));
+    Ok(())
 }
 
 /// Completes an outbound unsubscribe waiter when `ack_generation` matches the write task generation.
@@ -98,6 +119,7 @@ pub(super) fn complete_subscribe_ack(
 /// Stale-generation UNSUBACKs are ignored (waiter left pending; packet id not released; registry untouched).
 /// Unknown / duplicate packet ids (no waiter) are ignored.
 /// A closed oneshot (app timeout / cancel) still applies the registry update and frees the id.
+/// An UNSUBACK with the wrong number of reason codes ends the connection.
 pub(super) fn complete_unsubscribe_ack(
     waiters: &mut SubUnsubWaiters,
     inflight: &mut InflightPots,
@@ -105,16 +127,24 @@ pub(super) fn complete_unsubscribe_ack(
     write_generation: Generation,
     ack_generation: Generation,
     ack: UnsubscribeAck,
-) {
+) -> Result<(), WriteOutcome> {
     if !ack_generation_applies(write_generation, ack_generation) {
-        return;
+        return Ok(());
     }
     let packet_id = ack.packet_id;
     let Some(pending) = waiters.unsubscribe.remove(&packet_id) else {
         // Unknown / duplicate UNSUBACK (wrong pot or already completed) — ignore.
-        return;
+        return Ok(());
     };
     inflight.release_subscribe(packet_id);
+    if ack.status.len() != pending.filters.len() {
+        let _ = pending.reply.send(Err(AppError::ConnectionLost));
+        return Err(reason_count_violation(
+            "UNSUBACK",
+            pending.filters.len(),
+            ack.status.len(),
+        ));
+    }
     if let Ok(mut registry) = subscription_registry.write() {
         apply_unsubscribe_ack_to_registry(&mut registry, &pending.filters, &ack.status);
     }
@@ -123,6 +153,7 @@ pub(super) fn complete_unsubscribe_ack(
         reason_string: ack.reason_string,
         user_properties: ack.properties,
     }));
+    Ok(())
 }
 
 pub(super) fn fail_all_waiters(
@@ -165,7 +196,10 @@ pub(super) fn fail_waiters_for_outcome(
     // never-sent publishes always go (like ones issued during the reconnect backoff).
     if matches!(
         outcome,
-        WriteOutcome::Transport(_) | WriteOutcome::Protocol(_) | WriteOutcome::Cancelled
+        WriteOutcome::Transport(_)
+            | WriteOutcome::Protocol(_)
+            | WriteOutcome::BrokerViolation(_)
+            | WriteOutcome::Cancelled
     ) && let Some(carry) = publish_waiters.carry.clone()
     {
         let mut slot = carry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -205,9 +239,11 @@ pub(super) fn fail_waiters_for_outcome(
 pub(super) fn waiter_error_for_outcome(outcome: &WriteOutcome) -> AppError {
     match outcome {
         WriteOutcome::CommandChannelClosed | WriteOutcome::ControlChannelClosed => AppError::CommandChannelClosed,
-        WriteOutcome::Transport(_) | WriteOutcome::Protocol(_) | WriteOutcome::Cancelled | WriteOutcome::Shutdown => {
-            AppError::ConnectionLost
-        }
+        WriteOutcome::Transport(_)
+        | WriteOutcome::Protocol(_)
+        | WriteOutcome::BrokerViolation(_)
+        | WriteOutcome::Cancelled
+        | WriteOutcome::Shutdown => AppError::ConnectionLost,
         #[cfg(test)]
         WriteOutcome::StubExit => AppError::CommandChannelClosed,
     }
@@ -216,7 +252,7 @@ pub(super) fn waiter_error_for_outcome(outcome: &WriteOutcome) -> AppError {
 pub(super) fn app_error_from_write_outcome(outcome: &WriteOutcome) -> AppError {
     match outcome {
         WriteOutcome::Transport(error) => AppError::SendFailed(error.to_string()),
-        WriteOutcome::Protocol(error) => AppError::SendFailed(error.to_string()),
+        WriteOutcome::Protocol(error) | WriteOutcome::BrokerViolation(error) => AppError::SendFailed(error.to_string()),
         WriteOutcome::CommandChannelClosed | WriteOutcome::ControlChannelClosed => AppError::CommandChannelClosed,
         // Peer loss / graceful protocol close: waiters must not see "channel closed".
         WriteOutcome::Cancelled | WriteOutcome::Shutdown => AppError::ConnectionLost,

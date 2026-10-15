@@ -42,7 +42,8 @@ use self::commands::{
 };
 use self::io::{
     ControlCoalesceCtx, FlushAbort, GracefulDisconnectCtx, drain_ready_control_coalesce, feed_inbound_publish_ack,
-    flush_writes, graceful_disconnect, handle_deferred_control, send_packet, send_pending_protocol_disconnect,
+    flush_writes, graceful_disconnect, handle_deferred_control, send_broker_violation_disconnect, send_packet,
+    send_pending_protocol_disconnect,
 };
 use self::keepalive::keep_alive_ping_timer;
 
@@ -99,6 +100,10 @@ pub(crate) enum WriteOutcome {
     Transport(TransportError),
     /// Encode / protocol failure while writing.
     Protocol(ProtocolError),
+    /// The broker broke the protocol in a way only the write task sees (an acknowledgement
+    /// that does not answer its request): DISCONNECT 0x82 goes out, then this ends as
+    /// [`Self::Protocol`].
+    BrokerViolation(ProtocolError),
 }
 
 /// Outstanding subscribe/unsubscribe waiters keyed by Packet Identifier.
@@ -690,27 +695,65 @@ where
                         ack,
                         generation: ack_generation,
                     }) => {
-                        complete_subscribe_ack(
+                        if let Err(outcome) = complete_subscribe_ack(
                             &mut waiters,
                             &mut inflight,
                             &subscription_registry,
                             generation,
                             ack_generation,
                             ack,
-                        );
+                        ) {
+                            return finish_hot_path_write_outcome(
+                                &mut framed,
+                                GracefulDisconnectCtx {
+                                    control_rx: &mut control_rx,
+                                    waiters: &mut waiters,
+                                    publish_waiters: &mut publish_waiters,
+                                    inflight: &mut inflight,
+                                    flush_budget: graceful_disconnect_timeout,
+                                    command_rx,
+                                    publish_limits,
+                                    subscription_registry: &subscription_registry,
+                                    generation,
+                                    read_stop: &read_stop,
+                                },
+                                read_done,
+                                outcome,
+                            )
+                            .await;
+                        }
                     }
                     Some(ControlMessage::UnsubscribeAck {
                         ack,
                         generation: ack_generation,
                     }) => {
-                        complete_unsubscribe_ack(
+                        if let Err(outcome) = complete_unsubscribe_ack(
                             &mut waiters,
                             &mut inflight,
                             &subscription_registry,
                             generation,
                             ack_generation,
                             ack,
-                        );
+                        ) {
+                            return finish_hot_path_write_outcome(
+                                &mut framed,
+                                GracefulDisconnectCtx {
+                                    control_rx: &mut control_rx,
+                                    waiters: &mut waiters,
+                                    publish_waiters: &mut publish_waiters,
+                                    inflight: &mut inflight,
+                                    flush_budget: graceful_disconnect_timeout,
+                                    command_rx,
+                                    publish_limits,
+                                    subscription_registry: &subscription_registry,
+                                    generation,
+                                    read_stop: &read_stop,
+                                },
+                                read_done,
+                                outcome,
+                            )
+                            .await;
+                        }
                     }
                     Some(ControlMessage::PublishAck { ack, generation: ack_generation }) => {
                         complete_publish_ack(
@@ -1015,6 +1058,15 @@ where
 {
     match outcome {
         WriteOutcome::Shutdown => graceful_disconnect(framed, graceful, read_done).await,
+        WriteOutcome::BrokerViolation(error) => {
+            send_broker_violation_disconnect(framed).await;
+            finish_write_outcome(
+                graceful.waiters,
+                graceful.publish_waiters,
+                graceful.inflight,
+                WriteOutcome::Protocol(error),
+            )
+        }
         other => finish_write_outcome(graceful.waiters, graceful.publish_waiters, graceful.inflight, other),
     }
 }

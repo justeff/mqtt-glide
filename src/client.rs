@@ -3567,6 +3567,40 @@ mod tests {
         let _ = run.await;
     }
 
+    /// [MQTT-3.9.3-2], [MQTT-3.11.3-2]: a SUBACK or UNSUBACK that does not carry one reason code
+    /// per filter is not an answer; the request fails and the client leaves with 0x82.
+    #[rstest]
+    #[case::suback_short(AckKind::Subscribe, -1)]
+    #[case::suback_long(AckKind::Subscribe, 1)]
+    #[case::unsuback_short(AckKind::Unsubscribe, -1)]
+    #[case::unsuback_long(AckKind::Unsubscribe, 1)]
+    #[tokio::test]
+    async fn an_ack_with_the_wrong_number_of_reason_codes_ends_the_connection(
+        #[case] kind: AckKind,
+        #[case] extra: isize,
+    ) {
+        let (disconnect_tx, disconnect_rx) = oneshot::channel();
+        let port = spawn_reason_count_broker(ConnectAck::default(), extra, disconnect_tx).await;
+        let (client, run) = start_against(port).await;
+
+        let filters = [("a", QoS::AtLeastOnce), ("b", QoS::AtLeastOnce)];
+        let result = match kind {
+            AckKind::Subscribe => client.subscribe(filters).await.map(drop),
+            _ => client.unsubscribe(["a", "b"]).await.map(drop),
+        };
+        assert_eq!(result, Err(AppError::ConnectionLost));
+        let reason = timeout(Duration::from_secs(2), disconnect_rx)
+            .await
+            .expect("DISCONNECT in time")
+            .expect("broker saw a DISCONNECT");
+        assert_eq!(reason, crate::codec::DisconnectReasonCode::ProtocolError);
+        let outcome = timeout(Duration::from_secs(2), run)
+            .await
+            .expect("driver ends")
+            .expect("driver task");
+        assert!(matches!(outcome, Err(ConnectionOutcome::Protocol(_))), "{outcome:?}");
+    }
+
     /// Inbound aliases: the broker binds an alias, then sends only the alias; the
     /// application sees the full topic both times ([MQTT-3.3.2-10]).
     #[tokio::test]

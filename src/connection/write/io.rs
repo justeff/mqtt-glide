@@ -124,10 +124,16 @@ where
                         flush_writes(framed, flush_abort).await?;
                     }
                     Some(ControlMessage::SubscribeAck { ack, generation: ack_generation }) => {
-                        complete_subscribe_ack(waiters, inflight, subscription_registry, generation, ack_generation, ack);
+                        if complete_subscribe_ack(waiters, inflight, subscription_registry, generation, ack_generation, ack).is_err() {
+                            disconnect_reason = DisconnectReasonCode::ProtocolError;
+                            break;
+                        }
                     }
                     Some(ControlMessage::UnsubscribeAck { ack, generation: ack_generation }) => {
-                        complete_unsubscribe_ack(waiters, inflight, subscription_registry, generation, ack_generation, ack);
+                        if complete_unsubscribe_ack(waiters, inflight, subscription_registry, generation, ack_generation, ack).is_err() {
+                            disconnect_reason = DisconnectReasonCode::ProtocolError;
+                            break;
+                        }
                     }
                     // The read task saw a protocol violation: nothing more will be acknowledged.
                     Some(ControlMessage::ProtocolDisconnect(reason)) => {
@@ -301,6 +307,19 @@ where
 /// torn down; the supervisor is waiting for this task.
 const PENDING_DISCONNECT_BUDGET: Duration = Duration::from_secs(1);
 
+/// Best-effort DISCONNECT 0x82 for a [`WriteOutcome::BrokerViolation`] (§4.13).
+pub(super) async fn send_broker_violation_disconnect<W>(framed: &mut FramedWrite<W, V5Codec>)
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let disconnect = send_packet(
+        framed,
+        Packet::Disconnect(Disconnect::new(DisconnectReasonCode::ProtocolError)),
+        FlushAbort::Graceful,
+    );
+    let _ = tokio::time::timeout(PENDING_DISCONNECT_BUDGET, disconnect).await;
+}
+
 /// The supervisor cancelled the session after the read task ended. If that task queued a
 /// DISCONNECT reason first (a packet it could not accept, [MQTT-3.14.1-1]), send it now: the
 /// cancel can win the race against the queued message.
@@ -399,7 +418,7 @@ where
                     ctx.generation,
                     ack_generation,
                     ack,
-                );
+                )?;
             }
             Ok(ControlMessage::UnsubscribeAck {
                 ack,
@@ -412,7 +431,7 @@ where
                     ctx.generation,
                     ack_generation,
                     ack,
-                );
+                )?;
             }
             #[cfg(test)]
             Ok(ControlMessage::StubExitRead) => {}

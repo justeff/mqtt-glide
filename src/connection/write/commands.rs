@@ -156,7 +156,8 @@ where
                     packet_id,
                     PendingSubscribe {
                         reply: Some(reply),
-                        filters: Vec::new(),
+                        // One filter: the tests answer with a single reason code.
+                        filters: vec![(ByteString::from_static("test/waiter"), SubscriptionOptions::default())],
                         id: None,
                     },
                 );
@@ -171,7 +172,7 @@ where
                     packet_id,
                     PendingUnsubscribe {
                         reply,
-                        filters: Vec::new(),
+                        filters: vec![ByteString::from_static("test/waiter")],
                     },
                 );
             }

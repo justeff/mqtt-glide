@@ -238,7 +238,7 @@ covered by the statement that binds the client.
 | **[MQTT-3.9.2-1]** The Server MUST NOT send this Property if it would increase the size of the SUBACK packet beyond the Maximum Packet Size specified by the Client. | — server obligation |  |
 | **[MQTT-3.9.2-2]** The Server MUST NOT send this property if it would increase the size of the SUBACK packet beyond the Maximum Packet Size specified by the Client. | — server obligation |  |
 | **[MQTT-3.9.3-1]** The order of Reason Codes in the SUBACK packet MUST match the order of Topic Filters in the SUBSCRIBE packet. | — server obligation |  |
-| **[MQTT-3.9.3-2]** The Server sending the SUBACK packet MUST send one of the Subscribe Reason Code values for each Topic Filter received. | — server obligation |  |
+| **[MQTT-3.9.3-2]** The Server sending the SUBACK packet MUST send one of the Subscribe Reason Code values for each Topic Filter received. | — server obligation | `an_ack_with_the_wrong_number_of_reason_codes_ends_the_connection` (src/client.rs) |
 
 ## 3.10
 
@@ -261,7 +261,7 @@ covered by the statement that binds the client.
 | **[MQTT-3.11.2-1]** The Server MUST NOT send this Property if it would increase the size of the UNSUBACK packet beyond the Maximum Packet Size specified by the Client. | — server obligation |  |
 | **[MQTT-3.11.2-2]** The Server MUST NOT send this property if it would increase the size of the UNSUBACK packet beyond the Maximum Packet Size specified by the receiver. | — server obligation |  |
 | **[MQTT-3.11.3-1]** The order of Reason Codes in the UNSUBACK packet MUST match the order of Topic Filters in the UNSUBSCRIBE packet. | — server obligation |  |
-| **[MQTT-3.11.3-2]** The Server sending the UNSUBACK packet MUST use one of the UNSUBSCRIBE Reason Code values for each Topic Filter received. | — server obligation |  |
+| **[MQTT-3.11.3-2]** The Server sending the UNSUBACK packet MUST use one of the UNSUBSCRIBE Reason Code values for each Topic Filter received. | — server obligation | `an_ack_with_the_wrong_number_of_reason_codes_ends_the_connection` (src/client.rs) |
 
 ## 3.12
 

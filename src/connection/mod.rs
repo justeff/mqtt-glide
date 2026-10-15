@@ -846,7 +846,9 @@ impl<H: InboundSink> Connection<H> {
             Ok(WriteOutcome::CommandChannelClosed) => ConnectionOutcome::Application(AppError::CommandChannelClosed),
             Ok(WriteOutcome::ControlChannelClosed) => ConnectionOutcome::Application(AppError::CommandChannelClosed),
             Ok(WriteOutcome::Transport(error)) => ConnectionOutcome::Transport(error),
-            Ok(WriteOutcome::Protocol(error)) => ConnectionOutcome::Protocol(error),
+            Ok(WriteOutcome::Protocol(error) | WriteOutcome::BrokerViolation(error)) => {
+                ConnectionOutcome::Protocol(error)
+            }
             Err(join_err) => ConnectionOutcome::Application(AppError::TaskJoin(join_err.to_string())),
         }
     }
