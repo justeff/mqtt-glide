@@ -103,7 +103,8 @@ mod tests {
     }
 
     async fn run_proxy(response: &'static [u8], proxy: HttpProxy) -> (Result<(), TransportError>, String, Vec<u8>) {
-        let (mut client, mut server) = duplex(4096);
+        // Room for a whole oversized head, so a client that stops reading early cannot stall the proxy side.
+        let (mut client, mut server) = duplex(16 * 1024);
         let server_side = tokio::spawn(async move {
             let mut request = Vec::new();
             while !request.ends_with(b"\r\n\r\n") {
@@ -135,6 +136,22 @@ mod tests {
              Proxy-Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\n\r\n"
         );
         assert_eq!(rest, b"MQT", "bytes after the handshake reach the broker side");
+    }
+
+    /// A response head of up to 8 KiB is read (long `Via` or cookie headers); one byte more is refused.
+    #[tokio::test]
+    async fn response_head_limit_is_inclusive() {
+        fn head_of(len: usize) -> &'static [u8] {
+            let head = format!("HTTP/1.1 200 OK\r\nX-Pad: {}\r\n\r\n", "a".repeat(len - 28));
+            assert_eq!(head.len(), len);
+            Box::leak(head.into_bytes().into_boxed_slice())
+        }
+        let (result, _, rest) = run_proxy(head_of(8 * 1024), HttpProxy::new("proxy", 3128)).await;
+        result.expect("a head of exactly the limit");
+        assert_eq!(rest, b"MQT");
+        let (result, _, _) = run_proxy(head_of(8 * 1024 + 1), HttpProxy::new("proxy", 3128)).await;
+        let error = result.expect_err("one byte over the limit").to_string();
+        assert!(error.contains("too large"), "{error}");
     }
 
     #[tokio::test]

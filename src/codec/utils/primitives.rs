@@ -361,6 +361,26 @@ mod tests {
         ));
     }
 
+    /// Long Topic Names take the SIMD scan; it must find a forbidden byte anywhere, as the
+    /// short loop does.
+    #[test]
+    fn long_topic_names_are_scanned_for_forbidden_bytes() {
+        for len in [SIMD_SCAN_MIN_LEN - 1, SIMD_SCAN_MIN_LEN, 4 * SIMD_SCAN_MIN_LEN + 3] {
+            let clean = vec![b'a'; len];
+            assert!(!topic_name_bytes_forbidden(&clean), "clean, {len} bytes");
+            for forbidden in [0, b'+', b'#'] {
+                for at in [0, len / 2, len - 1] {
+                    let mut topic = clean.clone();
+                    topic[at] = forbidden;
+                    assert!(
+                        topic_name_bytes_forbidden(&topic),
+                        "{forbidden:#04x} at {at} of {len} bytes"
+                    );
+                }
+            }
+        }
+    }
+
     /// [MQTT-4.7.1-1] `#` alone or after `/`, and last character only.
     #[rstest]
     #[case::hash_alone("#")]

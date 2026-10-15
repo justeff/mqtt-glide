@@ -466,4 +466,82 @@ mod tests {
         assert_eq!(decoded.reason_code, ConnectAckReason::Unknown(141));
         assert_eq!(u8::from(decoded.reason_code), 141);
     }
+
+    #[test]
+    fn connack_decodes_every_property_from_spec_wire_bytes() {
+        // Identifiers spelled out from §3.2.2.3, not taken from `property_type`.
+        #[rustfmt::skip]
+        let props: &[u8] = &[
+            0x11, 0x00, 0x00, 0x0E, 0x10,                  // Session Expiry Interval 3600
+            0x21, 0x00, 0x14,                              // Receive Maximum 20
+            0x24, 0x01,                                    // Maximum QoS 1
+            0x25, 0x00,                                    // Retain Available 0
+            0x27, 0x00, 0x00, 0x10, 0x00,                  // Maximum Packet Size 4096
+            0x12, 0x00, 0x03, b'c', b'-', b'1',            // Assigned Client Identifier
+            0x22, 0x00, 0x0A,                              // Topic Alias Maximum 10
+            0x1F, 0x00, 0x02, b'o', b'k',                  // Reason String
+            0x26, 0x00, 0x01, b'k', 0x00, 0x01, b'v',      // User Property
+            0x28, 0x00,                                    // Wildcard Subscription Available 0
+            0x29, 0x00,                                    // Subscription Identifiers Available 0
+            0x2A, 0x00,                                    // Shared Subscription Available 0
+            0x13, 0x00, 0x1E,                              // Server Keep Alive 30
+            0x1A, 0x00, 0x02, b'r', b'/',                  // Response Information
+            0x1C, 0x00, 0x03, b'h', b':', b'1',            // Server Reference
+            0x15, 0x00, 0x02, b'm', b'1',                  // Authentication Method
+            0x16, 0x00, 0x02, 0xAB, 0xCD,                  // Authentication Data
+        ];
+        let mut wire = vec![0x01, 0x00, props.len() as u8];
+        wire.extend_from_slice(props);
+
+        let ack = ConnectAck::decode(&mut Bytes::from(wire)).unwrap();
+        assert_eq!(
+            ack,
+            ConnectAck {
+                session_present: true,
+                reason_code: ConnectAckReason::Success,
+                session_expiry_interval: Some(3600),
+                receive_max: NonZeroU16::new(20).unwrap(),
+                max_qos: QoS::AtLeastOnce,
+                max_packet_size: Some(4096),
+                assigned_client_id: Some(ByteString::from_static("c-1")),
+                topic_alias_max: 10,
+                retain_available: false,
+                wildcard_subscription_available: false,
+                subscription_identifiers_available: false,
+                shared_subscription_available: false,
+                server_keep_alive: Some(30),
+                response_info: Some(ByteString::from_static("r/")),
+                server_reference: Some(ByteString::from_static("h:1")),
+                auth_method: Some(ByteString::from_static("m1")),
+                auth_data: Some(Bytes::from_static(&[0xAB, 0xCD])),
+                reason_string: Some(ByteString::from_static("ok")),
+                user_properties: vec![("k", "v").into()],
+            }
+        );
+    }
+
+    #[test]
+    fn connack_reason_labels_name_the_refusal() {
+        for (code, label) in [
+            (ConnectAckReason::Success, "Connection Accepted"),
+            (
+                ConnectAckReason::UnsupportedProtocolVersion,
+                "protocol version is not supported",
+            ),
+            (
+                ConnectAckReason::ClientIdentifierNotValid,
+                "client identifier is invalid",
+            ),
+            (ConnectAckReason::ServerUnavailable, "Server unavailable"),
+            (ConnectAckReason::BadUserNameOrPassword, "bad user name or password"),
+            (ConnectAckReason::NotAuthorized, "not authorized"),
+            (
+                ConnectAckReason::Unknown(0x8D),
+                "Connection Refused (unknown reason code)",
+            ),
+            (ConnectAckReason::Banned, "Connection Refused"),
+        ] {
+            assert_eq!(code.reason(), label, "{code:?}");
+        }
+    }
 }

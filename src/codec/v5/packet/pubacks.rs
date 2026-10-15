@@ -318,6 +318,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::codec::v5::{Packet, V5Codec};
 
     #[rstest]
     #[case::success_empty(b"\xFF\xFF\x00\x00", 65535, PublishAckReason::Success, vec![], None)]
@@ -370,6 +371,56 @@ mod tests {
         let err = encode_publish_ack(NonZeroU16::new(1).unwrap(), 3, &mut buf).expect_err("oversize");
         assert!(matches!(err, EncodeError::OverMaxPacketSize { size: 4, max: 3 }));
         assert!(buf.is_empty(), "rejected encode must not leave partial bytes");
+
+        encode_publish_ack(NonZeroU16::new(1).unwrap(), 4, &mut buf).expect("exactly at the limit");
+        assert_eq!(buf.len(), 4);
+    }
+
+    /// Reason Code and Property Length are left out when they would say nothing (§3.4.2.1,
+    /// §3.6.2.1): Success needs neither, any other reason no properties block.
+    #[test]
+    fn acks_use_the_shortest_wire_form() {
+        let id = NonZeroU16::new(0x0102).unwrap();
+        let cases = [
+            (
+                Packet::PublishAck(PublishAck {
+                    packet_id: id,
+                    ..Default::default()
+                }),
+                &b"\x40\x02\x01\x02"[..],
+            ),
+            (
+                Packet::PublishReceived(PublishAck {
+                    packet_id: id,
+                    reason_code: PublishAckReason::NotAuthorized,
+                    ..Default::default()
+                }),
+                b"\x50\x03\x01\x02\x87",
+            ),
+            (
+                Packet::PublishRelease(PubRelComp {
+                    packet_id: id,
+                    reason_code: PubRelCompReason::Success,
+                    properties: UserProperties::default(),
+                    reason_string: None,
+                }),
+                b"\x62\x02\x01\x02",
+            ),
+            (
+                Packet::PublishComplete(PubRelComp {
+                    packet_id: id,
+                    reason_code: PubRelCompReason::PacketIdNotFound,
+                    properties: UserProperties::default(),
+                    reason_string: None,
+                }),
+                b"\x70\x03\x01\x02\x92",
+            ),
+        ];
+        for (packet, wire) in cases {
+            let mut buf = BytesMut::new();
+            V5Codec::default().encode_packet(packet.clone(), &mut buf).unwrap();
+            assert_eq!(&buf[..], wire, "{packet:?}");
+        }
     }
 
     fn round_trip_puback(ack: &PublishAck) {

@@ -202,4 +202,34 @@ mod tests {
             Err(DecodeError::MalformedPacket("invalid encoding").to_string())
         );
     }
+
+    #[test]
+    fn auth_decodes_every_property_from_spec_wire_bytes() {
+        // Identifiers spelled out from §3.15.2.2; Success may carry properties too.
+        #[rustfmt::skip]
+        let props: &[u8] = &[
+            0x15, 0x00, 0x02, b'm', b'1',                  // Authentication Method
+            0x16, 0x00, 0x02, 0xAB, 0xCD,                  // Authentication Data
+            0x1F, 0x00, 0x02, b'o', b'k',                  // Reason String
+            0x26, 0x00, 0x01, b'k', 0x00, 0x01, b'v',      // User Property
+        ];
+        let mut body = vec![0x00, props.len() as u8];
+        body.extend_from_slice(props);
+
+        let auth = Auth::decode(&mut Bytes::from(body)).unwrap();
+        let expected = Auth {
+            reason_code: AuthReasonCode::Success,
+            auth_method: Some(ByteString::from_static("m1")),
+            auth_data: Some(Bytes::from_static(&[0xAB, 0xCD])),
+            reason_string: Some(ByteString::from_static("ok")),
+            user_properties: vec![("k", "v").into()],
+        };
+        assert_eq!(auth, expected);
+
+        // A Success that carries properties is not the empty-body form.
+        let mut wire = BytesMut::new();
+        let body_len = expected.encoded_body_len(u32::MAX).unwrap() as u32;
+        expected.encode_body(&mut wire, body_len).unwrap();
+        assert_eq!(Auth::decode(&mut wire.freeze()).unwrap(), expected);
+    }
 }

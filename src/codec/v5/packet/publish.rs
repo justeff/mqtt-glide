@@ -448,4 +448,50 @@ mod tests {
             Err(EncodeError::MalformedPacket)
         ));
     }
+
+    #[test]
+    fn publish_decodes_every_property_from_spec_wire_bytes() {
+        // Identifiers spelled out from §3.3.2.3, not taken from `property_type`.
+        #[rustfmt::skip]
+        let props: &[u8] = &[
+            0x01, 0x01,                                    // Payload Format Indicator 1
+            0x02, 0x00, 0x00, 0x00, 0x3C,                  // Message Expiry Interval 60
+            0x23, 0x00, 0x05,                              // Topic Alias 5
+            0x08, 0x00, 0x03, b'r', b'/', b'1',            // Response Topic
+            0x09, 0x00, 0x02, 0x09, 0x08,                  // Correlation Data
+            0x26, 0x00, 0x01, b'k', 0x00, 0x01, b'v',      // User Property
+            0x0B, 0x81, 0x01,                              // Subscription Identifier 129
+            0x03, 0x00, 0x03, b't', b'/', b'p',            // Content Type
+        ];
+        let mut body = vec![0x00, 0x03, b'a', b'/', b'b', 0x00, 0x07, props.len() as u8];
+        body.extend_from_slice(props);
+        body.extend_from_slice(b"hi");
+
+        let publish = PublishPacket::decode(Bytes::from(body), 0b0011).unwrap();
+        assert_eq!(
+            publish,
+            PublishPacket {
+                message: PublishMessage {
+                    topic: ByteString::from_static("a/b"),
+                    payload: Bytes::from_static(b"hi"),
+                    properties: PublishProperties {
+                        correlation_data: Some(Bytes::from_static(&[0x09, 0x08])),
+                        message_expiry_interval: Some(60),
+                        content_type: Some(ByteString::from_static("t/p")),
+                        user_properties: vec![("k", "v").into()],
+                        payload_format_indicator: true,
+                        response_topic: Some(ByteString::from_static("r/1")),
+                    },
+                },
+                meta: PublishPacketMeta {
+                    dup: false,
+                    retain: true,
+                    qos: QoS::AtLeastOnce,
+                    packet_id: NonZeroU16::new(7),
+                },
+                wire_topic_alias: NonZeroU16::new(5),
+                subscription_ids: vec![NonZeroU32::new(129).unwrap()],
+            }
+        );
+    }
 }

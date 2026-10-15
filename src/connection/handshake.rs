@@ -397,6 +397,13 @@ mod tests {
         assert!(matches!(validate_will_message(&will), Err(AppError::InvalidRequest(_))));
     }
 
+    /// 65535 bytes is the longest a two-byte length can carry, so it is still accepted (§1.5.4, §1.5.6).
+    #[test]
+    fn validate_will_message_accepts_the_longest_two_byte_lengths() {
+        let will = WillMessage::new("t".repeat(65_535), vec![0u8; 65_535]).correlation_data(vec![0u8; 65_535]);
+        validate_will_message(&will).expect("at the limit");
+    }
+
     /// A Will QoS of 1 is accepted ([MQTT-3.1.2-12]); QoS 2 is refused above, like PUBLISH.
     #[test]
     fn validate_will_message_accepts_qos1() {

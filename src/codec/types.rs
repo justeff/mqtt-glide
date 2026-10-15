@@ -130,3 +130,23 @@ pub(super) mod packet_type {
     /// AUTH (`0xF0`, MQTT 5.0).
     pub(crate) const AUTH: u8 = 0b1111_0000;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::QoS;
+
+    #[test]
+    fn qos_value_and_min() {
+        assert_eq!(QoS::AtMostOnce.value(), 0);
+        assert_eq!(QoS::AtLeastOnce.value(), 1);
+        assert_eq!(QoS::ExactlyOnce.value(), 2);
+        for (a, b, lower) in [
+            (QoS::AtMostOnce, QoS::AtLeastOnce, QoS::AtMostOnce),
+            (QoS::AtLeastOnce, QoS::AtMostOnce, QoS::AtMostOnce),
+            (QoS::ExactlyOnce, QoS::AtLeastOnce, QoS::AtLeastOnce),
+            (QoS::AtLeastOnce, QoS::AtLeastOnce, QoS::AtLeastOnce),
+        ] {
+            assert_eq!(a.min(b), lower, "{a:?}.min({b:?})");
+        }
+    }
+}

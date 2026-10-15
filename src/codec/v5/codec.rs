@@ -264,6 +264,22 @@ mod tests {
         );
     }
 
+    /// The inbound limit is the largest packet accepted, counting the fixed header.
+    #[test]
+    fn max_inbound_size_is_inclusive() {
+        let frame = [0xD0u8, 0x00]; // PINGRESP: 2 bytes on the wire
+        let mut buf = BytesMut::from(&frame[..]);
+        assert!(matches!(
+            V5Codec::new(2, 0).decode(&mut buf),
+            Ok(Some((DecodedFrame::Control(Packet::PingResponse), _)))
+        ));
+        let mut buf = BytesMut::from(&frame[..]);
+        assert!(matches!(
+            V5Codec::new(1, 0).decode(&mut buf),
+            Err(DecodeError::MaxSizeExceeded { size: 2, max: 1 })
+        ));
+    }
+
     #[test]
     fn outbound_max_size_counts_fixed_header() {
         let connect = Packet::Connect(Box::new(Connect {
@@ -412,5 +428,111 @@ mod tests {
         codec.encode(ack, &mut buf).unwrap();
         // After stripping diagnostics, Success PUBACK is Packet Identifier only (Remaining Length 2).
         assert_eq!(buf[1], 0x02);
+    }
+
+    /// Every packet the codec sends after a CONNECT, with or without diagnostics.
+    fn packets_after_connect(diagnostics: bool) -> Vec<Packet> {
+        use crate::codec::v5::{
+            Auth, AuthReasonCode, PubRelComp, PubRelCompReason, PublishAckReason, Subscribe, SubscribeAck,
+            SubscribeAckReason, SubscriptionOptions, Unsubscribe, UnsubscribeAck, UnsubscribeAckReason,
+        };
+        let packet_id = NonZeroU16::new(9).unwrap();
+        let props = || {
+            if diagnostics {
+                vec![("k", "v").into()]
+            } else {
+                Vec::new()
+            }
+        };
+        let reason = || diagnostics.then(|| ByteString::from_static("why"));
+        let ack = PublishAck {
+            packet_id,
+            reason_code: PublishAckReason::QuotaExceeded,
+            properties: props(),
+            reason_string: reason(),
+        };
+        let rel_comp = PubRelComp {
+            packet_id,
+            reason_code: PubRelCompReason::PacketIdNotFound,
+            properties: props(),
+            reason_string: reason(),
+        };
+        vec![
+            Packet::PublishAck(ack.clone()),
+            Packet::PublishReceived(ack),
+            Packet::PublishRelease(rel_comp.clone()),
+            Packet::PublishComplete(rel_comp),
+            Packet::Subscribe(Subscribe {
+                packet_id,
+                id: None,
+                user_properties: props(),
+                topic_filters: vec![(ByteString::from_static("a"), SubscriptionOptions::default())],
+            }),
+            Packet::SubscribeAck(SubscribeAck {
+                packet_id,
+                properties: props(),
+                reason_string: reason(),
+                status: vec![SubscribeAckReason::GrantedQos1],
+            }),
+            Packet::Unsubscribe(Unsubscribe {
+                packet_id,
+                user_properties: props(),
+                topic_filters: vec![ByteString::from_static("a")],
+            }),
+            Packet::UnsubscribeAck(UnsubscribeAck {
+                packet_id,
+                properties: props(),
+                reason_string: reason(),
+                status: vec![UnsubscribeAckReason::Success],
+            }),
+            Packet::Auth(Auth {
+                reason_code: AuthReasonCode::ContinueAuth,
+                auth_method: Some(ByteString::from_static("m")),
+                auth_data: None,
+                reason_string: reason(),
+                user_properties: props(),
+            }),
+        ]
+    }
+
+    /// [MQTT-3.1.2-29] Request Problem Information 0 in the peer's CONNECT drops Reason String
+    /// and User Properties from every later packet except PUBLISH, CONNACK and DISCONNECT.
+    #[rstest::rstest]
+    #[case::requested(true)]
+    #[case::not_requested(false)]
+    fn request_problem_information_decides_whether_diagnostics_are_sent(#[case] requested: bool) {
+        let mut connect = BytesMut::new();
+        V5Codec::default()
+            .encode(
+                Packet::Connect(Box::new(Connect {
+                    client_id: ByteString::from_static("c"),
+                    request_problem_info: requested,
+                    ..Default::default()
+                })),
+                &mut connect,
+            )
+            .unwrap();
+        let mut peer = V5Codec::default();
+        peer.decode(&mut connect).unwrap().expect("CONNECT");
+
+        for (sent, expected) in packets_after_connect(true)
+            .into_iter()
+            .zip(packets_after_connect(requested))
+        {
+            let mut wire = BytesMut::new();
+            peer.encode(sent.clone(), &mut wire).unwrap();
+            let received = V5Codec::default().decode_frame(&mut wire).unwrap().expect("frame");
+            assert_eq!(received, DecodedFrame::Control(expected), "sent {sent:?}");
+        }
+    }
+
+    #[test]
+    fn limits_follow_the_constructor_and_setters() {
+        let codec = V5Codec::with_max_packet_size(300);
+        assert_eq!((codec.max_inbound_size(), codec.max_outbound_size()), (300, 300));
+        let mut codec = V5Codec::default();
+        codec.set_max_inbound_size(9);
+        codec.set_max_outbound_size(8);
+        assert_eq!((codec.max_inbound_size(), codec.max_outbound_size()), (9, 8));
     }
 }

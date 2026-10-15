@@ -118,3 +118,112 @@ impl RestoreRetry {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bytestring::ByteString;
+    use nonzero_ext::nonzero;
+
+    use super::*;
+    use crate::codec::{SubscribeAckReason, SubscriptionOptions};
+
+    /// A registry whose one filter the broker refused to restore.
+    fn refused_registry() -> Arc<RwLock<SubscriptionRegistry>> {
+        let filters = vec![(ByteString::from_static("restore/acl"), SubscriptionOptions::default())];
+        let mut registry = SubscriptionRegistry::default();
+        registry.upsert(filters.clone());
+        registry.apply_restore_ack(&filters, &[SubscribeAckReason::NotAuthorized], None, false);
+        Arc::new(RwLock::new(registry))
+    }
+
+    struct Harness {
+        framed: FramedWrite<tokio::io::DuplexStream, V5Codec>,
+        _peer: tokio::io::DuplexStream,
+        inflight: InflightPots,
+        waiters: SubUnsubWaiters,
+        registry: Arc<RwLock<SubscriptionRegistry>>,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let (task_end, peer) = tokio::io::duplex(4096);
+            Self {
+                framed: FramedWrite::new(task_end, V5Codec::with_max_packet_size(0)),
+                _peer: peer,
+                inflight: InflightPots::new(nonzero!(4u16)),
+                waiters: SubUnsubWaiters::new(),
+                registry: refused_registry(),
+            }
+        }
+
+        /// Sleeps until `retry` asks to be woken, then wakes it.
+        async fn wake(&mut self, retry: &mut RestoreRetry) -> Result<(), WriteOutcome> {
+            tokio::time::sleep_until(retry.wake_at().expect("retry armed")).await;
+            retry
+                .on_wake(
+                    &mut self.framed,
+                    &mut self.inflight,
+                    &mut self.waiters,
+                    &self.registry,
+                    true,
+                    FlushAbort::Graceful,
+                )
+                .await
+        }
+
+        /// The broker refused the retry again: its waiter and Packet Identifier are gone.
+        fn refuse_retries(&mut self) {
+            for packet_id in self.waiters.subscribe.keys().copied().collect::<Vec<_>>() {
+                self.waiters.subscribe.remove(&packet_id);
+                self.inflight.release_subscribe(packet_id);
+            }
+        }
+    }
+
+    /// The next attempt can fall due while the last retry still waits for its SUBACK: that is
+    /// no reason to give up on it before the ack timeout, nor to ask a second time.
+    #[tokio::test]
+    async fn retry_in_flight_keeps_until_its_ack_timeout() {
+        let mut harness = Harness::new();
+        let mut retry = RestoreRetry::new(&harness.registry, Duration::from_secs(30));
+
+        harness.wake(&mut retry).await.expect("first retry");
+        assert_eq!(harness.waiters.subscribe.len(), 1, "one retry in flight");
+
+        harness
+            .wake(&mut retry)
+            .await
+            .expect("unanswered before the ack timeout");
+        assert_eq!(
+            harness.waiters.subscribe.len(),
+            1,
+            "no second retry while one is in flight"
+        );
+    }
+
+    /// A refused retry with a short ack timeout leaves a deadline that passes before the next
+    /// attempt is due: waking at it must not send that attempt early.
+    #[tokio::test]
+    async fn answered_retry_waits_for_the_backoff() {
+        let mut harness = Harness::new();
+        let mut retry = RestoreRetry::new(&harness.registry, Duration::from_millis(1));
+        // A later attempt, so the backoff (200–400 ms) dwarfs the ack timeout.
+        retry.attempt = 4;
+
+        harness.wake(&mut retry).await.expect("retry");
+        assert_eq!(harness.waiters.subscribe.len(), 1);
+        let due = retry.next_at.expect("next attempt scheduled");
+        harness.refuse_retries();
+
+        harness.wake(&mut retry).await.expect("deadline wake");
+        assert!(harness.waiters.subscribe.is_empty(), "nothing sent before the backoff");
+        assert_eq!(retry.wake_at(), Some(due), "the next wake is the scheduled attempt");
+
+        harness.wake(&mut retry).await.expect("next attempt");
+        assert_eq!(
+            harness.waiters.subscribe.len(),
+            1,
+            "asked again once the backoff passed"
+        );
+    }
+}

@@ -766,4 +766,18 @@ mod tests {
                 .receive_max(10),
         );
     }
+
+    #[test]
+    fn builder_setters_fill_the_login_fields() {
+        let connect = Connect::default().client_id("id").username("user").password("pass");
+        assert_eq!(connect.client_id, "id");
+        assert_eq!(connect.username.as_deref(), Some("user"));
+        assert_eq!(connect.password.as_deref(), Some(&b"pass"[..]));
+    }
+
+    #[test]
+    fn receive_max_zero_leaves_the_property_out() {
+        assert_eq!(Connect::default().receive_max(5).receive_max, NonZeroU16::new(5));
+        assert_eq!(Connect::default().receive_max(5).receive_max(0).receive_max, None);
+    }
 }

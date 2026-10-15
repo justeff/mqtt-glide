@@ -1103,6 +1103,65 @@ async fn handle_publish_rejects_qos2_without_wire_publish() {
     assert_eq!(frames, 0, "a rejected QoS 2 publish must write nothing");
 }
 
+/// With the broker's Receive Maximum window full, the write task parks at most
+/// [`MAX_PARKED_PUBLISHES`] publishes and then stops reading commands, so the application
+/// meets a full command channel instead of an ever-growing queue.
+#[tokio::test]
+async fn full_parked_queue_leaves_commands_in_the_channel() {
+    let (framed, peer_end) = duplex_framed_write();
+    // Swallow what is written; the window never opens (no PUBACK).
+    let peer = tokio::spawn(async move {
+        let mut framed = FramedRead::new(peer_end, V5Codec::with_max_packet_size(0));
+        while framed.next().await.is_some() {}
+    });
+    let harness = spawn_write_task(
+        framed,
+        WriteSessionOverrides {
+            inflight_capacity: nonzero!(1u16),
+            ..Default::default()
+        },
+    );
+
+    let publish = |reply| ClientCommand::Publish {
+        message: PublishMessage {
+            topic: ByteString::from_static("t/parked"),
+            payload: Bytes::from_static(b"x"),
+            properties: PublishProperties::default(),
+        },
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        reply,
+    };
+    // One in flight, a full parked queue, and the command channel's capacity on top.
+    let channel_capacity = harness.command_tx.max_capacity();
+    let mut replies = Vec::new();
+    for n in 0..1 + MAX_PARKED_PUBLISHES + channel_capacity {
+        let (tx, rx) = oneshot::channel();
+        replies.push(rx);
+        let sent = timeout(Duration::from_secs(2), harness.command_tx.send(publish(tx))).await;
+        assert!(matches!(sent, Ok(Ok(()))), "publish {n} must still fit");
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (tx, _rx) = oneshot::channel();
+    assert!(
+        matches!(
+            harness.command_tx.try_send(publish(tx)),
+            Err(mpsc::error::TrySendError::Full(_))
+        ),
+        "the write task must stop taking commands once the parked queue is full"
+    );
+    assert!(
+        replies.iter_mut().all(|reply| reply.try_recv().is_err()),
+        "nothing is answered while the window stays full"
+    );
+
+    drop(harness.command_tx);
+    drop(harness.control_tx);
+    harness.cancel.cancel();
+    let _ = timeout(Duration::from_secs(2), harness.join).await;
+    let _ = timeout(Duration::from_secs(2), peer).await;
+}
+
 /// The PUBACK that frees the window can be handled in the same step that then runs into
 /// shutdown (coalesced with inbound PUBACKs, followed by a flush that waits for room). The
 /// publish parked behind it must still go out on the graceful path: no further PUBACK is
@@ -1178,4 +1237,59 @@ async fn graceful_disconnect_sends_publishes_parked_behind_a_freed_window() {
         .expect("peer timeout")
         .expect("peer join");
     assert_eq!(wire, ["t/parked", "DISCONNECT"]);
+}
+
+/// Inbound PUBACKs queued together are coalesced into one write, and a protocol DISCONNECT
+/// queued behind them still ends the connection with its reason ([MQTT-3.14.4-1]).
+#[tokio::test]
+async fn coalesced_inbound_acks_keep_a_queued_protocol_disconnect() {
+    use crate::codec::{DecodedFrame, Packet};
+
+    let (framed, peer_end) = duplex_framed_write();
+    let peer = tokio::spawn(async move {
+        let mut framed = FramedRead::new(peer_end, V5Codec::with_max_packet_size(0));
+        let mut frames = Vec::new();
+        while let Some(Ok((frame, _))) = framed.next().await {
+            frames.push(match frame {
+                DecodedFrame::Control(Packet::PublishAck(ack)) => format!("puback:{}", ack.packet_id),
+                DecodedFrame::Control(Packet::Disconnect(d)) => format!("disconnect:{:?}", d.reason_code),
+                _ => "other".into(),
+            });
+        }
+        frames
+    });
+
+    let harness = spawn_write_task(framed, WriteSessionOverrides::default());
+    // Queued before the write task first runs, so it finds them all in one wakeup.
+    for packet_id in [1u16, 2, 3] {
+        harness
+            .control_tx
+            .try_send(ControlMessage::AckInboundPublish {
+                packet_id: NonZeroU16::new(packet_id).expect("nz"),
+            })
+            .expect("inbound ack");
+    }
+    harness
+        .control_tx
+        .try_send(ControlMessage::ProtocolDisconnect(
+            DisconnectReasonCode::TopicAliasInvalid,
+        ))
+        .expect("protocol disconnect");
+
+    let frames = timeout(Duration::from_secs(2), peer)
+        .await
+        .expect("peer must EOF after the protocol DISCONNECT")
+        .expect("peer join");
+    assert_eq!(
+        frames,
+        ["puback:1", "puback:2", "puback:3", "disconnect:TopicAliasInvalid"],
+        "got {frames:?}"
+    );
+
+    harness.cancel.cancel();
+    let outcome = timeout(Duration::from_secs(2), harness.join)
+        .await
+        .expect("write join timeout")
+        .expect("write join");
+    assert_eq!(outcome, WriteOutcome::Cancelled);
 }

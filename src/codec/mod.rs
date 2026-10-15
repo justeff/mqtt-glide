@@ -149,4 +149,10 @@ mod facade_tests {
             .expect("reuse encode PINGREQ");
         assert!(buf.capacity() >= cap);
     }
+
+    #[test]
+    fn user_property_splits_into_name_and_value() {
+        let (name, value): (ByteString, ByteString) = UserProperty::from(("unit", "°C")).into();
+        assert_eq!((name.as_ref(), value.as_ref()), ("unit", "°C"));
+    }
 }

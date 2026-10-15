@@ -281,6 +281,63 @@ mod tests {
         assert_eq!(frame, Message::Binary(Bytes::from_static(b"abcd")));
     }
 
+    /// A long burst without a flush goes out once 64 KiB are pending, so one frame does not
+    /// grow without bound.
+    #[tokio::test]
+    async fn long_burst_is_sent_before_the_flush() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let port = server(Some("mqtt"), move |mut ws| {
+            Box::pin(async move {
+                let first = ws.next().await.expect("frame").expect("ok");
+                let _ = tx.send(first);
+            })
+        })
+        .await;
+        let mut stream = connect(port).await.expect("handshake");
+        let chunk = vec![7u8; 40 * 1024];
+        for _ in 0..3 {
+            stream.write_all(&chunk).await.expect("write");
+        }
+        let frame = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("a frame before any flush")
+            .expect("server saw a frame");
+        let Message::Binary(frame) = frame else {
+            panic!("expected a binary frame, got {frame:?}");
+        };
+        assert_eq!(frame.len(), 80 * 1024, "the bytes pending when the limit was reached");
+    }
+
+    /// Shutdown sends what is still pending, then closes the WebSocket with a Close frame.
+    #[tokio::test]
+    async fn shutdown_sends_pending_bytes_then_close() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let port = server(Some("mqtt"), move |mut ws| {
+            Box::pin(async move {
+                let mut seen = Vec::new();
+                while let Some(Ok(message)) = ws.next().await {
+                    let close = message.is_close();
+                    seen.push(message);
+                    if close {
+                        break;
+                    }
+                }
+                let _ = tx.send(seen);
+            })
+        })
+        .await;
+        let mut stream = connect(port).await.expect("handshake");
+        stream.write_all(b"xy").await.expect("write");
+        stream.shutdown().await.expect("shutdown");
+        let seen = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("server saw the connection end")
+            .expect("server result");
+        assert_eq!(seen.len(), 2, "pending bytes, then Close: {seen:?}");
+        assert_eq!(seen[0], Message::Binary(Bytes::from_static(b"xy")));
+        assert!(seen[1].is_close(), "got {:?}", seen[1]);
+    }
+
     /// The client offers `mqtt` ([MQTT-6.0.0-3]; asserted by the in-process server) and refuses
     /// a server that does not select it.
     #[tokio::test]

@@ -792,4 +792,58 @@ mod tests {
             "poisoned registry must surface as AppError::Internal, not TaskJoin/empty; got {result:?}"
         );
     }
+
+    /// Restoring many subscriptions keeps at most [`RESUBSCRIBE_WINDOW`] SUBSCRIBEs waiting
+    /// for their SUBACK; the rest wait for an answer.
+    #[tokio::test]
+    async fn resubscribe_keeps_at_most_a_window_of_subscribes_unanswered() {
+        let (client_end, broker_end) = tokio::io::duplex(64 * 1024);
+        let (read_half, write_half) = tokio::io::split(client_end);
+        let mut framed_read = FramedRead::new(read_half, V5Codec::with_max_packet_size(0));
+        let mut framed_write = FramedWrite::new(write_half, V5Codec::with_max_packet_size(0));
+        let mut inflight = InflightPots::new(NonZeroU16::new(8).expect("nz"));
+        let registry = RwLock::new(SubscriptionRegistry::default());
+        let groups: Vec<ResubscribeGroup> = (0..RESUBSCRIBE_WINDOW + 2)
+            .map(|i| {
+                (
+                    None,
+                    vec![(ByteString::from(format!("f/{i}")), SubscriptionOptions::default())],
+                )
+            })
+            .collect();
+        let (handoff, _handoff_rx) = flume::bounded::<crate::codec::InboundMessage>(1);
+        let stats = crate::stats::Stats::default();
+        let mut topic_aliases = super::super::topic_alias::InboundTopicAliases::new(0);
+        let response_router = crate::request::ResponseRouter::default();
+
+        // The broker never answers, so the wait times out once the window is full.
+        let result = resubscribe_pending(
+            &mut framed_read,
+            &mut framed_write,
+            &mut inflight,
+            &registry,
+            groups,
+            Duration::from_millis(50),
+            &CancellationToken::new(),
+            ResubscribeInbound {
+                handoff: &handoff,
+                stats: &stats,
+                topic_aliases: &mut topic_aliases,
+                subscription_identifiers_available: false,
+                response_router: &response_router,
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(ConnectionOutcome::Protocol(_))), "{result:?}");
+        drop((framed_read, framed_write));
+
+        let mut broker = FramedRead::new(broker_end, V5Codec::with_max_packet_size(0));
+        let mut subscribes = 0;
+        while let Some(Ok((frame, _))) = broker.next().await {
+            if matches!(frame, DecodedFrame::Control(Packet::Subscribe(_))) {
+                subscribes += 1;
+            }
+        }
+        assert_eq!(subscribes, RESUBSCRIBE_WINDOW);
+    }
 }

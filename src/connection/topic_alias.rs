@@ -169,6 +169,18 @@ mod tests {
         assert_eq!(&*again.message.topic, "c/d");
     }
 
+    /// The advertised Topic Alias Maximum is itself a usable alias ([MQTT-3.3.2-10]).
+    #[test]
+    fn inbound_accepts_the_maximum_alias() {
+        let mut aliases = InboundTopicAliases::new(2);
+        aliases
+            .resolve(&mut packet("a/b", Some(2)))
+            .expect("bind the highest alias");
+        let mut reuse = packet("", Some(2));
+        aliases.resolve(&mut reuse).expect("reuse the highest alias");
+        assert_eq!(&*reuse.message.topic, "a/b");
+    }
+
     #[test]
     fn inbound_rejects_unbound_and_out_of_range_aliases() {
         let mut aliases = InboundTopicAliases::new(2);

@@ -1158,6 +1158,137 @@ mod tests {
         assert_eq!(&buf[..], b"keep", "rejected encode must not leave a partial frame");
     }
 
+    fn reason_string_of(packet: &Packet) -> Option<&ByteString> {
+        match packet {
+            Packet::Auth(auth) => auth.reason_string.as_ref(),
+            Packet::Disconnect(disconnect) => disconnect.reason_string.as_ref(),
+            Packet::ConnectAck(ack) => ack.reason_string.as_ref(),
+            Packet::PublishAck(ack) => ack.reason_string.as_ref(),
+            Packet::PublishComplete(ack) => ack.reason_string.as_ref(),
+            other => panic!("no Reason String on {other:?}"),
+        }
+    }
+
+    fn with_reason_string(kind: &str) -> Packet {
+        use crate::codec::v5::{
+            Auth, AuthReasonCode, ConnectAck, ConnectAckReason, Disconnect, DisconnectReasonCode, PubRelComp,
+            PubRelCompReason, PublishAck, PublishAckReason,
+        };
+        let reason_string = Some(ByteString::from_static("why"));
+        let packet_id = NonZeroU16::new(7).unwrap();
+        match kind {
+            "auth" => Packet::Auth(Auth {
+                reason_code: AuthReasonCode::ContinueAuth,
+                auth_method: Some(ByteString::from_static("m")),
+                auth_data: None,
+                reason_string,
+                user_properties: UserProperties::default(),
+            }),
+            "disconnect" => Packet::Disconnect(Disconnect {
+                reason_code: DisconnectReasonCode::UnspecifiedError,
+                session_expiry_interval: None,
+                server_reference: Some(ByteString::from_static("s")),
+                reason_string,
+                user_properties: UserProperties::default(),
+            }),
+            "connack" => Packet::ConnectAck(Box::new(ConnectAck {
+                reason_code: ConnectAckReason::NotAuthorized,
+                reason_string,
+                ..Default::default()
+            })),
+            "puback" => Packet::PublishAck(PublishAck {
+                packet_id,
+                reason_code: PublishAckReason::NotAuthorized,
+                properties: UserProperties::default(),
+                reason_string,
+            }),
+            "pubcomp" => Packet::PublishComplete(PubRelComp {
+                packet_id,
+                reason_code: PubRelCompReason::PacketIdNotFound,
+                properties: UserProperties::default(),
+                reason_string,
+            }),
+            other => panic!("no case {other}"),
+        }
+    }
+
+    /// A Reason String goes out exactly when the body budget holds it plus the 4 bytes
+    /// reserved for the Property Length (ack property blocks reserve their own 4 on top), is
+    /// dropped below that rather than overflowing the budget, and the body written always has
+    /// the length the Remaining Length announces.
+    #[rstest]
+    #[case::auth("auth", 3)]
+    #[case::disconnect("disconnect", 3)]
+    #[case::connack("connack", 3)]
+    #[case::puback("puback", 7)]
+    #[case::pubcomp("pubcomp", 7)]
+    fn reason_string_is_sent_only_when_the_budget_holds_it(#[case] kind: &str, #[case] reserve: u32) {
+        let packet = with_reason_string(kind);
+        let full = packet.encoded_body_len(u32::MAX).unwrap() as u32;
+        let trimmed = packet.encoded_body_len(0).unwrap() as u32;
+        assert!(trimmed < full);
+        for budget in trimmed..=full + reserve + 2 {
+            let body_len = packet.encoded_body_len(budget).unwrap();
+            let kept = budget >= full + reserve;
+            assert_eq!(body_len as u32 == full, kept, "budget {budget}: body {body_len}");
+            // Never beyond the receiver's limit: [MQTT-3.4.2-2], [MQTT-3.14.2-3].
+            assert!(body_len as u32 <= budget, "budget {budget}: body {body_len}");
+
+            let mut wire = BytesMut::new();
+            packet.encode_wire(&mut wire, body_len as u32).unwrap();
+            assert_eq!(
+                wire.len(),
+                2 + body_len,
+                "budget {budget}: body differs from its Remaining Length"
+            );
+            let decoded = crate::codec::v5::V5Codec::new(0, 0)
+                .decode_frame(&mut wire)
+                .unwrap()
+                .expect("one whole frame");
+            let crate::codec::v5::DecodedFrame::Control(decoded) = decoded else {
+                panic!("control packet expected");
+            };
+            assert_eq!(reason_string_of(&decoded), reason_string_of(&packet).filter(|_| kept));
+        }
+    }
+
+    #[test]
+    fn publish_limits_are_inclusive() {
+        let delivery = PublishDelivery {
+            dup: false,
+            retain: false,
+            qos: QoS::AtMostOnce,
+            packet_id: None,
+        };
+        // Maximum Packet Size counts the whole packet; a PUBLISH of exactly that size fits.
+        let message = PublishMessage {
+            topic: ByteString::from_static("t"),
+            payload: Bytes::from_static(&[7; 100]),
+            properties: PublishProperties::default(),
+        };
+        let wire_len = publish_wire_len(&message, delivery, 0).unwrap() as u32;
+        let mut buf = BytesMut::new();
+        encode_publish(&message, delivery, wire_len, &mut buf).expect("exactly at the limit");
+        assert_eq!(buf.len() as u32, wire_len);
+        assert!(matches!(
+            encode_publish(&message, delivery, wire_len - 1, &mut BytesMut::new()),
+            Err(EncodeError::OverMaxPacketSize { .. })
+        ));
+
+        // A body of exactly the Remaining Length ceiling still frames (planned only, the
+        // lazily zero-mapped payload is never touched).
+        let body_overhead = 2 + 1 + 1; // topic length + "t" + Property Length
+        let message = PublishMessage {
+            payload: Bytes::from(vec![
+                0u8;
+                crate::codec::utils::MAX_VARIABLE_LENGTH as usize - body_overhead
+            ]),
+            ..message
+        };
+        let wire_len = publish_wire_len(&message, delivery, 0).expect("body at the ceiling");
+        assert_eq!(wire_len, 1 + 4 + crate::codec::utils::MAX_VARIABLE_LENGTH as usize);
+    }
+
     #[test]
     fn encode_publish_reuse_with_caller_clear() {
         let message = PublishMessage {

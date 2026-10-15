@@ -181,3 +181,71 @@ pub(crate) mod property_type {
     pub(crate) const SUB_IDS_AVAIL: u8 = 0x29;
     pub(crate) const SHARED_SUB_AVAIL: u8 = 0x2A;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::types::QoS;
+
+    /// Every byte in `spec` decodes and encodes back to itself; every other byte is refused.
+    fn assert_code_table<T>(spec: &[u8])
+    where
+        T: TryFrom<u8> + Copy + std::fmt::Debug,
+        u8: From<T>,
+    {
+        for byte in 0..=u8::MAX {
+            match T::try_from(byte) {
+                Ok(code) => {
+                    assert!(
+                        spec.contains(&byte),
+                        "{byte:#04x} decodes to {code:?} but is not in the table"
+                    );
+                    assert_eq!(u8::from(code), byte, "{code:?} encodes to a different byte");
+                }
+                Err(_) => assert!(!spec.contains(&byte), "{byte:#04x} is in the table but refused"),
+            }
+        }
+    }
+
+    #[test]
+    fn reason_codes_match_the_spec_tables() {
+        // §3.4.2.1 PUBACK and §3.5.2.1 PUBREC share one table.
+        assert_code_table::<PublishAckReason>(&[0x00, 0x10, 0x80, 0x83, 0x87, 0x90, 0x91, 0x97, 0x99]);
+        // §3.6.2.1 PUBREL and §3.7.2.1 PUBCOMP.
+        assert_code_table::<PubRelCompReason>(&[0x00, 0x92]);
+        // §3.9.3 SUBACK.
+        assert_code_table::<SubscribeAckReason>(&[
+            0x00, 0x01, 0x02, 0x80, 0x83, 0x87, 0x8F, 0x91, 0x97, 0x9E, 0xA1, 0xA2,
+        ]);
+        // §3.11.3 UNSUBACK.
+        assert_code_table::<UnsubscribeAckReason>(&[0x00, 0x11, 0x80, 0x83, 0x87, 0x8F, 0x91]);
+        // §3.14.2.1 DISCONNECT.
+        assert_code_table::<DisconnectReasonCode>(&[
+            0x00, 0x04, 0x80, 0x81, 0x82, 0x83, 0x87, 0x89, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F, 0x90, 0x93, 0x94, 0x95, 0x96,
+            0x97, 0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F, 0xA0, 0xA1, 0xA2,
+        ]);
+        // §3.15.2.1 AUTH.
+        assert_code_table::<AuthReasonCode>(&[0x00, 0x18, 0x19]);
+        // §3.8.3.1 Retain Handling and §4.3 QoS.
+        assert_code_table::<RetainHandling>(&[0, 1, 2]);
+        assert_code_table::<QoS>(&[0, 1, 2]);
+    }
+
+    #[test]
+    fn connack_reason_codes_match_the_spec_table() {
+        // §3.2.2.2: codes outside the table are kept as `Unknown` instead of refused.
+        const SPEC: &[u8] = &[
+            0x00, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8C, 0x90, 0x95, 0x97, 0x99, 0x9A,
+            0x9B, 0x9C, 0x9D, 0x9F,
+        ];
+        for byte in 0..=u8::MAX {
+            let code = ConnectAckReason::from(byte);
+            assert_eq!(u8::from(code), byte, "{code:?} encodes to a different byte");
+            assert_eq!(
+                matches!(code, ConnectAckReason::Unknown(_)),
+                !SPEC.contains(&byte),
+                "{byte:#04x} decodes to {code:?}"
+            );
+        }
+    }
+}

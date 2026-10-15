@@ -664,4 +664,42 @@ mod tests {
             ]
         );
     }
+
+    /// Only the three Granted QoS codes grant a subscription; every failure code (0x80 and up) does not.
+    #[test]
+    fn only_granted_qos_codes_grant_the_subscription() {
+        for byte in 0..=u8::MAX {
+            if let Ok(reason) = SubscribeAckReason::try_from(byte) {
+                assert_eq!(reason.is_granted(), byte <= 2, "{reason:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn subscription_options_byte_follows_the_spec_layout() {
+        // §3.8.3.1: bits 0-1 QoS, bit 2 No Local, bit 3 Retain As Published, bits 4-5 Retain Handling.
+        for qos in [QoS::AtMostOnce, QoS::AtLeastOnce, QoS::ExactlyOnce] {
+            for no_local in [false, true] {
+                for retain_as_published in [false, true] {
+                    for (retain_handling, rh) in [
+                        (RetainHandling::AtSubscribe, 0u8),
+                        (RetainHandling::AtSubscribeNew, 1),
+                        (RetainHandling::NoAtSubscribe, 2),
+                    ] {
+                        let options = SubscriptionOptions {
+                            qos,
+                            no_local,
+                            retain_as_published,
+                            retain_handling,
+                        };
+                        let byte = qos as u8 | (no_local as u8) << 2 | (retain_as_published as u8) << 3 | rh << 4;
+                        let mut buf = BytesMut::new();
+                        options.encode(&mut buf).unwrap();
+                        assert_eq!(buf.as_ref(), &[byte], "{options:?}");
+                        assert_eq!(SubscriptionOptions::decode(&mut buf.freeze()).unwrap(), options);
+                    }
+                }
+            }
+        }
+    }
 }

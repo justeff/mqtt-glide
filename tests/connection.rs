@@ -16,9 +16,9 @@ use std::num::NonZeroU16;
 use futures_util::{SinkExt, StreamExt};
 use mqtt_glide::codec::{ConnectAck, DecodedFrame, Packet, PublishDelivery, encode_publish};
 use mqtt_glide::{
-    AuthError, BrokerUrl, ClientId, ConnectOptions, ConnectionOutcome, DEFAULT_MAX_PACKET_SIZE, DisconnectReasonCode,
-    InboundMessage, NoopLifecycle, ProtocolError, Publish, PublishMessage, QoS, SessionPhase, StandardReconnectPolicy,
-    connect,
+    AuthError, BrokerUrl, ClientId, ConnectAckReason, ConnectOptions, ConnectionOutcome, DEFAULT_MAX_PACKET_SIZE,
+    DisconnectReasonCode, InboundMessage, NoopLifecycle, ProtocolError, Publish, PublishMessage, QoS, SessionPhase,
+    StandardReconnectPolicy, connect,
 };
 use secrecy::SecretString;
 use tokio::net::TcpListener;
@@ -253,6 +253,42 @@ async fn auth_failure_reconnect_replenishes_channel_before_invalidate() {
         .expect("run must finish after shutdown")
         .expect("run task join");
     peer.abort();
+}
+
+/// A CONNACK refusing the credentials invalidates them once: the failed attempt does not
+/// invalidate them again when it ends.
+#[tokio::test]
+async fn refused_connack_invalidates_credentials_once() {
+    let (port, peer) = spawn_peer_broker(|broker| async move {
+        let mut session = broker.accept_session().await;
+        session.expect_connect().await;
+        session
+            .send_connack(ConnectAck {
+                reason_code: ConnectAckReason::NotAuthorized,
+                ..Default::default()
+            })
+            .await;
+    })
+    .await;
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("refused-creds"));
+    let invalidations = Arc::new(AtomicUsize::new(0));
+    let creds = CountingInvalidate {
+        invalidations: Arc::clone(&invalidations),
+    };
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
+    let (_client, connection, _phase) = connect(options, creds, NoReconnect, tx, NoopLifecycle).expect("wiring");
+
+    let outcome = timeout(Duration::from_secs(5), connection.run())
+        .await
+        .expect("run finishes");
+    assert!(matches!(
+        outcome,
+        Err(ConnectionOutcome::Auth(AuthError::NotAuthorized))
+    ));
+    assert_eq!(invalidations.load(Ordering::SeqCst), 1);
+    join_peer(peer).await;
 }
 
 /// [MQTT-3.2.2-2]: Clean Start = 1 with Session Present = 1 stops the driver (no reconnect loop).

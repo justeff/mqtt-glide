@@ -3235,6 +3235,58 @@ mod tests {
         let _ = run.await;
     }
 
+    /// When the driver stops for good, publishes it was still carrying to the next connection
+    /// fail as `ConnectionLost`, like the one that was on the wire.
+    #[tokio::test]
+    async fn carried_publishes_fail_as_connection_lost_when_the_driver_stops() {
+        let port = spawn_broker_once(|mut framed_read, mut framed_write| async move {
+            let mut ack = ConnectAck::default();
+            ack.receive_max = NonZeroU16::new(1).expect("nz");
+            if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
+                return;
+            }
+            while let Some(Ok(frame)) = framed_read.next().await {
+                if matches!(frame, (DecodedFrame::Publish(_), _)) {
+                    // Let the client park the rest behind the window, then drop with no PUBACK.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    return;
+                }
+            }
+        })
+        .await;
+
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+        let (client, connection, mut phase) = connect(
+            ConnectOptions::new(url),
+            static_test_credentials(),
+            NoReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let completions: Vec<_> = (0..3u8)
+            .map(|i| {
+                client
+                    .try_start_publish(Publish::new("t/carried", Bytes::from(vec![i])).qos(QoS::AtLeastOnce))
+                    .expect("enqueue")
+            })
+            .collect();
+        for (i, completion) in completions.into_iter().enumerate() {
+            let result = timeout(Duration::from_secs(5), completion.wait())
+                .await
+                .expect("resolves");
+            assert!(
+                matches!(result, Err(AppError::ConnectionLost)),
+                "publish {i}: {result:?}"
+            );
+        }
+        let _ = timeout(Duration::from_secs(5), run).await.expect("driver stops");
+    }
+
     /// `is_connected` follows the session; with `fail_fast_when_disconnected` commands issued
     /// while no connection is up fail at once with `NotConnected` instead of queueing.
     #[tokio::test]

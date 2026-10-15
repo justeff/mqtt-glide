@@ -161,6 +161,31 @@ mod tests {
     }
 
     #[test]
+    fn variable_length_encoding_keeps_every_bit_at_each_width() {
+        // Mixed bit patterns, so a lost or shifted group shows up; one vector per width boundary.
+        let cases: &[(u32, &[u8])] = &[
+            (0, &[0x00]),
+            (128, &[0x80, 0x01]),
+            (321, &[0xC1, 0x02]),
+            (16_384, &[0x80, 0x80, 0x01]),
+            (1_193_046, &[0xD6, 0xE8, 0x48]),
+            (2_097_151, &[0xFF, 0xFF, 0x7F]),
+            (2_097_152, &[0x80, 0x80, 0x80, 0x01]),
+            (11_259_375, &[0xEF, 0x9B, 0xAF, 0x05]),
+        ];
+        for &(value, wire) in cases {
+            let mut buf = BytesMut::new();
+            write_variable_length(value, &mut buf).unwrap();
+            assert_eq!(buf.as_ref(), wire, "encoding {value}");
+            assert_eq!(
+                decode_variable_length(wire).unwrap(),
+                Some((value, wire.len())),
+                "decoding {value}"
+            );
+        }
+    }
+
+    #[test]
     fn variable_length_rejects_oversized_values() {
         let mut buf = BytesMut::new();
         assert!(matches!(

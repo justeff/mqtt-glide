@@ -311,4 +311,42 @@ mod tests {
             "User Property must be omitted when it would exceed the DISCONNECT body budget"
         );
     }
+
+    #[test]
+    fn disconnect_with_only_a_reason_code_keeps_it() {
+        // §3.14.2.2.1: the Property Length may be left out, so a broker can send `E0 01 8B`.
+        for code in [
+            DisconnectReasonCode::ServerShuttingDown,
+            DisconnectReasonCode::UseAnotherServer,
+        ] {
+            let disconnect = Disconnect::decode(&mut Bytes::copy_from_slice(&[code.into()])).unwrap();
+            assert_eq!(disconnect, Disconnect::new(code));
+        }
+    }
+
+    #[test]
+    fn disconnect_decodes_every_property_from_spec_wire_bytes() {
+        // Identifiers spelled out from §3.14.2.2, not taken from `property_type`.
+        #[rustfmt::skip]
+        let props: &[u8] = &[
+            0x11, 0x00, 0x00, 0x00, 0x1E,                  // Session Expiry Interval 30
+            0x1F, 0x00, 0x02, b'b', b'y',                  // Reason String
+            0x26, 0x00, 0x01, b'k', 0x00, 0x01, b'v',      // User Property
+            0x1C, 0x00, 0x03, b'h', b':', b'1',            // Server Reference
+        ];
+        let mut body = vec![0x9C, props.len() as u8];
+        body.extend_from_slice(props);
+
+        let disconnect = Disconnect::decode(&mut Bytes::from(body)).unwrap();
+        assert_eq!(
+            disconnect,
+            Disconnect {
+                reason_code: DisconnectReasonCode::UseAnotherServer,
+                session_expiry_interval: Some(30),
+                server_reference: Some(ByteString::from_static("h:1")),
+                reason_string: Some(ByteString::from_static("by")),
+                user_properties: vec![("k", "v").into()],
+            }
+        );
+    }
 }

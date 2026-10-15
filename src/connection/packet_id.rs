@@ -295,6 +295,8 @@ impl InflightPots {
 
 #[cfg(test)]
 mod tests {
+    use std::hash::BuildHasher;
+
     use super::*;
     use nonzero_ext::nonzero;
 
@@ -453,6 +455,84 @@ mod tests {
             allocated, 7,
             "8-slot window with one migrated subscribe leaves 7 publish ids"
         );
+    }
+
+    /// Ids rotate through the window: the one freed last is the last to be handed out again.
+    #[test]
+    fn publish_ids_rotate_through_the_window() {
+        let mut pots = InflightPots::new(nonzero!(4u16));
+        let first = pots.alloc_publish().expect("1");
+        pots.alloc_publish().expect("2");
+        pots.release_publish(first);
+        let order: Vec<u16> = (0..3).map(|_| pots.alloc_publish().expect("free id").get()).collect();
+        assert_eq!(order, [3, 4, 1]);
+    }
+
+    /// A resumed session resends with the original identifier even when the broker lowered its
+    /// Receive Maximum below it ([MQTT-4.4.0-1]); the id still counts against the window.
+    #[test]
+    fn reserved_publish_id_above_the_window_is_held() {
+        let mut pots = InflightPots::new(nonzero!(2u16));
+        let reserved = nonzero!(5u16);
+        assert!(pots.reserve_publish(reserved));
+        assert!(pots.publish_contains(reserved));
+        assert!(!pots.reserve_publish(reserved), "already in use");
+        pots.alloc_publish().expect("one slot left");
+        assert!(!pots.has_publish_capacity(), "the reserved id takes the other slot");
+        pots.release_publish(reserved);
+        assert!(!pots.publish_contains(reserved));
+        assert!(pots.has_publish_capacity());
+    }
+
+    /// A subscribe id goes inside the publish window only once every id above it is taken.
+    #[test]
+    fn subscribe_searches_every_id_above_the_window() {
+        let mut pots = InflightPots::new(nonzero!(1u16));
+        let above: Vec<NonZeroU16> = (2..=u16::MAX).map(|_| pots.alloc_subscribe().expect("above")).collect();
+        assert!(above.iter().all(|id| id.get() > 1));
+        let top = nonzero!(65535u16);
+        pots.release_subscribe(top);
+        assert_eq!(pots.alloc_subscribe().expect("the freed top id"), top);
+        assert_eq!(pots.alloc_subscribe().expect("only the window is left").get(), 1);
+        assert!(!pots.has_publish_capacity());
+    }
+
+    #[test]
+    fn growing_capacity_keeps_subscribe_ids_beyond_the_table_high() {
+        let mut pots = InflightPots::new(nonzero!(1u16));
+        let inside = pots.alloc_subscribe().expect("2");
+        let beyond = pots.alloc_subscribe().expect("3");
+        pots.set_publish_capacity(nonzero!(2u16));
+        assert_eq!(pots.slots[usize::from(inside.get())], Slot::Subscribe);
+        assert!(pots.subscribe_high.contains(&beyond));
+        assert!(pots.subscribe_contains(inside) && pots.subscribe_contains(beyond));
+        assert_eq!(pots.alloc_publish().expect("one slot left").get(), 1);
+        assert!(
+            !pots.has_publish_capacity(),
+            "the migrated subscribe takes the other slot"
+        );
+    }
+
+    #[test]
+    fn releasing_an_id_outside_the_table_is_a_no_op() {
+        let mut pots = InflightPots::new(nonzero!(4u16));
+        let outside = NonZeroU16::new(u16::try_from(pots.slots.len()).expect("small")).expect("nz");
+        pots.release_publish(outside);
+        pots.release_subscribe(outside);
+        assert!(pots.has_publish_capacity());
+    }
+
+    /// Consecutive ids land in distinct buckets of every power-of-two table that fits them.
+    #[test]
+    fn packet_id_hasher_is_a_bijection_on_the_low_bits() {
+        let build = BuildHasherDefault::<PacketIdHasher>::default();
+        for bits in [4u32, 10, 15] {
+            let mask = (1u64 << bits) - 1;
+            let buckets: HashSet<u64> = (1..=1u16 << bits)
+                .map(|id| build.hash_one(NonZeroU16::new(id).expect("nz")) & mask)
+                .collect();
+            assert_eq!(buckets.len(), 1 << bits, "{bits} bits");
+        }
     }
 
     /// With a window of several, only the identifier that was released is handed out again, and

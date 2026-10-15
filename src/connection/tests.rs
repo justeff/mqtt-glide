@@ -74,6 +74,33 @@ async fn run_returns_observable_result_on_shutdown() {
     );
 }
 
+/// Only a redirect that ends a long session starts a new streak: a redirecting CONNACK still
+/// counts towards the cap, however long the session before it ran.
+#[tokio::test]
+async fn a_redirect_while_connecting_does_not_end_the_streak() {
+    let url = BrokerUrl::parse("mqtt://127.0.0.1:1883").expect("valid url");
+    let options = ConnectOptions::new(url).follow_server_redirects(true);
+    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (_client, mut connection, _phase) =
+        connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
+    connection.redirects_in_row = redirect::MAX_REDIRECTS_IN_ROW;
+    connection.session_up_since = Instant::now().checked_sub(redirect::STREAK_RESET_AFTER * 2);
+
+    let refused = ConnectionOutcome::Protocol(ProtocolError::Violation("CONNACK rejected: UseAnotherServer".into()));
+    let redirect = redirect::ServerRedirect {
+        reference: "other.example".into(),
+        permanent: false,
+    };
+    let disposition = connection
+        .finish_session_or_redirect(refused, false, Some(redirect))
+        .await;
+    assert!(
+        matches!(disposition, SessionDisposition::Stop(Err(_))),
+        "the sixth redirect in a row is not followed"
+    );
+    assert!(connection.redirect_once.is_none());
+}
+
 #[tokio::test]
 async fn read_task_exit_cancels_write_and_joins() {
     let (_client, connection, mut phase) = test_connect().await;

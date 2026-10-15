@@ -234,4 +234,49 @@ mod tests {
         encode_opt_props(&[], &reason, &mut buf, 5).expect("encode");
         assert!(buf.is_empty(), "reason string that does not fit must be omitted");
     }
+
+    /// User Properties are kept in order while they fit, and the Reason String only after
+    /// all of them; the encode path writes exactly what the size path counted.
+    #[test]
+    fn opt_props_keep_what_fits_in_order() {
+        let props: UserProperties = vec![("k", "v").into(), ("k", "v").into()]; // 7 wire bytes each
+        let reason = Some(ByteString::from_static("abc")); // 6 wire bytes
+        for (limit, expected) in [(20, 20), (19, 14), (14, 14), (13, 7), (7, 7), (6, 0), (0, 0)] {
+            assert_eq!(
+                encoded_size_opt_props(&props, &reason, limit),
+                expected,
+                "limit {limit}"
+            );
+        }
+        for limit in 0..=21 {
+            let mut buf = BytesMut::new();
+            encode_opt_props(&props, &reason, &mut buf, limit).expect("encode");
+            assert_eq!(
+                buf.len(),
+                encoded_size_opt_props(&props, &reason, limit),
+                "limit {limit}"
+            );
+        }
+    }
+
+    /// The ACK property block reserves 4 bytes for its Property Length before trimming.
+    #[test]
+    fn ack_props_size_reserves_the_property_length() {
+        let props: UserProperties = vec![("k", "v").into(), ("k", "v").into()];
+        let reason = Some(ByteString::from_static("abc"));
+        for (limit, expected) in [(3, 1), (10, 1), (11, 8), (17, 8), (18, 15), (24, 21)] {
+            assert_eq!(
+                ack_props::encoded_size(&props, &reason, limit),
+                expected,
+                "limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn var_int_len_from_size_inverts_the_prefixed_length() {
+        for len in (0u32..20_000).chain([2_097_151, 2_097_152, 268_435_455]) {
+            assert_eq!(var_int_len_from_size(var_int_len(len as usize) + len), len, "len {len}");
+        }
+    }
 }
