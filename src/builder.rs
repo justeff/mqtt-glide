@@ -10,6 +10,24 @@
 //! background task. These paths are mutually exclusive (compile-time). The unset state
 //! does not expose `connect`.
 //!
+//! The state is part of the type: [`InboundSinkUnset`], [`InboundSinkReady`] or
+//! [`InboundSinkDiscard`]. Name it to hand a partly configured builder around:
+//!
+//! ```
+//! use mqtt_glide::builder::InboundSinkReady;
+//! use mqtt_glide::{BrokerUrlError, ClientBuilder, InboundMessage};
+//! use tokio::sync::mpsc;
+//!
+//! fn sensor_client(
+//!     url: &str,
+//!     sink: mpsc::Sender<InboundMessage>,
+//! ) -> Result<ClientBuilder<InboundSinkReady<mpsc::Sender<InboundMessage>>>, BrokerUrlError> {
+//!     Ok(ClientBuilder::new(url)?.inbound_sink(sink))
+//! }
+//! # let (tx, _rx) = mpsc::channel(8);
+//! # sensor_client("mqtt://127.0.0.1:1883", tx).unwrap();
+//! ```
+//!
 //! # Example
 //!
 //! ```no_run
@@ -48,19 +66,17 @@ use crate::inbound_sink::{InboundSink, OnInboundSink};
 use crate::options::ConnectOptions;
 use crate::util::{BrokerUrl, BrokerUrlError, ClientId, ClientIdError};
 
-/// Marker: handoff not configured — [`ClientBuilder::connect`] is unavailable.
-#[doc(hidden)]
+/// Builder state: no inbound handoff chosen yet, so [`ClientBuilder::connect`] is unavailable.
 #[derive(Debug)]
 pub struct InboundSinkUnset;
 
-/// Marker: application [`InboundSink`] set via [`ClientBuilder::inbound_sink`].
-#[doc(hidden)]
+/// Builder state: inbound messages go to the [`InboundSink`] `S`, set with
+/// [`ClientBuilder::inbound_sink`] or [`ClientBuilder::on_inbound`].
 pub struct InboundSinkReady<S: InboundSink> {
     sink: S,
 }
 
-/// Marker: inbound PUBLISH discarded via [`ClientBuilder::discard_inbound`].
-#[doc(hidden)]
+/// Builder state: inbound messages are dropped, set with [`ClientBuilder::discard_inbound`].
 #[derive(Debug)]
 pub struct InboundSinkDiscard;
 
