@@ -153,6 +153,7 @@ where
         outbound_topic_aliases: 0,
         subscription_identifiers_available: true,
         stats: Default::default(),
+        ack_timeout: Duration::from_secs(30),
     };
     let join = tokio::spawn(async move {
         let mut command_rx = command_rx;

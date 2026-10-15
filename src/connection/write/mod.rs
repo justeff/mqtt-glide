@@ -8,6 +8,7 @@ mod acks;
 mod commands;
 mod io;
 mod keepalive;
+mod restore;
 
 #[cfg(test)]
 mod tests;
@@ -107,7 +108,8 @@ pub(super) struct SubUnsubWaiters {
 }
 
 pub(super) struct PendingSubscribe {
-    pub(super) reply: SubscribeReply,
+    /// `None` for the driver's own retry of a refused restore ([`restore::RestoreRetry`]).
+    pub(super) reply: Option<SubscribeReply>,
     pub(super) filters: Vec<(ByteString, SubscriptionOptions)>,
     /// Subscription Identifier the SUBSCRIBE carried (kept in the registry for resubscribe).
     pub(super) id: Option<std::num::NonZeroU32>,
@@ -336,6 +338,9 @@ pub(crate) struct WriteSession {
     pub subscription_identifiers_available: bool,
     /// Counters behind [`crate::MqttClient::stats`].
     pub stats: crate::stats::Stats,
+    /// [`crate::ConnectOptions::ack_timeout`]: a retried restore SUBSCRIBE unanswered for
+    /// this long ends the connection.
+    pub ack_timeout: Duration,
 }
 
 /// Runs the write task until cancelled, shut down, or signalled to exit.
@@ -377,6 +382,7 @@ where
     let inbound_publish_ack_counter = session.bench_inbound_publish_ack_counter;
     let read_stop = session.read_stop;
     let subscription_identifiers_available = session.subscription_identifiers_available;
+    let mut restore = restore::RestoreRetry::new(&subscription_registry, session.ack_timeout);
     let mut awaiting_pingresp = false;
     let generation = session.generation;
     let receive_maximum = session.receive_maximum;
@@ -468,6 +474,7 @@ where
         let stub_exit = stub_exit_rx.recv();
         #[cfg(not(test))]
         let stub_exit = std::future::pending::<Option<()>>();
+        let restore_wake = restore.wake_at();
 
         tokio::select! {
             biased;
@@ -850,6 +857,46 @@ where
                             WriteOutcome::ControlChannelClosed,
                         );
                     }
+                }
+            }
+            () = async {
+                match restore_wake {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if shutdown_notify.is_cancelled() || cancel.is_cancelled() {
+                    continue;
+                }
+                if let Err(outcome) = restore
+                    .on_wake(
+                        &mut framed,
+                        &mut inflight,
+                        &mut waiters,
+                        &subscription_registry,
+                        subscription_identifiers_available,
+                        flush_abort,
+                    )
+                    .await
+                {
+                    return finish_hot_path_write_outcome(
+                        &mut framed,
+                        GracefulDisconnectCtx {
+                            control_rx: &mut control_rx,
+                            waiters: &mut waiters,
+                            publish_waiters: &mut publish_waiters,
+                            inflight: &mut inflight,
+                            flush_budget: graceful_disconnect_timeout,
+                            command_rx,
+                            publish_limits,
+                            subscription_registry: &subscription_registry,
+                            generation,
+                            read_stop: &read_stop,
+                        },
+                        read_done,
+                        outcome,
+                    )
+                    .await;
                 }
             }
             exit = stub_exit => {

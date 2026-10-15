@@ -31,6 +31,22 @@ impl fmt::Display for PublishRejection {
     }
 }
 
+/// A subscription the broker refused to restore after a reconnect, as listed by
+/// [`MqttClient::refused_subscriptions`](crate::MqttClient::refused_subscriptions).
+///
+/// The client keeps asking for it on the same connection, with backoff, until the broker
+/// grants it or the application unsubscribes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RefusedSubscription {
+    /// The topic filter.
+    pub filter: ByteString,
+    /// SUBACK reason code of the last refusal, e.g. [`SubscribeAckReason::NotAuthorized`].
+    pub reason: SubscribeAckReason,
+    /// Broker's diagnostic text of the last refusal, if it sent one.
+    pub reason_string: Option<ByteString>,
+}
+
 /// Generates the SUBACK / UNSUBACK response types: per-filter reason codes plus the
 /// packet's Reason String and User Properties. Derefs to the reason codes, so it reads
 /// like the plain list (`resp[0]`, `resp.iter()`, `resp == vec![…]`).

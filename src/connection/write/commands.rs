@@ -154,7 +154,7 @@ where
                 ctx.waiters.subscribe.insert(
                     packet_id,
                     PendingSubscribe {
-                        reply,
+                        reply: Some(reply),
                         filters: Vec::new(),
                         id: None,
                     },
@@ -490,7 +490,7 @@ where
     waiters.subscribe.insert(
         packet_id,
         PendingSubscribe {
-            reply,
+            reply: Some(reply),
             filters: filters.clone(),
             id,
         },
@@ -506,7 +506,9 @@ where
     if let Err(outcome) = send_packet(framed, packet, flush_abort).await {
         if let Some(pending) = waiters.subscribe.remove(&packet_id) {
             inflight.release_subscribe(packet_id);
-            let _ = pending.reply.send(Err(app_error_from_write_outcome(&outcome)));
+            if let Some(reply) = pending.reply {
+                let _ = reply.send(Err(app_error_from_write_outcome(&outcome)));
+            }
         }
         return Err(outcome);
     }

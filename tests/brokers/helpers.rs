@@ -1,6 +1,6 @@
 //! Shared Mosquitto container helpers for mqtt-glide broker tests.
 //!
-//! eclipse-mosquitto `2.1.2-alpine`, anonymous + reject-connect configs.
+//! eclipse-mosquitto `2.1.2-alpine`: anonymous, reject-connect and Dynamic Security configs.
 //!
 //! When Docker is unavailable, [`start_mosquitto`] / [`start_mosquitto_reject_connect`] /
 //! [`start_mosquitto_on_port`] return `None` after printing
@@ -20,7 +20,7 @@ use testcontainers::ContainerAsync;
 use testcontainers::ContainerRequest;
 use testcontainers::GenericImage;
 use testcontainers::ImageExt;
-use testcontainers::core::WaitFor;
+use testcontainers::core::{CmdWaitFor, ExecCommand, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -29,6 +29,10 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 
 /// Mosquitto config used by most tests: anonymous access, no auth.
 const CONF_NO_AUTH: &str = "listener 1883\nallow_anonymous true\n";
+
+/// Mosquitto with the Dynamic Security plugin; the config file is created at start with an
+/// `admin` / `adminpw` administrator (see [`dynsec`]).
+const CONF_DYNSEC: &str = "listener 1883\nplugin /usr/lib/mosquitto_dynamic_security.so\nplugin_opt_config_file /mosquitto/data/dynsec.json\n";
 
 /// Mosquitto config that rejects all connections: anonymous access disabled,
 /// no password file configured → every CONNECT results in ConnAck(NotAuthorized).
@@ -98,6 +102,47 @@ pub async fn start_mosquitto_reject_connect() -> Option<(ContainerAsync<GenericI
 
     let port = container.get_host_port_ipv4(1883).await.expect("mapped mosquitto port");
     Some((container, port))
+}
+
+/// Starts a Mosquitto container with Dynamic Security (no clients yet besides the admin);
+/// set it up with [`dynsec`].
+///
+/// Returns `None` (after a skip message) when Docker is unavailable.
+pub async fn start_mosquitto_dynsec() -> Option<(ContainerAsync<GenericImage>, u16)> {
+    if skip_without_docker() {
+        return None;
+    }
+    let container = GenericImage::new("eclipse-mosquitto", "2.1.2-alpine")
+        .with_wait_for(WaitFor::message_on_stderr(" running"))
+        .with_copy_to("/mosquitto-test.conf", CONF_DYNSEC.as_bytes().to_vec())
+        .with_cmd([
+            "sh",
+            "-c",
+            "mosquitto_ctrl dynsec init /mosquitto/data/dynsec.json admin adminpw >/dev/null \
+             && chown mosquitto /mosquitto/data/dynsec.json \
+             && exec mosquitto -c /mosquitto-test.conf",
+        ])
+        .start()
+        .await
+        .expect("failed to start Mosquitto container (dynsec)");
+    let port = container.get_host_port_ipv4(1883).await.expect("mapped mosquitto port");
+    Some((container, port))
+}
+
+/// Runs `mosquitto_ctrl dynsec <args>` as the admin of a [`start_mosquitto_dynsec`] broker.
+/// A change to a role's ACLs makes Mosquitto drop every connected client with that role.
+pub async fn dynsec(container: &ContainerAsync<GenericImage>, args: &[&str]) {
+    let mut command = vec!["mosquitto_ctrl", "-u", "admin", "-P", "adminpw", "dynsec"];
+    command.extend_from_slice(args);
+    let result = container
+        .exec(ExecCommand::new(command).with_cmd_ready_condition(CmdWaitFor::exit()))
+        .await
+        .expect("exec in mosquitto container");
+    assert_eq!(
+        result.exit_code().await.expect("exit code"),
+        Some(0),
+        "dynsec {args:?} failed"
+    );
 }
 
 /// Starts Mosquitto mapped to a fixed host port (reconnect tests after stop/drop).

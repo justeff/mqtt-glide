@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use mqtt_glide::codec::{ConnectAckReason, PublishAckReason};
+use mqtt_glide::codec::{ConnectAckReason, PublishAckReason, SubscribeAckReason};
 use mqtt_glide::testing::{FaultProxy, TestBroker};
 use mqtt_glide::{
     AppError, ClientBuilder, InboundMessage, MqttClient, Publish, QoS, StandardReconnectPolicy, Subscription,
@@ -166,6 +166,56 @@ async fn a_dropped_client_reconnects_resubscribes_and_its_will_goes_out() {
         broker.wait_for_subscription("device", "cmd/device", WAIT).await,
         "subscription restored"
     );
+    broker.publish(Publish::new("cmd/device", "reboot").qos(QoS::AtLeastOnce));
+    assert_eq!(&next(&device_rx).await.payload[..], b"reboot");
+}
+
+/// A broker that refuses a subscription after a reconnect (an ACL revoked meanwhile) leaves
+/// the client connected and publishing; the client lists the refusal and gets the
+/// subscription back on its own once the broker allows it again.
+#[tokio::test]
+async fn a_subscription_refused_after_reconnect_comes_back_when_allowed_again() {
+    let broker = TestBroker::start().await.expect("broker");
+    let (device, device_rx) = client(&broker.url(), "device").await;
+    device
+        .subscribe([("cmd/device", QoS::AtLeastOnce), ("cfg/device", QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe");
+
+    broker.refuse_subscription("cmd/device", Some(SubscribeAckReason::NotAuthorized));
+    broker.drop_connections();
+    let mut refused = device.refused_subscriptions();
+    let listed = tokio::time::timeout(WAIT, refused.wait_for(|list| !list.is_empty()))
+        .await
+        .expect("refusal listed")
+        .expect("watch open")
+        .clone();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (&*listed[0].filter, listed[0].reason),
+        ("cmd/device", SubscribeAckReason::NotAuthorized)
+    );
+    assert!(device.is_connected(), "a refused filter does not end the connection");
+    assert!(broker.wait_for_subscription("device", "cfg/device", WAIT).await);
+    device
+        .publish("status/device", "online")
+        .qos(QoS::AtLeastOnce)
+        .await
+        .expect("publishing keeps working");
+
+    broker.refuse_subscription("cmd/device", None);
+    // First retry after 2.5 to 5 s.
+    assert!(
+        broker
+            .wait_for_subscription("device", "cmd/device", Duration::from_secs(8))
+            .await,
+        "retried on the same connection"
+    );
+    tokio::time::timeout(WAIT, refused.wait_for(|list| list.is_empty()))
+        .await
+        .expect("list empty again")
+        .expect("watch open");
+    assert_eq!(broker.connect_count(), 2, "no reconnect for the retry");
     broker.publish(Publish::new("cmd/device", "reboot").qos(QoS::AtLeastOnce));
     assert_eq!(&next(&device_rx).await.payload[..], b"reboot");
 }

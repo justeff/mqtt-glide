@@ -24,9 +24,11 @@ pub enum SessionPhase {
     /// Active MQTT session after a successful CONNECT/CONNACK.
     ///
     /// On a reconnect where the broker holds no session (Clean Start, or no Session
-    /// Present), every previously granted subscription has already been restored and
-    /// granted again when this is published; if the broker refuses one, the connection
-    /// fails instead. A resumed session keeps the broker's subscriptions as they are.
+    /// Present), every previously granted subscription has already been asked for again
+    /// when this is published. One the broker refused is listed in
+    /// [`MqttClient::refused_subscriptions`](crate::MqttClient::refused_subscriptions) and
+    /// retried on this connection. A resumed session keeps the broker's subscriptions as
+    /// they are.
     Connected {
         /// Connection generation for this session.
         generation: u64,

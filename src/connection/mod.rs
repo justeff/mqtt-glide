@@ -83,6 +83,8 @@ pub(crate) struct ConnectionChannels<H: InboundSink> {
     pub response_router: Arc<crate::request::ResponseRouter>,
     /// Counters behind [`crate::MqttClient::stats`].
     pub stats: crate::stats::Stats,
+    /// Behind [`crate::MqttClient::refused_subscriptions`], kept current by the registry.
+    pub refused_subscriptions: watch::Sender<Vec<crate::ack::RefusedSubscription>>,
     /// Test/supervision hooks: clone senders before [`Connection::run`].
     #[cfg(test)]
     #[allow(dead_code)]
@@ -189,6 +191,9 @@ impl<H: InboundSink> Connection<H> {
         let inflight = packet_id::InflightPots::new(options.receive_maximum);
         let resumable = !options.clean_start && handshake::session_expiry_secs(options.session_expiry) > 0;
         let session_carry = Arc::new(std::sync::Mutex::new(write::Carry::new(resumable)));
+        let subscription_registry = Arc::new(std::sync::RwLock::new(SubscriptionRegistry::new(
+            channels.refused_subscriptions.clone(),
+        )));
         Self {
             options,
             credentials,
@@ -199,7 +204,7 @@ impl<H: InboundSink> Connection<H> {
             generation: Generation(0),
             state: ConnectionState::Stopped,
             inflight,
-            subscription_registry: std::sync::Arc::new(std::sync::RwLock::new(SubscriptionRegistry::default())),
+            subscription_registry,
             session_carry,
             redirect_once: None,
             redirects_in_row: 0,
@@ -458,6 +463,7 @@ impl<H: InboundSink> Connection<H> {
                 &mut framed_read,
                 &mut framed_write,
                 &mut self.inflight,
+                &self.subscription_registry,
                 pending,
                 self.options.ack_timeout,
                 &self.cancel,
@@ -567,6 +573,7 @@ impl<H: InboundSink> Connection<H> {
             outbound_topic_aliases,
             subscription_identifiers_available,
             stats: self.channels.stats.clone(),
+            ack_timeout: self.options.ack_timeout,
         };
         // The task hands the command receiver back with its outcome.
         let write_handle = tokio::spawn(async move {

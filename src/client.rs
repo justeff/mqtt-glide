@@ -283,6 +283,8 @@ pub struct MqttClient {
     fail_fast_when_disconnected: bool,
     /// Session phase watch (the same one [`connect`] returns), for [`Self::session_phase`].
     phase: watch::Receiver<SessionPhase>,
+    /// For [`Self::refused_subscriptions`].
+    refused: watch::Receiver<Vec<crate::RefusedSubscription>>,
     /// Response routing for [`crate::Requester`] (shared with the driver's read path).
     router: Arc<crate::request::ResponseRouter>,
     /// Counters kept by the driver.
@@ -300,6 +302,7 @@ struct ClientOptions {
 struct DriverShared {
     connected: Arc<AtomicBool>,
     phase: watch::Receiver<SessionPhase>,
+    refused: watch::Receiver<Vec<crate::RefusedSubscription>>,
     router: Arc<crate::request::ResponseRouter>,
     #[cfg(feature = "stats")]
     stats: crate::stats::Stats,
@@ -323,6 +326,7 @@ impl MqttClient {
             shutting_down: Arc::default(),
             fail_fast_when_disconnected: options.fail_fast_when_disconnected,
             phase: shared.phase,
+            refused: shared.refused,
             router: shared.router,
             #[cfg(feature = "stats")]
             stats: shared.stats,
@@ -352,6 +356,35 @@ impl MqttClient {
     /// For a cheap snapshot use [`Self::is_connected`].
     pub fn session_phase(&self) -> watch::Receiver<SessionPhase> {
         self.phase.clone()
+    }
+
+    /// Subscriptions the broker refused to restore after a reconnect: the current list plus
+    /// every change. Empty while every subscription is active.
+    ///
+    /// When the broker has no session for the client (Clean Start, or the session expired), the
+    /// client subscribes again to everything the application subscribed to. A filter the broker
+    /// refuses then (an ACL revoked meanwhile, a quota) does not end the connection: it stays
+    /// listed here with the SUBACK reason code, and the client asks again on the same
+    /// connection, first after about 5 s, then doubling up to every 5 min, until the broker
+    /// grants it or the application calls [`Self::unsubscribe`] for it. Each refusal is also
+    /// logged at `warn`.
+    ///
+    /// A non-empty list means messages on those filters are not arriving, which makes it a
+    /// natural health check:
+    ///
+    /// ```no_run
+    /// # fn report_degraded(_: &[mqtt_glide::RefusedSubscription]) {}
+    /// # async fn example(client: mqtt_glide::MqttClient) {
+    /// let mut refused = client.refused_subscriptions();
+    /// while refused.changed().await.is_ok() {
+    ///     report_degraded(&refused.borrow_and_update());
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// A refusal of [`Self::subscribe`] itself is not listed: that answer goes to the caller.
+    pub fn refused_subscriptions(&self) -> watch::Receiver<Vec<crate::RefusedSubscription>> {
+        self.refused.clone()
     }
 
     /// Whether a session is currently up (between `Connected` and `Disconnected`).
@@ -867,6 +900,7 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
     let command_tx = Arc::new(ArcSwap::from_pointee(command_tx));
     let (control_tx, control_rx) = mpsc::channel(control_channel_capacity(options.receive_maximum));
     let (phase_tx, phase_rx) = watch::channel(SessionPhase::initial());
+    let (refused_tx, refused_rx) = watch::channel(Vec::new());
     #[cfg(test)]
     let (read_stub_exit_tx, read_stub_exit_rx) = mpsc::channel(1);
     #[cfg(test)]
@@ -893,6 +927,7 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
         lifecycle,
         connected: Arc::clone(&connected),
         response_router: Arc::clone(&router),
+        refused_subscriptions: refused_tx,
         #[cfg(feature = "stats")]
         stats: stats.clone(),
         #[cfg(not(feature = "stats"))]
@@ -925,6 +960,7 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
             DriverShared {
                 connected,
                 phase: phase_rx.clone(),
+                refused: refused_rx,
                 router,
                 #[cfg(feature = "stats")]
                 stats,

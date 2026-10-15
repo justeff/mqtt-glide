@@ -76,10 +76,17 @@ pub(super) fn complete_subscribe_ack(
         return;
     };
     inflight.release_subscribe(packet_id);
+    let Some(reply) = pending.reply else {
+        // The driver's retry of a refused restore: no caller, only the registry to update.
+        if let Ok(mut registry) = subscription_registry.write() {
+            registry.apply_restore_ack(&pending.filters, &ack.status, ack.reason_string.as_ref(), true);
+        }
+        return;
+    };
     if let Ok(mut registry) = subscription_registry.write() {
         apply_subscribe_ack_to_registry(&mut registry, &pending.filters, pending.id, &ack.status);
     }
-    let _ = pending.reply.send(Ok(crate::ack::SubscribeResponse {
+    let _ = reply.send(Ok(crate::ack::SubscribeResponse {
         reasons: ack.status,
         reason_string: ack.reason_string,
         user_properties: ack.properties,
@@ -126,7 +133,9 @@ pub(super) fn fail_all_waiters(
 ) {
     for (id, pending) in waiters.subscribe.drain() {
         inflight.release_subscribe(id);
-        let _ = pending.reply.send(Err(error.clone()));
+        if let Some(reply) = pending.reply {
+            let _ = reply.send(Err(error.clone()));
+        }
     }
     for (id, pending) in waiters.unsubscribe.drain() {
         inflight.release_subscribe(id);

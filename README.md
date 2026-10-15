@@ -163,7 +163,7 @@ No MQTT 3.1.1 and no QoS 2: both are out of scope, not pending. If you need eith
 
 ## Upgrading from 0.2
 
-The biggest changes: a new publish API (`client.publish(topic, payload).qos(..)`, and an owned `Publish` for `send`), inbound messages delivered as `InboundMessage` (with `retain`, `dup` and `qos`), the non-blocking enqueue renamed to `try_start_publish` while `start_publish` now waits for room, and `#[non_exhaustive]` on most public enums and response types, so a `match` on them needs a wildcard arm. The [CHANGELOG](CHANGELOG.md#unreleased) has a migration table from the old calls to the new ones.
+The biggest changes: a new publish API (`client.publish(topic, payload).qos(..)`, and an owned `Publish` for `send`), inbound messages delivered as `InboundMessage` (with `retain`, `dup` and `qos`), the non-blocking enqueue renamed to `try_start_publish` while `start_publish` now waits for room, and `#[non_exhaustive]` on most public enums and response types, so a `match` on them needs a wildcard arm. A filter the broker refuses to restore after a reconnect no longer makes the client reconnect; watch `refused_subscriptions()` instead. The [CHANGELOG](CHANGELOG.md#unreleased) has a migration table from the old calls to the new ones.
 
 ## Architecture
 
@@ -212,7 +212,7 @@ Without an explicit `client_id`, the builder mints a fresh UUID (`ClientId::from
 
 ### No session
 
-`clean_start` is `true` and `session_expiry` is unset (property omitted; MQTT default 0 s), so the broker drops your subscriptions and anything queued for you as soon as the connection ends. Resuming a session needs `clean_start(false)` plus a non-zero `session_expiry`; re-subscribe whenever CONNACK reports `session_present = false`.
+`clean_start` is `true` and `session_expiry` is unset (property omitted; MQTT default 0 s), so the broker drops your subscriptions and anything queued for you as soon as the connection ends. Resuming a session needs `clean_start(false)` plus a non-zero `session_expiry`; when CONNACK reports `session_present = false`, the client subscribes again to everything the application subscribed to.
 
 A service restarted with `clean_start(false)`, the same client ID and an unexpired session resumes the session the broker kept for it, and receives what was queued meanwhile. The broker keeps that session's subscriptions as well, including ones the new version no longer wants. A service that changes its subscriptions between versions should unsubscribe the old filters, or connect once with Clean Start to discard the session.
 
@@ -351,7 +351,9 @@ Each delivery is an `InboundMessage`: `topic`, `payload`, `properties`, plus `re
 
 Shared filters: build with `shared_filter(group, topic)` (validates ShareName).
 
-Granted subscriptions are remembered and restored on reconnect whenever the broker holds no session for the client (Clean Start, or CONNACK without Session Present), **before** `SessionPhase::Connected` is published. After a reconnect, `Connected` therefore means "connected and subscribed again"; on the first connect it only means "connected", and readiness is your own `subscribe` returning granted reason codes. If the broker refuses a restored filter (for example after an ACL change), the connection counts as failed and the reconnect policy decides; there is never a `Connected` with only part of the subscriptions back.
+Granted subscriptions are remembered and restored on reconnect whenever the broker holds no session for the client (Clean Start, or CONNACK without Session Present), **before** `SessionPhase::Connected` is published. After a reconnect, `Connected` therefore means "connected, and every filter the broker allows is subscribed again"; on the first connect it only means "connected", and readiness is your own `subscribe` returning granted reason codes.
+
+If the broker refuses a restored filter (for example after an ACL change), the connection stays up, and the other subscriptions and publishing keep working. The filter appears in `client.refused_subscriptions()`, a watch with the SUBACK reason code and Reason String, and is logged at `warn`. The client asks for it again on the same connection, first after about 5 s, then doubling up to every 5 minutes, until the broker grants it or you `unsubscribe` it, so a fixed ACL needs no restart. A non-empty list makes a good "degraded" health check. Only a broker that does not answer the SUBSCRIBE at all within `ack_timeout` makes the client reconnect.
 
 ### Hooks
 
@@ -439,7 +441,7 @@ assert!(broker.wait_for_subscription("lights", "cmd/+", WAIT).await);
 
 The two helpers:
 
-- `testing::TestBroker`: an in-process MQTT 5 broker on a free local port. It routes between its clients (wildcards, retained messages, Wills, `$share` groups, No Local), records what clients publish (`received`, `wait_for_publishes`), shows who is connected and subscribed (`connected_clients`, `subscriptions`, `wait_for_connects`, `wait_for_subscription`), injects messages (`publish`), and simulates trouble: `drop_client` / `drop_connections` (network cut), `disconnect_all(reason)`, `refuse_connections(reason)`, `reject_publishes(reason)`. It is a test double, not a broker to run: no persistence, authentication, QoS 2 or session resumption.
+- `testing::TestBroker`: an in-process MQTT 5 broker on a free local port. It routes between its clients (wildcards, retained messages, Wills, `$share` groups, No Local), records what clients publish (`received`, `wait_for_publishes`), shows who is connected and subscribed (`connected_clients`, `subscriptions`, `wait_for_connects`, `wait_for_subscription`), injects messages (`publish`), and simulates trouble: `drop_client` / `drop_connections` (network cut), `disconnect_all(reason)`, `refuse_connections(reason)`, `reject_publishes(reason)`, `refuse_subscription(filter, reason)`. It is a test double, not a broker to run: no persistence, authentication, QoS 2 or session resumption.
 - `testing::FaultProxy`: a TCP proxy in front of any broker (the `TestBroker` or a real one) that adds latency, stalls silently, splits packets at arbitrary bytes, resets connections or refuses new ones, switched at runtime.
 
 The `TestBroker` checks your service, not mqtt-glide: it shares the crate's codec, so it cannot catch the crate's own misreadings of the spec. That is what the tests against real brokers and [`CONFORMANCE.md`](CONFORMANCE.md) are for.

@@ -4,7 +4,7 @@ Integration tests against real brokers via [testcontainers](https://github.com/t
 
 ## Mosquitto 2.x coverage
 
-Image: `eclipse-mosquitto:2.1.2-alpine` (anonymous + reject-connect configs).
+Image: `eclipse-mosquitto:2.1.2-alpine` (anonymous, reject-connect and Dynamic Security configs).
 
 | Test | Expectation |
 |------|-------------|
@@ -16,6 +16,7 @@ Image: `eclipse-mosquitto:2.1.2-alpine` (anonymous + reject-connect configs).
 | `mosquitto_broker_kill_reconnects_and_emits_connected` | Broker kill → Transport disconnect → policy reconnect → Connected (newer generation) |
 | `mosquitto_auth_fail_stops_without_endless_reconnect` | Auth fail → Stopped + invalidate; no endless reconnect |
 | `mosquitto_handoff_full_keep_alive_no_spurious_reconnect` | Full handoff stall; connection stays up past keep-alive window (no spurious reconnect). Wire PINGREQ scheduling is covered by the unit keep-alive enforcer test |
+| `mosquitto_revoked_role_acl_keeps_the_client_connected` | Dynamic Security: revoking a role's subscribe ACL drops the client; the resubscribe gets 0x87 for that filter, the client stays connected with the rest and lists it in `refused_subscriptions`; restoring the ACL brings the subscription back. (A plain `acl_file` would not show this: Mosquitto grants such a SUBSCRIBE and only filters delivery.) |
 | `mosquitto_resubscribes_after_reconnect` | After reconnect, prior subscriptions deliver without re-subscribe |
 | `mosquitto_session_phase_updates_app_state_without_eventloop_poll` | App health driven solely by `SessionPhase` watch |
 | `mosquitto_handoff_survives_shutdown` | Handoff message remains receivable after `shutdown()`. Wire order PUBACK-before-DISCONNECT is covered by unit tests |
@@ -49,5 +50,6 @@ cargo test --test connection
 
 | Helper | Role |
 |--------|------|
-| `start_mosquitto` / `start_mosquitto_on_port` / `start_mosquitto_reject_connect` | Mosquitto containers |
+| `start_mosquitto` / `start_mosquitto_on_port` / `start_mosquitto_reject_connect` / `start_mosquitto_dynsec` | Mosquitto containers |
+| `dynsec` | `mosquitto_ctrl dynsec ...` as the admin of a Dynamic Security broker |
 | `publish_qos0_via_raw_session` / `publish_qos1_via_raw_session` | Second MQTT 5 session for inbound publishes |

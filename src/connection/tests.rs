@@ -1012,6 +1012,7 @@ fn test_channels() -> (
         connected: Arc::default(),
         response_router: Arc::default(),
         stats: Default::default(),
+        refused_subscriptions: watch::channel(Vec::new()).0,
         read_stub_exit_tx,
         read_stub_exit_rx,
         write_stub_exit_tx,
@@ -1201,41 +1202,77 @@ async fn resubscribe_does_not_silently_drop_inbound_publish() {
     let _ = timeout(Duration::from_secs(5), run).await;
 }
 
-/// non-granted auto-resubscribe SUBACK must not look like Connected-and-fine.
-#[tokio::test]
-async fn resubscribe_fails_when_suback_not_granted() {
-    use crate::client::Subscription;
-    use crate::codec::{QoS, SubscribeAckReason};
+/// What the mock broker of the restore tests answers to the n-th SUBSCRIBE of a session.
+#[derive(Clone, Copy)]
+enum SubackPlan {
+    Grant,
+    Refuse,
+    Silent,
+}
+
+/// Mock broker: session 1 grants and then drops the client; every later session answers its
+/// SUBSCRIBEs as `plan(session, nth_subscribe)` says. Returns the port and a log of
+/// (session, filters) per SUBSCRIBE.
+async fn spawn_restore_broker(
+    plan: fn(u32, usize) -> SubackPlan,
+) -> (u16, Arc<std::sync::Mutex<Vec<(u32, Vec<String>)>>>) {
+    use crate::codec::SubscribeAckReason;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     let sessions = Arc::new(AtomicU32::new(0));
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let port = spawn_broker_loop({
-        let sessions = Arc::clone(&sessions);
+        let log = Arc::clone(&log);
         move |mut framed_read, mut framed_write| {
-            let n = sessions.fetch_add(1, Ordering::SeqCst) + 1;
+            let session = sessions.fetch_add(1, Ordering::SeqCst) + 1;
+            let log = Arc::clone(&log);
             async move {
                 if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
                     return;
                 }
+                let mut nth = 0;
                 loop {
                     match framed_read.next().await {
                         Some(Ok((DecodedFrame::Control(Packet::Subscribe(sub)), _))) => {
-                            let reason = if n == 1 {
-                                SubscribeAckReason::GrantedQos1
+                            log.lock().unwrap().push((
+                                session,
+                                sub.topic_filters.iter().map(|(filter, _)| filter.to_string()).collect(),
+                            ));
+                            let answer = if session == 1 {
+                                SubackPlan::Grant
                             } else {
-                                SubscribeAckReason::NotAuthorized
+                                plan(session, nth)
+                            };
+                            nth += 1;
+                            let (status, reason_string) = match answer {
+                                SubackPlan::Grant => (SubscribeAckReason::GrantedQos1, None),
+                                SubackPlan::Refuse => (SubscribeAckReason::NotAuthorized, Some("ACL".into())),
+                                SubackPlan::Silent => continue,
                             };
                             let _ = framed_write
                                 .send(Packet::SubscribeAck(crate::codec::SubscribeAck {
                                     packet_id: sub.packet_id,
                                     properties: Vec::new(),
-                                    reason_string: None,
-                                    status: vec![reason],
+                                    reason_string,
+                                    status: vec![status; sub.topic_filters.len()],
                                 }))
                                 .await;
-                            if n == 1 {
-                                return;
+                            if session == 1 {
+                                return; // drop → reconnect → resubscribe
                             }
+                        }
+                        Some(Ok((DecodedFrame::Control(Packet::Unsubscribe(unsub)), _))) => {
+                            let _ = framed_write
+                                .send(Packet::UnsubscribeAck(crate::codec::UnsubscribeAck {
+                                    packet_id: unsub.packet_id,
+                                    properties: Vec::new(),
+                                    reason_string: None,
+                                    status: vec![
+                                        crate::codec::UnsubscribeAckReason::Success;
+                                        unsub.topic_filters.len()
+                                    ],
+                                }))
+                                .await;
                         }
                         Some(Ok(_)) => {}
                         Some(Err(_)) | None => return,
@@ -1245,9 +1282,26 @@ async fn resubscribe_fails_when_suback_not_granted() {
         }
     })
     .await;
+    (port, log)
+}
+
+/// Connects, subscribes `filter` (granted by session 1, which then drops the client) and
+/// waits for the reconnect.
+async fn connect_and_lose_session(
+    port: u16,
+    filter: &str,
+) -> (
+    crate::MqttClient,
+    tokio::task::JoinHandle<Result<(), ConnectionOutcome>>,
+    watch::Receiver<SessionPhase>,
+) {
+    use crate::client::Subscription;
+    use crate::codec::QoS;
 
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
+    let options = ConnectOptions::new(url)
+        .receive_maximum(NonZeroU16::new(8).expect("nz"))
+        .ack_timeout(Duration::from_millis(500));
     let (tx, _rx) = flume::bounded::<InboundMessage>(4);
     let (client, connection, mut phase) = connect(
         options,
@@ -1257,28 +1311,118 @@ async fn resubscribe_fails_when_suback_not_granted() {
         NoopLifecycle,
     )
     .expect("connect");
-
     let run = tokio::spawn(connection.run());
     await_connected(&mut phase).await;
     client
-        .subscribe(vec![Subscription::new("resub/denied", QoS::AtLeastOnce)])
+        .subscribe(vec![Subscription::new(filter, QoS::AtLeastOnce)])
         .await
         .expect("subscribe");
+    let _ = await_disconnected(&mut phase).await;
+    await_connected(&mut phase).await;
+    (client, run, phase)
+}
 
-    let disconnected = await_disconnected(&mut phase).await;
-    assert!(matches!(disconnected, SessionPhase::Disconnected(_)));
-    // Mark the first Disconnected as seen so the next wait observes the post-resub failure.
-    let _ = phase.borrow_and_update();
+/// A refused auto-resubscribe keeps the connection, lists the filter, and the client asks again
+/// on the same connection until the broker grants it.
+#[tokio::test]
+async fn refused_resubscribe_keeps_the_session_and_is_retried() {
+    use crate::codec::SubscribeAckReason;
 
-    timeout(Duration::from_secs(5), phase.changed())
+    // Session 2: refuse the resubscribe and the first retry, grant the second retry.
+    let (port, log) = spawn_restore_broker(|_, nth| if nth < 2 { SubackPlan::Refuse } else { SubackPlan::Grant }).await;
+    let (client, run, mut phase) = connect_and_lose_session(port, "restore/acl").await;
+
+    let mut refused = client.refused_subscriptions();
+    let listed = timeout(Duration::from_secs(5), refused.wait_for(|list| !list.is_empty()))
         .await
-        .expect("post-resubscribe phase change")
-        .expect("phase watch closed");
-    let next = phase.borrow().clone();
+        .expect("refusal listed")
+        .expect("watch open")
+        .clone();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(&*listed[0].filter, "restore/acl");
+    assert_eq!(listed[0].reason, SubscribeAckReason::NotAuthorized);
+    assert_eq!(listed[0].reason_string.as_deref(), Some("ACL"));
+
+    timeout(Duration::from_secs(5), refused.wait_for(|list| list.is_empty()))
+        .await
+        .expect("granted on a retry")
+        .expect("watch open");
+    let _ = phase.borrow_and_update();
     assert!(
-        matches!(next, SessionPhase::Disconnected(_)),
-        "non-granted auto-resubscribe must error/reconnect — not silent Connected; got {next:?}"
+        matches!(*phase.borrow(), SessionPhase::Connected { generation: 2, .. }),
+        "the refusal must not end the session; got {:?}",
+        *phase.borrow()
     );
+    let subscribes: Vec<_> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(session, _)| *session == 2)
+        .cloned()
+        .collect();
+    assert_eq!(
+        subscribes.len(),
+        3,
+        "resubscribe + two retries on session 2: {subscribes:?}"
+    );
+    assert!(subscribes.iter().all(|(_, filters)| filters == &["restore/acl"]));
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+}
+
+/// A retry the broker does not answer at all ends the connection (ack timeout), and the next
+/// connection subscribes again.
+#[tokio::test]
+async fn unanswered_restore_retry_reconnects() {
+    // Session 2: refuse the resubscribe, never answer the retry. Session 3 grants.
+    let (port, log) = spawn_restore_broker(|session, nth| match (session, nth) {
+        (2, 0) => SubackPlan::Refuse,
+        (2, _) => SubackPlan::Silent,
+        _ => SubackPlan::Grant,
+    })
+    .await;
+    let (client, run, mut phase) = connect_and_lose_session(port, "restore/silent").await;
+
+    let lost = timeout(Duration::from_secs(5), await_disconnected(&mut phase))
+        .await
+        .expect("missing SUBACK must end the session");
+    assert!(
+        matches!(&lost, SessionPhase::Disconnected(ConnectionOutcome::Protocol(_))),
+        "got {lost:?}"
+    );
+    await_connected(&mut phase).await;
+    let mut refused = client.refused_subscriptions();
+    timeout(Duration::from_secs(5), refused.wait_for(|list| list.is_empty()))
+        .await
+        .expect("session 3 grants the resubscribe")
+        .expect("watch open");
+    assert!(log.lock().unwrap().iter().any(|(session, _)| *session == 3));
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+}
+
+/// Unsubscribing a refused filter takes it off the list and stops the retries.
+#[tokio::test]
+async fn unsubscribe_stops_restore_retries() {
+    let (port, log) = spawn_restore_broker(|_, _| SubackPlan::Refuse).await;
+    let (client, run, _phase) = connect_and_lose_session(port, "restore/stop").await;
+
+    let mut refused = client.refused_subscriptions();
+    timeout(Duration::from_secs(5), refused.wait_for(|list| !list.is_empty()))
+        .await
+        .expect("refusal listed")
+        .expect("watch open");
+    client
+        .unsubscribe(vec![bytestring::ByteString::from_static("restore/stop")])
+        .await
+        .expect("unsubscribe");
+    assert!(refused.borrow().is_empty(), "UNSUBACK clears the list");
+
+    let before = log.lock().unwrap().len();
+    tokio::time::sleep(super::subscriptions::restore_retry_delay(8) * 2).await;
+    assert_eq!(log.lock().unwrap().len(), before, "no SUBSCRIBE after the unsubscribe");
 
     client.shutdown().await.expect("shutdown");
     let _ = timeout(Duration::from_secs(5), run).await;

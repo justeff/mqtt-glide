@@ -65,6 +65,8 @@ struct State {
     connects: usize,
     refuse_with: Option<ConnectAckReason>,
     reject_with: Option<PublishAckReason>,
+    /// Topic filters every SUBSCRIBE gets refused, with the reason code to answer.
+    refused_filters: HashMap<String, SubscribeAckReason>,
     shared_cursor: usize,
 }
 
@@ -264,6 +266,18 @@ impl TestBroker {
         lock(&self.shared).reject_with = reason;
     }
 
+    /// Answers every following SUBSCRIBE to exactly `filter` (as the client sends it, with any
+    /// `$share/<group>/` prefix) with `reason` and does not add the subscription, like a broker
+    /// whose ACL denies it (`None`: grant it again). Use a code of 0x80 or above, such as
+    /// [`SubscribeAckReason::NotAuthorized`].
+    pub fn refuse_subscription(&self, filter: &str, reason: Option<SubscribeAckReason>) {
+        let mut state = lock(&self.shared);
+        match reason {
+            Some(reason) => state.refused_filters.insert(filter.to_owned(), reason),
+            None => state.refused_filters.remove(filter),
+        };
+    }
+
     /// Drops every connection without a DISCONNECT, like a broker restart or a network cut.
     /// Nobody is left to receive the dropped clients' Wills; use [`Self::drop_client`] to test
     /// a Will.
@@ -451,6 +465,10 @@ async fn serve(shared: Arc<Shared>, id: u64, stream: TcpStream) {
                 {
                     let mut state = lock(&shared);
                     for (filter, options) in &subscribe.topic_filters {
+                        if let Some(reason) = state.refused_filters.get(&**filter) {
+                            status.push(*reason);
+                            continue;
+                        }
                         let (group, filter) = split_shared(filter);
                         let qos = options.qos.min(QoS::AtLeastOnce);
                         status.push(if qos == QoS::AtMostOnce {

@@ -8,11 +8,13 @@ use std::time::Duration;
 use bytestring::ByteString;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::watch;
 use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
 use super::packet_id::InflightPots;
+use crate::ack::RefusedSubscription;
 use crate::codec::{
     DecodedFrame, Packet, Subscribe, SubscribeAck, SubscribeAckReason, SubscriptionOptions, UnsubscribeAckReason,
     V5Codec, encode_publish_ack,
@@ -22,16 +24,40 @@ use crate::error::{AppError, ConnectionOutcome, ProtocolError, ShutdownError, Tr
 use crate::inbound_sink::InboundSink;
 
 /// Active topic filters + options remembered across reconnects (lives on [`super::Connection`]).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct SubscriptionRegistry {
-    /// Filter → options + the Subscription Identifier it was subscribed with.
-    entries: HashMap<ByteString, (SubscriptionOptions, Option<NonZeroU32>)>,
+    /// Filter → options, the Subscription Identifier it was subscribed with, and whether the
+    /// broker refused to restore it.
+    entries: HashMap<ByteString, Entry>,
+    /// Behind [`crate::MqttClient::refused_subscriptions`]; republished on every change.
+    refused_tx: watch::Sender<Vec<RefusedSubscription>>,
+}
+
+#[derive(Debug)]
+struct Entry {
+    options: SubscriptionOptions,
+    id: Option<NonZeroU32>,
+    /// Last refusal while restoring it; retried until granted or unsubscribed.
+    refused: Option<(SubscribeAckReason, Option<ByteString>)>,
+}
+
+impl Default for SubscriptionRegistry {
+    fn default() -> Self {
+        Self::new(watch::channel(Vec::new()).0)
+    }
 }
 
 /// Filters sharing one Subscription Identifier: re-issued as one SUBSCRIBE.
 pub(crate) type ResubscribeGroup = (Option<NonZeroU32>, Vec<(ByteString, SubscriptionOptions)>);
 
 impl SubscriptionRegistry {
+    pub(crate) fn new(refused_tx: watch::Sender<Vec<RefusedSubscription>>) -> Self {
+        Self {
+            entries: HashMap::new(),
+            refused_tx,
+        }
+    }
+
     /// Registers or replaces filters granted by the broker (no Subscription Identifier).
     #[cfg(test)]
     pub(crate) fn upsert(&mut self, filters: impl IntoIterator<Item = (ByteString, SubscriptionOptions)>) {
@@ -45,8 +71,16 @@ impl SubscriptionRegistry {
         id: Option<NonZeroU32>,
     ) {
         for (filter, options) in filters {
-            self.entries.insert(filter, (options, id));
+            self.entries.insert(
+                filter,
+                Entry {
+                    options,
+                    id,
+                    refused: None,
+                },
+            );
         }
+        self.publish_refused();
     }
 
     /// Removes filters after a successful UNSUBSCRIBE.
@@ -54,6 +88,7 @@ impl SubscriptionRegistry {
         for filter in filters {
             self.entries.remove(&filter);
         }
+        self.publish_refused();
     }
 
     /// Flat snapshot (filter + options), for tests.
@@ -61,22 +96,119 @@ impl SubscriptionRegistry {
     pub(crate) fn snapshot(&self) -> Vec<(ByteString, SubscriptionOptions)> {
         self.entries
             .iter()
-            .map(|(filter, (options, _))| (filter.clone(), *options))
+            .map(|(filter, entry)| (filter.clone(), entry.options))
             .collect()
     }
 
     /// Snapshot grouped by Subscription Identifier (one SUBSCRIBE per identifier, since the
     /// identifier is a property of the whole packet).
     pub(crate) fn snapshot_grouped(&self) -> Vec<ResubscribeGroup> {
+        self.grouped(|_| true)
+    }
+
+    /// Like [`Self::snapshot_grouped`], only the filters the broker refused to restore.
+    pub(crate) fn refused_grouped(&self) -> Vec<ResubscribeGroup> {
+        self.grouped(|entry| entry.refused.is_some())
+    }
+
+    pub(crate) fn has_refused(&self) -> bool {
+        self.entries.values().any(|entry| entry.refused.is_some())
+    }
+
+    fn grouped(&self, keep: impl Fn(&Entry) -> bool) -> Vec<ResubscribeGroup> {
         let mut groups: Vec<ResubscribeGroup> = Vec::new();
-        for (filter, (options, id)) in &self.entries {
-            match groups.iter_mut().find(|(group_id, _)| group_id == id) {
-                Some((_, filters)) => filters.push((filter.clone(), *options)),
-                None => groups.push((*id, vec![(filter.clone(), *options)])),
+        for (filter, entry) in self.entries.iter().filter(|(_, entry)| keep(entry)) {
+            match groups.iter_mut().find(|(group_id, _)| *group_id == entry.id) {
+                Some((_, filters)) => filters.push((filter.clone(), entry.options)),
+                None => groups.push((entry.id, vec![(filter.clone(), entry.options)])),
             }
         }
         groups
     }
+
+    /// Records the broker's answer to restoring `filters`: granted ones are active again,
+    /// refused ones stay registered and are retried.
+    ///
+    /// `retry` (a SUBSCRIBE sent while the application could subscribe and unsubscribe too)
+    /// only touches filters still waiting for a retry: one the application unsubscribed, or
+    /// subscribed again with its own answer, is left as the application made it.
+    pub(crate) fn apply_restore_ack(
+        &mut self,
+        filters: &[(ByteString, SubscriptionOptions)],
+        reasons: &[SubscribeAckReason],
+        reason_string: Option<&ByteString>,
+        retry: bool,
+    ) {
+        for ((filter, _), reason) in filters.iter().zip(reasons) {
+            let Some(entry) = self.entries.get_mut(filter) else {
+                continue;
+            };
+            if retry && entry.refused.is_none() {
+                continue;
+            }
+            if subscribe_reason_granted(*reason) {
+                if entry.refused.take().is_some() {
+                    tracing::info!(filter = %filter, "broker granted the refused subscription");
+                }
+            } else {
+                tracing::warn!(
+                    filter = %filter,
+                    reason = ?reason,
+                    reason_string = reason_string.map(|text| &**text),
+                    "broker refused to restore a subscription; retrying on this connection"
+                );
+                entry.refused = Some((*reason, reason_string.cloned()));
+            }
+        }
+        self.publish_refused();
+    }
+
+    fn publish_refused(&self) {
+        let mut refused: Vec<RefusedSubscription> = self
+            .entries
+            .iter()
+            .filter_map(|(filter, entry)| {
+                let (reason, reason_string) = entry.refused.as_ref()?;
+                Some(RefusedSubscription {
+                    filter: filter.clone(),
+                    reason: *reason,
+                    reason_string: reason_string.clone(),
+                })
+            })
+            .collect();
+        refused.sort_by(|a, b| a.filter.cmp(&b.filter));
+        self.refused_tx.send_if_modified(|current| {
+            let changed = *current != refused;
+            if changed {
+                *current = refused;
+            }
+            changed
+        });
+    }
+}
+
+/// First wait before asking again for refused subscriptions; doubles per attempt.
+const RESTORE_RETRY_FIRST: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(5)
+};
+/// Longest wait between two attempts.
+const RESTORE_RETRY_MAX: Duration = if cfg!(test) {
+    Duration::from_millis(400)
+} else {
+    Duration::from_secs(300)
+};
+
+/// Wait before retry `attempt` (0-based): doubling from [`RESTORE_RETRY_FIRST`] up to
+/// [`RESTORE_RETRY_MAX`], of which a random half, so clients refused at the same moment (a
+/// broker that drops every client of a changed role) do not keep retrying in lockstep.
+pub(crate) fn restore_retry_delay(attempt: u32) -> Duration {
+    let full = RESTORE_RETRY_FIRST
+        .saturating_mul(1 << attempt.min(16))
+        .min(RESTORE_RETRY_MAX);
+    let random = uuid::Uuid::new_v4().as_u64_pair().0 as f64 / u64::MAX as f64;
+    full.mul_f64(0.5 + random / 2.0)
 }
 
 /// Returns whether a SUBACK reason code grants a subscription.
@@ -133,11 +265,15 @@ pub(crate) fn apply_unsubscribe_ack_to_registry(
 /// Re-issues prior SUBSCRIBE filters on a fresh session before read/write tasks start.
 ///
 /// `cancel` must abort the wait. Inbound PUBLISH during the wait is delivered to `handoff`
-/// (enqueue-before-ack PUBACK on the wire for QoS 1). SUBACK reason codes must all be granted (QoS 0/1).
+/// (enqueue-before-ack PUBACK on the wire for QoS 1). A filter the broker refuses stays in
+/// `registry` as refused, and the write task asks for it again; only a SUBACK that does not
+/// answer the request (wrong reason count, none within `deadline`) ends the connection.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resubscribe_pending<H: InboundSink, R, W>(
     framed_read: &mut FramedRead<R, V5Codec>,
     framed_write: &mut FramedWrite<W, V5Codec>,
     inflight: &mut InflightPots,
+    registry: &RwLock<SubscriptionRegistry>,
     groups: Vec<ResubscribeGroup>,
     deadline: Duration,
     cancel: &CancellationToken,
@@ -157,11 +293,11 @@ where
             }
             id => id,
         };
-        resubscribe_group(
+        let ack = resubscribe_group(
             framed_read,
             framed_write,
             inflight,
-            filters,
+            filters.clone(),
             id,
             deadline,
             cancel,
@@ -174,6 +310,12 @@ where
             },
         )
         .await?;
+        registry
+            .write()
+            .map_err(|_| {
+                ConnectionOutcome::Application(AppError::Internal("subscription registry lock poisoned".into()))
+            })?
+            .apply_restore_ack(&filters, &ack.status, ack.reason_string.as_ref(), false);
     }
     Ok(())
 }
@@ -188,15 +330,11 @@ async fn resubscribe_group<H: InboundSink, R, W>(
     deadline: Duration,
     cancel: &CancellationToken,
     inbound: ResubscribeInbound<'_, H>,
-) -> Result<(), ConnectionOutcome>
+) -> Result<SubscribeAck, ConnectionOutcome>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    if filters.is_empty() {
-        return Ok(());
-    }
-
     let packet_id = inflight
         .alloc_subscribe()
         .map_err(|_| ConnectionOutcome::Protocol(ProtocolError::Violation("resubscribe packet id exhausted".into())))?;
@@ -223,7 +361,8 @@ where
             match result {
                 Ok(Ok(ack)) => {
                     inflight.release_subscribe(packet_id);
-                    validate_resubscribe_ack(&ack, filter_count)
+                    validate_resubscribe_ack(&ack, filter_count)?;
+                    Ok(ack)
                 }
                 Ok(Err(outcome)) => {
                     inflight.release_subscribe(packet_id);
@@ -276,21 +415,17 @@ pub(crate) fn session_resume_consistent(clean_start: bool, session_present: bool
     !(clean_start && session_present)
 }
 
-/// Rejects auto-resubscribe when the SUBACK does not grant every filter at QoS 0/1.
+/// Rejects an auto-resubscribe SUBACK that does not answer every filter.
 ///
 /// [MQTT-3.8.4-6]: the SUBACK must carry one reason code per sent filter; an empty or
-/// short status list is a protocol violation, not an implicit success.
+/// short status list is a protocol violation, not an implicit success. A refusal is an
+/// answer: [`SubscriptionRegistry::apply_restore_ack`] keeps the filter for a retry.
 fn validate_resubscribe_ack(ack: &SubscribeAck, expected_filters: usize) -> Result<(), ConnectionOutcome> {
-    if ack.status.len() != expected_filters {
-        return Err(ConnectionOutcome::Protocol(ProtocolError::Violation(
-            "auto-resubscribe SUBACK reason count did not match filters".into(),
-        )));
-    }
-    if ack.status.iter().all(|reason| subscribe_reason_granted(*reason)) {
+    if ack.status.len() == expected_filters {
         Ok(())
     } else {
         Err(ConnectionOutcome::Protocol(ProtocolError::Violation(
-            "auto-resubscribe SUBACK contained non-granted reason".into(),
+            "auto-resubscribe SUBACK reason count did not match filters".into(),
         )))
     }
 }
@@ -419,6 +554,87 @@ mod tests {
         assert_eq!(&*snap[0].0, "ok");
     }
 
+    /// A refused restore keeps the filter (it is retried) and lists it; a later grant clears it.
+    #[test]
+    fn restore_refusal_is_kept_listed_and_cleared_by_a_grant() {
+        let (tx, rx) = watch::channel(Vec::new());
+        let mut registry = SubscriptionRegistry::new(tx);
+        let opts = SubscriptionOptions::default();
+        let filters = [
+            (ByteString::from_static("ok"), opts),
+            (ByteString::from_static("denied"), opts),
+        ];
+        registry.upsert(filters.clone());
+
+        let reason_string = ByteString::from_static("ACL");
+        registry.apply_restore_ack(
+            &filters,
+            &[SubscribeAckReason::GrantedQos0, SubscribeAckReason::NotAuthorized],
+            Some(&reason_string),
+            false,
+        );
+        assert_eq!(registry.snapshot().len(), 2, "a refused filter stays registered");
+        assert_eq!(
+            *rx.borrow(),
+            vec![RefusedSubscription {
+                filter: "denied".into(),
+                reason: SubscribeAckReason::NotAuthorized,
+                reason_string: Some(reason_string),
+            }]
+        );
+        let retry = registry.refused_grouped();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(&*retry[0].1[0].0, "denied", "only the refused filter is retried");
+
+        registry.apply_restore_ack(&filters[1..], &[SubscribeAckReason::GrantedQos0], None, true);
+        assert!(rx.borrow().is_empty());
+        assert!(!registry.has_refused());
+    }
+
+    /// A retry answer must not undo what the application did meanwhile: an unsubscribed
+    /// filter stays gone, a re-subscribed (granted) one stays active.
+    #[test]
+    fn restore_retry_ack_leaves_filters_the_application_changed() {
+        let (tx, rx) = watch::channel(Vec::new());
+        let mut registry = SubscriptionRegistry::new(tx);
+        let opts = SubscriptionOptions::default();
+        let filters = [
+            (ByteString::from_static("gone"), opts),
+            (ByteString::from_static("again"), opts),
+        ];
+        registry.upsert(filters.clone());
+        let refused = [SubscribeAckReason::NotAuthorized, SubscribeAckReason::NotAuthorized];
+        registry.apply_restore_ack(&filters, &refused, None, false);
+        assert_eq!(rx.borrow().len(), 2);
+
+        registry.remove([ByteString::from_static("gone")]);
+        registry.upsert([(ByteString::from_static("again"), opts)]);
+        assert!(
+            rx.borrow().is_empty(),
+            "unsubscribe and a granted subscribe clear the list"
+        );
+
+        registry.apply_restore_ack(&filters, &refused, None, true);
+        assert!(rx.borrow().is_empty(), "the late retry answer changes nothing");
+        assert_eq!(registry.snapshot().len(), 1, "the unsubscribed filter is not re-added");
+    }
+
+    /// Doubling from the first delay up to the cap, each wait between half and all of it.
+    #[test]
+    fn restore_retry_delay_doubles_up_to_the_cap() {
+        for attempt in 0..40 {
+            let full = RESTORE_RETRY_FIRST
+                .saturating_mul(1 << attempt.min(16))
+                .min(RESTORE_RETRY_MAX);
+            let delay = restore_retry_delay(attempt);
+            assert!(
+                delay >= full / 2 && delay <= full,
+                "attempt {attempt}: {delay:?} of {full:?}"
+            );
+        }
+        assert!(restore_retry_delay(40) >= RESTORE_RETRY_MAX / 2);
+    }
+
     /// Connection does not support QoS 2 — GrantedQos2 must not count as granted.
     #[test]
     fn subscribe_reason_granted_rejects_qos2() {
@@ -462,7 +678,7 @@ mod tests {
     #[case::empty_status(vec![], 1, false)]
     #[case::short_status(vec![SubscribeAckReason::GrantedQos0], 2, false)]
     #[case::extra_reasons(vec![SubscribeAckReason::GrantedQos0, SubscribeAckReason::GrantedQos1], 1, false)]
-    #[case::not_authorized(vec![SubscribeAckReason::NotAuthorized], 1, false)]
+    #[case::not_authorized(vec![SubscribeAckReason::NotAuthorized], 1, true)]
     fn resubscribe_ack_validation(
         #[case] status: Vec<SubscribeAckReason>,
         #[case] expected_filters: usize,

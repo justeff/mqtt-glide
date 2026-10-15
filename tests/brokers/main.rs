@@ -29,8 +29,8 @@ use secrecy::SecretString;
 use tokio::time::timeout;
 
 use helpers::{
-    publish_qos0_via_raw_session, publish_qos1_via_raw_session, start_mosquitto, start_mosquitto_on_port,
-    start_mosquitto_reject_connect,
+    dynsec, publish_qos0_via_raw_session, publish_qos1_via_raw_session, start_mosquitto, start_mosquitto_dynsec,
+    start_mosquitto_on_port, start_mosquitto_reject_connect,
 };
 
 /// Reconnect quickly on transport/protocol; stop on auth/shutdown/app.
@@ -777,6 +777,96 @@ async fn mosquitto_handoff_full_keep_alive_no_spurious_reconnect() {
 }
 
 /// AC4: After reconnect, prior subscriptions are active again (message arrives without re-subscribe).
+/// Mosquitto's Dynamic Security drops every client of a role whose ACLs change. When the
+/// change revokes a filter, the client comes back, gets 0x87 for that filter on the
+/// resubscribe, and stays connected with the rest instead of reconnecting over and over;
+/// once the ACL is back, the next restore grants it.
+#[tokio::test]
+async fn mosquitto_revoked_role_acl_keeps_the_client_connected() {
+    let Some((container, port)) = start_mosquitto_dynsec().await else {
+        return;
+    };
+    dynsec(&container, &["createClient", "user", "-p", "pass"]).await;
+    dynsec(&container, &["createRole", "device"]).await;
+    for (acl_type, topic) in [
+        ("subscribeLiteral", "acl/cmd"),
+        ("subscribeLiteral", "acl/other"),
+        ("publishClientSend", "acl/#"),
+    ] {
+        dynsec(&container, &["addRoleACL", "device", acl_type, topic, "allow"]).await;
+    }
+    dynsec(&container, &["addClientRole", "user", "device"]).await;
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
+    let options = ConnectOptions::new(url).client_id(ClientId::try_from("acl-device").expect("client id"));
+    let (tx, rx) = flume::bounded::<InboundMessage>(16);
+    let (client, connection, mut phase) =
+        connect(options, static_credentials(), TransportOnlyReconnect, tx, NoopLifecycle).expect("connect wiring");
+    let run = tokio::spawn(connection.run());
+    wait_for_phase(&mut phase, Duration::from_secs(10), |e| {
+        matches!(e, SessionPhase::Connected { .. })
+    })
+    .await;
+    let granted = client
+        .subscribe([("acl/cmd", QoS::AtLeastOnce), ("acl/other", QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe");
+    assert!(granted.iter().all(|reason| reason.is_granted()), "{granted:?}");
+
+    dynsec(&container, &["removeRoleACL", "device", "subscribeLiteral", "acl/cmd"]).await;
+    let mut refused = client.refused_subscriptions();
+    let listed = timeout(Duration::from_secs(20), refused.wait_for(|list| !list.is_empty()))
+        .await
+        .expect("refusal listed")
+        .expect("watch open")
+        .clone();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(
+        (&*listed[0].filter, listed[0].reason),
+        ("acl/cmd", SubscribeAckReason::NotAuthorized)
+    );
+    let generation = match &*phase.borrow() {
+        SessionPhase::Connected { generation, .. } => *generation,
+        other => panic!("a refusal must not end the session: {other:?}"),
+    };
+    // The rest of the session works: the other subscription receives.
+    client.publish("acl/other", "still").await.expect("publish");
+    let message = timeout(Duration::from_secs(10), rx.recv_async())
+        .await
+        .expect("acl/other delivered")
+        .expect("handoff open");
+    assert_eq!(&*message.payload, b"still");
+    assert!(
+        matches!(&*phase.borrow(), SessionPhase::Connected { generation: now, .. } if *now == generation),
+        "no reconnect loop, got {:?}",
+        *phase.borrow()
+    );
+
+    dynsec(
+        &container,
+        &["addRoleACL", "device", "subscribeLiteral", "acl/cmd", "allow"],
+    )
+    .await;
+    timeout(Duration::from_secs(20), refused.wait_for(|list| list.is_empty()))
+        .await
+        .expect("granted again")
+        .expect("watch open");
+    client.publish("acl/cmd", "back").await.expect("publish");
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let message = rx.recv_async().await.expect("handoff open");
+            if &*message.payload == b"back" {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("acl/cmd delivered again");
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+}
+
 #[tokio::test]
 async fn mosquitto_resubscribes_after_reconnect() {
     let Some((container, port)) = start_mosquitto().await else {
