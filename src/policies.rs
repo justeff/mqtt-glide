@@ -20,13 +20,14 @@
 //!
 //! Call [`StandardReconnectPolicy::mark_live`] when the session is fully ready
 //! (apps often do this after SUBACK confirms subscriptions). The next
-//! [`ConnectionOutcome::Transport`] then returns `Duration::ZERO` once;
-//! subsequent transport failures use the configured reconnect delay.
+//! [`ConnectionOutcome::Transport`] then returns `Duration::ZERO` once, if the session
+//! stayed up for at least the reconnect delay; subsequent transport failures, and a session
+//! that dropped sooner, use the configured reconnect delay.
 //! Protocol outcomes (e.g. broker DISCONNECT) always use the fixed delay.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use crate::client::ReconnectPolicy;
 use crate::error::ConnectionOutcome;
@@ -57,8 +58,14 @@ struct StandardReconnectPolicyInner {
     max_auth_backoff: Duration,
     auth_failure_threshold: u32,
     consecutive_auth_failures: AtomicU32,
-    /// Armed by [`StandardReconnectPolicy::mark_live`]; consumed on the next transport delay.
-    had_live_session: AtomicBool,
+    /// When [`StandardReconnectPolicy::mark_live`] was called; consumed on the next delay.
+    live_since: Mutex<Option<Instant>>,
+}
+
+impl StandardReconnectPolicyInner {
+    fn take_live_since(&self) -> Option<Instant> {
+        self.live_since.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
 }
 
 /// Fixed reconnect delay, one immediate transport retry after a live session, and
@@ -95,7 +102,7 @@ impl StandardReconnectPolicy {
                 max_auth_backoff,
                 auth_failure_threshold,
                 consecutive_auth_failures: AtomicU32::new(0),
-                had_live_session: AtomicBool::new(false),
+                live_since: Mutex::new(None),
             }),
         }
     }
@@ -105,9 +112,20 @@ impl StandardReconnectPolicy {
     /// Resets the consecutive auth-failure streak and arms a single immediate
     /// transport reconnect. Apps often call this after SUBACK success — not on
     /// CONNACK alone — so health / readiness match a fully subscribed session.
+    ///
+    /// The reconnect is immediate only if the session then lasted at least the reconnect
+    /// delay: a broker that drops every connection right after accepting it is not dialled
+    /// in a loop, however often this is called.
     pub fn mark_live(&self) {
         self.inner.consecutive_auth_failures.store(0, Ordering::Relaxed);
-        self.inner.had_live_session.store(true, Ordering::Relaxed);
+        *self.inner.live_since.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+    }
+
+    /// [`Self::mark_live`] for a session that went live `ago`.
+    #[cfg(test)]
+    fn mark_live_ago(&self, ago: Duration) {
+        self.mark_live();
+        *self.inner.live_since.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now() - ago);
     }
 
     /// Returns the current consecutive auth-failure count (for metrics / logging).
@@ -125,7 +143,7 @@ impl StandardReconnectPolicy {
     /// Shares the consecutive-auth streak with CONNECT Auth for degraded-mode
     /// backoff, but **does not** invalidate credentials (CONNECT succeeded).
     pub fn record_subscribe_auth_failure(&self) -> Duration {
-        self.inner.had_live_session.store(false, Ordering::Relaxed);
+        self.inner.take_live_since();
         let failures = self.inner.consecutive_auth_failures.fetch_add(1, Ordering::Relaxed) + 1;
         auth_failure_delay(
             failures,
@@ -141,7 +159,7 @@ impl ReconnectPolicy for StandardReconnectPolicy {
         match outcome {
             ConnectionOutcome::Shutdown(_) | ConnectionOutcome::Application(_) => None,
             ConnectionOutcome::Auth(_) => {
-                self.inner.had_live_session.store(false, Ordering::Relaxed);
+                self.inner.take_live_since();
                 let failures = self.inner.consecutive_auth_failures.fetch_add(1, Ordering::Relaxed) + 1;
                 Some(auth_failure_delay(
                     failures,
@@ -151,15 +169,15 @@ impl ReconnectPolicy for StandardReconnectPolicy {
                 ))
             }
             ConnectionOutcome::Transport(_) => {
-                let immediate = self.inner.had_live_session.swap(false, Ordering::Relaxed);
-                if immediate {
+                let live_since = self.inner.take_live_since();
+                if live_since.is_some_and(|since| since.elapsed() >= self.inner.reconnect_delay) {
                     Some(Duration::ZERO)
                 } else {
                     Some(self.inner.reconnect_delay)
                 }
             }
             ConnectionOutcome::Protocol(_) => {
-                self.inner.had_live_session.store(false, Ordering::Relaxed);
+                self.inner.take_live_since();
                 Some(self.inner.reconnect_delay)
             }
         }
@@ -242,9 +260,20 @@ mod tests {
     #[test]
     fn transport_after_live_is_immediate_once() {
         let p = policy();
-        p.mark_live();
+        p.mark_live_ago(Duration::from_secs(5));
         assert_eq!(p.delay_after(&transport()), Some(Duration::ZERO));
         assert_eq!(p.delay_after(&transport()), Some(Duration::from_secs(5)));
+    }
+
+    /// A broker that drops every session right after it went live gets the reconnect delay,
+    /// however often the application marks the session live.
+    #[test]
+    fn transport_soon_after_live_uses_reconnect_delay() {
+        let p = policy();
+        for _ in 0..3 {
+            p.mark_live_ago(Duration::from_secs(4));
+            assert_eq!(p.delay_after(&transport()), Some(Duration::from_secs(5)));
+        }
     }
 
     #[test]
@@ -312,7 +341,7 @@ mod tests {
         assert_eq!(clone.consecutive_auth_failures(), DEFAULT_AUTH_FAILURE_THRESHOLD);
         assert_eq!(clone.delay_after(&auth()), Some(Duration::from_secs(90)));
 
-        p.mark_live();
+        p.mark_live_ago(Duration::from_secs(3));
         assert_eq!(clone.consecutive_auth_failures(), 0);
         assert_eq!(clone.delay_after(&transport()), Some(Duration::ZERO));
     }
