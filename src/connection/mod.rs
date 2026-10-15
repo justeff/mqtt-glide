@@ -285,12 +285,20 @@ impl<H: InboundSink> Connection<H> {
     /// **await** the returned future — it is not fire-and-forget.
     ///
     /// Reconnects on transport/protocol loss per [`ReconnectPolicy`]; auth and shutdown stop.
+    ///
+    /// Returns `Ok(())` once [`crate::MqttClient::shutdown`] stopped it, whatever the
+    /// connection was doing at the time (connected, connecting or waiting to reconnect).
+    ///
+    /// # Errors
+    ///
+    /// The outcome that made the driver stop on its own: the broker refused the credentials,
+    /// or the [`ReconnectPolicy`] gave up after a transport or protocol failure.
     pub async fn run(mut self) -> Result<(), ConnectionOutcome> {
         loop {
             if self.cancel.is_cancelled() {
                 self.state = ConnectionState::Stopped;
                 self.fail_carried();
-                return Err(ConnectionOutcome::Shutdown(ShutdownError::Cancelled));
+                return Ok(());
             }
 
             // First session uses channels from `connect()`; reconnect sessions already
@@ -723,7 +731,7 @@ impl<H: InboundSink> Connection<H> {
         self.state = ConnectionState::Backoff;
         if self.cancel.is_cancelled() {
             self.state = ConnectionState::Stopped;
-            return SessionDisposition::Stop(Err(ConnectionOutcome::Shutdown(ShutdownError::Cancelled)));
+            return SessionDisposition::Stop(Ok(()));
         }
         if delay.is_zero() {
             return SessionDisposition::Retry;
@@ -733,16 +741,15 @@ impl<H: InboundSink> Connection<H> {
             () = tokio::time::sleep(delay) => SessionDisposition::Retry,
             () = self.cancel.cancelled() => {
                 self.state = ConnectionState::Stopped;
-                SessionDisposition::Stop(Err(ConnectionOutcome::Shutdown(ShutdownError::Cancelled)))
+                SessionDisposition::Stop(Ok(()))
             }
         }
     }
 
+    /// A shutdown (requested, or cancelled before it could drain) ends the driver as asked.
     fn map_final_result(outcome: ConnectionOutcome) -> Result<(), ConnectionOutcome> {
         match &outcome {
-            ConnectionOutcome::Shutdown(ShutdownError::Requested) => Err(outcome),
-            ConnectionOutcome::Application(AppError::CommandChannelClosed) => Ok(()),
-            ConnectionOutcome::Shutdown(ShutdownError::Cancelled) => Ok(()),
+            ConnectionOutcome::Shutdown(_) | ConnectionOutcome::Application(AppError::CommandChannelClosed) => Ok(()),
             _ => Err(outcome),
         }
     }

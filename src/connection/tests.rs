@@ -68,10 +68,65 @@ async fn run_returns_observable_result_on_shutdown() {
     await_connected(&mut phase).await;
     client.shutdown().await.expect("shutdown not backpressured");
     let result = run.await.expect("join run task");
-    assert!(
-        matches!(result, Err(ConnectionOutcome::Shutdown(ShutdownError::Requested))),
-        "expected Shutdown(Requested) after active-session shutdown, got {result:?}"
-    );
+    assert!(result.is_ok(), "shutdown of an active session: {result:?}");
+}
+
+/// Waits a minute before every reconnect, so a test can shut down during the backoff.
+struct SlowReconnect;
+
+impl ReconnectPolicy for SlowReconnect {
+    fn delay_after(&self, _outcome: &ConnectionOutcome) -> Option<Duration> {
+        Some(Duration::from_secs(60))
+    }
+}
+
+/// `shutdown()` ends `run()` with `Ok(())` in every phase, not only with a session up: before
+/// the first dial, while the broker has not answered CONNECT, and while waiting to reconnect.
+#[tokio::test]
+async fn run_returns_ok_after_shutdown_in_every_phase() {
+    async fn run_until_shutdown(port: u16, before_shutdown: impl std::future::Future<Output = ()>, early: bool) {
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+        let (client, connection, _phase) = connect(
+            ConnectOptions::new(url),
+            static_test_credentials(),
+            SlowReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect wiring");
+        if early {
+            client.shutdown().await.expect("shutdown");
+        }
+        let run = tokio::spawn(connection.run());
+        before_shutdown.await;
+        client.shutdown().await.expect("shutdown");
+        let result = timeout(Duration::from_secs(5), run)
+            .await
+            .expect("driver stops")
+            .expect("join");
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    // Before the first dial.
+    run_until_shutdown(1, async {}, true).await;
+
+    // CONNECT sent, CONNACK never comes.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = silent.local_addr().expect("addr").port();
+    let held = tokio::spawn(async move {
+        let (stream, _) = silent.accept().await.expect("accept");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        drop(stream);
+    });
+    run_until_shutdown(port, tokio::time::sleep(Duration::from_millis(100)), false).await;
+    held.abort();
+
+    // Refused dial, then the one-minute backoff.
+    let refused = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = refused.local_addr().expect("addr").port();
+    drop(refused);
+    run_until_shutdown(port, tokio::time::sleep(Duration::from_millis(100)), false).await;
 }
 
 /// Only a redirect that ends a long session starts a new streak: a redirecting CONNACK still
