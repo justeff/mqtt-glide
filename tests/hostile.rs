@@ -25,9 +25,9 @@ use std::time::{Duration, Instant};
 
 use mqtt_glide::testing::{FaultProxy, TestBroker};
 use mqtt_glide::{
-    AppError, BrokerUrl, ClientId, ConnectOptions, Connection, ConnectionOutcome, InboundMessage, InboundSink,
-    MqttClient, NoopLifecycle, OnInboundSink, Publish, QoS, ReconnectPolicy, SessionPhase, StandardReconnectPolicy,
-    StaticCredentials, connect,
+    AppError, BrokerUrl, ClientId, ConnectOptions, Connection, ConnectionOutcome, HttpProxy, InboundMessage,
+    InboundSink, MqttClient, NoopLifecycle, OnInboundSink, Publish, QoS, ReconnectPolicy, SessionPhase,
+    StandardReconnectPolicy, StaticCredentials, connect,
 };
 use rstest::rstest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1173,6 +1173,368 @@ async fn mark_live_after_every_connect_does_not_busy_loop() {
         (2..=40).contains(&n),
         "mark_live defeats the reconnect delay: {n} connects in 3 s with a 300 ms delay"
     );
+    assert_no_library_panic();
+}
+
+// ---- Fragmented input, stale aliases, floods, silent brokers, hostile proxies ----
+
+/// Where a packet is cut into separately written, separately flushed pieces.
+#[derive(Debug, Clone, Copy)]
+enum Cut {
+    /// One byte per write.
+    EveryByte,
+    /// After the packet type byte and after the first Remaining Length byte (inside the varint of
+    /// a packet longer than 127 bytes).
+    InFixedHeader,
+    /// In the middle of the packet, inside its properties or payload.
+    MidPacket,
+    /// Everything but the last byte first.
+    BeforeLastByte,
+}
+
+impl Cut {
+    fn offsets(self, len: usize) -> Vec<usize> {
+        let mut at = match self {
+            Cut::EveryByte => (1..len).collect(),
+            Cut::InFixedHeader => vec![1, 2],
+            Cut::MidPacket => vec![len / 2],
+            Cut::BeforeLastByte => vec![len - 1],
+        };
+        at.retain(|&i| i > 0 && i < len);
+        at
+    }
+}
+
+impl Peer {
+    /// Writes `bytes` in pieces cut as `cut` says, each flushed on its own with a short pause, so
+    /// the client reads them one by one.
+    async fn send_cut(&mut self, bytes: &[u8], cut: Cut) {
+        let _ = self.stream.set_nodelay(true);
+        let mut from = 0;
+        for at in cut.offsets(bytes.len()).into_iter().chain([bytes.len()]) {
+            self.send(&bytes[from..at]).await;
+            from = at;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+}
+
+/// CONNACK, SUBACK and a QoS 1 PUBLISH whose Remaining Length is a two-byte varint arrive cut
+/// into pieces, also inside a varint or a property: the decoder waits for the rest and delivers
+/// the packet intact (and the PUBLISH is acknowledged exactly once).
+#[rstest]
+#[case::byte_by_byte(Cut::EveryByte)]
+#[case::inside_fixed_header(Cut::InFixedHeader)]
+#[case::mid_packet(Cut::MidPacket)]
+#[case::before_last_byte(Cut::BeforeLastByte)]
+#[tokio::test]
+async fn fragmented_packets_are_decoded(#[case] cut: Cut) {
+    const PID: u16 = 77;
+    let payload: Vec<u8> = (0..200u8).collect();
+    let expected = payload.clone();
+    let (port, broker) = evil(move |l| async move {
+        let mut p = l.accept().await;
+        p.expect_connect().await;
+        let welcome = connack(&[
+            prop::u16(0x21, 10),
+            [&[0x1F][..], &utf8("welcome")].concat(),
+            [&[0x26][..], &utf8("k"), &utf8("v")].concat(),
+        ]);
+        p.send_cut(&welcome, cut).await;
+        let (pid, _) = p.expect_request(8).await;
+        p.send_cut(&suback(pid, &[1]), cut).await;
+        let message = publish(
+            "frag/topic",
+            1,
+            PID,
+            &[
+                [&[0x03][..], &utf8("text/plain")].concat(),
+                [&[0x26][..], &utf8("name"), &utf8("value")].concat(),
+            ],
+            &payload,
+        );
+        p.send_cut(&message, cut).await;
+        let mut pubacks = 0;
+        while let Some(r) = p.next_skip_ping().await {
+            if r.kind() == 4 && r.body.starts_with(&PID.to_be_bytes()) {
+                pubacks += 1;
+                break;
+            }
+        }
+        (pubacks, p)
+    })
+    .await;
+    let mut h = Harness::plain(port);
+    h.connected().await;
+    within(10, h.client.subscribe([("frag/#", QoS::AtLeastOnce)]))
+        .await
+        .expect("subscribe over a fragmented SUBACK");
+    let message = within(10, h.rx.recv()).await.expect("delivery");
+    assert_eq!(&*message.topic, "frag/topic");
+    assert_eq!(&*message.payload, &expected[..]);
+    assert_eq!(message.qos, QoS::AtLeastOnce);
+    assert_eq!(message.properties.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(message.properties.user_properties.len(), 1);
+    let (pubacks, _peer) = within(15, broker).await.expect("broker task");
+    assert_eq!(pubacks, 1);
+    assert!(h.client.is_connected(), "the session was ended by fragmented input");
+    h.close().await;
+}
+
+/// Topic Alias bindings belong to one Network Connection ([MQTT-3.3.2-7]). The broker binds an
+/// alias on the first connection and uses it, without binding it again, on the second: the client
+/// answers DISCONNECT 0x94, does not acknowledge that PUBLISH and delivers nothing for the stale
+/// alias (the message of the first connection was delivered).
+#[tokio::test]
+async fn stale_topic_alias_after_reconnect_is_not_delivered() {
+    let (port, broker) = evil(|l| async move {
+        let mut p = l.accept().await;
+        p.handshake(&[]).await;
+        p.send(&publish("alias/stale", 1, 7, &[prop::u16(0x23, 1)], b"bound"))
+            .await;
+        while let Some(r) = p.next_skip_ping().await {
+            if r.kind() == 4 {
+                break;
+            }
+        }
+        drop(p);
+        let mut p = l.accept().await;
+        p.handshake(&[]).await;
+        p.send(&publish("", 1, 8, &[prop::u16(0x23, 1)], b"stale")).await;
+        let mut acked_stale = false;
+        let reason = timeout(Duration::from_secs(10), async {
+            while let Some(r) = p.next_skip_ping().await {
+                match r.kind() {
+                    4 => acked_stale = true,
+                    14 => return Some(r.body.first().copied().unwrap_or(0)),
+                    _ => {}
+                }
+            }
+            None
+        })
+        .await;
+        (reason.ok().flatten(), acked_stale, p)
+    })
+    .await;
+    let mut h = Harness::start(attack_options(port), Reconnect::every(Duration::from_millis(50)), 16);
+    let (reason, acked_stale, _peer) = within(30, broker).await.expect("broker task");
+    assert_eq!(reason, Some(0x94));
+    assert!(!acked_stale, "a PUBLISH with an unbound alias was acknowledged");
+    let delivered: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok()).collect();
+    assert_eq!(delivered.len(), 1, "delivered: {delivered:?}");
+    assert_eq!(&*delivered[0].topic, "alias/stale");
+    assert_eq!(&*delivered[0].payload, b"bound");
+    h.close().await;
+}
+
+/// A broker that sends far more unacknowledged QoS 1 PUBLISHes than the client's Receive Maximum
+/// (a broker obligation, spec 4.9) is not answered with 0x93: the client does not police
+/// its inbound window. It keeps the session, reads strictly in order, hands every message to the
+/// application and acknowledges each one after the handoff.
+#[tokio::test]
+async fn qos1_flood_beyond_receive_maximum_is_delivered_and_acknowledged_in_order() {
+    const N: u16 = 200;
+    let (port, broker) = evil(|l| async move {
+        let mut p = l.accept().await;
+        p.handshake(&[]).await;
+        let burst: Vec<u8> = (1..=N)
+            .flat_map(|pid| publish("flood", 1, pid, &[], &pid.to_be_bytes()))
+            .collect();
+        p.send(&burst).await;
+        let mut acked = Vec::new();
+        let mut disconnect = None;
+        while let Some(r) = p.next_skip_ping().await {
+            match r.kind() {
+                4 => acked.push(u16::from_be_bytes([r.body[0], r.body[1]])),
+                14 => {
+                    disconnect = r.body.first().copied();
+                    break;
+                }
+                _ => {}
+            }
+            if acked.len() == usize::from(N) {
+                break;
+            }
+        }
+        (acked, disconnect, p)
+    })
+    .await;
+    let mut h = Harness::start(
+        base_options(port).receive_maximum(std::num::NonZeroU16::new(2).unwrap()),
+        Reconnect::never(),
+        4,
+    );
+    let mut payloads = Vec::new();
+    while payloads.len() < usize::from(N) {
+        let message = within(20, h.rx.recv()).await.expect("delivery");
+        payloads.push(u16::from_be_bytes([message.payload[0], message.payload[1]]));
+    }
+    let (acked, disconnect, _peer) = within(20, broker).await.expect("broker task");
+    let expected: Vec<u16> = (1..=N).collect();
+    assert_eq!(disconnect, None, "the client ended the session");
+    assert_eq!(payloads, expected);
+    assert_eq!(acked, expected);
+    assert!(h.client.is_connected());
+    h.close().await;
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Silent {
+    /// One small QoS 1 PUBLISH stays unacknowledged.
+    UnackedPublish,
+    /// The broker never reads again and the client's send buffer is full of queued PUBLISHes.
+    SendBufferFull,
+}
+
+/// Connects to a broker that acknowledged CONNECT and then went silent (never reads or answers
+/// again), queues `silent`'s publishes, shuts down with a 300 ms graceful disconnect timeout and
+/// returns the driver's result, how long it took and the outcome of every publish.
+async fn shutdown_towards_silent_broker(
+    silent: Silent,
+) -> (Result<(), ConnectionOutcome>, Duration, Vec<Result<(), AppError>>) {
+    let (port, broker) = evil(|l| async move {
+        let mut p = l.accept().await;
+        p.handshake(&[]).await;
+        std::future::pending::<()>().await; // never read again, hold the socket open
+        drop(p);
+    })
+    .await;
+    let mut h = Harness::start(
+        base_options(port).graceful_disconnect_timeout(Duration::from_millis(300)),
+        Reconnect::never(),
+        16,
+    );
+    h.connected().await;
+    let (count, size) = match silent {
+        Silent::UnackedPublish => (1, 16),
+        Silent::SendBufferFull => (32, 1024 * 1024),
+    };
+    let mut completions = Vec::new();
+    for _ in 0..count {
+        let publish = Publish::new("silent", vec![1u8; size]).qos(QoS::AtLeastOnce);
+        completions.push(
+            within(10, h.client.start_publish(publish))
+                .await
+                .expect("start_publish"),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = Instant::now();
+    within(10, h.client.shutdown()).await.expect("shutdown");
+    let result = h.finish(10).await;
+    let elapsed = started.elapsed();
+    let mut outcomes = Vec::new();
+    for c in completions {
+        outcomes.push(within(10, c.wait()).await);
+    }
+    broker.abort();
+    assert_no_library_panic();
+    (result, elapsed, outcomes)
+}
+
+/// A broker that acknowledged CONNECT and then stops answering (and, in one case, stops reading)
+/// cannot hold `shutdown()` back: the driver ends with `Ok(())` within the graceful disconnect
+/// timeout (300 ms here, bound 3 s) and every unfinished publish fails.
+#[rstest]
+#[case::unacknowledged_publish(Silent::UnackedPublish)]
+#[case::send_buffer_full(Silent::SendBufferFull)]
+#[tokio::test]
+async fn shutdown_ends_when_the_broker_goes_silent(#[case] silent: Silent) {
+    let (result, elapsed, outcomes) = shutdown_towards_silent_broker(silent).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(elapsed < Duration::from_secs(3), "shutdown took {elapsed:?}");
+    assert!(outcomes.iter().all(Result::is_err), "{outcomes:?}");
+}
+
+/// Whatever is still unacknowledged when the shutdown budget runs out fails with
+/// `ConnectionLost`, as `MqttClient::shutdown` documents: also the publishes that never left the
+/// command channel (most of them here), not only those already written.
+#[tokio::test]
+async fn queued_publishes_fail_with_connection_lost_on_shutdown() {
+    let (_, _, outcomes) = shutdown_towards_silent_broker(Silent::SendBufferFull).await;
+    assert!(
+        outcomes.iter().all(|o| matches!(o, Err(AppError::ConnectionLost))),
+        "{outcomes:?}"
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Proxy {
+    /// Answers the CONNECT request with bytes that are no HTTP.
+    Garbage,
+    /// Closes the connection in the middle of the response head.
+    ClosesMidHead,
+    /// Sends half a response head and nothing more.
+    StallsMidHead,
+    /// A response head that never ends.
+    EndlessHead,
+    /// 200, then closes the tunnel before the broker says anything.
+    TunnelThenClose,
+    /// 200, then bytes that are no MQTT.
+    TunnelThenJunk,
+}
+
+/// An HTTP proxy that breaks its side of the CONNECT exchange ends the connection attempt with an
+/// error (a transport error for everything the proxy does wrong while setting up the tunnel) and
+/// never hangs it: the connect timeout is two seconds, the bound ten.
+#[rstest]
+#[case::garbage(Proxy::Garbage, true)]
+#[case::closes_mid_head(Proxy::ClosesMidHead, true)]
+#[case::stalls_mid_head(Proxy::StallsMidHead, true)]
+#[case::endless_head(Proxy::EndlessHead, true)]
+#[case::tunnel_then_close(Proxy::TunnelThenClose, true)]
+#[case::tunnel_then_junk(Proxy::TunnelThenJunk, false)]
+#[tokio::test]
+async fn hostile_http_proxy_ends_the_attempt_with_an_error(#[case] proxy: Proxy, #[case] transport: bool) {
+    let (proxy_port, script) = evil(move |l| async move {
+        let mut p = l.accept().await;
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0u8];
+            if p.stream.read_exact(&mut byte).await.is_err() {
+                return;
+            }
+            head.push(byte[0]);
+        }
+        match proxy {
+            Proxy::Garbage => p.send(b"\x00\x01SSH-2.0-not-a-proxy\r\n\r\n").await,
+            Proxy::ClosesMidHead => {
+                p.send(b"HTTP/1.1 200 Conn").await;
+                return;
+            }
+            Proxy::StallsMidHead => p.send(b"HTTP/1.1 200 Conn").await,
+            Proxy::EndlessHead => {
+                p.send(b"HTTP/1.1 200 OK\r\nX-Pad: ").await;
+                for _ in 0..64 {
+                    p.send(&[b'a'; 1024]).await;
+                }
+            }
+            Proxy::TunnelThenClose => {
+                p.send(b"HTTP/1.1 200 Connection established\r\n\r\n").await;
+                return;
+            }
+            Proxy::TunnelThenJunk => {
+                p.send(b"HTTP/1.1 200 Connection established\r\n\r\n\xFF\xFF\xFF\xFF\xFF")
+                    .await
+            }
+        }
+        // Held open until the client hangs up.
+        let mut sink = [0u8; 256];
+        while matches!(p.stream.read(&mut sink).await, Ok(n) if n > 0) {}
+    })
+    .await;
+    let options = ConnectOptions::new(BrokerUrl::parse("mqtt://127.0.0.1:1").expect("url"))
+        .client_id(ClientId::try_new("hostile").expect("id"))
+        .connect_timeout(Duration::from_secs(2))
+        .http_proxy(HttpProxy::new("127.0.0.1", proxy_port));
+    let mut h = Harness::start(options, Reconnect::never(), 16);
+    let result = h.finish(10).await;
+    let err = result.expect_err("the attempt must fail");
+    assert!(!is_task_join(&err), "driver task failed (panic?): {err:?}");
+    if transport {
+        assert!(matches!(err, ConnectionOutcome::Transport(_)), "{err:?}");
+    }
+    script.abort();
     assert_no_library_panic();
 }
 
