@@ -403,6 +403,17 @@ where
     // to free slots ([MQTT-4.9.0-2]) and is resent then, still before anything new.
     carried.sort_by_key(|entry| entry.seq);
     for entry in carried {
+        // A broker that lowered its Maximum QoS or withdrew Retain since must not get the
+        // publish again ([MQTT-3.2.2-11], [MQTT-3.2.2-14]); it fails like a new one would.
+        if let Err(error) = validate_publish_against_broker_limits(
+            QoS::AtLeastOnce,
+            entry.retain,
+            limits.max_qos,
+            limits.retain_available,
+        ) {
+            let _ = entry.reply.send(Err(error));
+            continue;
+        }
         if inflight.has_publish_capacity() && publish_waiters.resend_parked.is_empty() {
             resend_unacked(framed, inflight, publish_waiters, entry)?;
         } else {

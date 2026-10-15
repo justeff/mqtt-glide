@@ -2581,6 +2581,78 @@ mod tests {
         let _ = run.await;
     }
 
+    /// [MQTT-3.2.2-11], [MQTT-3.2.2-14]: a broker that resumes the session with a lower Maximum
+    /// QoS, or without Retain, does not get the unacknowledged publish again; it fails like a
+    /// new one would.
+    #[rstest]
+    #[case::maximum_qos_0(false)]
+    #[case::retain_unavailable(true)]
+    #[tokio::test]
+    async fn unacked_qos1_the_resumed_session_no_longer_allows_fails(#[case] retain: bool) {
+        let seen: SeenPublishes = Arc::default();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port = crate::connection::test_support::spawn_broker_loop({
+            let seen = Arc::clone(&seen);
+            move |mut framed_read, mut framed_write| {
+                let seen = Arc::clone(&seen);
+                let connections = Arc::clone(&connections);
+                async move {
+                    let index = connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut ack = ConnectAck::default();
+                    if index > 0 {
+                        ack.session_present = true;
+                        if retain {
+                            ack.retain_available = false;
+                        } else {
+                            ack.max_qos = QoS::AtMostOnce;
+                        }
+                    }
+                    if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
+                        return;
+                    }
+                    while let Some(Ok(frame)) = framed_read.next().await {
+                        let (DecodedFrame::Publish(packet), _) = frame else {
+                            continue;
+                        };
+                        let id = packet.meta.packet_id.expect("QoS 1 packet id");
+                        seen.lock()
+                            .await
+                            .push((index, id, packet.meta.dup, packet.message.payload.clone()));
+                        if index == 0 {
+                            return; // drop the connection with the PUBACK outstanding
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+        let (client, connection, mut phase) = connect(
+            resumable_options(port),
+            static_test_credentials(),
+            ImmediateReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+
+        let error = timeout(
+            Duration::from_secs(3),
+            client.publish("t/resume", "a").qos(QoS::AtLeastOnce).retain(retain),
+        )
+        .await
+        .expect("completion resolves on the resumed session")
+        .expect_err("the resumed session does not allow it");
+        assert!(matches!(error, AppError::InvalidRequest(_)), "{error:?}");
+        let frames = seen.lock().await.clone();
+        assert_eq!(frames.len(), 1, "sent once, not again: {frames:?}");
+
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
+
     /// The resumed connection allows fewer publishes in flight than are unacknowledged: all of
     /// them are still resent ([MQTT-4.4.0-1]) with DUP and their original ids, but never more
     /// at once than the new Receive Maximum ([MQTT-4.9.0-2]); the next goes out after a PUBACK.
