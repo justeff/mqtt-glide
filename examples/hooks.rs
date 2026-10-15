@@ -13,10 +13,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use mqtt_glide::Password;
 use mqtt_glide::{
     AuthError, ClientBuilder, CredentialsProvider, LifecycleHook, QoS, SessionPhase, StandardReconnectPolicy,
 };
-use secrecy::SecretString;
 use tokio::sync::{Mutex, mpsc};
 
 /// Example token cache. Real apps fetch/refresh OAuth (or similar) here.
@@ -25,9 +25,9 @@ struct TokenProvider {
 }
 
 impl CredentialsProvider for TokenProvider {
-    async fn credentials(&self) -> Result<(String, SecretString), AuthError> {
+    async fn credentials(&self) -> Result<(String, Password), AuthError> {
         let token = self.token.lock().await.clone();
-        Ok(("oauth2_client".into(), SecretString::from(token)))
+        Ok(("oauth2_client".into(), Password::from(token)))
     }
 
     async fn invalidate(&self) {

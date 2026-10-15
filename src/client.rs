@@ -18,9 +18,9 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use bytestring::ByteString;
-use secrecy::SecretString;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
+use zeroize::Zeroizing;
 
 use crate::codec::{QoS, RetainHandling, SubscriptionOptions};
 use crate::connection::{
@@ -88,6 +88,60 @@ impl<S: Into<ByteString>> From<(S, QoS)> for Subscription {
     }
 }
 
+/// A password, for CONNECT or an HTTP proxy.
+///
+/// Opaque bytes: the MQTT Password is Binary Data (§3.1.3.5), so it need not be UTF-8.
+/// Each copy wipes its bytes from memory when dropped, and [`Debug`] never prints them.
+/// An empty password is not sent.
+#[derive(Clone)]
+pub struct Password(Zeroizing<Vec<u8>>);
+
+impl Password {
+    /// Wraps `bytes` (a `String`, `&str`, `Vec<u8>` or `&[u8]`).
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        Self(Zeroizing::new(bytes.into()))
+    }
+
+    /// Whether the password is empty (and so left out of CONNECT).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Password {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Password([REDACTED])")
+    }
+}
+
+impl From<String> for Password {
+    fn from(password: String) -> Self {
+        Self::new(password)
+    }
+}
+
+impl From<&str> for Password {
+    fn from(password: &str) -> Self {
+        Self::new(password)
+    }
+}
+
+impl From<Vec<u8>> for Password {
+    fn from(password: Vec<u8>) -> Self {
+        Self::new(password)
+    }
+}
+
+impl From<&[u8]> for Password {
+    fn from(password: &[u8]) -> Self {
+        Self::new(password)
+    }
+}
+
 /// Supplies MQTT username and password for CONNECT.
 ///
 /// Implementations must be [`Send`] + [`Sync`] so the driver can share them across tasks.
@@ -98,7 +152,7 @@ impl<S: Into<ByteString>> From<(S, QoS)> for Subscription {
 /// are `Send` and can be erased for storage in [`Connection`].
 pub trait CredentialsProvider: Send + Sync {
     /// Returns credentials for the next CONNECT attempt.
-    fn credentials(&self) -> impl Future<Output = Result<(String, SecretString), AuthError>> + Send;
+    fn credentials(&self) -> impl Future<Output = Result<(String, Password), AuthError>> + Send;
 
     /// Invalidates cached credentials after a broker auth rejection.
     ///
@@ -117,12 +171,12 @@ pub trait CredentialsProvider: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct StaticCredentials {
     username: String,
-    password: SecretString,
+    password: Password,
 }
 
 impl StaticCredentials {
     /// Builds a provider that always returns the same `username` and `password`.
-    pub fn new(username: impl Into<String>, password: impl Into<SecretString>) -> Self {
+    pub fn new(username: impl Into<String>, password: impl Into<Password>) -> Self {
         Self {
             username: username.into(),
             password: password.into(),
@@ -131,7 +185,7 @@ impl StaticCredentials {
 }
 
 impl CredentialsProvider for StaticCredentials {
-    async fn credentials(&self) -> Result<(String, SecretString), AuthError> {
+    async fn credentials(&self) -> Result<(String, Password), AuthError> {
         Ok((self.username.clone(), self.password.clone()))
     }
 }
@@ -144,8 +198,8 @@ impl CredentialsProvider for StaticCredentials {
 pub struct AnonymousCredentials;
 
 impl CredentialsProvider for AnonymousCredentials {
-    async fn credentials(&self) -> Result<(String, SecretString), AuthError> {
-        Ok((String::new(), SecretString::from(String::new())))
+    async fn credentials(&self) -> Result<(String, Password), AuthError> {
+        Ok((String::new(), Password::new(Vec::new())))
     }
 }
 
@@ -189,7 +243,7 @@ impl std::fmt::Debug for SharedCredentials {
     }
 }
 
-type CredentialFuture<'a> = Pin<Box<dyn Future<Output = Result<(String, SecretString), AuthError>> + Send + 'a>>;
+type CredentialFuture<'a> = Pin<Box<dyn Future<Output = Result<(String, Password), AuthError>> + Send + 'a>>;
 type InvalidateFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 trait CredentialsErased: Send + Sync {
@@ -218,7 +272,7 @@ impl SharedCredentials {
     }
 
     /// Fetches credentials for the next CONNECT.
-    pub(crate) async fn credentials(&self) -> Result<(String, SecretString), AuthError> {
+    pub(crate) async fn credentials(&self) -> Result<(String, Password), AuthError> {
         self.0.credentials().await
     }
 
@@ -1000,6 +1054,18 @@ mod tests {
     use crate::connection::{COMMAND_CHANNEL_CAPACITY, ControlMessage, Generation, NoopLifecycle};
     use crate::options::ConnectOptions;
     use crate::util::BrokerUrl;
+
+    /// A password keeps its bytes but never shows them, also not through the credentials holding it.
+    #[test]
+    fn password_is_redacted_in_debug_output() {
+        let password = Password::from("hunter2");
+        assert_eq!(password.expose(), b"hunter2");
+        assert!(!password.is_empty());
+        assert!(Password::from("").is_empty());
+        assert_eq!(format!("{password:?}"), "Password([REDACTED])");
+        let credentials = StaticCredentials::new("user", password);
+        assert!(!format!("{credentials:?}").contains("hunter2"));
+    }
 
     /// `(filter, qos)` converts to [`Subscription`] for ergonomic [`MqttClient::subscribe`].
     #[test]

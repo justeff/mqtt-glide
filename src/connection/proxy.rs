@@ -1,6 +1,5 @@
 //! `CONNECT` tunnel through an HTTP proxy (RFC 9110 §9.3.6).
 
-use secrecy::ExposeSecret;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::TransportError;
@@ -22,7 +21,8 @@ where
     };
     let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
     if let Some((user, password)) = proxy.credentials() {
-        let token = base64(format!("{user}:{}", password.expose_secret()).as_bytes());
+        let user_pass = [user.as_bytes(), b":", password.expose()].concat();
+        let token = base64(&user_pass);
         request.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
     }
     request.push_str("\r\n");

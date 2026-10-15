@@ -20,12 +20,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::{CountingInvalidate, NoReconnect, static_credentials, wait_for_phase};
+use mqtt_glide::Password;
 use mqtt_glide::{
     AuthError, BrokerUrl, ClientId, ConnectOptions, ConnectionOutcome, CredentialsProvider, InboundMessage,
     NoopLifecycle, Publish, QoS, ReconnectPolicy, SessionParams, SessionPhase, SubscribeAckReason, Subscription,
     connect, shared_filter,
 };
-use secrecy::SecretString;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -92,9 +92,9 @@ struct CountingCredentials {
 }
 
 impl CredentialsProvider for CountingCredentials {
-    async fn credentials(&self) -> Result<(String, SecretString), AuthError> {
+    async fn credentials(&self) -> Result<(String, Password), AuthError> {
         self.fetches.fetch_add(1, Ordering::SeqCst);
-        Ok(("user".into(), SecretString::from("pass".to_owned())))
+        Ok(("user".into(), Password::from("pass")))
     }
 
     async fn invalidate(&self) {

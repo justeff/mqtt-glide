@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `InboundSinkClosed` and `InboundTrySendError` implement `Display` and `std::error::Error`; `ClientBuilder` and `OnInboundSink` implement `Debug`
 
 - Removed from the public API: `Connection::state` / `Connection::generation` (`run` consumes the `Connection`, so they could only ever report the initial state) together with the `ConnectionState` / `Generation` re-exports, and the test-only `TlsMode` / `resolve_tls_mode`. Observe the session through `SessionPhase`, a `LifecycleHook` or `MqttClient::is_connected`
+- Passwords are the new `Password` type instead of `secrecy::SecretString`, and `secrecy` is no longer a dependency: `CredentialsProvider::credentials` returns `(String, Password)`, and `StaticCredentials::new` and `HttpProxy::basic_auth` take `impl Into<Password>` (string literals and `String`s work unchanged). `Password` holds bytes, since the MQTT Password is Binary Data, so it also takes a `Vec<u8>` or `&[u8]` that is not UTF-8. It is wiped on drop and redacted in `Debug`
 - flume is no longer part of the public API by default: the `InboundSink` impl for `flume::Sender<InboundMessage>` moved behind the new `flume` feature (which pins the API to flume 0.12), and the default type parameter of `Connection<H>` is now `tokio::sync::mpsc::Sender<InboundMessage>`. A plain build no longer links flume
 - Removed `PublishAckReason::should_disconnect`, `PubRelCompReason::should_disconnect` and their `ToReasonCode` impls. They were unused and encoded a disconnect policy the spec does not prescribe: a PUBACK refusal or PUBCOMP 0x92 does not end the connection
 
@@ -46,7 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Raised the declared minimum versions of `secrecy` (0.10.1), `thiserror` (2.0.7), `rustls` (0.23.5) and `tracing` (0.1.6) to what actually builds; the old `rustls` floor also admitted releases with a known infinite-loop bug. `tokio-util` no longer needs its `rt` feature. Nothing is capped, so dependents still get newer compatible releases
+- Raised the declared minimum versions of `thiserror` (2.0.7), `rustls` (0.23.5) and `tracing` (0.1.6) to what actually builds; the old `rustls` floor also admitted releases with a known infinite-loop bug. `tokio-util` no longer needs its `rt` feature. Nothing is capped, so dependents still get newer compatible releases
 - A Session Expiry Interval in a broker DISCONNECT, which servers must not send, is ignored and logged at `debug`
 
 ### Added

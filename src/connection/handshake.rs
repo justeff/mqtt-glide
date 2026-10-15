@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use bytestring::ByteString;
-use secrecy::{ExposeSecret, SecretString};
 
+use crate::client::Password;
 use crate::codec::{Connect, ConnectAck, ConnectAckReason, QoS, WillMessage};
 use crate::error::{AppError, AuthError, ConnectionOutcome, ProtocolError};
 use crate::options::{ConnectOptions, TlsConfig};
@@ -53,7 +53,7 @@ pub(crate) struct ConnectCredentials {
     /// MQTT CONNECT username.
     pub username: String,
     /// MQTT CONNECT password (secret).
-    pub password: SecretString,
+    pub password: Password,
 }
 
 /// Builds the MQTT 5 CONNECT packet from options + credentials.
@@ -70,7 +70,7 @@ pub(crate) fn build_connect(options: &ConnectOptions, client_id: &str, credentia
     } else {
         Some(ByteString::from(credentials.username.as_str()))
     };
-    let password_bytes = credentials.password.expose_secret().as_bytes();
+    let password_bytes = credentials.password.expose();
     let password = if password_bytes.is_empty() {
         None
     } else {
@@ -264,7 +264,6 @@ mod tests {
 
     use bytes::Bytes;
     use nonzero_ext::nonzero;
-    use secrecy::{ExposeSecret, SecretString};
 
     use rstest::rstest;
 
@@ -289,7 +288,7 @@ mod tests {
     fn sample_credentials() -> ConnectCredentials {
         ConnectCredentials {
             username: "oauth-user".into(),
-            password: SecretString::from("secret-token".to_owned()),
+            password: Password::from("secret-token"),
         }
     }
 
@@ -306,8 +305,21 @@ mod tests {
         assert_eq!(packet.username.as_ref().map(|u| u.as_ref() as &str), Some("oauth-user"));
         assert_eq!(
             packet.password.as_ref().map(Bytes::as_ref),
-            Some(credentials.password.expose_secret().as_bytes())
+            Some(credentials.password.expose())
         );
+    }
+
+    /// The Password is Binary Data (§3.1.3.5): bytes that are not UTF-8 go out unchanged.
+    #[test]
+    fn build_connect_sends_a_binary_password_unchanged() {
+        let options = sample_options();
+        let client_id = resolve_client_id_str(&options);
+        let credentials = ConnectCredentials {
+            username: "device".into(),
+            password: Password::from([0xFF, 0x00, 0xC3].as_slice()),
+        };
+        let packet = build_connect(&options, &client_id, &credentials);
+        assert_eq!(packet.password.as_deref(), Some([0xFF, 0x00, 0xC3].as_slice()));
     }
 
     /// Empty username/password are omitted (anonymous CONNECT — no auth flags).
@@ -317,7 +329,7 @@ mod tests {
         let client_id = resolve_client_id_str(&options);
         let credentials = ConnectCredentials {
             username: String::new(),
-            password: SecretString::from(String::new()),
+            password: Password::from(""),
         };
         let packet = build_connect(&options, &client_id, &credentials);
 
@@ -548,8 +560,8 @@ mod tests {
         }
 
         impl CredentialsProvider for CountingCreds {
-            async fn credentials(&self) -> Result<(String, SecretString), AuthError> {
-                Ok(("user".into(), SecretString::from("pass".to_owned())))
+            async fn credentials(&self) -> Result<(String, Password), AuthError> {
+                Ok(("user".into(), Password::from("pass")))
             }
 
             async fn invalidate(&self) {
@@ -580,8 +592,8 @@ mod tests {
         }
 
         impl CredentialsProvider for CountingCreds {
-            async fn credentials(&self) -> Result<(String, SecretString), AuthError> {
-                Ok(("user".into(), SecretString::from("pass".to_owned())))
+            async fn credentials(&self) -> Result<(String, Password), AuthError> {
+                Ok(("user".into(), Password::from("pass")))
             }
 
             async fn invalidate(&self) {

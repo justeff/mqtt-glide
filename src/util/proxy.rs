@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use secrecy::SecretString;
+use crate::client::Password;
 
 use super::broker_url::{BrokerUrlError, split_host_port};
 
@@ -30,7 +30,7 @@ const DEFAULT_HTTP_PORT: u16 = 80;
 pub struct HttpProxy {
     host: String,
     port: u16,
-    credentials: Option<(String, SecretString)>,
+    credentials: Option<(String, Password)>,
 }
 
 impl HttpProxy {
@@ -65,7 +65,7 @@ impl HttpProxy {
 
     /// Authenticates to the proxy with HTTP Basic (`Proxy-Authorization`). Basic sends the
     /// credentials in clear text to the proxy; use it only on a network you trust.
-    pub fn basic_auth(mut self, user: impl Into<String>, password: impl Into<SecretString>) -> Self {
+    pub fn basic_auth(mut self, user: impl Into<String>, password: impl Into<Password>) -> Self {
         self.credentials = Some((user.into(), password.into()));
         self
     }
@@ -80,7 +80,7 @@ impl HttpProxy {
         self.port
     }
 
-    pub(crate) fn credentials(&self) -> Option<&(String, SecretString)> {
+    pub(crate) fn credentials(&self) -> Option<&(String, Password)> {
         self.credentials.as_ref()
     }
 }
@@ -116,8 +116,6 @@ fn percent_decode(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use secrecy::ExposeSecret;
-
     use super::*;
 
     #[test]
@@ -125,7 +123,7 @@ mod tests {
         let proxy = HttpProxy::parse("http://svc%40corp:p%3Ass@proxy.internal:3128/").expect("valid");
         assert_eq!((proxy.host(), proxy.port()), ("proxy.internal", 3128));
         let (user, password) = proxy.credentials().expect("credentials");
-        assert_eq!((user.as_str(), password.expose_secret()), ("svc@corp", "p:ss"));
+        assert_eq!((user.as_str(), password.expose()), ("svc@corp", b"p:ss".as_slice()));
 
         let bare = HttpProxy::parse("http://[fd00::1]").expect("valid");
         assert_eq!((bare.host(), bare.port()), ("fd00::1", 80));

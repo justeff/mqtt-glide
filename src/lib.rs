@@ -54,8 +54,8 @@ pub mod testing;
 pub mod util;
 
 pub use client::{
-    AnonymousCredentials, ClientBuilder, CredentialsProvider, MqttClient, NoReconnect, Publish, PublishBuilder,
-    PublishCompletion, PublishWindow, ReconnectPolicy, StaticCredentials, Subscription, connect,
+    AnonymousCredentials, ClientBuilder, CredentialsProvider, MqttClient, NoReconnect, Password, Publish,
+    PublishBuilder, PublishCompletion, PublishWindow, ReconnectPolicy, StaticCredentials, Subscription, connect,
 };
 // Application-facing message and option types. Wire-level packet types, the codec and the
 // encode helpers stay under [`codec`].

@@ -374,20 +374,20 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
+        use crate::client::Password;
         use crate::client::{CredentialsProvider, SharedCredentials};
         use crate::codec::{ConnectAck, ConnectAckReason, Packet};
         use crate::error::AuthError;
         use crate::options::ConnectOptions;
         use crate::util::BrokerUrl;
-        use secrecy::SecretString;
 
         use tokio_util::codec::Encoder;
 
         struct TestCreds;
 
         impl CredentialsProvider for TestCreds {
-            async fn credentials(&self) -> Result<(String, SecretString), AuthError> {
-                Ok(("user".into(), SecretString::from("pass".to_owned())))
+            async fn credentials(&self) -> Result<(String, Password), AuthError> {
+                Ok(("user".into(), Password::from("pass")))
             }
         }
 
@@ -438,15 +438,15 @@ mod tests {
     async fn connack_timeout_surfaces_transport_error() {
         use tokio::net::TcpListener;
 
+        use crate::client::Password;
         use crate::client::{CredentialsProvider, SharedCredentials};
         use crate::error::AuthError;
-        use secrecy::SecretString;
 
         struct TestCreds;
 
         impl CredentialsProvider for TestCreds {
-            async fn credentials(&self) -> Result<(String, SecretString), AuthError> {
-                Ok(("user".into(), SecretString::from("pass".to_owned())))
+            async fn credentials(&self) -> Result<(String, Password), AuthError> {
+                Ok(("user".into(), Password::from("pass")))
             }
         }
 

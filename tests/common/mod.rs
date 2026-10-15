@@ -16,12 +16,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use mqtt_glide::Password;
 use mqtt_glide::codec::{Connect, ConnectAck, DecodedFrame, Disconnect, Packet, SubscribeAck, V5Codec};
 use mqtt_glide::{
     AuthError, ConnectionOutcome, CredentialsProvider, DisconnectReasonCode, ReconnectPolicy, SessionPhase,
     SubscribeAckReason,
 };
-use secrecy::SecretString;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -44,8 +44,8 @@ pub struct CountingInvalidate {
 }
 
 impl CredentialsProvider for CountingInvalidate {
-    async fn credentials(&self) -> Result<(String, SecretString), AuthError> {
-        Ok(("user".into(), SecretString::from("pass".to_owned())))
+    async fn credentials(&self) -> Result<(String, Password), AuthError> {
+        Ok(("user".into(), Password::from("pass")))
     }
 
     async fn invalidate(&self) {

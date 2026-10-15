@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use bytestring::ByteString;
+use mqtt_glide::Password;
 use mqtt_glide::{
     AuthError, BrokerUrl, ClientId as GlideClientId, ConnectOptions, ConnectionOutcome, CredentialsProvider,
     InboundMessage, MqttClient, NoopLifecycle, Publish, PublishMessage, PublishProperties, QoS, ReconnectPolicy,
     SessionParams, SessionPhase, connect,
 };
-use secrecy::SecretString;
 use tokio::task::JoinHandle;
 
 use crate::compare::fixtures::{
@@ -27,8 +27,8 @@ use crate::support::handoff::touch_publish;
 struct BenchCredentials;
 
 impl CredentialsProvider for BenchCredentials {
-    async fn credentials(&self) -> Result<(String, SecretString), AuthError> {
-        Ok(("bench".into(), SecretString::from("bench".to_owned())))
+    async fn credentials(&self) -> Result<(String, Password), AuthError> {
+        Ok(("bench".into(), Password::from("bench")))
     }
 }
 

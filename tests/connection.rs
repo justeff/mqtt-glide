@@ -14,13 +14,13 @@ use common::{
 use std::num::NonZeroU16;
 
 use futures_util::{SinkExt, StreamExt};
+use mqtt_glide::Password;
 use mqtt_glide::codec::{ConnectAck, DecodedFrame, Packet, PublishDelivery, encode_publish};
 use mqtt_glide::{
     AuthError, BrokerUrl, ClientId, ConnectAckReason, ConnectOptions, ConnectionOutcome, DEFAULT_MAX_PACKET_SIZE,
     DisconnectReasonCode, InboundMessage, NoopLifecycle, ProtocolError, Publish, PublishMessage, QoS, SessionPhase,
     StandardReconnectPolicy, connect,
 };
-use secrecy::SecretString;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -161,8 +161,8 @@ struct LatchedInvalidate {
 }
 
 impl mqtt_glide::CredentialsProvider for LatchedInvalidate {
-    async fn credentials(&self) -> Result<(String, SecretString), AuthError> {
-        Ok(("user".into(), SecretString::from("pass".to_owned())))
+    async fn credentials(&self) -> Result<(String, Password), AuthError> {
+        Ok(("user".into(), Password::from("pass")))
     }
 
     async fn invalidate(&self) {
