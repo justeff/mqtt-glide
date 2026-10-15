@@ -17,8 +17,10 @@ use super::handshake::{
     on_auth_failure, resolve_client_id_str,
 };
 use super::redirect::ServerRedirect;
+use super::subscriptions::refuse_packet;
 use crate::client::SharedCredentials;
-use crate::codec::{ConnectAck, DecodedFrame, Packet, V5Codec};
+use crate::codec::v5::ToReasonCode;
+use crate::codec::{ConnectAck, DecodeError, DecodedFrame, DisconnectReasonCode, Packet, V5Codec};
 use crate::error::{ConnectionOutcome, ProtocolError, TransportError};
 use crate::options::ConnectOptions;
 
@@ -62,7 +64,11 @@ where
         .await
         .map_err(map_connect_send_error)?;
 
-    let ack = read_connack(&mut framed_read, deadline, options.connect_timeout).await?;
+    let ack = match read_connack(&mut framed_read, deadline, options.connect_timeout).await {
+        Ok(ack) => ack,
+        Err((outcome, None)) => return Err(outcome),
+        Err((outcome, Some(reason))) => return Err(refuse_packet(&mut framed_write, reason, outcome).await),
+    };
     match apply_connack(options.keep_alive, &ack) {
         Ok(session) => {
             apply_session_limits_to_codecs(&mut framed_write, &session);
@@ -255,11 +261,15 @@ fn tls_server_name(host: &str) -> Result<ServerName<'static>, ConnectionOutcome>
         .map_err(|_| ConnectionOutcome::Transport(TransportError::Tls(format!("invalid TLS server name: {host}"))))
 }
 
+/// The CONNACK, or why there is none: with the DISCONNECT reason when the broker sent a
+/// packet that is broken or has no place before CONNACK.
+type ConnackRead = Result<ConnectAck, (ConnectionOutcome, Option<DisconnectReasonCode>)>;
+
 async fn read_connack<R>(
     framed_read: &mut FramedRead<R, V5Codec>,
     deadline: Instant,
     connect_timeout: Duration,
-) -> Result<ConnectAck, ConnectionOutcome>
+) -> ConnackRead
 where
     R: AsyncRead + Unpin,
 {
@@ -269,28 +279,41 @@ where
     )
     .await
     .unwrap_or_else(|_| {
-        Err(ConnectionOutcome::Transport(TransportError::Connection(format!(
-            "CONNACK timed out after {connect_timeout:?}"
-        ))))
+        Err((
+            ConnectionOutcome::Transport(TransportError::Connection(format!(
+                "CONNACK timed out after {connect_timeout:?}"
+            ))),
+            None,
+        ))
     })
 }
 
-async fn read_connack_unbounded<R>(framed_read: &mut FramedRead<R, V5Codec>) -> Result<ConnectAck, ConnectionOutcome>
+async fn read_connack_unbounded<R>(framed_read: &mut FramedRead<R, V5Codec>) -> ConnackRead
 where
     R: AsyncRead + Unpin,
 {
+    let unexpected = |packet: String| {
+        Err((
+            ConnectionOutcome::Protocol(ProtocolError::Violation(format!("expected CONNACK, got {packet}"))),
+            Some(DisconnectReasonCode::ProtocolError),
+        ))
+    };
     match framed_read.next().await {
         Some(Ok((DecodedFrame::Control(Packet::ConnectAck(ack)), _wire_len))) => Ok(*ack),
-        Some(Ok((DecodedFrame::Control(other), _))) => Err(ConnectionOutcome::Protocol(ProtocolError::Violation(
-            format!("expected CONNACK, got {:?}", other.packet_type()),
-        ))),
-        Some(Ok((DecodedFrame::Publish(_), _))) => Err(ConnectionOutcome::Protocol(ProtocolError::Violation(
-            "expected CONNACK, got PUBLISH".into(),
-        ))),
-        Some(Err(error)) => Err(ConnectionOutcome::Protocol(ProtocolError::Decode(error.to_string()))),
-        None => Err(ConnectionOutcome::Transport(TransportError::Connection(
-            "connection closed before CONNACK".into(),
-        ))),
+        Some(Ok((DecodedFrame::Control(other), _))) => unexpected(format!("{:?}", other.packet_type())),
+        Some(Ok((DecodedFrame::Publish(_), _))) => unexpected("PUBLISH".into()),
+        Some(Err(DecodeError::Io(message))) => Err((
+            ConnectionOutcome::Transport(TransportError::Connection(message.to_string())),
+            None,
+        )),
+        Some(Err(error)) => Err((
+            ConnectionOutcome::Protocol(ProtocolError::Decode(error.to_string())),
+            Some(error.to_reason_code()),
+        )),
+        None => Err((
+            ConnectionOutcome::Transport(TransportError::Connection("connection closed before CONNACK".into())),
+            None,
+        )),
     }
 }
 

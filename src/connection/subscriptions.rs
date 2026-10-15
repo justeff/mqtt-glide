@@ -15,9 +15,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::packet_id::InflightPots;
 use crate::ack::RefusedSubscription;
+use crate::codec::v5::ToReasonCode;
 use crate::codec::{
-    DecodedFrame, Packet, Subscribe, SubscribeAck, SubscribeAckReason, SubscriptionOptions, UnsubscribeAckReason,
-    V5Codec, encode_publish_ack,
+    DecodedFrame, Disconnect, DisconnectReasonCode, Packet, Subscribe, SubscribeAck, SubscribeAckReason,
+    SubscriptionOptions, UnsubscribeAckReason, V5Codec, encode_publish_ack,
 };
 use crate::connection::session_policy::inbound_publish_policy;
 use crate::error::{AppError, ConnectionOutcome, ProtocolError, ShutdownError, TransportError};
@@ -348,7 +349,9 @@ where
                 .remove(&ack.packet_id)
                 .expect("read_suback returns a waiting id");
             inflight.release_subscribe(ack.packet_id);
-            validate_resubscribe_ack(&ack, filters.len())?;
+            if let Err(outcome) = validate_resubscribe_ack(&ack, filters.len()) {
+                return Err(refuse_packet(framed_write, DisconnectReasonCode::ProtocolError, outcome).await);
+            }
             registry
                 .write()
                 .map_err(|_| {
@@ -415,7 +418,8 @@ fn validate_resubscribe_ack(ack: &SubscribeAck, expected_filters: usize) -> Resu
     }
 }
 
-/// Reads until a SUBACK for one of the `waiting` SUBSCRIBEs arrives.
+/// Reads until a SUBACK for one of the `waiting` SUBSCRIBEs arrives. A packet that is broken
+/// or has no place here ends the connection with the matching DISCONNECT reason (§4.13).
 async fn read_suback<H: InboundSink, R, W, V>(
     framed_read: &mut FramedRead<R, V5Codec>,
     framed_write: &mut FramedWrite<W, V5Codec>,
@@ -427,31 +431,58 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     loop {
-        match framed_read.next().await {
+        let (reason, outcome) = match framed_read.next().await {
             Some(Ok((DecodedFrame::Control(Packet::SubscribeAck(ack)), _))) if waiting.contains_key(&ack.packet_id) => {
                 return Ok(ack);
             }
-            Some(Ok((DecodedFrame::Control(Packet::SubscribeAck(_)), _))) => {}
+            Some(Ok((DecodedFrame::Control(Packet::SubscribeAck(_)), _))) => continue,
             Some(Ok((DecodedFrame::Publish(packet), _))) => {
                 deliver_publish_during_resubscribe(framed_write, inbound, packet).await?;
+                continue;
             }
-            Some(Ok((DecodedFrame::Control(other), _))) => {
-                return Err(ConnectionOutcome::Protocol(ProtocolError::Violation(format!(
+            Some(Ok((DecodedFrame::Control(other), _))) => (
+                DisconnectReasonCode::ProtocolError,
+                ConnectionOutcome::Protocol(ProtocolError::Violation(format!(
                     "expected SUBACK during resubscribe, got {:?}",
                     other.packet_type()
-                ))));
+                ))),
+            ),
+            Some(Err(crate::codec::DecodeError::Io(message))) => {
+                return Err(ConnectionOutcome::Transport(TransportError::Connection(
+                    message.to_string(),
+                )));
             }
-            Some(Err(error)) => {
-                return Err(ConnectionOutcome::Protocol(ProtocolError::Decode(error.to_string())));
-            }
+            Some(Err(error)) => (
+                error.to_reason_code(),
+                ConnectionOutcome::Protocol(ProtocolError::Decode(error.to_string())),
+            ),
             None => {
                 return Err(ConnectionOutcome::Transport(TransportError::Connection(
                     "connection closed before resubscribe SUBACK".into(),
                 )));
             }
-        }
+        };
+        return Err(refuse_packet(framed_write, reason, outcome).await);
     }
 }
+
+/// Tells the broker why a packet it sent before the session runs ends the connection (§4.13:
+/// the client SHOULD send DISCONNECT with the reason), then hands back `outcome`.
+pub(crate) async fn refuse_packet<W>(
+    framed_write: &mut FramedWrite<W, V5Codec>,
+    reason: DisconnectReasonCode,
+    outcome: ConnectionOutcome,
+) -> ConnectionOutcome
+where
+    W: AsyncWrite + Unpin,
+{
+    let disconnect = framed_write.send(Packet::Disconnect(Disconnect::new(reason)));
+    let _ = timeout(REFUSE_DISCONNECT_BUDGET, disconnect).await;
+    outcome
+}
+
+/// Time a [`refuse_packet`] DISCONNECT may take; the connection is being dropped anyway.
+const REFUSE_DISCONNECT_BUDGET: Duration = Duration::from_secs(1);
 
 /// Delivers an inbound PUBLISH that arrives while waiting for auto-resubscribe SUBACK.
 ///
@@ -466,11 +497,17 @@ async fn deliver_publish_during_resubscribe<H: InboundSink, W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    inbound
-        .topic_aliases
-        .resolve(&mut packet)
-        .map_err(ConnectionOutcome::Protocol)?;
-    let puback_id = inbound_publish_policy(&packet).map_err(ConnectionOutcome::Protocol)?;
+    if let Err(error) = inbound.topic_aliases.resolve(&mut packet) {
+        let outcome = ConnectionOutcome::Protocol(error);
+        return Err(refuse_packet(framed_write, DisconnectReasonCode::TopicAliasInvalid, outcome).await);
+    }
+    let puback_id = match inbound_publish_policy(&packet) {
+        Ok(puback_id) => puback_id,
+        Err(error) => {
+            let outcome = ConnectionOutcome::Protocol(error);
+            return Err(refuse_packet(framed_write, DisconnectReasonCode::ProtocolError, outcome).await);
+        }
+    };
     inbound.stats.publish_received(packet.meta.qos, packet.meta.dup);
     if let Some(message) = inbound
         .response_router

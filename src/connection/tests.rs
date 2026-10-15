@@ -1527,6 +1527,97 @@ async fn resubscribe_repeats_each_subscribe_and_pipelines_them() {
     let _ = timeout(Duration::from_secs(5), run).await;
 }
 
+/// §4.13: a packet broken or out of place before the session runs (instead of the CONNACK,
+/// or while subscriptions are restored) gets a DISCONNECT with its reason, as it does later.
+#[rstest::rstest]
+#[case::reserved_type_before_connack(false, &[0x00, 0x00], 0x81)]
+#[case::pubrec_before_connack(false, &[0x50, 0x02, 0x00, 0x01], 0x82)]
+#[case::reserved_type_while_restoring(true, &[0x00, 0x00], 0x81)]
+#[case::pubrec_while_restoring(true, &[0x50, 0x02, 0x00, 0x01], 0x82)]
+// QoS 0 PUBLISH "t" with Topic Alias 1; the client allows no inbound aliases.
+#[case::topic_alias_while_restoring(true, &[0x30, 0x08, 0x00, 0x01, b't', 0x03, 0x23, 0x00, 0x01, b'x'], 0x94)]
+#[tokio::test]
+async fn a_bad_packet_before_the_session_runs_gets_its_disconnect_reason(
+    #[case] while_restoring: bool,
+    #[case] attack: &'static [u8],
+    #[case] reason: u8,
+) {
+    use crate::client::Subscription;
+    use crate::codec::{QoS, SubscribeAckReason};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    let sessions = Arc::new(AtomicU32::new(0));
+    let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel();
+    let port = spawn_broker_loop(move |mut framed_read, mut framed_write| {
+        let session = sessions.fetch_add(1, Ordering::SeqCst) + 1;
+        let seen_tx = seen_tx.clone();
+        async move {
+            let attack_now = !while_restoring || session > 1;
+            if !while_restoring {
+                let _ = framed_read.next().await; // CONNECT
+                let _ = framed_write.get_mut().write_all(attack).await;
+            } else if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+                return;
+            }
+            while let Some(Ok((frame, _))) = framed_read.next().await {
+                match frame {
+                    DecodedFrame::Control(Packet::Subscribe(_)) if attack_now => {
+                        let _ = framed_write.get_mut().write_all(attack).await;
+                    }
+                    DecodedFrame::Control(Packet::Subscribe(sub)) => {
+                        let _ = framed_write
+                            .send(Packet::SubscribeAck(crate::codec::SubscribeAck {
+                                packet_id: sub.packet_id,
+                                properties: Vec::new(),
+                                reason_string: None,
+                                status: vec![SubscribeAckReason::GrantedQos1],
+                            }))
+                            .await;
+                        return; // drop → reconnect → resubscribe
+                    }
+                    DecodedFrame::Control(Packet::Disconnect(disconnect)) => {
+                        let _ = seen_tx.send(disconnect.reason_code as u8);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await;
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (client, connection, mut phase) = connect(
+        ConnectOptions::new(url),
+        static_test_credentials(),
+        DelayedReconnect {
+            delay: Duration::from_millis(50),
+        },
+        tx,
+        NoopLifecycle,
+    )
+    .expect("connect");
+    let run = tokio::spawn(connection.run());
+    if while_restoring {
+        await_connected(&mut phase).await;
+        client
+            .subscribe(vec![Subscription::new("restore/me", QoS::AtLeastOnce)])
+            .await
+            .expect("subscribe");
+    }
+    let mut seen_rx = seen_rx;
+    let seen = timeout(Duration::from_secs(5), seen_rx.recv())
+        .await
+        .expect("DISCONNECT in time")
+        .expect("broker running");
+    assert_eq!(seen, reason, "DISCONNECT reason");
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+}
+
 /// after connect+run, watch shows Connected and QoS0 publish works
 /// (session start is not blocked by lifecycle consumers).
 #[tokio::test]
