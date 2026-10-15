@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Raised the declared minimum versions of `secrecy` (0.10.1), `thiserror` (2.0.7), `rustls` (0.23.5) and `tracing` (0.1.6) to what actually builds; the old `rustls` floor also admitted releases with a known infinite-loop bug. `tokio-util` no longer needs its `rt` feature. Nothing is capped, so dependents still get newer compatible releases
+- A Session Expiry Interval in a broker DISCONNECT, which servers must not send, is ignored and logged at `debug`
 
 ### Added
 

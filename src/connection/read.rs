@@ -331,7 +331,14 @@ async fn dispatch_control(
 ) -> Option<ReadOutcome> {
     match packet {
         Packet::PingResponse => None,
-        Packet::Disconnect(disconnect) => Some(ReadOutcome::BrokerDisconnect(Box::new(disconnect))),
+        Packet::Disconnect(disconnect) => {
+            // [MQTT-3.14.2-2] forbids it from a server; the connection ends anyway, so the
+            // value is only ignored and named for whoever debugs the broker.
+            if let Some(seconds) = disconnect.session_expiry_interval {
+                tracing::debug!(seconds, "ignoring Session Expiry Interval in broker DISCONNECT");
+            }
+            Some(ReadOutcome::BrokerDisconnect(Box::new(disconnect)))
+        }
         Packet::SubscribeAck(ack) => {
             if control_tx
                 .send(ControlMessage::SubscribeAck { ack, generation })

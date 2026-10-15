@@ -143,7 +143,8 @@ fn parse_publish_properties(src: &mut Bytes) -> Result<Option<PublishWirePropert
             pt::CORR_DATA => correlation_data.read_value(prop_src)?,
             pt::SUB_ID => {
                 // One per matching subscription that carried an identifier (§3.3.2.3.8).
-                // An illegal 0 from a lenient peer is skipped rather than failing the packet.
+                // An illegal 0 is skipped rather than failing the packet: a broker that sends
+                // it does so for every redelivery, so a disconnect would loop forever.
                 let id = utils::decode_variable_length_cursor(prop_src)?;
                 match NonZeroU32::new(id) {
                     Some(id) => subscription_ids.push(id),
