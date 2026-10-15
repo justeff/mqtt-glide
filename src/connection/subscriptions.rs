@@ -247,7 +247,9 @@ pub(crate) fn apply_subscribe_ack_to_registry(
     }
 }
 
-/// Removes filters that received UNSUBACK Success.
+/// Removes the filters the broker no longer holds: unsubscribed, or never subscribed in its
+/// session (No subscription existed, an UNSUBSCRIBE repeated or sent after a broker restart).
+/// A refused UNSUBSCRIBE leaves the broker's subscription, and the filter stays.
 pub(crate) fn apply_unsubscribe_ack_to_registry(
     registry: &mut SubscriptionRegistry,
     filters: &[ByteString],
@@ -256,7 +258,12 @@ pub(crate) fn apply_unsubscribe_ack_to_registry(
     let to_remove: Vec<_> = filters
         .iter()
         .zip(reasons.iter())
-        .filter(|(_, reason)| **reason == UnsubscribeAckReason::Success)
+        .filter(|(_, reason)| {
+            matches!(
+                reason,
+                UnsubscribeAckReason::Success | UnsubscribeAckReason::NoSubscriptionExisted
+            )
+        })
         .map(|(filter, _)| filter.clone())
         .collect();
     registry.remove(to_remove);
@@ -552,6 +559,27 @@ mod tests {
         let snap = registry.snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(&*snap[0].0, "ok");
+    }
+
+    /// Only a filter the broker still holds survives an UNSUBACK: one it had no subscription
+    /// for is gone too, or the next reconnect would subscribe to it again.
+    #[test]
+    fn unsubscribe_ack_keeps_only_filters_the_broker_still_holds() {
+        let mut registry = SubscriptionRegistry::default();
+        let filters = ["gone", "never", "refused"].map(ByteString::from_static);
+        registry.upsert(filters.clone().map(|filter| (filter, SubscriptionOptions::default())));
+        apply_unsubscribe_ack_to_registry(
+            &mut registry,
+            &filters,
+            &[
+                UnsubscribeAckReason::Success,
+                UnsubscribeAckReason::NoSubscriptionExisted,
+                UnsubscribeAckReason::NotAuthorized,
+            ],
+        );
+        let snap = registry.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(&*snap[0].0, "refused");
     }
 
     /// A refused restore keeps the filter (it is retried) and lists it; a later grant clears it.
