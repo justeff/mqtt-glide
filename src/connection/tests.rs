@@ -1210,12 +1210,13 @@ enum SubackPlan {
     Silent,
 }
 
+/// (session, filters) of every SUBSCRIBE a mock broker received.
+type SubscribeLog = Arc<std::sync::Mutex<Vec<(u32, Vec<String>)>>>;
+
 /// Mock broker: session 1 grants and then drops the client; every later session answers its
 /// SUBSCRIBEs as `plan(session, nth_subscribe)` says. Returns the port and a log of
 /// (session, filters) per SUBSCRIBE.
-async fn spawn_restore_broker(
-    plan: fn(u32, usize) -> SubackPlan,
-) -> (u16, Arc<std::sync::Mutex<Vec<(u32, Vec<String>)>>>) {
+async fn spawn_restore_broker(plan: fn(u32, usize) -> SubackPlan) -> (u16, SubscribeLog) {
     use crate::codec::SubscribeAckReason;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1423,6 +1424,104 @@ async fn unsubscribe_stops_restore_retries() {
     let before = log.lock().unwrap().len();
     tokio::time::sleep(super::subscriptions::restore_retry_delay(8) * 2).await;
     assert_eq!(log.lock().unwrap().len(), before, "no SUBSCRIBE after the unsubscribe");
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+}
+
+/// Restoring subscriptions repeats the application's SUBSCRIBEs one by one: a broker that
+/// caps the filters per SUBSCRIBE (AWS IoT Core at 8) took each of them once already. They
+/// are pipelined: the broker here answers only once ten are waiting.
+#[tokio::test]
+async fn resubscribe_repeats_each_subscribe_and_pipelines_them() {
+    use crate::client::Subscription;
+    use crate::codec::{QoS, SubscribeAckReason};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const CALLS: usize = 12;
+    let sessions = Arc::new(AtomicU32::new(0));
+    let log: SubscribeLog = Arc::default();
+    let port = spawn_broker_loop({
+        let log = Arc::clone(&log);
+        move |mut framed_read, mut framed_write| {
+            let session = sessions.fetch_add(1, Ordering::SeqCst) + 1;
+            let log = Arc::clone(&log);
+            async move {
+                if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+                    return;
+                }
+                let mut held = Vec::new();
+                while let Some(Ok((frame, _))) = framed_read.next().await {
+                    let DecodedFrame::Control(Packet::Subscribe(sub)) = frame else {
+                        continue;
+                    };
+                    let filters = sub.topic_filters.iter().map(|(filter, _)| filter.to_string()).collect();
+                    log.lock().unwrap().push((session, filters));
+                    held.push(sub);
+                    if session > 1 && held.len() < 10 && log.lock().unwrap().len() < 2 * CALLS {
+                        continue;
+                    }
+                    for sub in held.drain(..) {
+                        let _ = framed_write
+                            .send(Packet::SubscribeAck(crate::codec::SubscribeAck {
+                                packet_id: sub.packet_id,
+                                properties: Vec::new(),
+                                reason_string: None,
+                                status: vec![SubscribeAckReason::GrantedQos1; sub.topic_filters.len()],
+                            }))
+                            .await;
+                    }
+                    if session == 1 && log.lock().unwrap().len() == CALLS {
+                        return; // drop → reconnect → resubscribe
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).ack_timeout(Duration::from_millis(500));
+    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (client, connection, mut phase) = connect(
+        options,
+        static_test_credentials(),
+        DelayedReconnect { delay: Duration::ZERO },
+        tx,
+        NoopLifecycle,
+    )
+    .expect("connect");
+    let run = tokio::spawn(connection.run());
+    await_connected(&mut phase).await;
+    for call in 0..CALLS {
+        let mut filters = vec![Subscription::new(format!("calls/{call}/a"), QoS::AtLeastOnce)];
+        if call == 0 {
+            filters.push(Subscription::new("calls/0/b", QoS::AtLeastOnce));
+        }
+        client.subscribe(filters).await.expect("subscribe");
+    }
+    let _ = await_disconnected(&mut phase).await;
+    timeout(Duration::from_secs(5), async {
+        while log.lock().unwrap().len() < 2 * CALLS {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("every SUBSCRIBE repeated, without waiting for each SUBACK");
+    await_connected(&mut phase).await;
+
+    let log = log.lock().unwrap().clone();
+    let per_session = |session| {
+        log.iter()
+            .filter(|(s, _)| *s == session)
+            .map(|(_, f)| f.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut restored = per_session(2);
+    for filters in &mut restored {
+        filters.sort();
+    }
+    assert_eq!(restored, per_session(1), "the same SUBSCRIBEs, in the same order");
 
     client.shutdown().await.expect("shutdown");
     let _ = timeout(Duration::from_secs(5), run).await;

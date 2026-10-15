@@ -31,12 +31,16 @@ pub(crate) struct SubscriptionRegistry {
     entries: HashMap<ByteString, Entry>,
     /// Behind [`crate::MqttClient::refused_subscriptions`]; republished on every change.
     refused_tx: watch::Sender<Vec<RefusedSubscription>>,
+    /// Numbers the SUBSCRIBEs whose grants are recorded, in order.
+    next_batch: u64,
 }
 
 #[derive(Debug)]
 struct Entry {
     options: SubscriptionOptions,
     id: Option<NonZeroU32>,
+    /// The SUBSCRIBE that granted it: restored together with the filters it came with.
+    batch: u64,
     /// Last refusal while restoring it; retried until granted or unsubscribed.
     refused: Option<(SubscribeAckReason, Option<ByteString>)>,
 }
@@ -47,7 +51,9 @@ impl Default for SubscriptionRegistry {
     }
 }
 
-/// Filters sharing one Subscription Identifier: re-issued as one SUBSCRIBE.
+/// Filters granted by one SUBSCRIBE (so sharing its Subscription Identifier): re-issued as
+/// one SUBSCRIBE again, which the broker took once already. Brokers cap the filters per
+/// SUBSCRIBE (AWS IoT Core at 8), so the whole registry in one packet could be refused.
 pub(crate) type ResubscribeGroup = (Option<NonZeroU32>, Vec<(ByteString, SubscriptionOptions)>);
 
 impl SubscriptionRegistry {
@@ -55,6 +61,7 @@ impl SubscriptionRegistry {
         Self {
             entries: HashMap::new(),
             refused_tx,
+            next_batch: 0,
         }
     }
 
@@ -64,18 +71,21 @@ impl SubscriptionRegistry {
         self.upsert_with_id(filters, None);
     }
 
-    /// Registers or replaces filters granted by the broker for a SUBSCRIBE with `id`.
+    /// Registers or replaces filters granted by one SUBSCRIBE with `id`.
     pub(crate) fn upsert_with_id(
         &mut self,
         filters: impl IntoIterator<Item = (ByteString, SubscriptionOptions)>,
         id: Option<NonZeroU32>,
     ) {
+        let batch = self.next_batch;
+        self.next_batch += 1;
         for (filter, options) in filters {
             self.entries.insert(
                 filter,
                 Entry {
                     options,
                     id,
+                    batch,
                     refused: None,
                 },
             );
@@ -100,8 +110,7 @@ impl SubscriptionRegistry {
             .collect()
     }
 
-    /// Snapshot grouped by Subscription Identifier (one SUBSCRIBE per identifier, since the
-    /// identifier is a property of the whole packet).
+    /// Snapshot grouped by the SUBSCRIBE that granted them, in the order they were granted.
     pub(crate) fn snapshot_grouped(&self) -> Vec<ResubscribeGroup> {
         self.grouped(|_| true)
     }
@@ -116,14 +125,15 @@ impl SubscriptionRegistry {
     }
 
     fn grouped(&self, keep: impl Fn(&Entry) -> bool) -> Vec<ResubscribeGroup> {
-        let mut groups: Vec<ResubscribeGroup> = Vec::new();
+        let mut batches: std::collections::BTreeMap<u64, ResubscribeGroup> = std::collections::BTreeMap::new();
         for (filter, entry) in self.entries.iter().filter(|(_, entry)| keep(entry)) {
-            match groups.iter_mut().find(|(group_id, _)| *group_id == entry.id) {
-                Some((_, filters)) => filters.push((filter.clone(), entry.options)),
-                None => groups.push((entry.id, vec![(filter.clone(), entry.options)])),
-            }
+            batches
+                .entry(entry.batch)
+                .or_insert_with(|| (entry.id, Vec::new()))
+                .1
+                .push((filter.clone(), entry.options));
         }
-        groups
+        batches.into_values().collect()
     }
 
     /// Records the broker's answer to restoring `filters`: granted ones are active again,
@@ -240,10 +250,14 @@ pub(crate) fn apply_subscribe_ack_to_registry(
     id: Option<NonZeroU32>,
     reasons: &[SubscribeAckReason],
 ) {
-    for ((filter, options), reason) in filters.iter().zip(reasons.iter()) {
-        if subscribe_reason_granted(*reason) {
-            registry.upsert_with_id([(filter.clone(), *options)], id);
-        }
+    let granted: Vec<_> = filters
+        .iter()
+        .zip(reasons)
+        .filter(|(_, reason)| subscribe_reason_granted(**reason))
+        .map(|(filter, _)| filter.clone())
+        .collect();
+    if !granted.is_empty() {
+        registry.upsert_with_id(granted, id);
     }
 }
 
@@ -269,12 +283,17 @@ pub(crate) fn apply_unsubscribe_ack_to_registry(
     registry.remove(to_remove);
 }
 
+/// SUBSCRIBEs a resubscribe keeps waiting for their SUBACK at once.
+const RESUBSCRIBE_WINDOW: usize = 10;
+
 /// Re-issues prior SUBSCRIBE filters on a fresh session before read/write tasks start.
 ///
+/// One SUBSCRIBE per earlier one, up to [`RESUBSCRIBE_WINDOW`] unanswered at a time.
 /// `cancel` must abort the wait. Inbound PUBLISH during the wait is delivered to `handoff`
 /// (enqueue-before-ack PUBACK on the wire for QoS 1). A filter the broker refuses stays in
 /// `registry` as refused, and the write task asks for it again; only a SUBACK that does not
-/// answer the request (wrong reason count, none within `deadline`) ends the connection.
+/// answer the request (wrong reason count, none within `deadline` of the last one) ends the
+/// connection.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resubscribe_pending<H: InboundSink, R, W>(
     framed_read: &mut FramedRead<R, V5Codec>,
@@ -284,106 +303,65 @@ pub(crate) async fn resubscribe_pending<H: InboundSink, R, W>(
     groups: Vec<ResubscribeGroup>,
     deadline: Duration,
     cancel: &CancellationToken,
-    inbound: ResubscribeInbound<'_, H>,
+    mut inbound: ResubscribeInbound<'_, H>,
 ) -> Result<(), ConnectionOutcome>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    for (id, filters) in groups {
+    if groups.iter().any(|(id, _)| id.is_some()) && !inbound.subscription_identifiers_available {
         // A broker that stopped offering identifiers must not get one (§3.2.2.3.12);
         // the subscription itself still matters more than the routing hint.
-        let id = match id {
-            Some(_) if !inbound.subscription_identifiers_available => {
-                tracing::warn!("broker no longer supports Subscription Identifiers; restoring without");
-                None
-            }
-            id => id,
-        };
-        let ack = resubscribe_group(
-            framed_read,
-            framed_write,
-            inflight,
-            filters.clone(),
-            id,
-            deadline,
-            cancel,
-            ResubscribeInbound {
-                handoff: inbound.handoff,
-                stats: inbound.stats,
-                topic_aliases: &mut *inbound.topic_aliases,
-                subscription_identifiers_available: inbound.subscription_identifiers_available,
-                response_router: inbound.response_router,
-            },
-        )
-        .await?;
-        registry
-            .write()
-            .map_err(|_| {
-                ConnectionOutcome::Application(AppError::Internal("subscription registry lock poisoned".into()))
-            })?
-            .apply_restore_ack(&filters, &ack.status, ack.reason_string.as_ref(), false);
+        tracing::warn!("broker no longer supports Subscription Identifiers; restoring without");
     }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn resubscribe_group<H: InboundSink, R, W>(
-    framed_read: &mut FramedRead<R, V5Codec>,
-    framed_write: &mut FramedWrite<W, V5Codec>,
-    inflight: &mut InflightPots,
-    filters: Vec<(ByteString, SubscriptionOptions)>,
-    id: Option<NonZeroU32>,
-    deadline: Duration,
-    cancel: &CancellationToken,
-    inbound: ResubscribeInbound<'_, H>,
-) -> Result<SubscribeAck, ConnectionOutcome>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    let packet_id = inflight
-        .alloc_subscribe()
-        .map_err(|_| ConnectionOutcome::Protocol(ProtocolError::Violation("resubscribe packet id exhausted".into())))?;
-
-    let filter_count = filters.len();
-    let packet = Packet::Subscribe(Subscribe {
-        packet_id,
-        id,
-        user_properties: Vec::new(),
-        topic_filters: filters,
-    });
-
-    framed_write.send(packet).await.map_err(map_resubscribe_send_error)?;
-
-    tokio::select! {
-        () = cancel.cancelled() => {
-            inflight.release_subscribe(packet_id);
-            Err(ConnectionOutcome::Shutdown(ShutdownError::Cancelled))
-        }
-        result = timeout(
-            deadline,
-            read_suback_for_id(framed_read, framed_write, packet_id, inbound),
-        ) => {
-            match result {
-                Ok(Ok(ack)) => {
-                    inflight.release_subscribe(packet_id);
-                    validate_resubscribe_ack(&ack, filter_count)?;
-                    Ok(ack)
-                }
-                Ok(Err(outcome)) => {
-                    inflight.release_subscribe(packet_id);
-                    Err(outcome)
-                }
-                Err(_elapsed) => {
-                    inflight.release_subscribe(packet_id);
-                    Err(ConnectionOutcome::Protocol(ProtocolError::Violation(
-                        "resubscribe SUBACK timeout".into(),
-                    )))
-                }
+    let mut groups = groups.into_iter();
+    let mut waiting: HashMap<NonZeroU16, Vec<(ByteString, SubscriptionOptions)>> = HashMap::new();
+    let result = async {
+        loop {
+            while waiting.len() < RESUBSCRIBE_WINDOW
+                && let Some((id, filters)) = groups.next()
+            {
+                let packet_id = inflight.alloc_subscribe().map_err(|_| {
+                    ConnectionOutcome::Protocol(ProtocolError::Violation("resubscribe packet id exhausted".into()))
+                })?;
+                waiting.insert(packet_id, filters.clone());
+                let packet = Packet::Subscribe(Subscribe {
+                    packet_id,
+                    id: id.filter(|_| inbound.subscription_identifiers_available),
+                    user_properties: Vec::new(),
+                    topic_filters: filters,
+                });
+                framed_write.send(packet).await.map_err(map_resubscribe_send_error)?;
             }
+            if waiting.is_empty() {
+                return Ok(());
+            }
+            let ack = tokio::select! {
+                () = cancel.cancelled() => return Err(ConnectionOutcome::Shutdown(ShutdownError::Cancelled)),
+                result = timeout(deadline, read_suback(framed_read, framed_write, &waiting, &mut inbound)) => {
+                    result.map_err(|_elapsed| {
+                        ConnectionOutcome::Protocol(ProtocolError::Violation("resubscribe SUBACK timeout".into()))
+                    })??
+                }
+            };
+            let filters = waiting
+                .remove(&ack.packet_id)
+                .expect("read_suback returns a waiting id");
+            inflight.release_subscribe(ack.packet_id);
+            validate_resubscribe_ack(&ack, filters.len())?;
+            registry
+                .write()
+                .map_err(|_| {
+                    ConnectionOutcome::Application(AppError::Internal("subscription registry lock poisoned".into()))
+                })?
+                .apply_restore_ack(&filters, &ack.status, ack.reason_string.as_ref(), false);
         }
     }
+    .await;
+    for packet_id in waiting.into_keys() {
+        inflight.release_subscribe(packet_id);
+    }
+    result
 }
 
 /// Where PUBLISHes that arrive during the resubscribe wait go: the application sink, after
@@ -437,11 +415,12 @@ fn validate_resubscribe_ack(ack: &SubscribeAck, expected_filters: usize) -> Resu
     }
 }
 
-async fn read_suback_for_id<H: InboundSink, R, W>(
+/// Reads until a SUBACK for one of the `waiting` SUBSCRIBEs arrives.
+async fn read_suback<H: InboundSink, R, W, V>(
     framed_read: &mut FramedRead<R, V5Codec>,
     framed_write: &mut FramedWrite<W, V5Codec>,
-    expected_id: NonZeroU16,
-    mut inbound: ResubscribeInbound<'_, H>,
+    waiting: &HashMap<NonZeroU16, V>,
+    inbound: &mut ResubscribeInbound<'_, H>,
 ) -> Result<SubscribeAck, ConnectionOutcome>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -449,12 +428,12 @@ where
 {
     loop {
         match framed_read.next().await {
-            Some(Ok((DecodedFrame::Control(Packet::SubscribeAck(ack)), _))) if ack.packet_id == expected_id => {
+            Some(Ok((DecodedFrame::Control(Packet::SubscribeAck(ack)), _))) if waiting.contains_key(&ack.packet_id) => {
                 return Ok(ack);
             }
             Some(Ok((DecodedFrame::Control(Packet::SubscribeAck(_)), _))) => {}
             Some(Ok((DecodedFrame::Publish(packet), _))) => {
-                deliver_publish_during_resubscribe(framed_write, &mut inbound, packet).await?;
+                deliver_publish_during_resubscribe(framed_write, inbound, packet).await?;
             }
             Some(Ok((DecodedFrame::Control(other), _))) => {
                 return Err(ConnectionOutcome::Protocol(ProtocolError::Violation(format!(
