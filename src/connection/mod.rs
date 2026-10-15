@@ -212,8 +212,16 @@ impl<H: InboundSink> Connection<H> {
         }
     }
 
-    /// Fails everything still carried (driver stopping).
-    fn fail_carried(&self) {
+    /// Fails everything still carried or queued (driver stopping).
+    fn fail_carried(&mut self) {
+        if let Some(command_rx) = self.channels.command_rx.as_mut() {
+            let refused = if self.cancel.is_cancelled() {
+                AppError::ShuttingDown
+            } else {
+                AppError::ConnectionLost
+            };
+            channels::fail_queued_commands(command_rx, &refused);
+        }
         let (unacked, unsent) = self
             .session_carry
             .lock()

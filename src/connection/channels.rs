@@ -191,6 +191,29 @@ pub(crate) type CommandSender = mpsc::Sender<ClientCommand>;
 /// Bounded command channel receiver type alias.
 pub(crate) type CommandReceiver = mpsc::Receiver<ClientCommand>;
 
+/// Fails what is still queued once nothing will send it: publishes with
+/// [`AppError::ConnectionLost`], like the unacknowledged ones, and subscribe / unsubscribe
+/// with `refused`. Dropping them instead would hand every caller
+/// [`AppError::CommandChannelClosed`], which reads as a client that is gone.
+pub(crate) fn fail_queued_commands(command_rx: &mut CommandReceiver, refused: &AppError) {
+    command_rx.close();
+    while let Ok(command) = command_rx.try_recv() {
+        match command {
+            ClientCommand::Publish { reply, .. } => {
+                let _ = reply.send(Err(AppError::ConnectionLost));
+            }
+            ClientCommand::Subscribe { reply, .. } => {
+                let _ = reply.send(Err(refused.clone()));
+            }
+            ClientCommand::Unsubscribe { reply, .. } => {
+                let _ = reply.send(Err(refused.clone()));
+            }
+            #[allow(unreachable_patterns)] // test-only commands
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

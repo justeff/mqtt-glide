@@ -80,6 +80,49 @@ impl ReconnectPolicy for SlowReconnect {
     }
 }
 
+/// Commands queued while the client waits to reconnect are answered when the driver stops,
+/// not dropped: a publish with `ConnectionLost`, a subscribe with `ShuttingDown`. Dropping them
+/// would read as `CommandChannelClosed`, a client that is gone.
+#[tokio::test]
+async fn commands_queued_in_the_backoff_fail_when_shutdown_stops_the_driver() {
+    let refused = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = refused.local_addr().expect("addr").port();
+    drop(refused);
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (client, connection, _phase) = connect(
+        ConnectOptions::new(url),
+        static_test_credentials(),
+        SlowReconnect,
+        tx,
+        NoopLifecycle,
+    )
+    .expect("connect wiring");
+    let run = tokio::spawn(connection.run());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let publish = client
+        .try_start_publish(Publish::new("t/queued", "x").qos(crate::QoS::AtLeastOnce))
+        .expect("queued");
+    let subscriber = client.clone();
+    let subscribe = tokio::spawn(async move { subscriber.subscribe([("t/queued", crate::QoS::AtLeastOnce)]).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    client.shutdown().await.expect("shutdown");
+
+    let result = timeout(Duration::from_secs(5), run)
+        .await
+        .expect("stops")
+        .expect("join");
+    assert!(result.is_ok(), "{result:?}");
+    let publish = timeout(Duration::from_secs(1), publish.wait()).await.expect("answered");
+    assert!(matches!(publish, Err(AppError::ConnectionLost)), "{publish:?}");
+    let subscribe = timeout(Duration::from_secs(1), subscribe)
+        .await
+        .expect("answered")
+        .expect("join");
+    assert!(matches!(subscribe, Err(AppError::ShuttingDown)), "{subscribe:?}");
+}
+
 /// `shutdown()` ends `run()` with `Ok(())` in every phase, not only with a session up: before
 /// the first dial, while the broker has not answered CONNECT, and while waiting to reconnect.
 #[tokio::test]

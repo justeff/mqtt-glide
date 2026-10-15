@@ -173,6 +173,8 @@ where
     let drained = tokio::time::timeout(flush_budget, drain).await;
     read_stop.cancel();
     fail_all_waiters(waiters, publish_waiters, inflight, &AppError::ConnectionLost);
+    // What the budget left in the channel was never taken up.
+    crate::connection::channels::fail_queued_commands(command_rx, &AppError::ShuttingDown);
     match drained {
         Ok(Ok(())) => WriteOutcome::Shutdown,
         Ok(Err(outcome)) => outcome,
