@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AppError` is `#[non_exhaustive]`, and so are `SessionPhase`, `ConnectionOutcome`, `ConnectError`, `AuthError`, `TransportError`, `ProtocolError`, `ShutdownError`, `ShareNameError`, `TlsConfig`, `DecodeError`, `EncodeError`, `PublishRejection`, `SubscribeResponse` and `UnsubscribeResponse`: a `match` on them needs a wildcard arm, and the structs are only built by the client. New variants and fields are then no longer breaking changes
 - `ConnectOptions` can no longer be written as a struct literal (it gained a private field when the bench-only `bench_inbound_publish_ack_counter` hook left the public API); build it with `ConnectOptions::new(url)` and its setters
 - `PublishPacket` gained the public field `subscription_ids`, so a struct literal needs it
+- `AppError::PublishAckTimeout` is renamed `AppError::PublishTimeout`: it is also what a QoS 0 publish gets that was not written in time, while the connection was down, and QoS 0 has no acknowledgement.
 - `InboundSinkClosed` and `InboundTrySendError` implement `Display` and `std::error::Error`; `ClientBuilder` and `OnInboundSink` implement `Debug`
 
 - Removed from the public API: `Connection::state` / `Connection::generation` (`run` consumes the `Connection`, so they could only ever report the initial state) together with the `ConnectionState` / `Generation` re-exports, and the test-only `TlsMode` / `resolve_tls_mode`. Observe the session through `SessionPhase`, a `LifecycleHook` or `MqttClient::is_connected`

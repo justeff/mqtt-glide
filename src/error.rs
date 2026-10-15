@@ -86,9 +86,10 @@ pub enum AppError {
     /// UNSUBSCRIBE was sent but no matching UNSUBACK arrived before the deadline.
     #[error("unsubscribe acknowledgement timed out after {0:?}")]
     UnsubscribeAckTimeout(Duration),
-    /// PUBLISH was sent but no matching PUBACK arrived before the deadline (QoS 1).
-    #[error("publish acknowledgement timed out after {0:?}")]
-    PublishAckTimeout(Duration),
+    /// The publish did not complete before the deadline: no PUBACK arrived for QoS 1, or a
+    /// QoS 0 publish was not written yet (it waited out a reconnect, say).
+    #[error("publish did not complete within {0:?}")]
+    PublishTimeout(Duration),
     /// Caller request was invalid (e.g. empty subscribe filter list).
     #[error("invalid request: {0}")]
     InvalidRequest(String),

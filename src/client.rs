@@ -256,7 +256,7 @@ impl PublishCompletion {
     /// QoS 0 completes after the PUBLISH is encoded into the connection write buffer (not
     /// necessarily flushed or broker-received). QoS 1 completes after the matching PUBACK.
     /// If completion does not arrive before the configured acknowledgement timeout, this
-    /// returns [`AppError::PublishAckTimeout`].
+    /// returns [`AppError::PublishTimeout`].
     #[inline]
     pub async fn wait(self) -> Result<(), AppError> {
         await_ack(self.ack_timeout, self.reply_rx, AckKind::Publish).await
@@ -509,7 +509,7 @@ impl MqttClient {
     /// (not necessarily flushed or broker-received), the matching `PUBACK` for QoS 1.
     /// QoS 1 publishes beyond the broker's Receive Maximum wait for a free slot.
     /// Both waits are bounded by [`ConnectOptions::ack_timeout`]
-    /// ([`AppError::Backpressure`] / [`AppError::PublishAckTimeout`]).
+    /// ([`AppError::Backpressure`] / [`AppError::PublishTimeout`]).
     ///
     /// `topic` / `payload` take the same types as [`Publish::new`].
     ///
@@ -830,7 +830,7 @@ async fn await_ack<T>(
         Ok(Ok(result)) => result,
         Ok(Err(_closed)) => Err(AppError::CommandChannelClosed),
         Err(_elapsed) => match kind {
-            AckKind::Publish => Err(AppError::PublishAckTimeout(deadline)),
+            AckKind::Publish => Err(AppError::PublishTimeout(deadline)),
             AckKind::Subscribe => Err(AppError::SubscribeAckTimeout(deadline)),
             AckKind::Unsubscribe => Err(AppError::UnsubscribeAckTimeout(deadline)),
         },
@@ -3304,7 +3304,7 @@ mod tests {
         assert!(!client.is_connected());
         let err = client.publish("t/q", "x").await.expect_err("nobody encodes it");
         assert!(
-            matches!(err, AppError::PublishAckTimeout(_)),
+            matches!(err, AppError::PublishTimeout(_)),
             "queued, then timed out: {err:?}"
         );
     }

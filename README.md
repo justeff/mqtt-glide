@@ -223,7 +223,7 @@ What happens to your publishes when the connection drops and the client reconnec
 | Never sent (parked behind Receive Maximum, or still queued) | sent on the next connection | sent on the next connection |
 | QoS 1 sent, `PUBACK` missing | fails with `AppError::ConnectionLost` | resent in order with its original packet id and `DUP` set ([MQTT-4.4.0-1]); fails with `ConnectionLost` if CONNACK reports no session |
 
-A caller that stops waiting earlier (its `ack_timeout` ran out during a long reconnect backoff) gets `PublishAckTimeout`, but the publish is not withdrawn: a never-sent one is dropped, an unacknowledged one in a resumed session is still resent. Retrying on that timeout can therefore deliver twice, as usual for QoS 1. Keep `ack_timeout` above your reconnect delay, or wait on a `PublishCompletion` yourself, if that matters.
+A caller that stops waiting earlier (its `ack_timeout` ran out during a long reconnect backoff) gets `PublishTimeout`, but the publish is not withdrawn: a never-sent one is dropped, an unacknowledged one in a resumed session is still resent. Retrying on that timeout can therefore deliver twice, as usual for QoS 1. Keep `ack_timeout` above your reconnect delay, or wait on a `PublishCompletion` yourself, if that matters.
 
 ### Capacities sized for a few connections, not a pipeline
 
