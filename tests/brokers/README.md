@@ -10,7 +10,7 @@ Image: `eclipse-mosquitto:2.1.2-alpine` (anonymous, reject-connect and Dynamic S
 |------|-------------|
 | `mosquitto_connect_connack_and_disconnect` | CONNECT/CONNACK success (`SessionParams.from_connack`), then clean shutdown |
 | `mosquitto_not_authorized_invalidates_credentials` | CONNACK `AuthError::NotAuthorized` + `CredentialsProvider::invalidate` (single attempt) |
-| `mosquitto_shared_subscription_delivers_to_handoff` | `$share/{group}/{topic}` SUBACK + broker PUBLISH reaches flume handoff |
+| `mosquitto_shared_subscription_delivers_to_handoff` | `$share/{group}/{topic}` SUBACK + broker PUBLISH reaches mpsc handoff |
 | `mosquitto_qos1_publish_awaits_puback` | QoS 1 `publish().await` completes after Mosquitto PUBACK |
 | `mosquitto_publish_properties_roundtrip` | User Properties + Message Expiry Interval **property** round-trip publish → subscribe (immediate delivery; broker drop-on-expiry not asserted here) |
 | `mosquitto_broker_kill_reconnects_and_emits_connected` | Broker kill → Transport disconnect → policy reconnect → Connected (newer generation) |

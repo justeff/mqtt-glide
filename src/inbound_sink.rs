@@ -1,14 +1,15 @@
 //! Injectable inbound PUBLISH sink (enqueue-before-ack).
 //!
 //! The read task delivers each inbound [`InboundMessage`] through a [`InboundSink`]
-//! **before** QoS 1 PUBACK. Built-ins: [`flume::Sender`], [`tokio::sync::mpsc::Sender`],
-//! and [`OnInboundSink`] (inline handler via [`crate::ClientBuilder::on_inbound`]).
+//! **before** QoS 1 PUBACK. Built-ins: [`tokio::sync::mpsc::Sender`], [`OnInboundSink`]
+//! (inline handler via [`crate::ClientBuilder::on_inbound`]) and, with the `flume`
+//! feature, `flume::Sender`.
 //!
 //! # Cancel safety
 //!
 //! On shutdown/session cancel the read task may drop a pending [`InboundSink::send`]
 //! future. That **MUST** mean the message was **not** accepted into the sink (so the
-//! client correctly skips PUBACK). flume `send_async`, Tokio `mpsc::Sender::send`, and
+//! client correctly skips PUBACK). Tokio `mpsc::Sender::send`, flume `send_async`, and
 //! [`OnInboundSink`] satisfy this. Custom sinks **MUST** uphold the same contract: do
 //! not deliver to the consumer before the `send` future completes with `Ok(())`.
 
@@ -60,6 +61,8 @@ pub trait InboundSink: Clone + Send + Sync + 'static {
     fn send(&self, message: InboundMessage) -> impl Future<Output = Result<(), InboundSinkClosed>> + Send;
 }
 
+// Unit tests use flume (a dev-dependency) as their sink with or without the feature.
+#[cfg(any(feature = "flume", test))]
 impl InboundSink for flume::Sender<InboundMessage> {
     #[inline]
     fn is_closed(&self) -> bool {
@@ -108,7 +111,7 @@ impl InboundSink for tokio::sync::mpsc::Sender<InboundMessage> {
 
 /// Inline inbound handoff: runs `handler` on the connection **read task** (no app queue).
 ///
-/// Prefer a channel [`InboundSink`] (`flume` / `tokio::mpsc`) for non-trivial work —
+/// Prefer a channel [`InboundSink`] (`tokio::mpsc`, or `flume` with the feature) for non-trivial work —
 /// this path stalls decode and keepalive while `handler` runs. QoS 1 `PUBACK` is sent
 /// only after `handler` returns. Built for [`crate::ClientBuilder::on_inbound`]; also
 /// usable with [`crate::connect`].

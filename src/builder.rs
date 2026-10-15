@@ -4,7 +4,7 @@
 //!
 //! Incoming PUBLISH delivery **MUST** be configured before [`ClientBuilder::connect`]:
 //! call [`.inbound_sink`](ClientBuilder::inbound_sink) with any [`InboundSink`] (for
-//! example `flume::Sender` or `tokio::sync::mpsc::Sender`),
+//! example `tokio::sync::mpsc::Sender`, or `flume::Sender` with the `flume` feature),
 //! [`.on_inbound`](ClientBuilder::on_inbound) for an inline handler on the read task,
 //! or [`.discard_inbound`](ClientBuilder::discard_inbound) to drain/drop messages in a
 //! background task. These paths are mutually exclusive (compile-time). The unset state
@@ -34,6 +34,7 @@ use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::client::{
@@ -266,7 +267,7 @@ impl ClientBuilder<InboundSinkDiscard> {
 async fn finish_connect<S: InboundSink>(
     config: BuilderConfig,
     sink: S,
-    discard_rx: Option<flume::Receiver<InboundMessage>>,
+    discard_rx: Option<mpsc::Receiver<InboundMessage>>,
 ) -> Result<MqttClient, ConnectError> {
     let BuilderConfig {
         mut options,
@@ -282,8 +283,8 @@ async fn finish_connect<S: InboundSink>(
 
     let connect_timeout = options.connect_timeout;
 
-    if let Some(rx) = discard_rx {
-        tokio::spawn(async move { while rx.recv_async().await.is_ok() {} });
+    if let Some(mut rx) = discard_rx {
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
     }
 
     let (client, connection, mut phase) = connect_with_shared(options, credentials, reconnect, sink, lifecycle)?;
@@ -303,10 +304,8 @@ async fn finish_connect<S: InboundSink>(
 }
 
 /// Bounded discard handoff capacity = CONNECT `Receive Maximum`.
-fn make_discard_channel(
-    receive_maximum: NonZeroU16,
-) -> (flume::Sender<InboundMessage>, flume::Receiver<InboundMessage>) {
-    flume::bounded(usize::from(receive_maximum.get()))
+fn make_discard_channel(receive_maximum: NonZeroU16) -> (mpsc::Sender<InboundMessage>, mpsc::Receiver<InboundMessage>) {
+    mpsc::channel(usize::from(receive_maximum.get()))
 }
 
 /// Awaits the detached driver and logs join panics.

@@ -39,7 +39,7 @@ pub(crate) fn reject_inbound_topic_alias(packet: &PublishPacket) -> Result<(), P
 /// Shared inbound PUBLISH policy for the read task and resubscribe wait path.
 ///
 /// Rejects topic alias and QoS 2. On success returns the packet id that **MUST** be
-/// PUBACKed only after successful flume accept (enqueue-before-ack), or `None` for QoS 0.
+/// PUBACKed only after the inbound sink accepts it (enqueue-before-ack), or `None` for QoS 0.
 ///
 /// Callers differ only in handoff cut-off and PUBACK emission: the live read path
 /// uses the control channel (write task owns the socket); resubscribe writes PUBACK

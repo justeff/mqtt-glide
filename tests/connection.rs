@@ -22,6 +22,7 @@ use mqtt_glide::{
 };
 use secrecy::SecretString;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 /// An unavailable endpoint must surface a transport failure, not a fake
@@ -34,7 +35,7 @@ async fn unreachable_broker_returns_transport_error() {
 
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("connect-down"));
-    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
     let (_client, connection, mut phase) =
         connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -73,7 +74,7 @@ async fn broker_disconnect_reason_classifies_auth_transport_protocol() {
         let creds = CountingInvalidate {
             invalidations: Arc::clone(&invalidations),
         };
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+        let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
         let (_client, connection, mut phase) = connect(options, creds, NoReconnect, tx, NoopLifecycle).expect("wiring");
         let run = tokio::spawn(connection.run());
 
@@ -103,7 +104,7 @@ async fn broker_disconnect_reason_classifies_auth_transport_protocol() {
         let (port, peer) = spawn_connack_then_disconnect(DisconnectReasonCode::KeepAliveTimeout).await;
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
         let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("disc-tx"));
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+        let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
         let (_client, connection, mut phase) =
             connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
         let run = tokio::spawn(connection.run());
@@ -129,7 +130,7 @@ async fn broker_disconnect_reason_classifies_auth_transport_protocol() {
         let (port, peer) = spawn_connack_then_disconnect(DisconnectReasonCode::ProtocolError).await;
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
         let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("disc-proto"));
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+        let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
         let (_client, connection, mut phase) =
             connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
         let run = tokio::spawn(connection.run());
@@ -207,7 +208,7 @@ async fn auth_failure_reconnect_replenishes_channel_before_invalidate() {
     let options = ConnectOptions::new(url)
         .client_id(ClientId::from_prefix("invalidate-order"))
         .connect_timeout(Duration::from_secs(1));
-    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
     let (client, connection, mut phase) = connect(options, creds, policy, tx, NoopLifecycle).expect("wiring");
     let run = tokio::spawn(connection.run());
 
@@ -281,7 +282,7 @@ async fn clean_start_session_present_stops_without_reconnect() {
         .clean_start(true)
         .connect_timeout(Duration::from_secs(1));
     let policy = StandardReconnectPolicy::new(Duration::from_millis(50), Duration::from_secs(1));
-    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
     let (_client, connection, mut phase) =
         connect(options, static_credentials(), policy, tx, NoopLifecycle).expect("wiring");
     let run = tokio::spawn(connection.run());
@@ -361,7 +362,7 @@ async fn first_connect_resumes_an_existing_broker_session() {
         .clean_start(false)
         .session_expiry(Some(Duration::from_secs(60)))
         .connect_timeout(Duration::from_secs(1));
-    let (tx, rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, mut rx) = mpsc::channel::<InboundMessage>(4);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
     let run = tokio::spawn(connection.run());
@@ -372,7 +373,7 @@ async fn first_connect_resumes_an_existing_broker_session() {
         |event| matches!(event, SessionPhase::Connected { session, .. } if session.session_present),
     )
     .await;
-    let message = timeout(Duration::from_secs(5), rx.recv_async())
+    let message = timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("queued message in time")
         .expect("sink open");
@@ -417,7 +418,7 @@ async fn lost_session_resubscribes_on_reconnect() {
         .session_expiry(Some(Duration::from_secs(60)))
         .connect_timeout(Duration::from_secs(1));
     let policy = StandardReconnectPolicy::new(Duration::from_millis(50), Duration::from_secs(1));
-    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), policy, tx, NoopLifecycle).expect("wiring");
     let run = tokio::spawn(connection.run());

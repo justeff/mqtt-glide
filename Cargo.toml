@@ -26,7 +26,7 @@ exclude = [
 unsafe_code = "deny"
 
 [package.metadata.docs.rs]
-features = ["websocket", "testing", "stats"]
+features = ["websocket", "testing", "stats", "flume"]
 
 [[test]]
 name = "faults"
@@ -74,15 +74,18 @@ testing = []
 # `MqttClient::stats()`: counters of what the connection did, for the application to export.
 # Adds no dependencies; without it the counting compiles away.
 stats = []
+# `InboundSink` for `flume::Sender<InboundMessage>`. Ties the API to flume 0.12: a flume
+# upgrade here is a breaking change for code that enables this feature.
+flume = ["dep:flume"]
 # Internal: hooks for the `mqtt_compare` bench only. Not part of the public API.
-__bench = []
+__bench = ["flume"]
 
 [dependencies]
 arc-swap = "1.9"
 bitflags = "2.13"
 bytes = "1.12"
 bytestring = "1.5"
-flume = "0.12"
+flume = { version = "0.12", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 # SIMD byte scans (NUL / wildcard rejection) on the codec hot path. Safe API;
 # runtime-dispatched SSE2/AVX2 (x86_64) / NEON (aarch64) internally.
@@ -104,6 +107,8 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 # Dev/bench only — not linked into dependents or a plain `cargo build`.
 # `cargo test` / `cargo bench` resolve them (including rumqttc for mqtt_compare).
 [dev-dependencies]
+# Unit tests and the bench harness hand off through flume; the library only with the `flume` feature.
+flume = "0.12"
 # Bench: `getrusage` for subscriber CPU in `mqtt_compare` (see benches/support/cpu.rs).
 libc = "0.2"
 proptest = "1.11"

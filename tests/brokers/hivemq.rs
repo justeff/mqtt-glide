@@ -9,6 +9,7 @@ use mqtt_glide::{
     BrokerUrl, ConnectOptions, InboundMessage, MqttClient, NoopLifecycle, Publish, QoS, SessionParams, SessionPhase,
     connect, shared_filter,
 };
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::common::{NoReconnect, static_credentials, wait_for_phase};
@@ -17,13 +18,13 @@ use crate::helpers::start_hivemq;
 struct Client {
     client: MqttClient,
     session: SessionParams,
-    inbound: flume::Receiver<InboundMessage>,
+    inbound: mpsc::Receiver<InboundMessage>,
     run: tokio::task::JoinHandle<Result<(), mqtt_glide::ConnectionOutcome>>,
 }
 
 async fn client(port: u16) -> Client {
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let (tx, inbound) = flume::bounded::<InboundMessage>(10_000);
+    let (tx, inbound) = mpsc::channel::<InboundMessage>(10_000);
     let (client, connection, mut phase) = connect(
         ConnectOptions::new(url),
         static_credentials(),
@@ -93,13 +94,13 @@ async fn hivemq_retain_flag_distinguishes_stored_from_live() {
         .await
         .expect("retained publish");
 
-    let subscriber = client(port).await;
+    let mut subscriber = client(port).await;
     subscriber
         .client
         .subscribe([("interop/state", QoS::AtLeastOnce)])
         .await
         .expect("subscribe");
-    let stored = timeout(Duration::from_secs(5), subscriber.inbound.recv_async())
+    let stored = timeout(Duration::from_secs(5), subscriber.inbound.recv())
         .await
         .expect("retained delivery")
         .expect("open");
@@ -116,7 +117,7 @@ async fn hivemq_retain_flag_distinguishes_stored_from_live() {
         .retain(true)
         .await
         .expect("live publish");
-    let live = timeout(Duration::from_secs(5), subscriber.inbound.recv_async())
+    let live = timeout(Duration::from_secs(5), subscriber.inbound.recv())
         .await
         .expect("live delivery")
         .expect("open");
@@ -145,8 +146,8 @@ async fn hivemq_shared_subscription_splits_messages() {
         return;
     };
     let filter = shared_filter("workers", "interop/jobs").expect("share name");
-    let a = client(port).await;
-    let b = client(port).await;
+    let mut a = client(port).await;
+    let mut b = client(port).await;
     for member in [&a, &b] {
         member
             .client
@@ -166,8 +167,8 @@ async fn hivemq_shared_subscription_splits_messages() {
     let mut total = 0;
     while total < 200 {
         let message = tokio::select! {
-            m = a.inbound.recv_async() => m,
-            m = b.inbound.recv_async() => m,
+            m = a.inbound.recv() => m,
+            m = b.inbound.recv() => m,
             () = tokio::time::sleep(Duration::from_secs(5)) => panic!("only {total} of 200 jobs delivered"),
         }
         .expect("open");
@@ -207,7 +208,7 @@ async fn hivemq_shutdown_drains_outbound() {
 /// in rotation force rebinding; a plain subscriber must still see every message under its
 /// own topic.
 pub(crate) async fn outbound_aliases_roundtrip(port: u16, topic_prefix: &str) {
-    let subscriber = client(port).await;
+    let mut subscriber = client(port).await;
     subscriber
         .client
         .subscribe([(format!("{topic_prefix}/#"), QoS::AtLeastOnce)])
@@ -215,7 +216,7 @@ pub(crate) async fn outbound_aliases_roundtrip(port: u16, topic_prefix: &str) {
         .expect("subscribe");
 
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let (tx, _rx) = flume::bounded::<InboundMessage>(16);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(16);
     let (publisher, connection, mut phase) = connect(
         ConnectOptions::new(url).outbound_topic_aliases(64),
         static_credentials(),
@@ -251,7 +252,7 @@ pub(crate) async fn outbound_aliases_roundtrip(port: u16, topic_prefix: &str) {
         }
     }
     for (topic, payload) in expected {
-        let message = timeout(Duration::from_secs(5), subscriber.inbound.recv_async())
+        let message = timeout(Duration::from_secs(5), subscriber.inbound.recv())
             .await
             .expect("delivery")
             .expect("open");

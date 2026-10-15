@@ -840,7 +840,7 @@ async fn await_ack<T>(
 /// Establishes an MQTT 5 session and returns a client handle, driver, and phase watch.
 ///
 /// `inbound` is the injectable [`InboundSink`] for inbound PUBLISH delivery (for example
-/// a bounded `flume::Sender` or `tokio::sync::mpsc::Sender`).
+/// a bounded `tokio::sync::mpsc::Sender`, or `flume::Sender` with the `flume` feature).
 ///
 /// `lifecycle` is a required [`LifecycleHook`] (pass [`crate::NoopLifecycle`] for no side
 /// effects). It receives synchronous [`SessionPhase`] callbacks (`Connected` /
@@ -1062,7 +1062,13 @@ mod tests {
     }
 
     /// Wires a client against `port` with `receive_maximum=8` and [`NoReconnect`] (single mock session).
-    async fn connect_test_client(port: u16) -> (MqttClient, Connection, watch::Receiver<SessionPhase>) {
+    async fn connect_test_client(
+        port: u16,
+    ) -> (
+        MqttClient,
+        Connection<flume::Sender<InboundMessage>>,
+        watch::Receiver<SessionPhase>,
+    ) {
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
         let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
         let (tx, _rx) = flume::bounded::<InboundMessage>(4);

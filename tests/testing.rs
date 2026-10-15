@@ -7,11 +7,12 @@ use mqtt_glide::testing::{FaultProxy, TestBroker};
 use mqtt_glide::{
     AppError, ClientBuilder, InboundMessage, MqttClient, Publish, QoS, StandardReconnectPolicy, Subscription,
 };
+use tokio::sync::mpsc;
 
 const WAIT: Duration = Duration::from_secs(2);
 
-async fn client(url: &str, id: &str) -> (MqttClient, flume::Receiver<InboundMessage>) {
-    let (tx, rx) = flume::bounded(64);
+async fn client(url: &str, id: &str) -> (MqttClient, mpsc::Receiver<InboundMessage>) {
+    let (tx, rx) = mpsc::channel(64);
     let client = ClientBuilder::new(url)
         .expect("url")
         .client_id(id)
@@ -27,8 +28,8 @@ async fn client(url: &str, id: &str) -> (MqttClient, flume::Receiver<InboundMess
     (client, rx)
 }
 
-async fn next(rx: &flume::Receiver<InboundMessage>) -> InboundMessage {
-    tokio::time::timeout(WAIT, rx.recv_async())
+async fn next(rx: &mut mpsc::Receiver<InboundMessage>) -> InboundMessage {
+    tokio::time::timeout(WAIT, rx.recv())
         .await
         .expect("message in time")
         .expect("channel open")
@@ -61,8 +62,8 @@ async fn records_what_the_application_publishes() {
 #[tokio::test]
 async fn routes_between_clients_with_wildcards_retained_messages_and_no_local() {
     let broker = TestBroker::start().await.expect("broker");
-    let (publisher, publisher_rx) = client(&broker.url(), "publisher").await;
-    let (subscriber, subscriber_rx) = client(&broker.url(), "subscriber").await;
+    let (publisher, mut publisher_rx) = client(&broker.url(), "publisher").await;
+    let (subscriber, mut subscriber_rx) = client(&broker.url(), "subscriber").await;
 
     publisher
         .publish("sensors/t1", "21.5")
@@ -75,7 +76,7 @@ async fn routes_between_clients_with_wildcards_retained_messages_and_no_local() 
         .subscribe([("sensors/+", QoS::AtLeastOnce)])
         .await
         .expect("subscribe");
-    let retained = next(&subscriber_rx).await;
+    let retained = next(&mut subscriber_rx).await;
     assert!(retained.retain, "stored value arrives flagged as retained");
     assert_eq!(&retained.payload[..], b"21.5");
 
@@ -84,19 +85,19 @@ async fn routes_between_clients_with_wildcards_retained_messages_and_no_local() 
         .await
         .expect("subscribe");
     // The retained message for the publisher's own subscription, then nothing of its own.
-    assert_eq!(&next(&publisher_rx).await.payload[..], b"21.5");
+    assert_eq!(&next(&mut publisher_rx).await.payload[..], b"21.5");
     publisher
         .publish("sensors/t2", "19.0")
         .qos(QoS::AtLeastOnce)
         .await
         .expect("publish");
-    let live = next(&subscriber_rx).await;
+    let live = next(&mut subscriber_rx).await;
     assert_eq!(
         (&*live.topic, live.retain, live.qos),
         ("sensors/t2", false, QoS::AtLeastOnce)
     );
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), publisher_rx.recv_async())
+        tokio::time::timeout(Duration::from_millis(200), publisher_rx.recv())
             .await
             .is_err(),
         "No Local: the publisher does not get its own message"
@@ -107,8 +108,8 @@ async fn routes_between_clients_with_wildcards_retained_messages_and_no_local() 
 #[tokio::test]
 async fn injects_messages_and_balances_shared_subscriptions() {
     let broker = TestBroker::start().await.expect("broker");
-    let (a, a_rx) = client(&broker.url(), "worker-a").await;
-    let (b, b_rx) = client(&broker.url(), "worker-b").await;
+    let (a, mut a_rx) = client(&broker.url(), "worker-a").await;
+    let (b, mut b_rx) = client(&broker.url(), "worker-b").await;
     for worker in [&a, &b] {
         worker
             .subscribe([("$share/workers/jobs", QoS::AtLeastOnce)])
@@ -122,8 +123,8 @@ async fn injects_messages_and_balances_shared_subscriptions() {
     let mut got = [0, 0];
     for _ in 0..4 {
         tokio::select! {
-            Ok(_) = a_rx.recv_async() => got[0] += 1,
-            Ok(_) = b_rx.recv_async() => got[1] += 1,
+            Some(_) = a_rx.recv() => got[0] += 1,
+            Some(_) = b_rx.recv() => got[1] += 1,
         }
     }
     assert_eq!(got, [2, 2], "each job goes to exactly one worker, in turn");
@@ -132,13 +133,13 @@ async fn injects_messages_and_balances_shared_subscriptions() {
 #[tokio::test]
 async fn a_dropped_client_reconnects_resubscribes_and_its_will_goes_out() {
     let broker = TestBroker::start().await.expect("broker");
-    let (observer, observer_rx) = client(&broker.url(), "observer").await;
+    let (observer, mut observer_rx) = client(&broker.url(), "observer").await;
     observer
         .subscribe([("status/#", QoS::AtMostOnce)])
         .await
         .expect("subscribe");
 
-    let (tx, device_rx) = flume::bounded(16);
+    let (tx, mut device_rx) = mpsc::channel(16);
     let device = ClientBuilder::new(broker.url())
         .expect("url")
         .client_id("device")
@@ -158,7 +159,7 @@ async fn a_dropped_client_reconnects_resubscribes_and_its_will_goes_out() {
         .expect("subscribe");
 
     assert!(broker.drop_client("device"));
-    let will = next(&observer_rx).await;
+    let will = next(&mut observer_rx).await;
     assert_eq!((&*will.topic, &will.payload[..]), ("status/device", &b"offline"[..]));
 
     assert!(broker.wait_for_connects(3, WAIT).await, "the device reconnected");
@@ -167,7 +168,7 @@ async fn a_dropped_client_reconnects_resubscribes_and_its_will_goes_out() {
         "subscription restored"
     );
     broker.publish(Publish::new("cmd/device", "reboot").qos(QoS::AtLeastOnce));
-    assert_eq!(&next(&device_rx).await.payload[..], b"reboot");
+    assert_eq!(&next(&mut device_rx).await.payload[..], b"reboot");
 }
 
 /// A broker that refuses a subscription after a reconnect (an ACL revoked meanwhile) leaves
@@ -176,7 +177,7 @@ async fn a_dropped_client_reconnects_resubscribes_and_its_will_goes_out() {
 #[tokio::test]
 async fn a_subscription_refused_after_reconnect_comes_back_when_allowed_again() {
     let broker = TestBroker::start().await.expect("broker");
-    let (device, device_rx) = client(&broker.url(), "device").await;
+    let (device, mut device_rx) = client(&broker.url(), "device").await;
     device
         .subscribe([("cmd/device", QoS::AtLeastOnce), ("cfg/device", QoS::AtLeastOnce)])
         .await
@@ -217,7 +218,7 @@ async fn a_subscription_refused_after_reconnect_comes_back_when_allowed_again() 
         .expect("watch open");
     assert_eq!(broker.connect_count(), 2, "no reconnect for the retry");
     broker.publish(Publish::new("cmd/device", "reboot").qos(QoS::AtLeastOnce));
-    assert_eq!(&next(&device_rx).await.payload[..], b"reboot");
+    assert_eq!(&next(&mut device_rx).await.payload[..], b"reboot");
 }
 
 #[tokio::test]

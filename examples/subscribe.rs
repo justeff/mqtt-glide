@@ -1,7 +1,7 @@
 //! Subscribe and receive via `inbound_sink` (enqueue-before-ack).
 //!
 //! Shows [`Subscription`] options, a bounded receive loop, `unsubscribe`, and `shutdown`.
-//! Inbound QoS 1 is `PUBACK`ed only after the flume sink accepts the message.
+//! Inbound QoS 1 is `PUBACK`ed only after the mpsc sink accepts the message.
 //! For tiny sync work on the read task, see [`on_inbound.rs`](on_inbound.rs).
 //!
 //! ```shell
@@ -11,11 +11,12 @@
 use std::time::Duration;
 
 use mqtt_glide::{ClientBuilder, QoS, Subscription};
+use tokio::sync::mpsc;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broker = std::env::var("MQTT_GLIDE_BROKER").unwrap_or_else(|_| "mqtt://127.0.0.1:1883".into());
-    let (tx, rx) = flume::bounded(1024);
+    let (tx, mut rx) = mpsc::channel(1024);
 
     let client = ClientBuilder::new(&broker)?.inbound_sink(tx).connect().await?;
 
@@ -35,9 +36,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.publish(filter, "ping").qos(QoS::AtLeastOnce).send().await?;
 
     // App-level bound only: ack/connect timeouts do not cover waiting on the inbound sink.
-    let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv_async())
+    let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
-        .map_err(|_| "timed out waiting for inbound publish")??;
+        .map_err(|_| "timed out waiting for inbound publish")?
+        .ok_or("inbound sink closed")?;
     println!("{} => {} bytes", msg.topic, msg.payload.len());
 
     let unsub = client.unsubscribe([filter, "demo/glide/cmd"]).await?;

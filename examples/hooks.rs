@@ -17,7 +17,7 @@ use mqtt_glide::{
     AuthError, ClientBuilder, CredentialsProvider, LifecycleHook, QoS, SessionPhase, StandardReconnectPolicy,
 };
 use secrecy::SecretString;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 /// Example token cache. Real apps fetch/refresh OAuth (or similar) here.
 struct TokenProvider {
@@ -56,7 +56,7 @@ impl LifecycleHook for LogLifecycle {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broker = std::env::var("MQTT_GLIDE_BROKER").unwrap_or_else(|_| "mqtt://127.0.0.1:1883".into());
-    let (tx, _rx) = flume::bounded(256);
+    let (tx, _rx) = mpsc::channel(256);
 
     let policy = StandardReconnectPolicy::new(
         Duration::from_secs(3),   // transport / protocol delay

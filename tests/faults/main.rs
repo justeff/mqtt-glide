@@ -22,7 +22,7 @@ use mqtt_glide::{
     AppError, BrokerUrl, ClientId, ConnectOptions, Connection, ConnectionOutcome, InboundMessage, MqttClient,
     NoopLifecycle, Publish, QoS, ReconnectPolicy, SessionPhase, connect,
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -44,7 +44,7 @@ struct Session {
     client: MqttClient,
     phase: watch::Receiver<SessionPhase>,
     run: JoinHandle<Result<(), ConnectionOutcome>>,
-    inbound: flume::Receiver<InboundMessage>,
+    inbound: mpsc::Receiver<InboundMessage>,
 }
 
 fn options(port: u16) -> ConnectOptions {
@@ -53,7 +53,7 @@ fn options(port: u16) -> ConnectOptions {
 }
 
 async fn start(options: ConnectOptions) -> Session {
-    let (tx, inbound) = flume::bounded::<InboundMessage>(10_000);
+    let (tx, inbound) = mpsc::channel::<InboundMessage>(10_000);
     let (client, connection, mut phase): (_, Connection<_>, _) =
         connect(options, static_credentials(), FastReconnect, tx, NoopLifecycle).expect("connect wiring");
     let run = tokio::spawn(connection.run());
@@ -104,7 +104,7 @@ fn payload_index(payload: &[u8]) -> u32 {
 
 /// Collects observed indices until `done(seen)` holds or `deadline` passed.
 async fn collect_indices(
-    inbound: &flume::Receiver<InboundMessage>,
+    inbound: &mut mpsc::Receiver<InboundMessage>,
     deadline: Duration,
     done: impl Fn(&BTreeSet<u32>) -> bool,
 ) -> BTreeSet<u32> {
@@ -114,8 +114,8 @@ async fn collect_indices(
         let Some(left) = end.checked_duration_since(Instant::now()) else {
             break;
         };
-        match timeout(left, inbound.recv_async()).await {
-            Ok(Ok(message)) => {
+        match timeout(left, inbound.recv()).await {
+            Ok(Some(message)) => {
                 seen.insert(payload_index(&message.payload));
             }
             _ => break,
@@ -158,7 +158,7 @@ async fn reset_mid_burst_resumed_session_delivers_everything() {
     let Some((_broker, broker_port)) = helpers::start_mosquitto().await else {
         return;
     };
-    let watcher = observer(broker_port, "faults/resume").await;
+    let mut watcher = observer(broker_port, "faults/resume").await;
     let proxy = FaultProxy::start(([127, 0, 0, 1], broker_port).into())
         .await
         .expect("fault proxy");
@@ -177,7 +177,10 @@ async fn reset_mid_burst_resumed_session_delivers_everything() {
             "publish {i} must survive the reset in a resumed session: {result:?}"
         );
     }
-    let seen = collect_indices(&watcher.inbound, Duration::from_secs(10), |seen| seen.len() == 2_000).await;
+    let seen = collect_indices(&mut watcher.inbound, Duration::from_secs(10), |seen| {
+        seen.len() == 2_000
+    })
+    .await;
     assert_eq!(
         seen.len(),
         2_000,
@@ -186,7 +189,7 @@ async fn reset_mid_burst_resumed_session_delivers_everything() {
     assert!(proxy.accepted() >= 2, "the reset must have forced a reconnect");
 
     stop(session).await;
-    watcher.inbound.drain();
+    while watcher.inbound.try_recv().is_ok() {}
     stop(watcher).await;
 }
 
@@ -197,7 +200,7 @@ async fn reset_mid_burst_clean_session_reports_truthfully() {
     let Some((_broker, broker_port)) = helpers::start_mosquitto().await else {
         return;
     };
-    let watcher = observer(broker_port, "faults/clean").await;
+    let mut watcher = observer(broker_port, "faults/clean").await;
     let proxy = FaultProxy::start(([127, 0, 0, 1], broker_port).into())
         .await
         .expect("fault proxy");
@@ -222,7 +225,7 @@ async fn reset_mid_burst_clean_session_reports_truthfully() {
     }
     // Publishes that failed with ConnectionLost may still have reached the broker (only
     // the PUBACK got lost), so wait for the acknowledged set, not for a count.
-    let seen = collect_indices(&watcher.inbound, Duration::from_secs(10), |seen| ok.is_subset(seen)).await;
+    let seen = collect_indices(&mut watcher.inbound, Duration::from_secs(10), |seen| ok.is_subset(seen)).await;
     let missing: Vec<_> = ok.difference(&seen).take(10).collect();
     assert!(
         missing.is_empty(),
@@ -288,7 +291,7 @@ async fn byte_by_byte_link_round_trips() {
         .await
         .expect("fault proxy");
     proxy.set_slice(Some(1));
-    let session = start(options(proxy.port())).await;
+    let mut session = start(options(proxy.port())).await;
     session
         .client
         .subscribe([("faults/slice/#", QoS::AtLeastOnce)])
@@ -307,7 +310,7 @@ async fn byte_by_byte_link_round_trips() {
             .expect("publish through a sliced link");
     }
     for (i, size) in sizes.iter().enumerate() {
-        let message = timeout(Duration::from_secs(10), session.inbound.recv_async())
+        let message = timeout(Duration::from_secs(10), session.inbound.recv())
             .await
             .expect("echo arrives")
             .expect("sink open");
@@ -423,7 +426,7 @@ async fn reset_with_topic_aliases_rebinds_on_the_new_connection() {
     let Some((_broker, broker_port)) = helpers::start_mosquitto().await else {
         return;
     };
-    let watcher = observer(broker_port, "faults/alias").await;
+    let mut watcher = observer(broker_port, "faults/alias").await;
     let proxy = FaultProxy::start(([127, 0, 0, 1], broker_port).into())
         .await
         .expect("fault proxy");
@@ -440,7 +443,10 @@ async fn reset_with_topic_aliases_rebinds_on_the_new_connection() {
     for (i, result) in results.iter().enumerate() {
         assert!(result.is_ok(), "publish {i} failed across the reset: {result:?}");
     }
-    let seen = collect_indices(&watcher.inbound, Duration::from_secs(10), |seen| seen.len() == 1_000).await;
+    let seen = collect_indices(&mut watcher.inbound, Duration::from_secs(10), |seen| {
+        seen.len() == 1_000
+    })
+    .await;
     assert_eq!(seen.len(), 1_000, "every aliased publish must reach the broker");
     assert!(session.client.is_connected(), "broker must not have rejected an alias");
 
@@ -452,7 +458,7 @@ async fn reset_with_topic_aliases_rebinds_on_the_new_connection() {
 /// applied, and checks every echo arrives intact.
 #[cfg(feature = "websocket")]
 async fn websocket_roundtrip_over_sliced_link(url: String, proxy: &FaultProxy, slice: impl FnOnce(&FaultProxy)) {
-    let session = start(ConnectOptions::new(BrokerUrl::parse(&url).expect("ws url"))).await;
+    let mut session = start(ConnectOptions::new(BrokerUrl::parse(&url).expect("ws url"))).await;
     // Slice only after the HTTP upgrade: tungstenite rejects a handshake that arrives in
     // more than 64 reads averaging under 128 bytes as a slowloris attempt. Everything after
     // the upgrade (WebSocket frames, MQTT packets) is what these tests are about.
@@ -472,7 +478,7 @@ async fn websocket_roundtrip_over_sliced_link(url: String, proxy: &FaultProxy, s
             .expect("publish over sliced ws");
     }
     for i in 0..20usize {
-        let message = timeout(Duration::from_secs(10), session.inbound.recv_async())
+        let message = timeout(Duration::from_secs(10), session.inbound.recv())
             .await
             .expect("echo")
             .expect("open");
@@ -522,7 +528,7 @@ async fn websocket_reset_mid_burst_resumed_session_delivers_everything() {
     let Some((_broker, tcp_port, ws_port)) = helpers::start_mosquitto_websockets().await else {
         return;
     };
-    let watcher = observer(tcp_port, "faults/wsresume").await;
+    let mut watcher = observer(tcp_port, "faults/wsresume").await;
     let proxy = FaultProxy::start(([127, 0, 0, 1], ws_port).into())
         .await
         .expect("fault proxy");
@@ -539,7 +545,10 @@ async fn websocket_reset_mid_burst_resumed_session_delivers_everything() {
     for (i, result) in results.iter().enumerate() {
         assert!(result.is_ok(), "publish {i} must survive the reset: {result:?}");
     }
-    let seen = collect_indices(&watcher.inbound, Duration::from_secs(10), |seen| seen.len() == 1_000).await;
+    let seen = collect_indices(&mut watcher.inbound, Duration::from_secs(10), |seen| {
+        seen.len() == 1_000
+    })
+    .await;
     assert_eq!(seen.len(), 1_000);
     assert!(proxy.accepted() >= 2, "the reset must have forced a reconnect");
     stop(session).await;

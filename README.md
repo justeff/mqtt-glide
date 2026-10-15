@@ -16,7 +16,6 @@ MQTT 5 only, QoS 0 and 1, over TCP, TLS or (opt-in) WebSocket. No MQTT 3.1.1, no
 [dependencies]
 mqtt-glide = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
-flume = "0.12"   # optional; any InboundSink works
 ```
 
 TLS goes through rustls. Enable **exactly one** crypto provider: `tls-rustls-aws-lc` (default) or `tls-rustls-ring`. Prefer pinning the choice in dependents. The client builds its `ClientConfig` with `builder_with_provider` and does not rely on a process-global rustls default, so enabling both features (or `--all-features`) is rejected.
@@ -32,6 +31,13 @@ mqtt-glide = { version = "0.2", features = ["websocket"] }
 ```
 
 Then connect with `ws://broker:8080/mqtt` or `wss://broker/mqtt`.
+
+Inbound messages go into any `InboundSink`; `tokio::sync::mpsc::Sender` works out of the box. To hand them to a `flume::Sender` instead, enable the `flume` feature. It ties your build to flume 0.12, so a flume upgrade in mqtt-glide is a breaking change for you:
+
+```toml
+mqtt-glide = { version = "0.2", features = ["flume"] }
+flume = "0.12"
+```
 
 ## Quickstart
 
@@ -102,7 +108,7 @@ Step 3 after step 2 is the whole point, and the rest of this document calls it *
 
 ### One handoff instead of two queues
 
-Decoded messages go directly into your `InboundSink`: a `flume` or `tokio::sync::mpsc` sender, an inline handler, or your own implementation. There is no library-owned inbound queue in front of it to size, drain, or reason about.
+Decoded messages go directly into your `InboundSink`: a `tokio::sync::mpsc` sender (or `flume` with the feature), an inline handler, or your own implementation. There is no library-owned inbound queue in front of it to size, drain, or reason about.
 
 ### A slow consumer costs throughput, not the session
 
@@ -112,7 +118,7 @@ Read and write run as separate tasks on a split socket. While the read task wait
 |---------|----------|
 | App API | Cloneable `MqttClient` (no polling) |
 | I/O | Separate read and write tasks on a split socket |
-| Inbound | Injectable `InboundSink` (e.g. `flume` / `tokio::mpsc`) |
+| Inbound | Injectable `InboundSink` (e.g. `tokio::mpsc`, `flume` with the feature) |
 | QoS 1 ingress | enqueue-before-ack: `PUBACK` only after the sink accepts |
 | Keep-alive under load | Write keeps sending `PINGREQ` while read waits on a full sink; liveness treats that stall as self-induced |
 | Shutdown | Graceful drain, then `DISCONNECT` |
@@ -310,7 +316,7 @@ Prefer convenience (zero extra cost vs. the primitives underneath):
 | Burst | [`publish_batch`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.publish_batch) → one call (`push` + `drain` under the hood) |
 | Subscribe | [`subscribe`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.subscribe) / `subscribe_with_id` → per-filter reason codes plus the broker's Reason String and User Properties |
 | Request / response | `client.requester(response_topic).await?` → `.request(topic, payload).await` resolves with the response |
-| Receive + workers | `.inbound_sink(flume/mpsc)` + your `recv` loop |
+| Receive + workers | `.inbound_sink(mpsc)` + your `recv` loop |
 | Tiny sync inbound work | `.on_inbound(\|msg\| …)` (runs on the read task; keep it short) |
 
 Power (same semantics, more control): [`connect`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/fn.connect.html), custom [`InboundSink`](https://docs.rs/mqtt-glide/latest/mqtt_glide/inbound_sink/trait.InboundSink.html), [`send`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.send) / [`start_publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.start_publish) / [`try_start_publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.try_start_publish) + [`PublishCompletion`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.PublishCompletion.html).
@@ -362,7 +368,7 @@ If the broker refuses a restored filter (for example after an ACL change), the c
 | `CredentialsProvider` | Async `credentials()` before each `CONNECT`; `invalidate()` on CONNECT-level `NotAuthorized` only |
 | `ReconnectPolicy` | `delay_after(outcome) -> Option<Duration>` (`None` = stop). The outcome of a broker `DISCONNECT` or refused `CONNACK` includes the broker's Reason String (and Server Reference). Ready-made: `StandardReconnectPolicy` + `mark_live()` |
 | `LifecycleHook` | Sync `Connected` / `Disconnected` side effects on the driver task; keep short (no await). `ClientBuilder` already waits for the first `Connected`. For async waits use the [`SessionPhase`](https://docs.rs/mqtt-glide/latest/mqtt_glide/connection/enum.SessionPhase.html) watch (`client.session_phase()`, any client) and `client.is_connected()` for a snapshot |
-| `InboundSink` | Injectable inbound handoff; built-ins: `flume`, `tokio::mpsc`, `OnInboundSink` (`.on_inbound`). Custom sinks **MUST** be cancel-safe |
+| `InboundSink` | Injectable inbound handoff; built-ins: `tokio::mpsc`, `OnInboundSink` (`.on_inbound`), `flume` (feature). Custom sinks **MUST** be cancel-safe |
 
 ### Examples
 
@@ -393,7 +399,7 @@ Broader flows live under [`examples/`](examples/) and are the better starting po
 
 `StandardReconnectPolicy::mark_live()`: call once the session is fully ready (typically after subscriptions succeed). The next transport failure then retries immediately (`Duration::ZERO`) once, before falling back to the configured delay; only if the session lasted at least that delay, so a broker that drops every connection right away is not dialled in a loop. Auth failures use the normal delay, then `max_auth_backoff` after a streak (`DEFAULT_AUTH_FAILURE_THRESHOLD`). Credential cache clearing is `CredentialsProvider::invalidate`, not this policy.
 
-Custom `InboundSink` cancel safety: built-ins (`flume`, `tokio::mpsc`, `OnInboundSink`) are fine. If you implement `InboundSink`, dropping `send()` before `Ok(())` **MUST** mean the message was not accepted by your consumer. On shutdown the driver may drop a pending send and will withhold `PUBACK` in that case. `.on_inbound` runs on the connection read task; keep the handler short or use a channel sink.
+Custom `InboundSink` cancel safety: built-ins (`tokio::mpsc`, `OnInboundSink`, `flume`) are fine. If you implement `InboundSink`, dropping `send()` before `Ok(())` **MUST** mean the message was not accepted by your consumer. On shutdown the driver may drop a pending send and will withhold `PUBACK` in that case. `.on_inbound` runs on the connection read task; keep the handler short or use a channel sink.
 
 Spec **SHOULD**s this client adopts: `CONNACK` within `connect_timeout`; `PINGRESP` watchdog (~1× Keep Alive) with handoff-stall exemption.
 

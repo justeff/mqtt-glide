@@ -32,7 +32,7 @@ use mqtt_glide::{
 use rstest::rstest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -383,13 +383,13 @@ struct Harness {
     client: MqttClient,
     phase: watch::Receiver<SessionPhase>,
     run: JoinHandle<Result<(), ConnectionOutcome>>,
-    rx: flume::Receiver<InboundMessage>,
+    rx: mpsc::Receiver<InboundMessage>,
 }
 
 impl Harness {
     fn start(options: ConnectOptions, policy: Reconnect, sink_capacity: usize) -> Self {
         install_panic_hook();
-        let (tx, rx) = flume::bounded::<InboundMessage>(sink_capacity);
+        let (tx, rx) = mpsc::channel::<InboundMessage>(sink_capacity);
         let (client, connection, phase): (_, Connection<_>, _) = connect(
             options,
             StaticCredentials::new("user", "pass"),
@@ -493,7 +493,9 @@ async fn run_attack(attack: Vec<u8>, sentinel: bool) -> (Seen, Result<(), Connec
     }
     let result = h.finish(10).await;
     drop(peer);
-    let delivered = h.rx.try_iter().filter(|m| m.topic != "sentinel").collect();
+    let delivered = std::iter::from_fn(|| h.rx.try_recv().ok())
+        .filter(|m| m.topic != "sentinel")
+        .collect();
     assert_no_library_panic();
     (seen, result, delivered)
 }
@@ -1144,7 +1146,7 @@ async fn mark_live_after_every_connect_does_not_busy_loop() {
     })
     .await;
     let policy = StandardReconnectPolicy::new(Duration::from_millis(300), Duration::from_secs(1));
-    let (tx, _rx) = flume::bounded::<InboundMessage>(16);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(16);
     let (client, connection, mut phase) = connect(
         base_options(port),
         StaticCredentials::new("u", "p"),
@@ -1279,7 +1281,7 @@ impl Fleet {
             duplicates: Arc::default(),
         };
         for i in 0..2 {
-            let (tx, rx) = flume::bounded::<InboundMessage>(1024);
+            let (tx, mut rx) = mpsc::channel::<InboundMessage>(1024);
             let (client, driver) = Self::client(proxy, &format!("{prefix}-sub-{i}"), tx);
             let started = Instant::now();
             while client.subscribe([("soak/q1/#", QoS::AtLeastOnce)]).await.is_err() {
@@ -1291,7 +1293,7 @@ impl Fleet {
             let (received, duplicates) = (fleet.received.clone(), fleet.duplicates.clone());
             fleet.subscribers.push(tokio::spawn(async move {
                 let mut seen = std::collections::HashSet::new();
-                while let Ok(m) = rx.recv_async().await {
+                while let Some(m) = rx.recv().await {
                     let seq = u32::from_be_bytes(m.payload[..4].try_into().unwrap());
                     if !seen.insert((m.topic.to_string(), seq)) {
                         duplicates.fetch_add(1, Ordering::Relaxed);

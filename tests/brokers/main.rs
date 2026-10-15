@@ -26,6 +26,7 @@ use mqtt_glide::{
     connect, shared_filter,
 };
 use secrecy::SecretString;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use helpers::{
@@ -122,7 +123,7 @@ async fn mosquitto_connect_connack_and_disconnect() {
     };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("connect-ok"));
-    let (tx, _rx) = flume::bounded::<InboundMessage>(8);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(8);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -165,7 +166,7 @@ async fn mosquitto_not_authorized_invalidates_credentials() {
     let creds = CountingInvalidate {
         invalidations: Arc::clone(&invalidations),
     };
-    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
     let (_client, connection, mut phase) =
         connect(options, creds, NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -236,7 +237,7 @@ async fn mosquitto_shared_subscription_delivers_to_handoff() {
     };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("share-sub"));
-    let (tx, rx) = flume::bounded::<InboundMessage>(8);
+    let (tx, mut rx) = mpsc::channel::<InboundMessage>(8);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -281,7 +282,7 @@ async fn mosquitto_shared_subscription_delivers_to_handoff() {
 
     publish_qos0_via_raw_session(port, "shared-pub", topic, b"shared-payload").await;
 
-    let enqueued = timeout(Duration::from_secs(10), rx.recv_async())
+    let enqueued = timeout(Duration::from_secs(10), rx.recv())
         .await
         .expect("handoff receive timed out")
         .expect("handoff closed");
@@ -303,7 +304,7 @@ async fn mosquitto_qos1_publish_awaits_puback() {
     };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("qos1"));
-    let (tx, _rx) = flume::bounded::<InboundMessage>(8);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(8);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -352,7 +353,7 @@ async fn mosquitto_qos1_window_wider_than_receive_maximum() {
     };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("qos1-window"));
-    let (tx, _rx) = flume::bounded::<InboundMessage>(8);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(8);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -401,7 +402,7 @@ async fn mosquitto_publish_properties_roundtrip() {
     };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("props"));
-    let (tx, rx) = flume::bounded::<InboundMessage>(8);
+    let (tx, mut rx) = mpsc::channel::<InboundMessage>(8);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -452,7 +453,7 @@ async fn mosquitto_publish_properties_roundtrip() {
         .await
         .expect("publish with properties");
 
-    let enqueued = timeout(Duration::from_secs(10), rx.recv_async())
+    let enqueued = timeout(Duration::from_secs(10), rx.recv())
         .await
         .expect("handoff receive timed out")
         .expect("handoff closed");
@@ -508,7 +509,7 @@ async fn mosquitto_broker_kill_reconnects_and_emits_connected() {
     let policy = CountingTransportReconnect {
         transport_consults: Arc::clone(&transport_consults),
     };
-    let (tx, _rx) = flume::bounded::<InboundMessage>(8);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(8);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), policy, tx, NoopLifecycle).expect("connect wiring");
 
@@ -600,7 +601,7 @@ async fn mosquitto_auth_fail_stops_without_endless_reconnect() {
         transport_consults: Arc::clone(&transport_consults),
     };
 
-    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
     let (_client, connection, mut phase) = connect(options, creds, policy, tx, NoopLifecycle).expect("connect wiring");
 
     let run = tokio::spawn(connection.run());
@@ -684,7 +685,7 @@ async fn mosquitto_handoff_full_keep_alive_no_spurious_reconnect() {
         .client_id(ClientId::from_prefix("keepalive"))
         .keep_alive(keep_alive);
     // Capacity 1: one fill saturates; next inbound publish stalls Read on handoff (§3.2).
-    let (tx, rx) = flume::bounded::<InboundMessage>(1);
+    let (tx, mut rx) = mpsc::channel::<InboundMessage>(1);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), TransportOnlyReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -724,7 +725,7 @@ async fn mosquitto_handoff_full_keep_alive_no_spurious_reconnect() {
     publish_qos0_via_raw_session(port, "keepalive-pub1", topic, b"fill").await;
     // Do not drain — leave the one slot occupied.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(rx.is_full(), "handoff must be full after first inbound publish");
+    assert!(rx.len() == 1, "handoff must be full after first inbound publish");
 
     // Second publish parks Read on handoff push while Write must keep PINGing.
     publish_qos0_via_raw_session(port, "keepalive-pub2", topic, b"stall").await;
@@ -761,12 +762,12 @@ async fn mosquitto_handoff_full_keep_alive_no_spurious_reconnect() {
     }
 
     // Drain so Read can finish the stalled push; connection still live.
-    let fill = timeout(Duration::from_secs(5), rx.recv_async())
+    let fill = timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("handoff drain timed out")
         .expect("handoff closed");
     assert_eq!(&*fill.payload, b"fill");
-    let stalled = timeout(Duration::from_secs(5), rx.recv_async())
+    let stalled = timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("stalled handoff message timed out")
         .expect("handoff closed");
@@ -799,7 +800,7 @@ async fn mosquitto_revoked_role_acl_keeps_the_client_connected() {
 
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::try_from("acl-device").expect("client id"));
-    let (tx, rx) = flume::bounded::<InboundMessage>(16);
+    let (tx, mut rx) = mpsc::channel::<InboundMessage>(16);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), TransportOnlyReconnect, tx, NoopLifecycle).expect("connect wiring");
     let run = tokio::spawn(connection.run());
@@ -831,7 +832,7 @@ async fn mosquitto_revoked_role_acl_keeps_the_client_connected() {
     };
     // The rest of the session works: the other subscription receives.
     client.publish("acl/other", "still").await.expect("publish");
-    let message = timeout(Duration::from_secs(10), rx.recv_async())
+    let message = timeout(Duration::from_secs(10), rx.recv())
         .await
         .expect("acl/other delivered")
         .expect("handoff open");
@@ -854,7 +855,7 @@ async fn mosquitto_revoked_role_acl_keeps_the_client_connected() {
     client.publish("acl/cmd", "back").await.expect("publish");
     timeout(Duration::from_secs(10), async {
         loop {
-            let message = rx.recv_async().await.expect("handoff open");
+            let message = rx.recv().await.expect("handoff open");
             if &*message.payload == b"back" {
                 break;
             }
@@ -876,7 +877,7 @@ async fn mosquitto_resubscribes_after_reconnect() {
     let options = ConnectOptions::new(url)
         .client_id(ClientId::from_prefix("resub"))
         .keep_alive(Duration::from_secs(5));
-    let (tx, rx) = flume::bounded::<InboundMessage>(8);
+    let (tx, mut rx) = mpsc::channel::<InboundMessage>(8);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), TransportOnlyReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -907,7 +908,7 @@ async fn mosquitto_resubscribes_after_reconnect() {
     );
 
     publish_qos0_via_raw_session(port, "resub-pub1", topic, b"before-kill").await;
-    let before = timeout(Duration::from_secs(10), rx.recv_async())
+    let before = timeout(Duration::from_secs(10), rx.recv())
         .await
         .expect("pre-reconnect handoff timed out")
         .expect("handoff closed");
@@ -935,7 +936,7 @@ async fn mosquitto_resubscribes_after_reconnect() {
 
     // Do not call subscribe again — driver must re-issue prior filters after Clean Start reconnect.
     publish_qos0_via_raw_session(port, "resub-pub2", topic, b"after-reconnect").await;
-    let after = timeout(Duration::from_secs(10), rx.recv_async())
+    let after = timeout(Duration::from_secs(10), rx.recv())
         .await
         .expect("post-reconnect handoff timed out — subscriptions were not restored")
         .expect("handoff closed");
@@ -965,7 +966,7 @@ async fn mosquitto_session_phase_updates_app_state_without_eventloop_poll() {
     let options = ConnectOptions::new(url)
         .client_id(ClientId::from_prefix("phase"))
         .keep_alive(Duration::from_secs(5));
-    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), TransportOnlyReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -1034,7 +1035,7 @@ async fn mosquitto_handoff_survives_shutdown() {
     let topic = "handoff/survive";
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
     let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("handoff"));
-    let (tx, rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, mut rx) = mpsc::channel::<InboundMessage>(4);
     let (client, connection, mut phase) =
         connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
 
@@ -1061,7 +1062,7 @@ async fn mosquitto_handoff_survives_shutdown() {
     client.shutdown().await.expect("shutdown");
     join_run_after_shutdown(run).await;
 
-    let got = timeout(Duration::from_secs(2), rx.recv_async())
+    let got = timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("recv after shutdown")
         .expect("handoff");
@@ -1081,8 +1082,8 @@ async fn mosquitto_two_parallel_connections_isolated_handoff_and_phase() {
     let options_a = ConnectOptions::new(url_a).client_id(ClientId::from_prefix("parallel-a"));
     let options_b = ConnectOptions::new(url_b).client_id(ClientId::from_prefix("parallel-b"));
 
-    let (tx_a, rx_a) = flume::bounded::<InboundMessage>(8);
-    let (tx_b, rx_b) = flume::bounded::<InboundMessage>(8);
+    let (tx_a, mut rx_a) = mpsc::channel::<InboundMessage>(8);
+    let (tx_b, mut rx_b) = mpsc::channel::<InboundMessage>(8);
 
     let (client_a, connection_a, mut phase_a) =
         connect(options_a, static_credentials(), NoReconnect, tx_a, NoopLifecycle).expect("connect A");
@@ -1150,11 +1151,11 @@ async fn mosquitto_two_parallel_connections_isolated_handoff_and_phase() {
     publish_qos0_via_raw_session(port, "parallel-pub-a", topic_a, b"only-for-a").await;
     publish_qos0_via_raw_session(port, "parallel-pub-b", topic_b, b"only-for-b").await;
 
-    let msg_a = timeout(Duration::from_secs(10), rx_a.recv_async())
+    let msg_a = timeout(Duration::from_secs(10), rx_a.recv())
         .await
         .expect("handoff A timed out")
         .expect("handoff A closed");
-    let msg_b = timeout(Duration::from_secs(10), rx_b.recv_async())
+    let msg_b = timeout(Duration::from_secs(10), rx_b.recv())
         .await
         .expect("handoff B timed out")
         .expect("handoff B closed");
@@ -1167,33 +1168,33 @@ async fn mosquitto_two_parallel_connections_isolated_handoff_and_phase() {
     // Cross-isolation without a soft absence window: queues empty, then unique probes
     // must land only on the owning connection.
     assert!(
-        matches!(rx_a.try_recv(), Err(flume::TryRecvError::Empty)),
+        matches!(rx_a.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
         "A handoff must be empty after its own message"
     );
     assert!(
-        matches!(rx_b.try_recv(), Err(flume::TryRecvError::Empty)),
+        matches!(rx_b.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
         "B handoff must be empty after its own message"
     );
 
     publish_qos0_via_raw_session(port, "parallel-probe-a", topic_a, b"probe-a").await;
     publish_qos0_via_raw_session(port, "parallel-probe-b", topic_b, b"probe-b").await;
 
-    let probe_a = timeout(Duration::from_secs(10), rx_a.recv_async())
+    let probe_a = timeout(Duration::from_secs(10), rx_a.recv())
         .await
         .expect("probe A timed out")
         .expect("handoff A closed");
-    let probe_b = timeout(Duration::from_secs(10), rx_b.recv_async())
+    let probe_b = timeout(Duration::from_secs(10), rx_b.recv())
         .await
         .expect("probe B timed out")
         .expect("handoff B closed");
     assert_eq!(&*probe_a.payload, b"probe-a");
     assert_eq!(&*probe_b.payload, b"probe-b");
     assert!(
-        matches!(rx_a.try_recv(), Err(flume::TryRecvError::Empty)),
+        matches!(rx_a.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
         "A must not receive B's probe"
     );
     assert!(
-        matches!(rx_b.try_recv(), Err(flume::TryRecvError::Empty)),
+        matches!(rx_b.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
         "B must not receive A's probe"
     );
 
@@ -1203,7 +1204,7 @@ async fn mosquitto_two_parallel_connections_isolated_handoff_and_phase() {
 
     // B still alive: publish again and receive on B only.
     publish_qos0_via_raw_session(port, "parallel-pub-b2", topic_b, b"still-b").await;
-    let still_b = timeout(Duration::from_secs(10), rx_b.recv_async())
+    let still_b = timeout(Duration::from_secs(10), rx_b.recv())
         .await
         .expect("B must still receive after A shutdown")
         .expect("handoff B closed");
@@ -1211,7 +1212,7 @@ async fn mosquitto_two_parallel_connections_isolated_handoff_and_phase() {
     assert!(
         matches!(
             rx_a.try_recv(),
-            Err(flume::TryRecvError::Disconnected | flume::TryRecvError::Empty)
+            Err(mpsc::error::TryRecvError::Disconnected | mpsc::error::TryRecvError::Empty)
         ),
         "A must not receive after shutdown while B is probed"
     );
@@ -1257,7 +1258,7 @@ async fn mosquitto_broker_created_topic_aliases_resolve() {
         return;
     };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let (tx, inbound) = flume::bounded::<InboundMessage>(1_000);
+    let (tx, mut inbound) = mpsc::channel::<InboundMessage>(1_000);
     let (subscriber, connection, mut phase) = connect(
         ConnectOptions::new(url.clone()).topic_alias_maximum(4),
         static_credentials(),
@@ -1276,7 +1277,7 @@ async fn mosquitto_broker_created_topic_aliases_resolve() {
         .await
         .expect("subscribe");
 
-    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
     let (publisher, connection, mut phase) = connect(
         ConnectOptions::new(url),
         static_credentials(),
@@ -1304,7 +1305,7 @@ async fn mosquitto_broker_created_topic_aliases_resolve() {
         }
     }
     for (topic, payload) in expected {
-        let message = timeout(Duration::from_secs(5), inbound.recv_async())
+        let message = timeout(Duration::from_secs(5), inbound.recv())
             .await
             .expect("delivery")
             .expect("open");
@@ -1333,7 +1334,7 @@ async fn mosquitto_subscription_identifiers_tag_deliveries() {
         return;
     };
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let (tx, inbound) = flume::bounded::<InboundMessage>(16);
+    let (tx, mut inbound) = mpsc::channel::<InboundMessage>(16);
     let (client, connection, mut phase) = connect(
         ConnectOptions::new(url),
         static_credentials(),
@@ -1371,7 +1372,7 @@ async fn mosquitto_subscription_identifiers_tag_deliveries() {
     let mut temp_ids = std::collections::BTreeSet::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
-        let Ok(Ok(message)) = timeout(left, inbound.recv_async()).await else {
+        let Ok(Some(message)) = timeout(left, inbound.recv()).await else {
             break;
         };
         let target = if message.topic.ends_with("alarm") {
@@ -1410,11 +1411,11 @@ async fn mosquitto_request_response() {
         port: u16,
     ) -> (
         MqttClient,
-        flume::Receiver<InboundMessage>,
+        mpsc::Receiver<InboundMessage>,
         tokio::task::JoinHandle<Result<(), ConnectionOutcome>>,
     ) {
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let (tx, rx) = flume::bounded::<InboundMessage>(64);
+        let (tx, rx) = mpsc::channel::<InboundMessage>(64);
         let (client, connection, mut phase) = connect(
             ConnectOptions::new(url),
             static_credentials(),
@@ -1431,7 +1432,7 @@ async fn mosquitto_request_response() {
         (client, rx, run)
     }
 
-    let (responder, requests, responder_run) = start(port).await;
+    let (responder, mut requests, responder_run) = start(port).await;
     responder
         .subscribe([("rr/echo", QoS::AtLeastOnce)])
         .await
@@ -1439,7 +1440,7 @@ async fn mosquitto_request_response() {
     let answering = tokio::spawn({
         let responder = responder.clone();
         async move {
-            while let Ok(request) = requests.recv_async().await {
+            while let Some(request) = requests.recv().await {
                 let mut answer = b"re:".to_vec();
                 answer.extend_from_slice(&request.payload);
                 let reply = Publish::reply_to(&request, answer).expect("request carries a response topic");

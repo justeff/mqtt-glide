@@ -14,6 +14,7 @@ use mqtt_glide::{
     BrokerUrl, ClientId, ConnectOptions, ConnectionOutcome, DisconnectReasonCode, InboundMessage, NoopLifecycle,
     ReconnectPolicy, SessionPhase, connect,
 };
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 /// Reconnects at once after anything but shutdown.
@@ -82,7 +83,7 @@ async fn connack_redirect_is_followed_at_once() {
     })
     .await;
 
-    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
     let (client, connection, mut phase) = connect(
         options(port, true),
         static_credentials(),
@@ -120,7 +121,7 @@ async fn connack_redirect_is_reported_when_not_followed() {
     })
     .await;
 
-    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
     let (_client, connection, _phase) = connect(
         options(port, false),
         static_credentials(),
@@ -182,7 +183,7 @@ async fn server_moved_is_permanent() {
     })
     .await;
 
-    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
     let (client, connection, _phase) = connect(
         options(port, true),
         static_credentials(),
@@ -238,7 +239,7 @@ async fn use_another_server_is_one_connection_only() {
     })
     .await;
 
-    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
     let (client, connection, _phase) = connect(
         options(port, true),
         static_credentials(),
@@ -286,7 +287,7 @@ async fn redirects_in_a_row_are_capped() {
         }
     });
 
-    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
     let (_client, connection, _phase) = connect(
         options(port, true),
         static_credentials(),

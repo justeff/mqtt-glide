@@ -280,7 +280,11 @@ pub(crate) async fn send_inbound_qos1_publish_dup(
 }
 
 /// Wire a client against [`spawn_mock_broker`] with [`NoReconnect`].
-pub(crate) async fn test_connect() -> (crate::MqttClient, Connection, watch::Receiver<SessionPhase>) {
+pub(crate) async fn test_connect() -> (
+    crate::MqttClient,
+    Connection<flume::Sender<InboundMessage>>,
+    watch::Receiver<SessionPhase>,
+) {
     let port = spawn_mock_broker().await;
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
     let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));

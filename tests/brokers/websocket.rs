@@ -6,6 +6,7 @@ use std::time::Duration;
 use mqtt_glide::{
     BrokerUrl, ConnectOptions, InboundMessage, MqttClient, NoopLifecycle, Publish, QoS, SessionPhase, connect,
 };
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::common::{NoReconnect, static_credentials, wait_for_phase};
@@ -13,13 +14,13 @@ use crate::helpers::start_mosquitto_websockets;
 
 struct Client {
     client: MqttClient,
-    inbound: flume::Receiver<InboundMessage>,
+    inbound: mpsc::Receiver<InboundMessage>,
     run: tokio::task::JoinHandle<Result<(), mqtt_glide::ConnectionOutcome>>,
 }
 
 async fn client(url: &str) -> Client {
     let url = BrokerUrl::parse(url).expect("valid url");
-    let (tx, inbound) = flume::bounded::<InboundMessage>(10_000);
+    let (tx, inbound) = mpsc::channel::<InboundMessage>(10_000);
     let (client, connection, mut phase) = connect(
         ConnectOptions::new(url),
         static_credentials(),
@@ -49,7 +50,7 @@ async fn websocket_roundtrip_burst_and_large_payloads() {
     let Some((_broker, _tcp_port, ws_port)) = start_mosquitto_websockets().await else {
         return;
     };
-    let ws = client(&format!("ws://127.0.0.1:{ws_port}/mqtt")).await;
+    let mut ws = client(&format!("ws://127.0.0.1:{ws_port}/mqtt")).await;
     ws.client
         .subscribe([("ws/#", QoS::AtLeastOnce)])
         .await
@@ -68,13 +69,13 @@ async fn websocket_roundtrip_burst_and_large_payloads() {
         .expect("large publish over WebSocket");
 
     for i in 0..300u32 {
-        let message = timeout(Duration::from_secs(5), ws.inbound.recv_async())
+        let message = timeout(Duration::from_secs(5), ws.inbound.recv())
             .await
             .expect("burst")
             .expect("open");
         assert_eq!(&*message.payload, i.to_string().as_bytes());
     }
-    let message = timeout(Duration::from_secs(5), ws.inbound.recv_async())
+    let message = timeout(Duration::from_secs(5), ws.inbound.recv())
         .await
         .expect("big")
         .expect("open");
@@ -90,7 +91,7 @@ async fn websocket_publisher_reaches_tcp_subscriber() {
     let Some((_broker, tcp_port, ws_port)) = start_mosquitto_websockets().await else {
         return;
     };
-    let tcp = client(&format!("mqtt://127.0.0.1:{tcp_port}")).await;
+    let mut tcp = client(&format!("mqtt://127.0.0.1:{tcp_port}")).await;
     tcp.client
         .subscribe([("mixed/t", QoS::AtLeastOnce)])
         .await
@@ -101,7 +102,7 @@ async fn websocket_publisher_reaches_tcp_subscriber() {
         .qos(QoS::AtLeastOnce)
         .await
         .expect("ws publish");
-    let message = timeout(Duration::from_secs(5), tcp.inbound.recv_async())
+    let message = timeout(Duration::from_secs(5), tcp.inbound.recv())
         .await
         .expect("delivery")
         .expect("open");

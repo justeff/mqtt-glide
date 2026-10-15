@@ -12,6 +12,7 @@
 use std::time::Duration;
 
 use mqtt_glide::{ClientBuilder, Publish, QoS};
+use tokio::sync::mpsc;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,13 +20,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let request_topic = "demo/glide/rr/time";
 
     // Responder: answer every request on `request_topic`.
-    let (requests_tx, requests) = flume::bounded(64);
+    let (requests_tx, mut requests) = mpsc::channel(64);
     let responder = ClientBuilder::new(&broker)?.inbound_sink(requests_tx).connect().await?;
     responder.subscribe([(request_topic, QoS::AtLeastOnce)]).await?;
     let responder_task = tokio::spawn({
         let responder = responder.clone();
         async move {
-            while let Ok(request) = requests.recv_async().await {
+            while let Some(request) = requests.recv().await {
                 let answer = format!("pong for {}", String::from_utf8_lossy(&request.payload));
                 if let Some(reply) = Publish::reply_to(&request, answer)
                     && let Err(error) = responder.send(reply.qos(QoS::AtLeastOnce)).await

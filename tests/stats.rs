@@ -5,11 +5,12 @@ use std::time::Duration;
 use mqtt_glide::codec::{ConnectAckReason, PublishAckReason};
 use mqtt_glide::testing::{FaultProxy, TestBroker};
 use mqtt_glide::{ClientBuilder, ClientStats, InboundMessage, MqttClient, Publish, QoS, StandardReconnectPolicy};
+use tokio::sync::mpsc;
 
 const WAIT: Duration = Duration::from_secs(2);
 
-async fn client(url: String, id: &str, sink_capacity: usize) -> (MqttClient, flume::Receiver<InboundMessage>) {
-    let (tx, rx) = flume::bounded(sink_capacity);
+async fn client(url: String, id: &str, sink_capacity: usize) -> (MqttClient, mpsc::Receiver<InboundMessage>) {
+    let (tx, rx) = mpsc::channel(sink_capacity);
     let client = ClientBuilder::new(url)
         .expect("url")
         .client_id(id)
@@ -77,7 +78,7 @@ async fn counts_outbound_publishes_acks_and_bytes() {
 #[tokio::test]
 async fn counts_inbound_publishes_and_sink_stalls() {
     let broker = TestBroker::start().await.expect("broker");
-    let (app, rx) = client(broker.url(), "app", 1).await;
+    let (app, mut rx) = client(broker.url(), "app", 1).await;
     app.subscribe([("in/#", QoS::AtLeastOnce)]).await.expect("subscribe");
 
     broker.publish(Publish::new("in/a", "0"));
@@ -87,7 +88,7 @@ async fn counts_inbound_publishes_and_sink_stalls() {
     stats_until(&app, |stats| stats.inbound.handoff_stalls >= 1).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
     for _ in 0..3 {
-        tokio::time::timeout(WAIT, rx.recv_async())
+        tokio::time::timeout(WAIT, rx.recv())
             .await
             .expect("message in time")
             .expect("open");

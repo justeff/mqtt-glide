@@ -13,6 +13,7 @@ use mqtt_glide::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -71,7 +72,7 @@ async fn session_runs_through_the_tunnel() {
     let (proxy_port, seen, proxy) = spawn_proxy("HTTP/1.1 200 Connection established\r\n\r\n").await;
 
     let proxy_config = HttpProxy::parse(&format!("http://svc:s%3Acret@127.0.0.1:{proxy_port}")).expect("proxy url");
-    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
     let (client, connection, mut phase) = connect(
         options(broker_port, proxy_config),
         static_credentials(),
@@ -109,7 +110,7 @@ async fn refused_tunnel_is_a_transport_error() {
     let (proxy_port, _seen, proxy) =
         spawn_proxy("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\n\r\n").await;
 
-    let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
     let (_client, connection, _phase) = connect(
         options(1, HttpProxy::new("127.0.0.1", proxy_port)),
         static_credentials(),

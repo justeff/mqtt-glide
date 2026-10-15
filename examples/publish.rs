@@ -13,11 +13,12 @@
 use std::num::NonZeroUsize;
 
 use mqtt_glide::{ClientBuilder, Publish, PublishProperties, QoS, shared_filter};
+use tokio::sync::mpsc;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broker = std::env::var("MQTT_GLIDE_BROKER").unwrap_or_else(|_| "mqtt://127.0.0.1:1883".into());
-    let (tx, _rx) = flume::bounded(256);
+    let (tx, _rx) = mpsc::channel(256);
 
     let client = ClientBuilder::new(&broker)?
         // Graceful `shutdown()` → Normal DISCONNECT → broker deletes the Will.

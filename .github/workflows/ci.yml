@@ -87,7 +87,7 @@ jobs:
         with:
           key: doc
       - name: cargo doc
-        run: cargo doc --no-deps --features websocket,testing,stats
+        run: cargo doc --no-deps --features websocket,testing,stats,flume
         env:
           RUSTDOCFLAGS: -D warnings
 
