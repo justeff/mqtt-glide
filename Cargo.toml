@@ -34,6 +34,11 @@ path = "tests/faults/main.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "hostile"
+path = "tests/hostile.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "testing"
 path = "tests/testing.rs"
 required-features = ["testing"]

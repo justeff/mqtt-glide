@@ -31,12 +31,14 @@ These need no Docker:
 ```shell
 cargo test --test connection --test redirect --test proxy --test codec_proptest
 cargo test --test testing --features testing
+cargo test --test hostile --features testing
 cargo test --test stats --features testing,stats
 ```
 
 - `connection`, `redirect`, `proxy`: the client against in-process mock brokers and proxies.
 - `codec_proptest`: property tests of the codec.
 - `testing`: the `testing` helpers (`TestBroker`, `FaultProxy`).
+- `hostile`: a scripted raw-TCP broker that attacks the client with malformed and abusive input; two `#[ignore]`d soak tests (`SOAK_SECS`, `SOAK_NO_CHAOS`) are documented in the file.
 - `stats`: the `stats` counters.
 
 These need Docker or Podman (the tests return early when neither is available):
