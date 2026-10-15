@@ -164,6 +164,17 @@ pub trait CredentialsProvider: Send + Sync {
     }
 }
 
+/// One provider shared by several clients, for example a token cache.
+impl<T: CredentialsProvider> CredentialsProvider for Arc<T> {
+    fn credentials(&self) -> impl Future<Output = Result<(String, Password), AuthError>> + Send {
+        (**self).credentials()
+    }
+
+    fn invalidate(&self) -> impl Future<Output = ()> + Send {
+        (**self).invalidate()
+    }
+}
+
 /// Fixed username/password credentials that never invalidate.
 ///
 /// Convenience helper for tests and simple deployments. Uses the default no-op
@@ -1065,6 +1076,29 @@ mod tests {
         assert_eq!(format!("{password:?}"), "Password([REDACTED])");
         let credentials = StaticCredentials::new("user", password);
         assert!(!format!("{credentials:?}").contains("hunter2"));
+    }
+
+    /// A shared provider answers and invalidates through the `Arc`, not with defaults.
+    #[tokio::test]
+    async fn arc_provider_forwards_credentials_and_invalidate() {
+        struct Rotating(std::sync::atomic::AtomicUsize);
+        impl CredentialsProvider for Rotating {
+            async fn credentials(&self) -> Result<(String, Password), AuthError> {
+                let round = self.0.load(std::sync::atomic::Ordering::SeqCst);
+                Ok((format!("user-{round}"), Password::from("token")))
+            }
+
+            async fn invalidate(&self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let shared = Arc::new(Rotating(std::sync::atomic::AtomicUsize::new(0)));
+        let other_client = Arc::clone(&shared);
+        let (user, _) = CredentialsProvider::credentials(&shared).await.expect("credentials");
+        assert_eq!(user, "user-0");
+        CredentialsProvider::invalidate(&other_client).await;
+        let (user, password) = CredentialsProvider::credentials(&shared).await.expect("credentials");
+        assert_eq!((user.as_str(), password.expose()), ("user-1", b"token".as_slice()));
     }
 
     /// `(filter, qos)` converts to [`Subscription`] for ergonomic [`MqttClient::subscribe`].
