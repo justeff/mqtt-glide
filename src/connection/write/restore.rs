@@ -14,7 +14,7 @@ use tokio_util::codec::FramedWrite;
 
 use crate::codec::{Packet, Subscribe, V5Codec};
 use crate::connection::packet_id::InflightPots;
-use crate::connection::subscriptions::{SubscriptionRegistry, restore_retry_delay};
+use crate::connection::subscriptions::{SubscriptionRegistry, fit_to_packet_size, restore_retry_delay};
 use crate::error::ProtocolError;
 
 use super::io::{FlushAbort, send_packet};
@@ -80,6 +80,7 @@ impl RestoreRetry {
             .read()
             .map(|registry| registry.refused_grouped())
             .unwrap_or_default();
+        let groups = fit_to_packet_size(groups, framed.encoder(), subscription_identifiers_available, registry);
         if groups.is_empty() {
             self.next_at = None;
             self.attempt = 0;

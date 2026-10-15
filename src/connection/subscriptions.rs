@@ -287,9 +287,68 @@ pub(crate) fn apply_unsubscribe_ack_to_registry(
 /// SUBSCRIBEs a resubscribe keeps waiting for their SUBACK at once.
 const RESUBSCRIBE_WINDOW: usize = 10;
 
+/// Splits restore SUBSCRIBEs so each fits the broker's Maximum Packet Size ([MQTT-3.2.2-15]),
+/// which may be smaller than on the connection that granted them. A filter too long to fit
+/// even alone cannot be restored on this connection: it is forgotten with a warning, so the
+/// restore does not fail (and reconnect) over it again and again.
+pub(crate) fn fit_to_packet_size(
+    groups: Vec<ResubscribeGroup>,
+    codec: &V5Codec,
+    subscription_identifiers_available: bool,
+    registry: &RwLock<SubscriptionRegistry>,
+) -> Vec<ResubscribeGroup> {
+    let fits = |id: Option<NonZeroU32>, filters: &[(ByteString, SubscriptionOptions)]| {
+        codec.fits_outbound(&Packet::Subscribe(Subscribe {
+            packet_id: NonZeroU16::MAX,
+            id: id.filter(|_| subscription_identifiers_available),
+            user_properties: Vec::new(),
+            topic_filters: filters.to_vec(),
+        }))
+    };
+    let mut fitted = Vec::with_capacity(groups.len());
+    let mut unsendable = Vec::new();
+    for (id, filters) in groups {
+        if fits(id, &filters) {
+            fitted.push((id, filters));
+            continue;
+        }
+        let mut part = Vec::new();
+        for filter in filters {
+            part.push(filter);
+            if fits(id, &part) {
+                continue;
+            }
+            let filter = part.pop().expect("just pushed");
+            if !part.is_empty() {
+                fitted.push((id, std::mem::take(&mut part)));
+            }
+            if fits(id, std::slice::from_ref(&filter)) {
+                part.push(filter);
+            } else {
+                unsendable.push(filter.0);
+            }
+        }
+        if !part.is_empty() {
+            fitted.push((id, part));
+        }
+    }
+    if !unsendable.is_empty() {
+        tracing::warn!(
+            filters = ?unsendable,
+            max_packet_size = codec.max_outbound_size(),
+            "subscription too long for the broker's Maximum Packet Size; not restored"
+        );
+        if let Ok(mut registry) = registry.write() {
+            registry.remove(unsendable);
+        }
+    }
+    fitted
+}
+
 /// Re-issues prior SUBSCRIBE filters on a fresh session before read/write tasks start.
 ///
-/// One SUBSCRIBE per earlier one, up to [`RESUBSCRIBE_WINDOW`] unanswered at a time.
+/// One SUBSCRIBE per earlier one (split where it no longer fits, see
+/// [`fit_to_packet_size`]), up to [`RESUBSCRIBE_WINDOW`] unanswered at a time.
 /// `cancel` must abort the wait. Inbound PUBLISH during the wait is delivered to `handoff`
 /// (enqueue-before-ack PUBACK on the wire for QoS 1). A filter the broker refuses stays in
 /// `registry` as refused, and the write task asks for it again; only a SUBACK that does not
@@ -315,6 +374,12 @@ where
         // the subscription itself still matters more than the routing hint.
         tracing::warn!("broker no longer supports Subscription Identifiers; restoring without");
     }
+    let groups = fit_to_packet_size(
+        groups,
+        framed_write.encoder(),
+        inbound.subscription_identifiers_available,
+        registry,
+    );
     let mut groups = groups.into_iter();
     let mut waiting: HashMap<NonZeroU16, Vec<(ByteString, SubscriptionOptions)>> = HashMap::new();
     let result = async {
@@ -845,5 +910,113 @@ mod tests {
             }
         }
         assert_eq!(subscribes, RESUBSCRIBE_WINDOW);
+    }
+
+    fn filter(name: &str) -> (ByteString, SubscriptionOptions) {
+        (ByteString::from(name), SubscriptionOptions::default())
+    }
+
+    /// A restore SUBSCRIBE over the broker's (now smaller) Maximum Packet Size is split, in
+    /// order and with its Subscription Identifier; a filter that cannot fit alone is
+    /// forgotten instead of failing every restore ([MQTT-3.2.2-15]).
+    #[test]
+    fn restore_subscribes_are_split_to_the_packet_size() {
+        let long = "l".repeat(100);
+        let filters = vec![
+            filter("f/aaaaaaaaaaaaaa"),
+            filter("f/bbbbbbbbbbbbbb"),
+            filter(&long),
+            filter("f/cccccccccccccc"),
+        ];
+        let registry = RwLock::new(SubscriptionRegistry::default());
+        registry.write().unwrap().upsert(filters.clone());
+        // One filter of 16 bytes makes a 24-byte SUBSCRIBE; two make 43.
+        let codec = V5Codec::new(0, 30);
+        let id = NonZeroU32::new(7);
+
+        let fitted = fit_to_packet_size(vec![(id, filters.clone())], &codec, false, &registry);
+        assert_eq!(
+            fitted,
+            vec![
+                (id, vec![filters[0].clone()]),
+                (id, vec![filters[1].clone()]),
+                (id, vec![filters[3].clone()]),
+            ]
+        );
+        let kept: Vec<_> = registry
+            .read()
+            .unwrap()
+            .snapshot()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert_eq!(kept.len(), 3);
+        assert!(!kept.iter().any(|f| *f == *long));
+
+        let roomy = V5Codec::new(0, 0);
+        let whole = vec![(id, filters[..2].to_vec())];
+        assert_eq!(fit_to_packet_size(whole.clone(), &roomy, true, &registry), whole);
+    }
+
+    /// End to end: the split SUBSCRIBEs each fit, and the restore succeeds.
+    #[tokio::test]
+    async fn resubscribe_sends_split_subscribes_that_fit() {
+        let (client_end, broker_end) = tokio::io::duplex(64 * 1024);
+        let (read_half, write_half) = tokio::io::split(client_end);
+        let mut framed_read = FramedRead::new(read_half, V5Codec::with_max_packet_size(0));
+        let mut framed_write = FramedWrite::new(write_half, V5Codec::new(0, 30));
+        let mut inflight = InflightPots::new(NonZeroU16::new(8).expect("nz"));
+        let filters = vec![filter("f/aaaaaaaaaaaaaa"), filter("f/bbbbbbbbbbbbbb")];
+        let registry = RwLock::new(SubscriptionRegistry::default());
+        registry.write().unwrap().upsert(filters.clone());
+
+        let broker = tokio::spawn(async move {
+            let (read_half, write_half) = tokio::io::split(broker_end);
+            let mut broker_read = FramedRead::new(read_half, V5Codec::with_max_packet_size(0));
+            let mut broker_write = FramedWrite::new(write_half, V5Codec::with_max_packet_size(0));
+            let mut sizes = Vec::new();
+            while sizes.len() < 2 {
+                let Some(Ok((DecodedFrame::Control(Packet::Subscribe(sub)), remaining_length))) =
+                    broker_read.next().await
+                else {
+                    continue;
+                };
+                // Type byte and a one-byte Remaining Length in front of the body.
+                sizes.push(2 + remaining_length);
+                let ack = SubscribeAck {
+                    packet_id: sub.packet_id,
+                    properties: Vec::new(),
+                    reason_string: None,
+                    status: vec![SubscribeAckReason::GrantedQos1; sub.topic_filters.len()],
+                };
+                broker_write.send(Packet::SubscribeAck(ack)).await.expect("suback");
+            }
+            sizes
+        });
+
+        let (handoff, _handoff_rx) = flume::bounded::<crate::codec::InboundMessage>(1);
+        let stats = crate::stats::Stats::default();
+        let mut topic_aliases = super::super::topic_alias::InboundTopicAliases::new(0);
+        let response_router = crate::request::ResponseRouter::default();
+        resubscribe_pending(
+            &mut framed_read,
+            &mut framed_write,
+            &mut inflight,
+            &registry,
+            vec![(None, filters)],
+            Duration::from_secs(5),
+            &CancellationToken::new(),
+            ResubscribeInbound {
+                handoff: &handoff,
+                stats: &stats,
+                topic_aliases: &mut topic_aliases,
+                subscription_identifiers_available: false,
+                response_router: &response_router,
+            },
+        )
+        .await
+        .expect("restored");
+        let sizes = broker.await.expect("broker");
+        assert!(sizes.iter().all(|&size| size <= 30), "{sizes:?}");
     }
 }

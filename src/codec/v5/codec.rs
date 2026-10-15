@@ -98,6 +98,16 @@ impl V5Codec {
         self.max_out_size = size;
     }
 
+    /// Whether [`Self::encode_packet`] could send `packet` within the Maximum Packet Size.
+    pub(crate) fn fits_outbound(&self, packet: &Packet) -> bool {
+        packet
+            .encoded_body_len(outbound_body_budget(self.max_out_size))
+            .is_ok_and(|body_len| {
+                body_len <= MAX_VARIABLE_LENGTH as usize
+                    && (self.max_out_size == 0 || mqtt_wire_len(body_len) <= self.max_out_size)
+            })
+    }
+
     /// Encode one control [`Packet`] by appending to `buf`.
     ///
     /// Does not clear `buf`. Callers that replace a single-frame buffer must `clear()` first.
