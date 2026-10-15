@@ -222,17 +222,6 @@ pub(crate) trait Encode {
     fn encode(&self, buf: &mut BytesMut) -> Result<(), EncodeError>;
 }
 
-// Encoding implementations for optional values
-impl<T: Encode> Encode for Option<T> {
-    fn encoded_size(&self) -> usize {
-        self.as_ref().map_or(0, |v| v.encoded_size())
-    }
-
-    fn encode(&self, buf: &mut BytesMut) -> Result<(), EncodeError> {
-        if let Some(v) = self { v.encode(buf) } else { Ok(()) }
-    }
-}
-
 // Primitive type encoding implementations
 impl Encode for bool {
     fn encoded_size(&self) -> usize {
@@ -310,17 +299,6 @@ impl Encode for ByteString {
     /// path stays single-pass over each string.
     fn encode(&self, buf: &mut BytesMut) -> Result<(), EncodeError> {
         self.as_bytes().encode(buf)
-    }
-}
-
-impl Encode for (ByteString, ByteString) {
-    fn encoded_size(&self) -> usize {
-        self.0.encoded_size() + self.1.encoded_size()
-    }
-
-    fn encode(&self, buf: &mut BytesMut) -> Result<(), EncodeError> {
-        self.0.encode(buf)?;
-        self.1.encode(buf)
     }
 }
 

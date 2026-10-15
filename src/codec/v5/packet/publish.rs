@@ -104,16 +104,6 @@ fn reject_qos0_packet_identifier(src: &Bytes) -> Result<(), DecodeError> {
     Ok(())
 }
 
-/// Converts a `UserProperties` vector into `PublishWireProperties`.
-impl std::convert::From<UserProperties> for PublishWireProperties {
-    fn from(props: UserProperties) -> Self {
-        PublishWireProperties {
-            user_properties: props,
-            ..Default::default()
-        }
-    }
-}
-
 /// Parses the PUBLISH property block. Property Length `0` (common ingress case) returns
 /// [`None`] without allocating property locals or empty vectors.
 fn parse_publish_properties(src: &mut Bytes) -> Result<Option<PublishWireProperties>, DecodeError> {

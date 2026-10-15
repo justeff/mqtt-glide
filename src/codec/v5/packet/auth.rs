@@ -78,19 +78,17 @@ impl Auth {
                 let mut reason_string = None;
                 let mut user_properties = Vec::new();
 
-                if reason_code != AuthReasonCode::Success || src.has_remaining() {
-                    let prop_src = &mut utils::take_properties(src)?;
-                    while prop_src.has_remaining() {
-                        match prop_src.get_u8() {
-                            pt::AUTH_METHOD => auth_method.read_value(prop_src)?,
-                            pt::AUTH_DATA => auth_data.read_value(prop_src)?,
-                            pt::REASON_STRING => reason_string.read_value(prop_src)?,
-                            pt::USER => user_properties.push(UserProperty::decode(prop_src)?),
-                            _ => return Err(DecodeError::MalformedPacket("unknown property or reason code")),
-                        }
+                let prop_src = &mut utils::take_properties(src)?;
+                while prop_src.has_remaining() {
+                    match prop_src.get_u8() {
+                        pt::AUTH_METHOD => auth_method.read_value(prop_src)?,
+                        pt::AUTH_DATA => auth_data.read_value(prop_src)?,
+                        pt::REASON_STRING => reason_string.read_value(prop_src)?,
+                        pt::USER => user_properties.push(UserProperty::decode(prop_src)?),
+                        _ => return Err(DecodeError::MalformedPacket("unknown property or reason code")),
                     }
-                    ensure!(!src.has_remaining(), DecodeError::InvalidLength);
                 }
+                ensure!(!src.has_remaining(), DecodeError::InvalidLength);
 
                 if matches!(reason_code, AuthReasonCode::ContinueAuth | AuthReasonCode::ReAuth) && auth_method.is_none()
                 {
