@@ -3,6 +3,7 @@
 use std::num::NonZeroU16;
 
 use bytestring::ByteString;
+use futures_util::SinkExt;
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 use tokio_util::codec::FramedWrite;
@@ -20,7 +21,7 @@ use crate::error::AppError;
 use crate::util::{is_shared_subscription_filter, validate_share_name};
 
 use super::acks::app_error_from_write_outcome;
-use super::io::{FlushAbort, feed_publish, flush_if_buffer_large, flush_writes, map_encode_error, send_packet};
+use super::io::{FlushAbort, feed_publish, flush_if_buffer_large, flush_writes, map_encode_error};
 use super::{
     BrokerPublishLimits, CarriedPublish, MAX_READY_DRAIN, PendingOutboundPublish, PendingSubscribe, PendingUnsubscribe,
     PublishWaiters, SubUnsubWaiters, WriteOutcome,
@@ -503,17 +504,16 @@ where
         topic_filters: filters,
     });
 
-    if let Err(outcome) = send_packet(framed, packet, flush_abort).await {
-        if let Some(pending) = waiters.subscribe.remove(&packet_id) {
-            inflight.release_subscribe(packet_id);
-            if let Some(reply) = pending.reply {
-                let _ = reply.send(Err(app_error_from_write_outcome(&outcome)));
-            }
+    let result = send_request(framed, packet, flush_abort).await;
+    if let Some(error) = request_error(&result)
+        && let Some(pending) = waiters.subscribe.remove(&packet_id)
+    {
+        inflight.release_subscribe(packet_id);
+        if let Some(reply) = pending.reply {
+            let _ = reply.send(Err(error));
         }
-        return Err(outcome);
     }
-
-    Ok(())
+    result.map(drop)
 }
 
 /// Validates subscribe filters before SUBSCRIBE encode
@@ -636,15 +636,46 @@ where
         topic_filters: filters,
     });
 
-    if let Err(outcome) = send_packet(framed, packet, flush_abort).await {
-        if let Some(pending) = waiters.unsubscribe.remove(&packet_id) {
-            inflight.release_subscribe(packet_id);
-            let _ = pending.reply.send(Err(app_error_from_write_outcome(&outcome)));
-        }
-        return Err(outcome);
+    let result = send_request(framed, packet, flush_abort).await;
+    if let Some(error) = request_error(&result)
+        && let Some(pending) = waiters.unsubscribe.remove(&packet_id)
+    {
+        inflight.release_subscribe(packet_id);
+        let _ = pending.reply.send(Err(error));
     }
+    result.map(drop)
+}
 
-    Ok(())
+/// What the caller of a failed [`send_request`] gets.
+fn request_error(result: &Result<Result<(), AppError>, WriteOutcome>) -> Option<AppError> {
+    match result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.clone()),
+        Err(outcome) => Some(app_error_from_write_outcome(outcome)),
+    }
+}
+
+/// Sends a SUBSCRIBE or UNSUBSCRIBE. One the broker could not take (a topic filter over
+/// 65535 bytes, a packet over its Maximum Packet Size, [MQTT-3.2.2-15]) is refused like such
+/// a publish: the encoder wrote nothing, so `Ok(Err(_))` and the connection stays.
+async fn send_request<W>(
+    framed: &mut FramedWrite<W, V5Codec>,
+    packet: Packet,
+    flush_abort: FlushAbort<'_>,
+) -> Result<Result<(), AppError>, WriteOutcome>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    match framed.feed(packet).await {
+        Ok(()) => flush_writes(framed, flush_abort).await.map(Ok),
+        Err(EncodeError::OverMaxPacketSize { size, max }) => Ok(Err(AppError::InvalidRequest(format!(
+            "request exceeds maximum packet size ({size} > {max})"
+        )))),
+        Err(EncodeError::InvalidLength) => Ok(Err(AppError::InvalidRequest(
+            "topic filter over 65535 bytes, or a request over 268435455 bytes".into(),
+        ))),
+        Err(other) => Err(map_encode_error(other)),
+    }
 }
 
 /// Replies to the publisher: app mistakes → `InvalidRequest` + keep session; I/O → fatal.

@@ -3481,6 +3481,92 @@ mod tests {
         let _ = run.await;
     }
 
+    /// CONNACK `ack`, then answers every SUBSCRIBE / UNSUBSCRIBE with `extra` more (or fewer)
+    /// granted / success reason codes than it has filters, and reports the client's DISCONNECT.
+    async fn spawn_reason_count_broker(
+        ack: ConnectAck,
+        extra: isize,
+        disconnect: oneshot::Sender<crate::codec::DisconnectReasonCode>,
+    ) -> u16 {
+        spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+            if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
+                return;
+            }
+            let count = |filters: usize| filters.saturating_add_signed(extra);
+            while let Some(Ok((frame, _))) = framed_read.next().await {
+                let reply = match frame {
+                    DecodedFrame::Control(Packet::Subscribe(sub)) => Packet::SubscribeAck(SubscribeAck {
+                        packet_id: sub.packet_id,
+                        properties: Vec::new(),
+                        reason_string: None,
+                        status: vec![SubscribeAckReason::GrantedQos1; count(sub.topic_filters.len())],
+                    }),
+                    DecodedFrame::Control(Packet::Unsubscribe(unsub)) => Packet::UnsubscribeAck(UnsubscribeAck {
+                        packet_id: unsub.packet_id,
+                        properties: Vec::new(),
+                        reason_string: None,
+                        status: vec![UnsubscribeAckReason::Success; count(unsub.topic_filters.len())],
+                    }),
+                    DecodedFrame::Control(Packet::Disconnect(packet)) => {
+                        let _ = disconnect.send(packet.reason_code);
+                        return;
+                    }
+                    _ => continue,
+                };
+                let _ = framed_write.send(reply).await;
+            }
+        })
+        .await
+    }
+
+    async fn start_against(port: u16) -> (MqttClient, tokio::task::JoinHandle<Result<(), ConnectionOutcome>>) {
+        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
+        let (client, connection, mut phase) = connect(
+            ConnectOptions::new(url),
+            static_test_credentials(),
+            NoReconnect,
+            tx,
+            NoopLifecycle,
+        )
+        .expect("connect wiring");
+        let run = tokio::spawn(connection.run());
+        await_connected(&mut phase).await;
+        (client, run)
+    }
+
+    /// [MQTT-3.2.2-15]: a SUBSCRIBE or UNSUBSCRIBE over the broker's Maximum Packet Size, or
+    /// with a topic filter over 65535 bytes, is refused like such a publish; the session stays.
+    #[tokio::test]
+    async fn subscribe_and_unsubscribe_the_broker_cannot_take_are_refused_and_the_session_stays() {
+        let mut ack = ConnectAck::default();
+        ack.max_packet_size = Some(64);
+        let (disconnect_tx, _disconnect_rx) = oneshot::channel();
+        let port = spawn_reason_count_broker(ack, 0, disconnect_tx).await;
+        let (client, run) = start_against(port).await;
+
+        for filter in ["t".repeat(100), "t".repeat(65_536)] {
+            let error = client
+                .subscribe([(filter.as_str(), QoS::AtLeastOnce)])
+                .await
+                .expect_err("subscribe too big");
+            assert!(matches!(error, AppError::InvalidRequest(_)), "{error:?}");
+            let error = client
+                .unsubscribe([filter.as_str()])
+                .await
+                .expect_err("unsubscribe too big");
+            assert!(matches!(error, AppError::InvalidRequest(_)), "{error:?}");
+        }
+        assert!(client.is_connected());
+        client
+            .subscribe([("t", QoS::AtLeastOnce)])
+            .await
+            .expect("session still usable");
+
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
+
     /// Inbound aliases: the broker binds an alias, then sends only the alias; the
     /// application sees the full topic both times ([MQTT-3.3.2-10]).
     #[tokio::test]
