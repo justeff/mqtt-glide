@@ -207,14 +207,29 @@ impl ConnectAckReason {
     /// Short English label for logging and diagnostics (not a wire field).
     pub fn reason(self) -> &'static str {
         match self {
-            ConnectAckReason::Success => "Connection Accepted",
-            ConnectAckReason::UnsupportedProtocolVersion => "protocol version is not supported",
-            ConnectAckReason::ClientIdentifierNotValid => "client identifier is invalid",
-            ConnectAckReason::ServerUnavailable => "Server unavailable",
+            ConnectAckReason::Success => "success",
+            ConnectAckReason::UnspecifiedError => "unspecified error",
+            ConnectAckReason::MalformedPacket => "malformed packet",
+            ConnectAckReason::ProtocolError => "protocol error",
+            ConnectAckReason::ImplementationSpecificError => "implementation specific error",
+            ConnectAckReason::UnsupportedProtocolVersion => "unsupported protocol version",
+            ConnectAckReason::ClientIdentifierNotValid => "client identifier not valid",
             ConnectAckReason::BadUserNameOrPassword => "bad user name or password",
             ConnectAckReason::NotAuthorized => "not authorized",
-            ConnectAckReason::Unknown(_) => "Connection Refused (unknown reason code)",
-            _ => "Connection Refused",
+            ConnectAckReason::ServerUnavailable => "server unavailable",
+            ConnectAckReason::ServerBusy => "server busy",
+            ConnectAckReason::Banned => "banned",
+            ConnectAckReason::BadAuthenticationMethod => "bad authentication method",
+            ConnectAckReason::TopicNameInvalid => "topic name invalid",
+            ConnectAckReason::PacketTooLarge => "packet too large",
+            ConnectAckReason::QuotaExceeded => "quota exceeded",
+            ConnectAckReason::PayloadFormatInvalid => "payload format invalid",
+            ConnectAckReason::RetainNotSupported => "retain not supported",
+            ConnectAckReason::QosNotSupported => "QoS not supported",
+            ConnectAckReason::UseAnotherServer => "use another server",
+            ConnectAckReason::ServerMoved => "server moved",
+            ConnectAckReason::ConnectionRateExceeded => "connection rate exceeded",
+            ConnectAckReason::Unknown(_) => "unknown reason code",
         }
     }
 }
@@ -520,28 +535,19 @@ mod tests {
         );
     }
 
+    /// Every code is labelled with its name from the spec table (§3.2.2.2).
     #[test]
     fn connack_reason_labels_name_the_refusal() {
         for (code, label) in [
-            (ConnectAckReason::Success, "Connection Accepted"),
-            (
-                ConnectAckReason::UnsupportedProtocolVersion,
-                "protocol version is not supported",
-            ),
-            (
-                ConnectAckReason::ClientIdentifierNotValid,
-                "client identifier is invalid",
-            ),
-            (ConnectAckReason::ServerUnavailable, "Server unavailable"),
-            (ConnectAckReason::BadUserNameOrPassword, "bad user name or password"),
-            (ConnectAckReason::NotAuthorized, "not authorized"),
-            (
-                ConnectAckReason::Unknown(0x8D),
-                "Connection Refused (unknown reason code)",
-            ),
-            (ConnectAckReason::Banned, "Connection Refused"),
+            (0x00, "success"),
+            (0x86, "bad user name or password"),
+            (0x88, "server unavailable"),
+            (0x8A, "banned"),
+            (0x9B, "QoS not supported"),
+            (0x9F, "connection rate exceeded"),
+            (0x8D, "unknown reason code"),
         ] {
-            assert_eq!(code.reason(), label, "{code:?}");
+            assert_eq!(ConnectAckReason::from(code).reason(), label, "{code:#04x}");
         }
     }
 }
