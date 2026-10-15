@@ -1212,16 +1212,15 @@ mod tests {
         }
     }
 
-    /// A Reason String goes out exactly when the body budget holds it plus the 4 bytes
-    /// reserved for the Property Length (ack property blocks reserve their own 4 on top), is
-    /// dropped below that rather than overflowing the budget, and the body written always has
-    /// the length the Remaining Length announces.
+    /// A Reason String goes out exactly when the body budget holds it with room for the
+    /// longest Property Length, is dropped below that rather than overflowing the budget, and
+    /// the body written always has the length the Remaining Length announces.
     #[rstest]
     #[case::auth("auth", 3)]
     #[case::disconnect("disconnect", 3)]
     #[case::connack("connack", 3)]
-    #[case::puback("puback", 7)]
-    #[case::pubcomp("pubcomp", 7)]
+    #[case::puback("puback", 3)]
+    #[case::pubcomp("pubcomp", 3)]
     fn reason_string_is_sent_only_when_the_budget_holds_it(#[case] kind: &str, #[case] reserve: u32) {
         let packet = with_reason_string(kind);
         let full = packet.encoded_body_len(u32::MAX).unwrap() as u32;

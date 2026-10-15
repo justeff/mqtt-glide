@@ -246,11 +246,12 @@ impl WireBodyEncode for PublishAck {
         if !self.has_ack_properties() {
             return Ok(HEADER_LEN as usize);
         }
-        // Body budget: Packet Identifier + Reason Code; reserve ≤4 bytes for Property Length varint.
+        // What remains after Packet Identifier + Reason Code; the property block reserves its
+        // own Property Length out of that.
         let prop_len = ack_props::encoded_size(
             &self.properties,
             &self.reason_string,
-            reduce_limit(max_out, (HEADER_LEN + 4) as usize),
+            reduce_limit(max_out, HEADER_LEN as usize),
         );
         Ok(HEADER_LEN as usize + prop_len)
     }
@@ -284,11 +285,12 @@ impl WireBodyEncode for PubRelComp {
         if !self.has_ack_properties() {
             return Ok(HEADER_LEN as usize);
         }
-        // Body budget: Packet Identifier + Reason Code; reserve ≤4 bytes for Property Length varint.
+        // What remains after Packet Identifier + Reason Code; the property block reserves its
+        // own Property Length out of that.
         let prop_len = ack_props::encoded_size(
             &self.properties,
             &self.reason_string,
-            reduce_limit(max_out, (HEADER_LEN + 4) as usize),
+            reduce_limit(max_out, HEADER_LEN as usize),
         );
         Ok(HEADER_LEN as usize + prop_len)
     }
