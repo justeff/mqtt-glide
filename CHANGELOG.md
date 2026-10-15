@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `InboundSinkClosed` and `InboundTrySendError` implement `Display` and `std::error::Error`; `ClientBuilder` and `OnInboundSink` implement `Debug`
 
 - Removed from the public API: `Connection::state` / `Connection::generation` (`run` consumes the `Connection`, so they could only ever report the initial state) together with the `ConnectionState` / `Generation` re-exports, and the test-only `TlsMode` / `resolve_tls_mode`. Observe the session through `SessionPhase`, a `LifecycleHook` or `MqttClient::is_connected`
+- Removed `PublishAckReason::should_disconnect`, `PubRelCompReason::should_disconnect` and their `ToReasonCode` impls. They were unused and encoded a disconnect policy the spec does not prescribe: a PUBACK refusal or PUBCOMP 0x92 does not end the connection
 
 - Wire-level codec items are no longer re-exported at the crate root: `Connect`, `ConnectAck`, `Disconnect`, `Packet`, `DecodedFrame`, `V5Codec`, `PublishPacket`, `PublishPacketMeta`, `PublishDelivery`, `PublishAck`, `Subscribe`, `SubscribeAck`, `Unsubscribe`, `UnsubscribeAck`, `DecodeError`, `EncodeError`, `RECEIVE_MAX_DEFAULT`, `encode_publish`, `ensure_publish_wire_fits`. Import them from `mqtt_glide::codec`. Message, option and reason-code types stay at the root
 

@@ -15,8 +15,8 @@ use crate::codec::error::{DecodeError, EncodeError};
 use crate::codec::properties::{ack_props, reduce_limit};
 use crate::codec::types::packet_type;
 use crate::codec::utils::{Decode, Encode, MINIMAL_PACKET_ID_ACK_WIRE_LEN, WireReader, encode_minimal_packet_id_ack};
+use crate::codec::v5::UserProperties;
 use crate::codec::v5::body_encode::WireBodyEncode;
-use crate::codec::v5::{DisconnectReasonCode, ToReasonCode, UserProperties};
 
 /// Append a minimal Success PUBACK to `buf` without building [`crate::codec::Packet`].
 ///
@@ -102,36 +102,6 @@ impl From<PublishAckReason> for u8 {
     }
 }
 
-impl PublishAckReason {
-    #[inline]
-    pub fn should_disconnect(&self) -> bool {
-        matches!(
-            self,
-            PublishAckReason::UnspecifiedError
-                | PublishAckReason::ImplementationSpecificError
-                | PublishAckReason::NotAuthorized
-                | PublishAckReason::TopicNameInvalid
-        )
-    }
-}
-
-impl ToReasonCode for PublishAckReason {
-    fn to_reason_code(&self) -> DisconnectReasonCode {
-        match self {
-            PublishAckReason::Success | PublishAckReason::NoMatchingSubscribers => {
-                DisconnectReasonCode::NormalDisconnection
-            }
-            PublishAckReason::UnspecifiedError => DisconnectReasonCode::UnspecifiedError,
-            PublishAckReason::ImplementationSpecificError => DisconnectReasonCode::ImplementationSpecificError,
-            PublishAckReason::NotAuthorized => DisconnectReasonCode::NotAuthorized,
-            PublishAckReason::TopicNameInvalid => DisconnectReasonCode::TopicNameInvalid,
-            PublishAckReason::PacketIdentifierInUse => DisconnectReasonCode::ProtocolError,
-            PublishAckReason::QuotaExceeded => DisconnectReasonCode::QuotaExceeded,
-            PublishAckReason::PayloadFormatInvalid => DisconnectReasonCode::PayloadFormatInvalid,
-        }
-    }
-}
-
 /// PUBREL / PUBCOMP Reason Codes (§3.6.2.1 / §3.7.2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -155,22 +125,6 @@ impl TryFrom<u8> for PubRelCompReason {
 impl From<PubRelCompReason> for u8 {
     fn from(v: PubRelCompReason) -> Self {
         v as u8
-    }
-}
-
-impl PubRelCompReason {
-    #[inline]
-    pub fn should_disconnect(&self) -> bool {
-        matches!(self, PubRelCompReason::PacketIdNotFound)
-    }
-}
-
-impl ToReasonCode for PubRelCompReason {
-    fn to_reason_code(&self) -> DisconnectReasonCode {
-        match self {
-            PubRelCompReason::Success => DisconnectReasonCode::NormalDisconnection,
-            PubRelCompReason::PacketIdNotFound => DisconnectReasonCode::ImplementationSpecificError,
-        }
     }
 }
 
