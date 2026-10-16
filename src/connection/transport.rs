@@ -337,18 +337,39 @@ mod tests {
         assert!(matches!(name, ServerName::DnsName(_)));
     }
 
+    /// Set in the child run of `rustls_connector_fails_without_trust_anchors`.
+    #[cfg(unix)]
+    const ROOTS_CHILD: &str = "MQTT_GLIDE_ROOTS_CHILD";
+
+    /// No trust anchor is a TLS error, never a connector that trusts nothing (or everything).
+    /// The system store comes from `SSL_CERT_FILE` when it is set, so the test runs itself again
+    /// in a child process with it pointing at an empty file: the environment of this process
+    /// stays untouched for the tests running next to it.
+    #[cfg(unix)]
     #[test]
-    fn rustls_connector_loads_system_roots_or_errors() {
-        match rustls_connector() {
-            Ok(_) => {}
-            Err(ConnectionOutcome::Transport(TransportError::Tls(message))) => {
-                assert!(
-                    message.contains("trust anchor") || message.contains("system"),
-                    "unexpected tls bootstrap error: {message}"
-                );
+    fn rustls_connector_fails_without_trust_anchors() {
+        if std::env::var_os(ROOTS_CHILD).is_some() {
+            match rustls_connector() {
+                Ok(_) => println!("ROOTS=ok"),
+                Err(ConnectionOutcome::Transport(TransportError::Tls(message))) => println!("ROOTS=tls:{message}"),
+                Err(other) => println!("ROOTS=other:{other:?}"),
             }
-            Err(other) => panic!("unexpected outcome: {other:?}"),
+            return;
         }
+        let name = module_path!()
+            .split_once("::")
+            .map(|(_, path)| format!("{path}::rustls_connector_fails_without_trust_anchors"))
+            .expect("module path");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env(ROOTS_CHILD, "1")
+            .env("SSL_CERT_FILE", "/dev/null")
+            .env_remove("SSL_CERT_DIR")
+            .output()
+            .expect("run child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "child failed: {stdout}");
+        assert!(stdout.contains("ROOTS=tls:no system trust anchors found\n"), "{stdout}");
     }
 
     #[test]

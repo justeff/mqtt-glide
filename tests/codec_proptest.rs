@@ -18,7 +18,6 @@ use std::num::{NonZeroU16, NonZeroU32};
 
 use bytes::{Bytes, BytesMut};
 use bytestring::ByteString;
-use mqtt_glide::codec::DEFAULT_MAX_PACKET_SIZE;
 use mqtt_glide::codec::{
     Auth, AuthReasonCode, Connect, ConnectAck, ConnectAckReason, DecodedFrame, Disconnect, DisconnectReasonCode,
     Packet, PubRelComp, PubRelCompReason, PublishAck, PublishAckReason, PublishDelivery, PublishMessage, PublishPacket,
@@ -26,6 +25,7 @@ use mqtt_glide::codec::{
     SubscriptionOptions, Unsubscribe, UnsubscribeAck, UnsubscribeAckReason, UserProperties, V5Codec, WillMessage,
     encode_publish,
 };
+use mqtt_glide::codec::{DEFAULT_MAX_PACKET_SIZE, EncodeError};
 use proptest::prelude::*;
 use proptest::strategy::Strategy;
 
@@ -122,11 +122,7 @@ fn round_trip_v5(packet: Packet) {
     codec
         .encode_packet(packet, &mut wire)
         .expect("encode must succeed for generated packet");
-    let decoded = codec
-        .decode_frame(&mut wire)
-        .expect("decode must not error for generated wire")
-        .expect("generated wire must contain a full packet");
-    assert_eq!(decoded, expected);
+    assert_decodes_to(&mut codec, wire, expected);
 }
 
 fn round_trip_v5_publish(message: PublishMessage, delivery: PublishDelivery) {
@@ -145,11 +141,54 @@ fn round_trip_v5_publish(message: PublishMessage, delivery: PublishDelivery) {
     let mut wire = BytesMut::new();
     encode_publish(&message, delivery, DEFAULT_MAX_PACKET_SIZE, &mut wire)
         .expect("encode must succeed for generated publish");
+
+    // The size check before writing uses the computed wire length; it must be the length written.
+    let wire_len = u32::try_from(wire.len()).expect("generated publish fits in u32");
+    let mut exact = BytesMut::new();
+    encode_publish(&message, delivery, wire_len, &mut exact)
+        .expect("a limit of the exact wire length holds the publish");
+    assert_eq!(exact, wire);
+    let mut short = BytesMut::new();
+    let error = encode_publish(&message, delivery, wire_len - 1, &mut short).expect_err("one byte short must not fit");
+    assert!(
+        matches!(error, EncodeError::OverMaxPacketSize { size, max } if size == wire_len && max == wire_len - 1),
+        "{error:?}"
+    );
+    assert!(short.is_empty());
+
+    assert_decodes_to(&mut codec, wire, expected);
+}
+
+/// Checks that the fixed header frames exactly the bytes written, then decodes the frame with
+/// nothing left over.
+fn assert_decodes_to(codec: &mut V5Codec, mut wire: BytesMut, expected: DecodedFrame) {
+    assert_eq!(
+        framed_len(&wire),
+        wire.len(),
+        "Remaining Length must match the body written"
+    );
     let decoded = codec
         .decode_frame(&mut wire)
         .expect("decode must not error for generated wire")
         .expect("generated wire must contain a full packet");
     assert_eq!(decoded, expected);
+    assert!(
+        wire.is_empty(),
+        "decoding must consume the whole frame, {} bytes left",
+        wire.len()
+    );
+}
+
+/// Frame length the fixed header declares: type byte, Remaining Length varint (§1.5.5), body.
+fn framed_len(wire: &[u8]) -> usize {
+    let mut remaining_length = 0usize;
+    for (i, &byte) in wire[1..].iter().take(4).enumerate() {
+        remaining_length |= usize::from(byte & 0x7F) << (7 * i);
+        if byte & 0x80 == 0 {
+            return 1 + (i + 1) + remaining_length;
+        }
+    }
+    panic!("Remaining Length must end within four bytes");
 }
 
 // --- Shared building blocks -------------------------------------------------------------

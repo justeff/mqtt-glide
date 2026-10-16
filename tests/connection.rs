@@ -47,9 +47,6 @@ async fn unreachable_broker_returns_transport_error() {
 
     match first {
         SessionPhase::Disconnected(ConnectionOutcome::Transport(_)) => {}
-        SessionPhase::Connected { session, .. } if !session.from_connack => {
-            panic!("skeleton Connected without TCP — connection must attempt broker connect");
-        }
         other => panic!("expected Disconnected(Transport(_)), got {other:?}"),
     }
 

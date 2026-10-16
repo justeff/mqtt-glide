@@ -1524,10 +1524,11 @@ mod tests {
         let _ = run.await;
     }
 
-    /// QoS 1: `publish().await` resolves only after PUBACK (mock broker). The PUBLISH goes out
-    /// as QoS 1 with a Packet Identifier ([MQTT-4.3.2-2]).
+    /// QoS 1: `publish().await` completes on the broker's PUBACK. The PUBLISH goes out as QoS 1
+    /// with a Packet Identifier ([MQTT-4.3.2-2]). Waiting for the matching PUBACK is covered by
+    /// [`qos1_publish_ignores_wrong_packet_id_puback_until_match`].
     #[tokio::test]
-    async fn qos1_publish_awaits_matching_puback() {
+    async fn qos1_publish_carries_packet_id_and_completes_on_puback() {
         let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let port = spawn_mock_broker_record_publishes(Arc::clone(&observed), NonZeroU16::new(8).expect("nz")).await;
         let (client, connection, mut phase) = connect_test_client(port).await;
@@ -1549,9 +1550,9 @@ mod tests {
         let _ = run.await;
     }
 
-    /// QoS 1: `try_start_publish` enqueues immediately and its completion waits for PUBACK.
+    /// QoS 1: `try_start_publish` enqueues immediately and its completion resolves on PUBACK.
     #[tokio::test]
-    async fn qos1_start_publish_completion_awaits_matching_puback() {
+    async fn qos1_start_publish_completion_resolves_on_puback() {
         let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let port = spawn_mock_broker_record_publishes(Arc::clone(&observed), NonZeroU16::new(8).expect("nz")).await;
         let (client, connection, mut phase) = connect_test_client(port).await;
@@ -2374,8 +2375,21 @@ mod tests {
     #[case::publish(AckKind::Publish)]
     #[tokio::test]
     async fn stale_generation_ack_does_not_complete_live_waiter(#[case] kind: AckKind) {
-        let port = spawn_mock_broker().await;
+        let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let port = spawn_mock_broker_record_publishes(Arc::clone(&observed), NonZeroU16::new(8).expect("nz")).await;
         let (client, run, control, live_generation) = connect_with_live_generation(port).await;
+        // Commands are handled in order: once a QoS 0 PUBLISH queued after the insert is on the
+        // wire, the waiter is registered, so the stale ack below meets a live waiter.
+        let waiter_registered = || async {
+            client.publish("t/sync", "after-insert").await.expect("QoS 0 marker");
+            timeout(Duration::from_secs(2), async {
+                while observed.lock().await.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("marker PUBLISH reaches the wire");
+        };
 
         let packet_id = NonZeroU16::new(42).expect("nz");
         let stale = Generation(live_generation.0.saturating_sub(1));
@@ -2387,9 +2401,7 @@ mod tests {
                 client
                     .try_insert_subscribe_waiter(packet_id, reply_tx)
                     .expect("insert subscribe waiter on live write task");
-                // Allow the write task to process InsertSubscribeWaiter.
-                tokio::task::yield_now().await;
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                waiter_registered().await;
 
                 let ack = SubscribeAck {
                     packet_id,
@@ -2416,9 +2428,7 @@ mod tests {
                 client
                     .try_insert_unsubscribe_waiter(packet_id, reply_tx)
                     .expect("insert unsubscribe waiter on live write task");
-                // Allow the write task to process InsertUnsubscribeWaiter.
-                tokio::task::yield_now().await;
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                waiter_registered().await;
 
                 let ack = UnsubscribeAck {
                     packet_id,
@@ -2447,9 +2457,7 @@ mod tests {
                 client
                     .try_insert_publish_waiter(packet_id, reply_tx)
                     .expect("insert publish waiter on live write task");
-                // Allow the write task to process InsertPublishWaiter.
-                tokio::task::yield_now().await;
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                waiter_registered().await;
 
                 let ack = PublishAck {
                     packet_id,
@@ -2508,10 +2516,6 @@ mod tests {
             matches!(err, AppError::ConnectionLost),
             "expected AppError::ConnectionLost after peer drop, got {err:?}"
         );
-        assert!(
-            !matches!(err, AppError::CommandChannelClosed),
-            "peer drop must not surface as CommandChannelClosed, got {err:?}"
-        );
 
         let _ = run.await;
     }
@@ -2569,10 +2573,6 @@ mod tests {
             err,
             AppError::ConnectionLost,
             "graceful_disconnect must fail waiters as ConnectionLost, got {err:?}"
-        );
-        assert!(
-            !matches!(err, AppError::CommandChannelClosed),
-            "graceful shutdown must not surface as CommandChannelClosed"
         );
 
         let _ = run.await;
@@ -4621,12 +4621,13 @@ mod tests {
                     .await;
             let (client, _rx, run) = start(options_for(port).keep_alive(Duration::from_secs(1))).await;
 
-            let stats = stats_until(&client, |stats| stats.connection.pings_sent >= 1).await;
-            assert!(stats.connection.pings_sent >= 1, "{stats:?}");
-            assert!(
-                pings.load(std::sync::atomic::Ordering::SeqCst) >= 1,
-                "the broker saw a PINGREQ"
-            );
+            // The counter must match the PINGREQs the broker received: not doubled, and not
+            // counting a ping that never reached the wire. `stats_until` panics if they never agree.
+            let broker_pings = || pings.load(std::sync::atomic::Ordering::SeqCst) as u64;
+            stats_until(&client, |stats| {
+                broker_pings() >= 1 && stats.connection.pings_sent == broker_pings()
+            })
+            .await;
 
             client.shutdown().await.expect("shutdown");
             let _ = run.await;

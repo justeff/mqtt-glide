@@ -109,16 +109,13 @@ impl Decode for UserProperty {
 
 #[cfg(test)]
 mod tests {
-    use bytes::BytesMut;
     use std::num::{NonZeroU16, NonZeroU32};
-    use tokio_util::codec::Encoder;
 
     use super::*;
-    use crate::codec::publish::{PublishDelivery, PublishMessage, PublishPacket, PublishPacketMeta, PublishProperties};
+    use crate::codec::publish::{PublishMessage, PublishPacket, PublishPacketMeta, PublishProperties};
     use crate::codec::types::QoS;
     use crate::codec::utils::decode_variable_length;
     use crate::codec::v5::UserProperties;
-    use crate::codec::v5::encode::encode_publish;
     use rstest::rstest;
 
     fn packet_id(v: u16) -> NonZeroU16 {
@@ -133,41 +130,17 @@ mod tests {
         DecodedFrame::Publish(packet)
     }
 
-    fn assert_decode_frame<B: AsRef<[u8]>>(bytes: B, res: DecodedFrame) {
+    fn assert_decode_frame<B: AsRef<[u8]>>(bytes: B, expected: DecodedFrame) {
         let bytes = bytes.as_ref();
-        let fixed = bytes[0];
-        let (_len, consumed) = decode_variable_length(&bytes[1..]).unwrap().unwrap();
-        let cur = Bytes::copy_from_slice(&bytes[consumed + 1..]);
-        let mut tmp = BytesMut::with_capacity(4096);
-        match &res {
-            DecodedFrame::Control(packet) => {
-                Encoder::encode(
-                    &mut crate::codec::v5::codec::V5Codec::default(),
-                    packet.clone(),
-                    &mut tmp,
-                )
-                .unwrap();
-            }
-            DecodedFrame::Publish(pkt) => {
-                let delivery = PublishDelivery {
-                    dup: pkt.meta.dup,
-                    retain: pkt.meta.retain,
-                    qos: pkt.meta.qos,
-                    packet_id: pkt.meta.packet_id,
-                };
-                encode_publish(&pkt.message, delivery, 0, &mut tmp).unwrap();
-            }
-        }
-        let decoded = decode_packet(cur, fixed);
-        let res = Ok(&res);
-        if decoded.as_ref().map_err(|e| e.to_string()) != res {
-            panic!(
-                "decoded packet does not match expectations.\nexpected: {:?}\nactual: {:?}\nencoding output for expected: {:X?}",
-                res,
-                decoded,
-                tmp.as_ref()
-            );
-        }
+        let (remaining_length, consumed) = decode_variable_length(&bytes[1..]).unwrap().unwrap();
+        let body = &bytes[1 + consumed..];
+        assert_eq!(
+            remaining_length as usize,
+            body.len(),
+            "Remaining Length of the test vector must match its body"
+        );
+        let decoded = decode_packet(Bytes::copy_from_slice(body), bytes[0]).expect("decode");
+        assert_eq!(decoded, expected);
     }
 
     #[test]
@@ -282,11 +255,6 @@ mod tests {
 
     #[test]
     fn test_decode_publish_packets() {
-        //assert_eq!(
-        //    decode_publish_packet(b"\x00\x05topic\x12\x34"),
-        //    Done(&b""[..], ("topic".to_owned(), 0x1234))
-        //);
-
         assert_decode_frame(
             b"\x3d\x0E\x00\x05topic\x43\x21\x00data",
             publish_frame(PublishPacket {
@@ -435,7 +403,7 @@ mod tests {
             reason_string: None,
         });
 
-        assert_decode_frame(b"\x90\x05\x12\x34\x00\x01\x80\x02", control(p));
+        assert_decode_frame(b"\x90\x06\x12\x34\x00\x01\x80\x02", control(p));
 
         let p = Packet::Unsubscribe(Unsubscribe {
             packet_id: packet_id(0x1234),

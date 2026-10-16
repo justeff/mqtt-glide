@@ -274,44 +274,76 @@ async fn fail_waiters_for_outcome_maps_transport_not_command_channel_closed() {
         matches!(err, AppError::ConnectionLost),
         "transport loss must fail waiters with ConnectionLost, got {err:?}"
     );
-    assert!(
-        !matches!(err, AppError::CommandChannelClosed),
-        "must not report CommandChannelClosed for transport failure"
-    );
 }
 
-/// graceful/shutdown waiter failure uses `ConnectionLost`, not channel-closed.
+/// Shutdown fails every waiter with the shutdown error: subscribes (the application's and the
+/// driver's own restore retry, which has no reply), unsubscribes and publishes all leave
+/// their tables and give their Packet Identifiers back.
 #[tokio::test]
-async fn graceful_shutdown_fail_all_waiters_uses_connection_lost() {
-    let mut waiters = SubUnsubWaiters {
-        subscribe: PacketIdMap::default(),
-        unsubscribe: PacketIdMap::default(),
-    };
+async fn shutdown_fail_all_waiters_releases_subscribe_unsubscribe_and_publish() {
+    let mut waiters = SubUnsubWaiters::new();
     let mut publish_waiters = PublishWaiters::new();
     let mut inflight = InflightPots::new(nonzero!(4u16));
-    let id = inflight.alloc_publish().expect("alloc");
-    let (tx, rx) = oneshot::channel();
-    publish_waiters.insert(id, tx);
+    let filter = || ByteString::from_static("t/1");
 
-    // Same error class as `graceful_disconnect` / `app_error_from_write_outcome(Shutdown)`.
+    let subscribe_id = inflight.alloc_subscribe().expect("alloc subscribe");
+    let (subscribe_tx, subscribe_rx) = oneshot::channel();
+    waiters.subscribe.insert(
+        subscribe_id,
+        PendingSubscribe {
+            reply: Some(subscribe_tx),
+            filters: vec![(filter(), SubscriptionOptions::default())],
+            id: None,
+        },
+    );
+    let retry_id = inflight.alloc_subscribe().expect("alloc restore retry");
+    waiters.subscribe.insert(
+        retry_id,
+        PendingSubscribe {
+            reply: None,
+            filters: vec![(filter(), SubscriptionOptions::default())],
+            id: None,
+        },
+    );
+    let unsubscribe_id = inflight.alloc_subscribe().expect("alloc unsubscribe");
+    let (unsubscribe_tx, unsubscribe_rx) = oneshot::channel();
+    waiters.unsubscribe.insert(
+        unsubscribe_id,
+        PendingUnsubscribe {
+            reply: unsubscribe_tx,
+            filters: vec![filter()],
+        },
+    );
+    let publish_id = inflight.alloc_publish().expect("alloc publish");
+    let (publish_tx, publish_rx) = oneshot::channel();
+    publish_waiters.insert(publish_id, publish_tx);
+
+    let error = app_error_from_write_outcome(&WriteOutcome::Shutdown);
+    fail_all_waiters(&mut waiters, &mut publish_waiters, &mut inflight, &error);
+
+    assert!(waiters.subscribe.is_empty() && waiters.unsubscribe.is_empty());
+    assert!(publish_waiters.is_empty());
+    for id in [subscribe_id, retry_id, unsubscribe_id] {
+        assert!(!inflight.subscribe_contains(id), "packet id {id} still held");
+    }
+    assert!(!inflight.publish_contains(publish_id));
     assert_eq!(
-        app_error_from_write_outcome(&WriteOutcome::Shutdown),
+        subscribe_rx
+            .await
+            .expect("subscribe reply")
+            .expect_err("subscribe must fail"),
         AppError::ConnectionLost
     );
-    fail_all_waiters(
-        &mut waiters,
-        &mut publish_waiters,
-        &mut inflight,
-        &AppError::ConnectionLost,
+    assert_eq!(
+        unsubscribe_rx
+            .await
+            .expect("unsubscribe reply")
+            .expect_err("unsubscribe must fail"),
+        AppError::ConnectionLost
     );
-
-    assert!(publish_waiters.is_empty());
-    assert!(!inflight.publish_contains(id));
-    let err = rx.await.expect("oneshot").expect_err("waiter must fail");
-    assert_eq!(err, AppError::ConnectionLost);
-    assert!(
-        !matches!(err, AppError::CommandChannelClosed),
-        "graceful disconnect must not report CommandChannelClosed"
+    assert_eq!(
+        publish_rx.await.expect("publish reply").expect_err("publish must fail"),
+        AppError::ConnectionLost
     );
 }
 

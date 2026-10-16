@@ -17,7 +17,7 @@ use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use common::{static_credentials, wait_for_phase};
+use common::static_credentials;
 use mqtt_glide::{
     AppError, BrokerUrl, ClientId, ConnectOptions, Connection, ConnectionOutcome, InboundMessage, MqttClient,
     NoopLifecycle, Publish, QoS, ReconnectPolicy, SessionPhase, connect,
@@ -74,8 +74,10 @@ async fn await_phase(
     label: &str,
     predicate: impl Fn(&SessionPhase) -> bool,
 ) {
-    wait_for_phase(phase, Duration::from_secs(10), predicate).await;
-    let _ = label;
+    timeout(Duration::from_secs(10), phase.wait_for(|p| predicate(p)))
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+        .unwrap_or_else(|_| panic!("phase watch closed while waiting for {label}"));
 }
 
 async fn stop(session: Session) {
@@ -231,6 +233,7 @@ async fn reset_mid_burst_clean_session_reports_truthfully() {
         missing.is_empty(),
         "acknowledged publishes missing at the broker: {missing:?}"
     );
+    assert!(proxy.accepted() >= 2, "the reset must have forced a reconnect");
 
     session
         .client

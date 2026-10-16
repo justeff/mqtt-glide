@@ -535,10 +535,18 @@ mod tests {
             loop {
                 match framed_read.next().await {
                     Some(Ok((DecodedFrame::Publish(packet), _))) => {
+                        let user_properties: Vec<(String, String)> = packet
+                            .message
+                            .properties
+                            .user_properties
+                            .iter()
+                            .map(|u| (u.name.to_string(), u.value.to_string()))
+                            .collect();
                         observed_broker.lock().await.push((
                             packet.meta.qos,
                             packet.meta.packet_id,
                             packet.message.payload.clone(),
+                            user_properties,
                         ));
                         if packet.meta.qos == QoS::AtLeastOnce {
                             let Some(id) = packet.meta.packet_id else {
@@ -593,25 +601,43 @@ mod tests {
         assert!(frames[0].1.is_some());
         assert_eq!(&*frames[0].2, b"need-ack");
         assert_eq!(&*frames[1].2, b"with-props");
+        assert!(frames[0].3.is_empty(), "no user property was set on the first publish");
+        assert_eq!(
+            frames[1].3,
+            [("k".to_owned(), "v".to_owned())],
+            "user property on the wire"
+        );
 
         client.shutdown().await.expect("shutdown");
     }
 
-    /// `from_options` + `wait_connected(false)` returns without waiting for CONNACK.
+    /// `from_options` + `wait_connected(false)` returns without waiting for CONNACK: the broker
+    /// accepts TCP but never answers, and `connect` still returns long before `connect_timeout`.
     #[tokio::test]
     async fn builder_from_options_without_wait_connected() {
-        let port = spawn_mock_broker().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let _held = listener.accept().await;
+            std::future::pending::<()>().await;
+        });
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("url");
-        let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("custom"));
+        let options = ConnectOptions::new(url)
+            .client_id(ClientId::from_prefix("custom"))
+            .connect_timeout(Duration::from_secs(30));
 
-        let client = ClientBuilder::from_options(options)
-            .wait_connected(false)
-            .discard_inbound()
-            .connect()
-            .await
-            .expect("connect without wait");
+        let client = tokio::time::timeout(
+            Duration::from_secs(2),
+            ClientBuilder::from_options(options)
+                .wait_connected(false)
+                .discard_inbound()
+                .connect(),
+        )
+        .await
+        .expect("connect must not wait for a CONNACK that never comes")
+        .expect("connect without wait");
+        assert!(!client.is_connected(), "no CONNACK was sent");
 
-        // Handle is usable; may or may not be Connected yet — just shutdown cleanly.
         client.shutdown().await.expect("shutdown");
     }
 

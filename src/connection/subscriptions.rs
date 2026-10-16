@@ -762,22 +762,73 @@ mod tests {
         assert!(!subscribe_reason_granted(SubscribeAckReason::NotAuthorized));
     }
 
-    /// [MQTT-4.1.0-1] In-connection subscription state is retained until explicit remove.
+    /// [MQTT-4.1.0-1] The subscriptions of the Session State survive everything else the open
+    /// connection does to them: other SUBSCRIBEs and UNSUBSCRIBEs, a refused re-SUBSCRIBE, a
+    /// refused UNSUBSCRIBE and a refused restore all leave the granted filter, with its options
+    /// and Subscription Identifier, in place for the next resubscribe. Only the broker
+    /// confirming its UNSUBSCRIBE removes it.
     #[test]
     fn session_subscription_state_retained_until_explicit_remove() {
         let mut registry = SubscriptionRegistry::default();
+        let keep = ByteString::from_static("active/topic");
+        let other = ByteString::from_static("other/topic");
         let opts = SubscriptionOptions {
             qos: QoS::AtLeastOnce,
+            no_local: true,
             ..SubscriptionOptions::default()
         };
-        registry.upsert([(ByteString::from_static("active/topic"), opts)]);
-        assert_eq!(
-            registry.snapshot().len(),
-            1,
-            "registry must retain subs while connection is open"
+        let id = NonZeroU32::new(7);
+        let kept = || vec![(id, vec![(keep.clone(), opts)])];
+
+        apply_subscribe_ack_to_registry(
+            &mut registry,
+            &[(keep.clone(), opts)],
+            id,
+            &[SubscribeAckReason::GrantedQos1],
         );
-        registry.remove([ByteString::from_static("active/topic")]);
-        assert!(registry.snapshot().is_empty());
+        assert_eq!(registry.snapshot_grouped(), kept());
+
+        apply_subscribe_ack_to_registry(
+            &mut registry,
+            &[(other.clone(), SubscriptionOptions::default())],
+            None,
+            &[SubscribeAckReason::GrantedQos0],
+        );
+        apply_subscribe_ack_to_registry(
+            &mut registry,
+            &[(keep.clone(), SubscriptionOptions::default())],
+            None,
+            &[SubscribeAckReason::NotAuthorized],
+        );
+        apply_unsubscribe_ack_to_registry(
+            &mut registry,
+            &[keep.clone(), other.clone()],
+            &[UnsubscribeAckReason::NotAuthorized, UnsubscribeAckReason::Success],
+        );
+        assert_eq!(
+            registry.snapshot_grouped(),
+            kept(),
+            "other subscribes and unsubscribes, and refused ones, must not discard the subscription"
+        );
+
+        registry.apply_restore_ack(
+            &[(keep.clone(), opts)],
+            &[SubscribeAckReason::NotAuthorized],
+            None,
+            false,
+        );
+        assert_eq!(
+            registry.snapshot_grouped(),
+            kept(),
+            "a refused restore keeps the subscription for the retry"
+        );
+
+        apply_unsubscribe_ack_to_registry(
+            &mut registry,
+            std::slice::from_ref(&keep),
+            &[UnsubscribeAckReason::Success],
+        );
+        assert!(registry.snapshot_grouped().is_empty());
     }
 
     /// Auto-resubscribe SUBACK must carry one granted reason per sent filter

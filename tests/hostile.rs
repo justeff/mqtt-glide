@@ -27,7 +27,7 @@ use mqtt_glide::testing::{FaultProxy, TestBroker};
 use mqtt_glide::{
     AppError, BrokerUrl, ClientId, ConnectOptions, Connection, ConnectionOutcome, HttpProxy, InboundMessage,
     InboundSink, MqttClient, NoopLifecycle, OnInboundSink, Publish, QoS, ReconnectPolicy, SessionPhase,
-    StandardReconnectPolicy, StaticCredentials, connect,
+    StandardReconnectPolicy, StaticCredentials, TransportError, connect,
 };
 use rstest::rstest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1001,7 +1001,10 @@ async fn keep_alive_detects_a_stalled_broker(#[case] stall: Stall) {
         16,
     );
     let result = h.finish(10).await;
-    assert!(result.is_err(), "driver should end with an error");
+    assert!(
+        matches!(&result, Err(ConnectionOutcome::Transport(TransportError::Connection(msg))) if msg.contains("PINGRESP timed out")),
+        "the keep-alive watchdog must end the session: {result:?}"
+    );
     within(10, broker).await.unwrap();
     assert_no_library_panic();
 }

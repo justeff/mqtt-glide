@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use mqtt_glide::testing::{FaultProxy, TestBroker};
 use mqtt_glide::{
-    AppError, ClientBuilder, InboundMessage, MqttClient, Publish, QoS, StandardReconnectPolicy, Subscription,
+    AppError, ClientBuilder, ConnectError, InboundMessage, MqttClient, Publish, QoS, StandardReconnectPolicy,
+    Subscription,
 };
-use mqtt_glide::{ConnectAckReason, PublishAckReason, SubscribeAckReason};
+use mqtt_glide::{ConnectAckReason, ProtocolError, PublishAckReason, SubscribeAckReason};
 use tokio::sync::mpsc;
 
 const WAIT: Duration = Duration::from_secs(2);
@@ -290,7 +291,11 @@ async fn refusals_and_rejections_reach_the_application() {
         .discard_inbound()
         .connect()
         .await;
-    assert!(refused.is_err(), "CONNACK refusal surfaces as a connect error");
+    assert!(
+        matches!(&refused, Err(ConnectError::Protocol(ProtocolError::Violation(msg))) if msg.contains("ServerUnavailable")),
+        "a CONNACK refusal surfaces as a connect error naming the reason: {:?}",
+        refused.err()
+    );
 }
 
 #[tokio::test]

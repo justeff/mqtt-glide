@@ -211,23 +211,36 @@ pub(crate) async fn spawn_mock_broker_keepalive_enforcer(
     .await
 }
 
-/// PUBLISH with Topic Alias property (empty topic + alias=1) after CONNACK.
-pub(crate) async fn spawn_mock_broker_with_inbound_topic_alias() -> u16 {
-    spawn_broker_loop(|mut framed_read, mut framed_write| async move {
-        if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
-            return;
+/// PUBLISH with Topic Alias property (empty topic + alias=1) after CONNACK. The receiver gets
+/// the reason of the DISCONNECT the client answered with, per connection (`None` without one).
+pub(crate) async fn spawn_mock_broker_with_inbound_topic_alias()
+-> (u16, flume::Receiver<Option<crate::codec::DisconnectReasonCode>>) {
+    let (reason_tx, reason_rx) = flume::unbounded();
+    let port = spawn_broker_loop(move |mut framed_read, mut framed_write| {
+        let reason_tx = reason_tx.clone();
+        async move {
+            if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+                return;
+            }
+            // QoS 0 PUBLISH: empty topic + Topic Alias property (1) + payload "d".
+            let publish_with_alias = [0x30_u8, 0x07, 0x00, 0x00, 0x03, 0x23, 0x00, 0x01, b'd'];
+            if framed_write.get_mut().write_all(&publish_with_alias).await.is_err() {
+                return;
+            }
+            if framed_write.flush().await.is_err() {
+                return;
+            }
+            let mut reason = None;
+            while let Some(frame) = framed_read.next().await {
+                if let Ok((DecodedFrame::Control(Packet::Disconnect(disconnect)), _)) = frame {
+                    reason = Some(disconnect.reason_code);
+                }
+            }
+            let _ = reason_tx.send(reason);
         }
-        // QoS 0 PUBLISH: empty topic + Topic Alias property (1) + payload "d".
-        let publish_with_alias = [0x30_u8, 0x07, 0x00, 0x00, 0x03, 0x23, 0x00, 0x01, b'd'];
-        if framed_write.get_mut().write_all(&publish_with_alias).await.is_err() {
-            return;
-        }
-        if framed_write.flush().await.is_err() {
-            return;
-        }
-        while framed_read.next().await.is_some() {}
     })
-    .await
+    .await;
+    (port, reason_rx)
 }
 
 /// Accepts CONNECT, CONNACK, then closes so the client observes Transport loss.

@@ -620,10 +620,11 @@ async fn server_keep_alive_from_connack_drives_pingreq_interval() {
     let _ = timeout(Duration::from_secs(5), run).await;
 }
 
-/// Inbound `wire_topic_alias` on the live read path → Protocol Error.
+/// An inbound Topic Alias when we advertised a Topic Alias Maximum of 0 (§3.3.2.3.4) ends the
+/// session with a Protocol Error locally, and the broker is told with DISCONNECT 0x94.
 #[tokio::test]
 async fn inbound_topic_alias_on_read_path_disconnects() {
-    let port = spawn_mock_broker_with_inbound_topic_alias().await;
+    let (port, wire_reason) = spawn_mock_broker_with_inbound_topic_alias().await;
     let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
     let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
     let (tx, _rx) = flume::bounded::<InboundMessage>(4);
@@ -644,6 +645,11 @@ async fn inbound_topic_alias_on_read_path_disconnects() {
         result,
         Err(ConnectionOutcome::Protocol(ProtocolError::TopicAliasNotSupported))
     ));
+    let reason = timeout(Duration::from_secs(5), wire_reason.recv_async())
+        .await
+        .expect("broker result timeout")
+        .expect("broker result");
+    assert_eq!(reason, Some(crate::codec::DisconnectReasonCode::TopicAliasInvalid));
 }
 
 // --- inbound enqueue-before-ack / flow-control contracts ---

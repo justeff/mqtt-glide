@@ -306,8 +306,9 @@ mod tests {
         };
         let mut buf = BytesMut::new();
         disconnect.encode_body(&mut buf, 2).expect("encode");
-        assert!(
-            !buf.as_ref().contains(&pt::USER),
+        assert_eq!(
+            buf.as_ref(),
+            [u8::from(DisconnectReasonCode::NotAuthorized), 0x00],
             "User Property must be omitted when it would exceed the DISCONNECT body budget"
         );
     }

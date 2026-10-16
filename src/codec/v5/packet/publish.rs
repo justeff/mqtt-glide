@@ -241,8 +241,8 @@ mod tests {
     }
 
     #[test]
-    fn publish_decode_server_subscription_identifier_accepted_and_discarded() {
-        // Server→Client may carry Subscription Identifier; product API does not expose it.
+    fn publish_decode_keeps_server_subscription_identifier() {
+        // Server→Client may carry Subscription Identifier; the decoder keeps it apart from the properties.
         let mut body = BytesMut::new();
         ByteString::from_static("topic").encode(&mut body).unwrap();
         body.put_u8(2); // Property Length
@@ -254,6 +254,7 @@ mod tests {
         assert_eq!(&*publish.message.topic, "topic");
         assert_eq!(publish.message.payload.as_ref(), b"data");
         assert!(publish.message.properties.is_wire_empty());
+        assert_eq!(publish.subscription_ids, [NonZeroU32::new(1).unwrap()]);
     }
 
     #[test]
@@ -268,6 +269,7 @@ mod tests {
         let publish = PublishPacket::decode(body.freeze(), QOS0_FLAGS).expect("SUB_ID 0 ok");
         assert_eq!(&*publish.message.topic, "topic");
         assert_eq!(publish.message.payload.as_ref(), b"data");
+        assert!(publish.subscription_ids.is_empty());
     }
 
     #[test]
@@ -276,10 +278,7 @@ mod tests {
         const QOS1_FLAGS: u8 = 0b0010;
         let body = Bytes::from_static(&[0x00, 0x01, b't', 0x00]);
         let result = PublishPacket::decode(body, QOS1_FLAGS);
-        assert!(matches!(
-            result,
-            Err(DecodeError::InvalidLength) | Err(DecodeError::MalformedPacket(_))
-        ));
+        assert!(matches!(result, Err(DecodeError::InvalidLength)), "{result:?}");
     }
 
     #[test]
