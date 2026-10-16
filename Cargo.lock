@@ -1311,6 +1311,7 @@ dependencies = [
  "futures-util",
  "libc",
  "memchr",
+ "mqtt-glide",
  "mqtt5",
  "nonzero_ext",
  "proptest",

@@ -44,8 +44,17 @@ pub enum InboundTrySendError {
 /// Implementors **MUST** be cheap to [`Clone`] so the connection driver can keep an
 /// anchor handle across read-task respawn without closing the channel.
 ///
-/// [`Self::send`] **MUST** be cancel-safe: dropping the returned future before
-/// `Ready(Ok(()))` means the message was not accepted (see module-level cancel safety).
+/// The read task delivers each inbound message through the sink **before** the QoS 1
+/// PUBACK. Built-ins: [`tokio::sync::mpsc::Sender`], [`OnInboundSink`] (inline handler via
+/// [`crate::ClientBuilder::on_inbound`]) and, with the `flume` feature, `flume::Sender`.
+///
+/// # Cancel safety
+///
+/// On shutdown/session cancel the read task may drop a pending [`Self::send`] future. That
+/// **MUST** mean the message was **not** accepted into the sink (so the client correctly
+/// skips PUBACK). Tokio `mpsc::Sender::send`, flume `send_async`, and [`OnInboundSink`]
+/// satisfy this. Custom sinks **MUST** uphold the same contract: do not deliver to the
+/// consumer before the `send` future completes with `Ok(())`.
 pub trait InboundSink: Clone + Send + Sync + 'static {
     /// Whether further sends will fail because the consumer side is gone.
     fn is_closed(&self) -> bool;
@@ -57,7 +66,7 @@ pub trait InboundSink: Clone + Send + Sync + 'static {
     /// Async push with backpressure until capacity is available or the sink closes.
     ///
     /// Returns a [`Send`] future so the read task can run on a multi-thread runtime.
-    /// See cancel safety in the [module docs](self).
+    /// See the cancel safety contract on [`InboundSink`].
     fn send(&self, message: InboundMessage) -> impl Future<Output = Result<(), InboundSinkClosed>> + Send;
 }
 

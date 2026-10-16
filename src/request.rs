@@ -1,37 +1,5 @@
 //! MQTT 5 request / response (§4.10): [`Requester`] on the asking side,
 //! [`Publish::reply_to`](crate::Publish::reply_to) on the answering side.
-//!
-//! A requester subscribes once to its own response topic. Every request carries that topic as
-//! Response Topic plus fresh Correlation Data; the driver hands a matching response straight
-//! to the waiting request instead of the application's inbound sink.
-//!
-//! # Examples
-//!
-//! ```no_run
-//! use std::time::Duration;
-//!
-//! use mqtt_glide::{MqttClient, Publish, QoS};
-//!
-//! # async fn demo(client: MqttClient) -> Result<(), mqtt_glide::AppError> {
-//! // Asking side.
-//! let requester = client.requester("svc/replies/edge-01").await?;
-//! let reply = requester
-//!     .request("svc/time", "now?")
-//!     .qos(QoS::AtLeastOnce)
-//!     .timeout(Duration::from_secs(2))
-//!     .await?;
-//! println!("{:?}", reply.payload);
-//! # Ok(())
-//! # }
-//!
-//! # async fn answer(client: MqttClient, request: mqtt_glide::InboundMessage) -> Result<(), mqtt_glide::AppError> {
-//! // Answering side, for each request taken from the inbound sink.
-//! if let Some(reply) = Publish::reply_to(&request, "12:00") {
-//!     client.send(reply).await?;
-//! }
-//! # Ok(())
-//! # }
-//! ```
 
 use std::collections::HashMap;
 use std::future::{Future, IntoFuture};
@@ -142,8 +110,40 @@ impl Drop for PendingGuard {
     }
 }
 
-/// Sends requests and awaits their responses on one response topic; see the
-/// [module docs](self). Cheap to clone and safe to use from many tasks at once.
+/// Sends requests and awaits their responses on one response topic. Cheap to clone and
+/// safe to use from many tasks at once.
+///
+/// A requester subscribes once to its own response topic. Every request carries that topic as
+/// Response Topic plus fresh Correlation Data; the driver hands a matching response straight
+/// to the waiting request instead of the application's inbound sink.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::time::Duration;
+///
+/// use mqtt_glide::{MqttClient, Publish, QoS};
+///
+/// # async fn demo(client: MqttClient) -> Result<(), mqtt_glide::AppError> {
+/// // Asking side.
+/// let requester = client.requester("svc/replies/edge-01").await?;
+/// let reply = requester
+///     .request("svc/time", "now?")
+///     .qos(QoS::AtLeastOnce)
+///     .timeout(Duration::from_secs(2))
+///     .await?;
+/// println!("{:?}", reply.payload);
+/// # Ok(())
+/// # }
+///
+/// # async fn answer(client: MqttClient, request: mqtt_glide::InboundMessage) -> Result<(), mqtt_glide::AppError> {
+/// // Answering side, for each request taken from the inbound sink.
+/// if let Some(reply) = Publish::reply_to(&request, "12:00") {
+///     client.send(reply).await?;
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct Requester {
     client: MqttClient,

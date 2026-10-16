@@ -77,8 +77,11 @@ stats = []
 # `InboundSink` for `flume::Sender<InboundMessage>`. Ties the API to flume 0.12: a flume
 # upgrade here is a breaking change for code that enables this feature.
 flume = ["dep:flume"]
+# Internal: makes the wire codec and connection modules public for the crate's own tests,
+# benches and fuzz target. Not part of the public API; no stability guarantees.
+__internals = []
 # Internal: hooks for the `mqtt_compare` bench only. Not part of the public API.
-__bench = ["flume"]
+__bench = ["flume", "__internals"]
 
 [dependencies]
 arc-swap = "1.9"
@@ -108,6 +111,9 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 # Dev/bench only — not linked into dependents or a plain `cargo build`.
 # `cargo test` / `cargo bench` resolve them (including rumqttc for mqtt_compare).
 [dev-dependencies]
+# The crate itself with its internals public, so integration tests and benches can drive the
+# wire codec. No TLS feature here: the package's own feature selection supplies the provider.
+mqtt-glide = { path = ".", default-features = false, features = ["__internals"] }
 # Unit tests and the bench harness hand off through flume; the library only with the `flume` feature.
 flume = "0.12"
 # Bench: `getrusage` for subscriber CPU in `mqtt_compare` (see benches/support/cpu.rs).

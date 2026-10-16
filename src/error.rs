@@ -1,7 +1,7 @@
 //! Typed client errors (transport, protocol, auth, shutdown).
 //!
 //! Error classes: each category maps to a distinct reconnect or
-//! shutdown reaction in the connection driver ([`crate::connection`]).
+//! shutdown reaction in the connection driver ([`crate::Connection`]).
 
 use std::fmt;
 use std::time::Duration;
@@ -14,7 +14,7 @@ use thiserror::Error;
 pub enum AuthError {
     /// Broker rejected the supplied username or password.
     ///
-    /// Triggers [`crate::client::CredentialsProvider::invalidate`] on connect and active session end.
+    /// Triggers [`CredentialsProvider::invalidate`](crate::CredentialsProvider::invalidate) on connect and active session end.
     #[error("broker rejected credentials")]
     NotAuthorized,
     /// Credentials could not be obtained from the provider (transient upstream failure).

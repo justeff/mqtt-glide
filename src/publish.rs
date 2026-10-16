@@ -1,28 +1,4 @@
-//! Outbound PUBLISH: the owned [`Publish`] value and the [`PublishBuilder`] returned by
-//! [`MqttClient::publish`](crate::MqttClient::publish).
-//!
-//! A [`Publish`] carries everything one PUBLISH needs — topic, payload, QoS, retain and
-//! MQTT 5 properties — so it can be built once and handed to
-//! [`MqttClient::send`](crate::MqttClient::send), [`MqttClient::try_start_publish`](crate::MqttClient::try_start_publish),
-//! [`PublishWindow::push`](crate::PublishWindow::push) or
-//! [`MqttClient::publish_batch`](crate::MqttClient::publish_batch).
-//! Defaults: QoS 0, retain `false`, no properties.
-//!
-//! # Examples
-//!
-//! ```no_run
-//! use mqtt_glide::{MqttClient, Publish, QoS};
-//!
-//! # async fn demo(client: MqttClient) -> Result<(), mqtt_glide::AppError> {
-//! // Fluent, awaited directly:
-//! client.publish("sensors/temp", "22.5").qos(QoS::AtLeastOnce).retain(true).await?;
-//!
-//! // Or build the value first and send it later:
-//! let status = Publish::new("status", "online").qos(QoS::AtLeastOnce).retain(true);
-//! client.send(status).await?;
-//! # Ok(())
-//! # }
-//! ```
+//! Outbound PUBLISH: the owned [`Publish`] value and its builder.
 
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
@@ -39,6 +15,26 @@ use crate::error::AppError;
 /// Build with [`Publish::new`] and the chained setters; defaults are QoS 0,
 /// retain `false` and no properties. Converts from a [`PublishMessage`] (for example to
 /// republish an inbound message) with the same defaults.
+///
+/// Built once, it can be handed to [`MqttClient::send`], [`MqttClient::try_start_publish`],
+/// [`PublishWindow::push`](crate::PublishWindow::push) or [`MqttClient::publish_batch`];
+/// [`MqttClient::publish`] returns the fluent [`PublishBuilder`] instead.
+///
+/// # Examples
+///
+/// ```no_run
+/// use mqtt_glide::{MqttClient, Publish, QoS};
+///
+/// # async fn demo(client: MqttClient) -> Result<(), mqtt_glide::AppError> {
+/// // Fluent, awaited directly:
+/// client.publish("sensors/temp", "22.5").qos(QoS::AtLeastOnce).retain(true).await?;
+///
+/// // Or build the value first and send it later:
+/// let status = Publish::new("status", "online").qos(QoS::AtLeastOnce).retain(true);
+/// client.send(status).await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Publish {
     pub(crate) message: PublishMessage,

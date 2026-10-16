@@ -44,6 +44,10 @@ jobs:
         run: cargo clippy --all-targets --features testing ${{ matrix.args }} -- -D warnings
       - name: clippy with stats (${{ matrix.name }})
         run: cargo clippy --all-targets --features testing,stats,__bench ${{ matrix.args }} -- -D warnings
+      # Test targets enable `__internals` through the self dev-dependency; the library as
+      # shipped keeps the codec private, so check it on its own for dead code.
+      - name: clippy library as shipped (${{ matrix.name }})
+        run: cargo clippy --lib --features testing,stats,flume ${{ matrix.args }} -- -D warnings
 
   test:
     name: test

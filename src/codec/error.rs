@@ -2,6 +2,7 @@
 //!
 //! - [`DecodeError`]: failures while parsing frames (§2 / §3 wire rules)
 //! - [`EncodeError`]: failures while serializing packets to bytes
+//! - [`UnknownCode`]: a byte that is no defined QoS, Retain Handling or reason code
 
 use std::io;
 
@@ -35,8 +36,6 @@ pub enum DecodeError {
     ConnectAckReservedFlagSet,
     #[error("Unsupported packet type")]
     UnsupportedPacketType,
-    #[error("Packet id is required")]
-    PacketIdRequired,
     #[error("Max size exceeded: size={size}, max={max}")]
     MaxSizeExceeded { size: u32, max: u32 },
     #[error("io error, {:?}", _0)]
@@ -63,10 +62,29 @@ impl ToReasonCode for DecodeError {
             DecodeError::ConnectReservedFlagSet => DisconnectReasonCode::MalformedPacket,
             DecodeError::ConnectAckReservedFlagSet => DisconnectReasonCode::MalformedPacket,
             DecodeError::UnsupportedPacketType => DisconnectReasonCode::MalformedPacket,
-            DecodeError::PacketIdRequired => DisconnectReasonCode::ProtocolError,
             DecodeError::MaxSizeExceeded { .. } => DisconnectReasonCode::PacketTooLarge,
             DecodeError::Io(_) => DisconnectReasonCode::UnspecifiedError,
         }
+    }
+}
+
+/// A byte that is not a defined value of the code type it was converted to: [`crate::QoS`],
+/// [`crate::RetainHandling`] or one of the reason code enums.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{0:#04x} is not a defined code")]
+pub struct UnknownCode(pub(crate) u8);
+
+impl UnknownCode {
+    /// The byte that was refused.
+    pub fn code(self) -> u8 {
+        self.0
+    }
+}
+
+/// Inside a packet an undefined code makes it malformed.
+impl From<UnknownCode> for DecodeError {
+    fn from(_: UnknownCode) -> Self {
+        DecodeError::MalformedPacket("unknown property or reason code")
     }
 }
 
@@ -82,8 +100,6 @@ pub enum EncodeError {
     MalformedPacket,
     #[error("Packet id is required")]
     PacketIdRequired,
-    #[error("Unsupported version")]
-    UnsupportedVersion,
     #[error("io error, {:?}", _0)]
     Io(ByteString),
 }
@@ -101,7 +117,6 @@ impl ToReasonCode for EncodeError {
             EncodeError::InvalidLength => DisconnectReasonCode::MalformedPacket,
             EncodeError::MalformedPacket => DisconnectReasonCode::MalformedPacket,
             EncodeError::PacketIdRequired => DisconnectReasonCode::ProtocolError,
-            EncodeError::UnsupportedVersion => DisconnectReasonCode::ImplementationSpecificError,
             EncodeError::Io(_) => DisconnectReasonCode::UnspecifiedError,
         }
     }

@@ -1,32 +1,4 @@
 //! Sliding-window outbound publish helper ([`PublishWindow`]).
-//!
-//! Wraps [`MqttClient::start_publish`](crate::MqttClient::start_publish) +
-//! [`PublishCompletion`] without spawning a task per message. Call
-//! [`PublishWindow::drain`] after the burst. For a one-shot burst, see
-//! [`MqttClient::publish_batch`](crate::MqttClient::publish_batch).
-//!
-//! # Example
-//!
-//! ```no_run
-//! use std::num::NonZeroUsize;
-//!
-//! use mqtt_glide::{ClientBuilder, Publish, QoS};
-//!
-//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-//! let client = ClientBuilder::new("mqtt://127.0.0.1:1883")?
-//!     .discard_inbound()
-//!     .connect()
-//!     .await?;
-//!
-//! let mut pipe = client.publish_window(NonZeroUsize::new(64).expect("nz"));
-//! for i in 0..1_000 {
-//!     pipe.push(Publish::new(format!("out/{i}"), "x").qos(QoS::AtLeastOnce)).await?;
-//! }
-//! pipe.drain().await?;
-//! client.shutdown().await?;
-//! # Ok(())
-//! # }
-//! ```
 
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
@@ -45,6 +17,29 @@ use crate::publish::Publish;
 /// Dropping without [`Self::drain`] discards the open completions (same as dropping
 /// [`PublishCompletion`] without [`PublishCompletion::wait`](crate::PublishCompletion::wait)):
 /// publishes the write task has already encoded proceed, still-queued ones may be skipped.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::num::NonZeroUsize;
+///
+/// use mqtt_glide::{ClientBuilder, Publish, QoS};
+///
+/// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+/// let client = ClientBuilder::new("mqtt://127.0.0.1:1883")?
+///     .discard_inbound()
+///     .connect()
+///     .await?;
+///
+/// let mut pipe = client.publish_window(NonZeroUsize::new(64).expect("nz"));
+/// for i in 0..1_000 {
+///     pipe.push(Publish::new(format!("out/{i}"), "x").qos(QoS::AtLeastOnce)).await?;
+/// }
+/// pipe.drain().await?;
+/// client.shutdown().await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct PublishWindow<'a> {
     client: &'a MqttClient,

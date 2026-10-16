@@ -12,7 +12,7 @@ use std::num::{NonZeroU16, NonZeroU32};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use bytestring::ByteString;
 
-use crate::codec::error::{DecodeError, EncodeError};
+use crate::codec::error::{DecodeError, EncodeError, UnknownCode};
 use crate::codec::properties::{ack_props, reduce_limit, var_int_len};
 use crate::codec::types::QoS;
 use crate::codec::utils::{self, Decode, Encode, decode_non_empty_topic};
@@ -63,14 +63,14 @@ pub enum RetainHandling {
 }
 
 impl TryFrom<u8> for RetainHandling {
-    type Error = DecodeError;
+    type Error = UnknownCode;
 
     fn try_from(v: u8) -> Result<Self, Self::Error> {
         match v {
             0 => Ok(Self::AtSubscribe),
             1 => Ok(Self::AtSubscribeNew),
             2 => Ok(Self::NoAtSubscribe),
-            _ => Err(DecodeError::MalformedPacket("unknown property or reason code")),
+            _ => Err(UnknownCode(v)),
         }
     }
 }
@@ -138,7 +138,7 @@ impl SubscribeAckReason {
 }
 
 impl TryFrom<u8> for SubscribeAckReason {
-    type Error = DecodeError;
+    type Error = UnknownCode;
 
     fn try_from(v: u8) -> Result<Self, Self::Error> {
         match v {
@@ -154,7 +154,7 @@ impl TryFrom<u8> for SubscribeAckReason {
             158 => Ok(Self::SharedSubscriptionNotSupported),
             161 => Ok(Self::SubscriptionIdentifiersNotSupported),
             162 => Ok(Self::WildcardSubscriptionsNotSupported),
-            _ => Err(DecodeError::MalformedPacket("unknown property or reason code")),
+            _ => Err(UnknownCode(v)),
         }
     }
 }
@@ -179,7 +179,7 @@ pub enum UnsubscribeAckReason {
 }
 
 impl TryFrom<u8> for UnsubscribeAckReason {
-    type Error = DecodeError;
+    type Error = UnknownCode;
 
     fn try_from(v: u8) -> Result<Self, Self::Error> {
         match v {
@@ -190,7 +190,7 @@ impl TryFrom<u8> for UnsubscribeAckReason {
             135 => Ok(Self::NotAuthorized),
             143 => Ok(Self::TopicFilterInvalid),
             145 => Ok(Self::PacketIdentifierInUse),
-            _ => Err(DecodeError::MalformedPacket("unknown property or reason code")),
+            _ => Err(UnknownCode(v)),
         }
     }
 }

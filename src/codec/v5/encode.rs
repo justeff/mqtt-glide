@@ -142,6 +142,7 @@ impl WireBodyEncode for V5PublishBody<'_> {
 }
 
 /// Wire length of an outbound PUBLISH after size checks (does not write).
+#[cfg(test)]
 pub(crate) fn publish_wire_len(
     message: &PublishMessage,
     delivery: PublishDelivery,

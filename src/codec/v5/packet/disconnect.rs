@@ -10,7 +10,7 @@ use std::convert::TryFrom;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use bytestring::ByteString;
 
-use crate::codec::error::{DecodeError, EncodeError};
+use crate::codec::error::{DecodeError, EncodeError, UnknownCode};
 use crate::codec::properties::{
     encode_opt_props, encode_property, encoded_property_size, encoded_size_opt_props, reduce_limit, var_int_len,
     var_int_len_from_size,
@@ -101,7 +101,7 @@ pub enum DisconnectReasonCode {
 }
 
 impl TryFrom<u8> for DisconnectReasonCode {
-    type Error = DecodeError;
+    type Error = UnknownCode;
 
     fn try_from(v: u8) -> Result<Self, Self::Error> {
         match v {
@@ -135,7 +135,7 @@ impl TryFrom<u8> for DisconnectReasonCode {
             160 => Ok(Self::MaximumConnectTime),
             161 => Ok(Self::SubscriptionIdentifiersNotSupported),
             162 => Ok(Self::WildcardSubscriptionsNotSupported),
-            _ => Err(DecodeError::MalformedPacket("unknown property or reason code")),
+            _ => Err(UnknownCode(v)),
         }
     }
 }

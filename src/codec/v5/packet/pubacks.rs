@@ -11,7 +11,7 @@ use std::num::NonZeroU16;
 use bytes::{BufMut, Bytes, BytesMut};
 use bytestring::ByteString;
 
-use crate::codec::error::{DecodeError, EncodeError};
+use crate::codec::error::{DecodeError, EncodeError, UnknownCode};
 use crate::codec::properties::{ack_props, reduce_limit};
 use crate::codec::types::packet_type;
 use crate::codec::utils::{Decode, Encode, MINIMAL_PACKET_ID_ACK_WIRE_LEN, WireReader, encode_minimal_packet_id_ack};
@@ -78,7 +78,7 @@ pub enum PublishAckReason {
 }
 
 impl TryFrom<u8> for PublishAckReason {
-    type Error = DecodeError;
+    type Error = UnknownCode;
 
     fn try_from(v: u8) -> Result<Self, Self::Error> {
         match v {
@@ -91,7 +91,7 @@ impl TryFrom<u8> for PublishAckReason {
             145 => Ok(Self::PacketIdentifierInUse),
             151 => Ok(Self::QuotaExceeded),
             153 => Ok(Self::PayloadFormatInvalid),
-            _ => Err(DecodeError::MalformedPacket("unknown property or reason code")),
+            _ => Err(UnknownCode(v)),
         }
     }
 }
@@ -111,13 +111,13 @@ pub enum PubRelCompReason {
 }
 
 impl TryFrom<u8> for PubRelCompReason {
-    type Error = DecodeError;
+    type Error = UnknownCode;
 
     fn try_from(v: u8) -> Result<Self, Self::Error> {
         match v {
             0 => Ok(Self::Success),
             146 => Ok(Self::PacketIdNotFound),
-            _ => Err(DecodeError::MalformedPacket("unknown property or reason code")),
+            _ => Err(UnknownCode(v)),
         }
     }
 }

@@ -190,24 +190,28 @@ impl WillMessage {
 
 impl Connect {
     /// Sets Client Identifier (§3.1.3.1).
+    #[cfg_attr(not(feature = "__internals"), allow(dead_code, reason = "used by tests and benches"))]
     pub fn client_id(mut self, client_id: impl Into<ByteString>) -> Self {
         self.client_id = client_id.into();
         self
     }
 
     /// Sets User Name (§3.1.3.5).
+    #[cfg_attr(not(feature = "__internals"), allow(dead_code, reason = "used by tests and benches"))]
     pub fn username(mut self, username: impl Into<ByteString>) -> Self {
         self.username = Some(username.into());
         self
     }
 
     /// Sets Password (§3.1.3.6).
+    #[cfg_attr(not(feature = "__internals"), allow(dead_code, reason = "used by tests and benches"))]
     pub fn password(mut self, password: impl Into<Bytes>) -> Self {
         self.password = Some(password.into());
         self
     }
 
     /// Sets Receive Maximum (§3.1.2.11.3); `0` clears the property (wire default applies).
+    #[cfg_attr(not(feature = "__internals"), allow(dead_code, reason = "used by tests and benches"))]
     pub fn receive_max(mut self, max: u16) -> Self {
         if let Some(num) = NonZeroU16::new(max) {
             self.receive_max = Some(num);
@@ -332,6 +336,7 @@ impl Connect {
     /// Effective Receive Maximum for server→client flow control when the property was omitted on the wire.
     ///
     /// MQTT v5 defaults absent CONNECT Receive Maximum to 65535 ([`RECEIVE_MAX_DEFAULT`]).
+    #[cfg_attr(not(feature = "__internals"), allow(dead_code, reason = "used by tests and benches"))]
     pub fn receive_max_or_default(&self) -> NonZeroU16 {
         self.receive_max.unwrap_or(RECEIVE_MAX_DEFAULT)
     }

@@ -250,7 +250,7 @@ A caller that stops waiting earlier (its `ack_timeout` ran out during a long rec
 | `max_packet_size` (inbound) | 1 MiB | you accept larger payloads |
 | `wait_connected` | `true` | you want `connect()` to return before CONNACK |
 
-On `ClientBuilder` itself only `reconnect`, `client_id` (a string), `credentials`, `lifecycle`, the Will setters and `wait_connected` exist. Every other setting in the table, and the other opt-ins such as `follow_server_redirects` and `http_proxy`, is a field of [`ConnectOptions`](https://docs.rs/mqtt-glide/latest/mqtt_glide/options/struct.ConnectOptions.html) (which lists the full set; `wait_connected` is not among them). Set them through [`ClientBuilder::options`](https://docs.rs/mqtt-glide/latest/mqtt_glide/builder/struct.ClientBuilder.html#method.options), or start from `ClientBuilder::from_options`:
+On `ClientBuilder` itself only `reconnect`, `client_id` (a string), `credentials`, `lifecycle`, the Will setters and `wait_connected` exist. Every other setting in the table, and the other opt-ins such as `follow_server_redirects` and `http_proxy`, is a field of [`ConnectOptions`](https://docs.rs/mqtt-glide/latest/mqtt_glide/struct.ConnectOptions.html) (which lists the full set; `wait_connected` is not among them). Set them through [`ClientBuilder::options`](https://docs.rs/mqtt-glide/latest/mqtt_glide/builder/struct.ClientBuilder.html#method.options), or start from `ClientBuilder::from_options`:
 
 ```rust,no_run
 # async fn demo() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -294,13 +294,13 @@ What a slow sink can hold is bounded by its own capacity, the read task's one me
 
 Not yours: the broker's Receive Maximum from `CONNACK` decides how many of your QoS 1 publishes can await `PUBACK` at once. Publishes beyond that window wait in order inside the write task (up to 32, then the command channel fills) and go out as `PUBACK`s free slots. They do not fail, and subscribe / unsubscribe are not held up behind them.
 
-How many publishes you have in flight is an application decision, not a library option. That is what [`publish_window`](https://docs.rs/mqtt-glide/latest/mqtt_glide/publish_window/struct.PublishWindow.html) gives you.
+How many publishes you have in flight is an application decision, not a library option. That is what [`publish_window`](https://docs.rs/mqtt-glide/latest/mqtt_glide/struct.PublishWindow.html) gives you.
 
-Do not confuse `DEFAULT_RECEIVE_MAXIMUM` (`32`, on `ConnectOptions`) with the codec's `RECEIVE_MAX_DEFAULT` (`65535`, the value assumed when the wire property is absent). Internal write coalesce / soft-flush sizes are fixed; there is no env-var tuning in the library (`MQTT_COMPARE_*` is bench-only).
+Do not confuse `DEFAULT_RECEIVE_MAXIMUM` (`32`, on `ConnectOptions`) with the protocol default of `65535`, which applies when the wire property is absent. Internal write coalesce / soft-flush sizes are fixed; there is no env-var tuning in the library (`MQTT_COMPARE_*` is bench-only).
 
 | Goal | What to set |
 |------|-------------|
-| Outbound pipeline / many concurrent `publish` | `command_channel_capacity` ≥ your in-flight count; prefer [`publish_window`](https://docs.rs/mqtt-glide/latest/mqtt_glide/publish_window/struct.PublishWindow.html) (or your own window over `start_publish`) |
+| Outbound pipeline / many concurrent `publish` | `command_channel_capacity` ≥ your in-flight count; prefer [`publish_window`](https://docs.rs/mqtt-glide/latest/mqtt_glide/struct.PublishWindow.html) (or your own window over `start_publish`) |
 | Inbound QoS 1 under load | Larger `receive_maximum`; keep the `InboundSink` draining (a full sink stalls decode and delays `PUBACK`) |
 | Comparing against another client | Same receive window and request capacity as the peer; measure pipelined or concurrent QoS 1, not serial round-trips |
 
@@ -313,15 +313,15 @@ Prefer convenience (zero extra cost vs. the primitives underneath):
 | Goal | API |
 |------|-----|
 | Connect | [`ClientBuilder`](https://docs.rs/mqtt-glide/latest/mqtt_glide/builder/struct.ClientBuilder.html): `.inbound_sink` / `.on_inbound` / `.discard_inbound` before `connect` |
-| One publish | [`publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.publish) → `.await` (or `.send().await`) |
-| Many publishes in flight | [`publish_window`](https://docs.rs/mqtt-glide/latest/mqtt_glide/publish_window/struct.PublishWindow.html) → `.push(Publish::new(..)).await` … `.drain().await` |
-| Burst | [`publish_batch`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.publish_batch) → one call (`push` + `drain` under the hood) |
-| Subscribe | [`subscribe`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.subscribe) / `subscribe_with_id` → per-filter reason codes plus the broker's Reason String and User Properties |
+| One publish | [`publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/struct.MqttClient.html#method.publish) → `.await` (or `.send().await`) |
+| Many publishes in flight | [`publish_window`](https://docs.rs/mqtt-glide/latest/mqtt_glide/struct.PublishWindow.html) → `.push(Publish::new(..)).await` … `.drain().await` |
+| Burst | [`publish_batch`](https://docs.rs/mqtt-glide/latest/mqtt_glide/struct.MqttClient.html#method.publish_batch) → one call (`push` + `drain` under the hood) |
+| Subscribe | [`subscribe`](https://docs.rs/mqtt-glide/latest/mqtt_glide/struct.MqttClient.html#method.subscribe) / `subscribe_with_id` → per-filter reason codes plus the broker's Reason String and User Properties |
 | Request / response | `client.requester(response_topic).await?` → `.request(topic, payload).await` resolves with the response |
 | Receive + workers | `.inbound_sink(mpsc)` + your `recv` loop |
 | Tiny sync inbound work | `.on_inbound(\|msg\| …)` (runs on the read task; keep it short) |
 
-Power (same semantics, more control): [`connect`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/fn.connect.html), custom [`InboundSink`](https://docs.rs/mqtt-glide/latest/mqtt_glide/inbound_sink/trait.InboundSink.html), [`send`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.send) / [`start_publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.start_publish) / [`try_start_publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.MqttClient.html#method.try_start_publish) + [`PublishCompletion`](https://docs.rs/mqtt-glide/latest/mqtt_glide/client/struct.PublishCompletion.html).
+Power (same semantics, more control): [`connect`](https://docs.rs/mqtt-glide/latest/mqtt_glide/fn.connect.html), custom [`InboundSink`](https://docs.rs/mqtt-glide/latest/mqtt_glide/trait.InboundSink.html), [`send`](https://docs.rs/mqtt-glide/latest/mqtt_glide/struct.MqttClient.html#method.send) / [`start_publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/struct.MqttClient.html#method.start_publish) / [`try_start_publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/struct.MqttClient.html#method.try_start_publish) + [`PublishCompletion`](https://docs.rs/mqtt-glide/latest/mqtt_glide/struct.PublishCompletion.html).
 
 ### Publish paths
 
@@ -330,7 +330,7 @@ Power (same semantics, more control): [`connect`](https://docs.rs/mqtt-glide/lat
 | `publish(topic, payload)` | Convenience one-shot | `.await` or `.send().await`; `.start().await` returns a `PublishCompletion` once queued, `.try_start()` without waiting at all. Default QoS 0. Setters: `.qos()`, `.retain()`, `.message_expiry(secs)`, `.user_property(name, value)` / `.user_properties(iter)`, `.content_type()`, `.response_topic()`, `.correlation_data()`. `.properties(...)` replaces the whole struct; call it before the other property setters. |
 | `publish_window(n)` | Convenience pipeline | Sliding window over `start_publish` (no task per message). `.push(impl Into<Publish>)` waits for command-channel room. Always `.drain()` after the burst. |
 | `publish_batch(msgs, n)` | Convenience burst | Internal window of capacity `n`; each message is an `impl Into<Publish>` carrying its own QoS / retain. |
-| `send(publish)` | Power one-shot | Ready [`Publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/publish/struct.Publish.html) value (also converts from a `PublishMessage`). |
+| `send(publish)` | Power one-shot | Ready [`Publish`](https://docs.rs/mqtt-glide/latest/mqtt_glide/struct.Publish.html) value (also converts from a `PublishMessage`). |
 | `start_publish` / `try_start_publish` + `PublishCompletion` | Power pipeline | Custom windowing / wait order. `start_publish` waits for command-channel room (up to `ack_timeout`); `try_start_publish` fails at once with `AppError::Backpressure` on a full channel, like `try_send` on a channel. |
 | `client.requester(topic)` → `request(topic, payload)` | Request / response | Subscribes once to `topic` (QoS 1, restored on reconnect); each request carries it as Response Topic with fresh Correlation Data and resolves with the matching `InboundMessage`. Setters: `.qos()`, `.timeout()` (default 10 s, then `AppError::ResponseTimeout`), `.user_property()`, `.content_type()`, `.message_expiry()`. Responses never reach the inbound sink. |
 | `Publish::reply_to(&request, payload)` | Answering side | `Some(Publish)` addressed to the request's Response Topic with its Correlation Data copied; `None` if the request carried no Response Topic. |
@@ -369,7 +369,7 @@ If the broker refuses a restored filter (for example after an ACL change), the c
 |----------------|------|
 | `CredentialsProvider` | Async `credentials()` before each `CONNECT`; `invalidate()` on CONNECT-level `NotAuthorized` only |
 | `ReconnectPolicy` | `delay_after(outcome) -> Option<Duration>` (`None` = stop). The outcome of a broker `DISCONNECT` or refused `CONNACK` includes the broker's Reason String (and Server Reference). Ready-made: `StandardReconnectPolicy` + `mark_live()` |
-| `LifecycleHook` | Sync `Connected` / `Disconnected` side effects on the driver task; keep short (no await). `ClientBuilder` already waits for the first `Connected`. For async waits use the [`SessionPhase`](https://docs.rs/mqtt-glide/latest/mqtt_glide/connection/enum.SessionPhase.html) watch (`client.session_phase()`, any client) and `client.is_connected()` for a snapshot |
+| `LifecycleHook` | Sync `Connected` / `Disconnected` side effects on the driver task; keep short (no await). `ClientBuilder` already waits for the first `Connected`. For async waits use the [`SessionPhase`](https://docs.rs/mqtt-glide/latest/mqtt_glide/enum.SessionPhase.html) watch (`client.session_phase()`, any client) and `client.is_connected()` for a snapshot |
 | `InboundSink` | Injectable inbound handoff; built-ins: `tokio::mpsc`, `OnInboundSink` (`.on_inbound`), `flume` (feature). Custom sinks **MUST** be cancel-safe |
 
 ### Examples
@@ -496,7 +496,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | Reconnect / credentials hooks | ✅ | Traits + optional helpers |
 | Enqueue-before-ack + `InboundSink` | ✅ | Product backpressure policy |
 | Cap / Receive Maximum flow control | ✅ | See [Flow control](#flow-control) |
-| Inbound Maximum Packet Size | ✅ | CONNECT advertises [`DEFAULT_MAX_PACKET_SIZE`](https://docs.rs/mqtt-glide/latest/mqtt_glide/codec/constant.DEFAULT_MAX_PACKET_SIZE.html) (1 MiB) by default; override via `ConnectOptions::max_packet_size`. Broker CONNACK limit applies outbound only |
+| Inbound Maximum Packet Size | ✅ | CONNECT advertises [`DEFAULT_MAX_PACKET_SIZE`](https://docs.rs/mqtt-glide/latest/mqtt_glide/constant.DEFAULT_MAX_PACKET_SIZE.html) (1 MiB) by default; override via `ConnectOptions::max_packet_size`. Broker CONNACK limit applies outbound only |
 | Graceful `shutdown` | ✅ | Budget via `graceful_disconnect_timeout` |
 | Subscription identifiers | ✅ | `subscribe_with_id(id, filters)`; inbound `InboundMessage::subscription_ids`; kept across resubscribe; refused when CONNACK says unsupported |
 | Request/response | ✅ | `client.requester(response_topic)` → `request(topic, payload).await` resolves with the response (correlation handled, responses bypass the inbound sink, `ResponseTimeout`); `Publish::reply_to(&request, payload)` on the answering side. CONNECT Request Response Information not requested |

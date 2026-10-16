@@ -38,8 +38,11 @@ use crate::error::{AppError, AuthError, ConnectionOutcome, ProtocolError, Shutdo
 use crate::inbound_sink::InboundSink;
 use crate::options::ConnectOptions;
 
-pub use crate::options::COMMAND_CHANNEL_CAPACITY;
-pub use channels::{CONTROL_CHANNEL_CAPACITY, control_channel_capacity};
+#[cfg(test)]
+pub(crate) use crate::options::COMMAND_CHANNEL_CAPACITY;
+#[cfg(test)]
+use channels::CONTROL_CHANNEL_CAPACITY;
+pub(crate) use channels::control_channel_capacity;
 pub(crate) use channels::{
     ClientCommand, CommandReceiver, CommandSender, ControlMessage, ControlReceiver, PublishReply, SubscribeReply,
     UnsubscribeReply,

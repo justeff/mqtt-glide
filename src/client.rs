@@ -1,12 +1,4 @@
 //! [`MqttClient`] handle and [`connect`] entry point.
-//!
-//! Subscribe / unsubscribe await SUBACK / UNSUBACK with per-filter reason codes.
-//! Publish: QoS 0 completes on encode; QoS 1 awaits PUBACK.
-//! [`MqttClient::publish`] is the fluent entry point; [`MqttClient::send`] takes a ready
-//! [`Publish`]; [`MqttClient::publish_window`] pipelines bursts.
-//!
-//! For a higher-level entry point that applies defaults and connects (spawns the driver), see
-//! [`ClientBuilder`].
 
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -329,6 +321,13 @@ impl PublishCompletion {
 }
 
 /// Cloneable command handle — sends application commands over a bounded channel.
+///
+/// Subscribe / unsubscribe await SUBACK / UNSUBACK with per-filter reason codes.
+/// Publish: QoS 0 completes on encode; QoS 1 awaits PUBACK.
+/// [`MqttClient::publish`] is the fluent entry point; [`MqttClient::send`] takes a ready
+/// [`Publish`]; [`MqttClient::publish_window`] pipelines bursts.
+///
+/// Created by [`connect`], or by [`ClientBuilder`], which applies defaults and spawns the driver.
 #[derive(Debug, Clone)]
 pub struct MqttClient {
     /// Shared sender replaced by the driver on each reconnect session (lock-free load).

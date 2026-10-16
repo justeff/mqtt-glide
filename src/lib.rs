@@ -1,7 +1,7 @@
 //! MQTT 5 Tokio client.
 //!
 //! Application-facing types live at the crate root; the wire codec (packet types, framing,
-//! encode helpers) is under [`codec`]. Connection options, error
+//! encode helpers) is internal. Connection options, error
 //! types, credential/reconnect hooks, and the [`connect`] entry point define the
 //! public application contract. For a higher-level connect path with defaults, see
 //! [`ClientBuilder`]. Session I/O is driven by [`Connection::run`], backed by the
@@ -36,33 +36,43 @@ compile_error!("features `tls-rustls-aws-lc` and `tls-rustls-ring` are mutually 
 #[cfg(not(any(feature = "tls-rustls-aws-lc", feature = "tls-rustls-ring")))]
 compile_error!("enable exactly one of `tls-rustls-aws-lc` or `tls-rustls-ring`");
 
-pub mod ack;
+mod ack;
 pub mod builder;
-pub mod client;
+mod client;
+// The wire layer is internal; `__internals` opens it for the crate's own tests, benches
+// and fuzz target only.
+#[cfg(feature = "__internals")]
+#[doc(hidden)]
 pub mod codec;
+#[cfg(not(feature = "__internals"))]
+mod codec;
+#[cfg(feature = "__internals")]
+#[doc(hidden)]
 pub mod connection;
-pub mod error;
-pub mod inbound_sink;
-pub mod options;
-pub mod policies;
-pub mod publish;
-pub mod publish_window;
-pub mod request;
+#[cfg(not(feature = "__internals"))]
+mod connection;
+mod error;
+mod inbound_sink;
+mod options;
+mod policies;
+mod publish;
+mod publish_window;
+mod request;
 mod stats;
 #[cfg(feature = "testing")]
 pub mod testing;
-pub mod util;
+mod util;
 
 pub use client::{
     AnonymousCredentials, ClientBuilder, CredentialsProvider, MqttClient, NoReconnect, Password, Publish,
     PublishBuilder, PublishCompletion, PublishWindow, ReconnectPolicy, StaticCredentials, Subscription, connect,
 };
 // Application-facing message and option types. Wire-level packet types, the codec and the
-// encode helpers stay under [`codec`].
+// encode helpers stay internal.
 pub use ack::{PublishRejection, RefusedSubscription, SubscribeResponse, UnsubscribeResponse};
 pub use codec::{
     ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, DisconnectReasonCode, InboundMessage, PublishAckReason, PublishMessage,
-    PublishProperties, QoS, RetainHandling, SubscribeAckReason, SubscriptionOptions, UnsubscribeAckReason,
+    PublishProperties, QoS, RetainHandling, SubscribeAckReason, SubscriptionOptions, UnknownCode, UnsubscribeAckReason,
     UserProperties, UserProperty, WillMessage,
 };
 pub use connection::{Connection, LifecycleHook, NoopLifecycle, SessionParams, SessionPhase};

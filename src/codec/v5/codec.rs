@@ -66,6 +66,7 @@ impl V5Codec {
     ///
     /// `0` means unlimited (see [`Self::new`]). Prefer this over separate in/out limits
     /// when constructing `Framed` halves for tests or the connection driver.
+    #[cfg_attr(not(feature = "__internals"), allow(dead_code, reason = "used by tests and benches"))]
     pub fn with_max_packet_size(max_packet_size: u32) -> Self {
         Self::new(max_packet_size, max_packet_size)
     }
@@ -73,6 +74,7 @@ impl V5Codec {
     /// Maximum inbound frame size in total wire bytes (fixed header included).
     ///
     /// `0` means unlimited.
+    #[cfg_attr(not(feature = "__internals"), allow(dead_code, reason = "used by tests and benches"))]
     pub fn max_inbound_size(&self) -> u32 {
         self.max_in_size
     }
@@ -87,6 +89,7 @@ impl V5Codec {
     /// Sets the maximum inbound frame size in total wire bytes.
     ///
     /// `0` means unlimited.
+    #[cfg(test)]
     pub fn set_max_inbound_size(&mut self, size: u32) {
         self.max_in_size = size;
     }
@@ -112,11 +115,13 @@ impl V5Codec {
     ///
     /// Does not clear `buf`. Callers that replace a single-frame buffer must `clear()` first.
     /// For PUBLISH use [`crate::codec::encode_publish`].
+    #[cfg_attr(not(feature = "__internals"), allow(dead_code, reason = "used by tests and benches"))]
     pub fn encode_packet(&mut self, packet: Packet, buf: &mut BytesMut) -> Result<(), EncodeError> {
         self.encode(packet, buf)
     }
 
     /// Decode one frame, discarding the consumed Remaining Length from the codec item.
+    #[cfg_attr(not(feature = "__internals"), allow(dead_code, reason = "used by tests and benches"))]
     pub fn decode_frame(&mut self, src: &mut BytesMut) -> Result<Option<DecodedFrame>, DecodeError> {
         self.decode(src).map(|maybe| maybe.map(|(packet, _)| packet))
     }

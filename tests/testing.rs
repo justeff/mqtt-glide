@@ -2,11 +2,11 @@
 
 use std::time::Duration;
 
-use mqtt_glide::codec::{ConnectAckReason, PublishAckReason, SubscribeAckReason};
 use mqtt_glide::testing::{FaultProxy, TestBroker};
 use mqtt_glide::{
     AppError, ClientBuilder, InboundMessage, MqttClient, Publish, QoS, StandardReconnectPolicy, Subscription,
 };
+use mqtt_glide::{ConnectAckReason, PublishAckReason, SubscribeAckReason};
 use tokio::sync::mpsc;
 
 const WAIT: Duration = Duration::from_secs(2);

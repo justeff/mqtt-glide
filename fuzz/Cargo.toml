@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 bytes = "1.12"
 libfuzzer-sys = "0.4"
-mqtt-glide = { path = ".." }
+mqtt-glide = { path = "..", features = ["__internals"] }
 
 # Not part of the library workspace: built only by `cargo fuzz` (nightly).
 [workspace]

@@ -1,6 +1,6 @@
 use std::convert::TryFrom;
 
-use crate::codec::error::DecodeError;
+use crate::codec::error::UnknownCode;
 
 /// Protocol Name bytes in CONNECT (`"MQTT"`, §3.1.2.1).
 pub(crate) const MQTT: &[u8] = b"MQTT";
@@ -27,14 +27,14 @@ pub enum QoS {
 }
 
 impl TryFrom<u8> for QoS {
-    type Error = DecodeError;
+    type Error = UnknownCode;
 
     fn try_from(v: u8) -> Result<Self, Self::Error> {
         match v {
             0 => Ok(Self::AtMostOnce),
             1 => Ok(Self::AtLeastOnce),
             2 => Ok(Self::ExactlyOnce),
-            _ => Err(DecodeError::MalformedPacket("unknown property or reason code")),
+            _ => Err(UnknownCode(v)),
         }
     }
 }

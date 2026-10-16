@@ -1,29 +1,4 @@
-//! Optional reconnect-delay helpers built on [`ReconnectPolicy`].
-//!
-//! The trait remains the generic core; [`StandardReconnectPolicy`] is a ready-made
-//! fixed-delay + auth-backoff policy. Apps that need different behaviour implement
-//! [`ReconnectPolicy`] directly.
-//!
-//! # Auth streak vs credential invalidation
-//!
-//! This policy **only** returns delays. Token / password invalidation is owned by
-//! [`CredentialsProvider::invalidate`](crate::CredentialsProvider::invalidate),
-//! which the driver invokes on CONNECT-level
-//! [`ConnectionOutcome::Auth`].
-//!
-//! Subscription-level `NotAuthorized` (ACL mismatch) is not a connection outcome.
-//! Apps that treat ACL failures like auth for backoff can call
-//! [`StandardReconnectPolicy::record_subscribe_auth_failure`] without invalidating
-//! credentials.
-//!
-//! # Immediate retry after a live session
-//!
-//! Call [`StandardReconnectPolicy::mark_live`] when the session is fully ready
-//! (apps often do this after SUBACK confirms subscriptions). The next
-//! [`ConnectionOutcome::Transport`] then returns `Duration::ZERO` once, if the session
-//! stayed up for at least the reconnect delay; subsequent transport failures, and a session
-//! that dropped sooner, use the configured reconnect delay.
-//! Protocol outcomes (e.g. broker DISCONNECT) always use the fixed delay.
+//! Reconnect-delay helpers built on [`ReconnectPolicy`](crate::ReconnectPolicy).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -77,6 +52,30 @@ impl StandardReconnectPolicyInner {
 ///
 /// Use [`Self::new`] for defaults, or [`Self::with_auth_failure_threshold`] to
 /// override the auth-streak switchover.
+///
+/// Apps that need different behaviour implement [`ReconnectPolicy`](crate::ReconnectPolicy)
+/// directly.
+///
+/// # Auth streak vs credential invalidation
+///
+/// This policy **only** returns delays. Token / password invalidation is owned by
+/// [`CredentialsProvider::invalidate`](crate::CredentialsProvider::invalidate),
+/// which the driver invokes on CONNECT-level
+/// [`ConnectionOutcome::Auth`].
+///
+/// Subscription-level `NotAuthorized` (ACL mismatch) is not a connection outcome.
+/// Apps that treat ACL failures like auth for backoff can call
+/// [`Self::record_subscribe_auth_failure`] without invalidating
+/// credentials.
+///
+/// # Immediate retry after a live session
+///
+/// Call [`Self::mark_live`] when the session is fully ready
+/// (apps often do this after SUBACK confirms subscriptions). The next
+/// [`ConnectionOutcome::Transport`] then returns `Duration::ZERO` once, if the session
+/// stayed up for at least the reconnect delay; subsequent transport failures, and a session
+/// that dropped sooner, use the configured reconnect delay.
+/// Protocol outcomes (e.g. broker DISCONNECT) always use the fixed delay.
 #[derive(Debug, Clone)]
 pub struct StandardReconnectPolicy {
     inner: Arc<StandardReconnectPolicyInner>,
