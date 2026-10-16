@@ -116,9 +116,25 @@ jobs:
         with:
           workspaces: fuzz
           key: fuzz
+      # The corpus only grows: each run restores the newest one and saves its own under a new key.
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      # New inputs go to the first corpus dir (the cached one); the committed seeds are read-only
+      # extras (regenerate with `cargo run --example gen_seeds` in fuzz/).
       - name: cargo fuzz run
         working-directory: fuzz
-        run: cargo fuzz run decode_frames -- -max_total_time=60 -max_len=4096
+        run: |
+          mkdir -p corpus/decode_frames
+          cargo fuzz run decode_frames corpus/decode_frames seeds/decode_frames -- -max_total_time=60 -max_len=4096
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
 
   msrv:
     name: MSRV (1.88)
