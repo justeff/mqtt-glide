@@ -667,7 +667,7 @@ mod tests {
         );
     }
 
-    /// A QoS 0 PUBLISH is never sent with DUP set ([MQTT-4.3.1-1]).
+    /// A QoS 0 PUBLISH is never sent with DUP set ([MQTT-4.3.1-1], [MQTT-3.3.1-2]).
     #[test]
     fn test_encode_publish_qos0_dup_rejected() {
         let message = PublishMessage {
@@ -789,25 +789,6 @@ mod tests {
     fn test_encode_ping_packets() {
         assert_encode_packet(&Packet::PingRequest, b"\xc0\x00");
         assert_encode_packet(&Packet::PingResponse, b"\xd0\x00");
-    }
-
-    #[test]
-    fn encode_publish_wire_len_matches_encoded_size() {
-        let message = PublishMessage {
-            topic: ByteString::from_static("telemetry/device/status"),
-            payload: Bytes::from(vec![0_u8; 64]),
-            properties: PublishProperties::default(),
-        };
-        let delivery = PublishDelivery {
-            dup: false,
-            retain: false,
-            qos: QoS::AtLeastOnce,
-            packet_id: Some(packet_id(42)),
-        };
-        let wire_len = publish_wire_len(&message, delivery, u32::MAX).expect("wire len");
-        let mut buf = BytesMut::new();
-        encode_publish(&message, delivery, u32::MAX, &mut buf).expect("encode");
-        assert_eq!(buf.len(), wire_len);
     }
 
     /// Assign sends topic + alias; Reuse sends a zero-length topic + alias; both decode back
@@ -1006,28 +987,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn encode_publish_never_writes_topic_alias_property() {
-        // Without an alias, `encode_publish` writes no Topic Alias property.
-        let message = PublishMessage {
-            topic: ByteString::from_static("telemetry/device/status"),
-            payload: Bytes::from_static(b"data"),
-            properties: PublishProperties::default(),
-        };
-        let delivery = PublishDelivery {
-            dup: false,
-            retain: false,
-            qos: QoS::AtMostOnce,
-            packet_id: None,
-        };
-        let mut buf = BytesMut::new();
-        encode_publish(&message, delivery, u32::MAX, &mut buf).expect("encode");
-        assert!(
-            !buf.as_ref().windows(1).any(|w| w[0] == pt::TOPIC_ALIAS),
-            "outbound PUBLISH must not contain Topic Alias property id 0x23"
-        );
-    }
-
     /// A Topic Name never carries wildcards ([MQTT-3.3.2-2], [MQTT-4.7.0-1]) or U+0000
     /// ([MQTT-4.7.3-2]); nothing is written for a rejected PUBLISH.
     #[rstest]
@@ -1089,23 +1048,6 @@ mod tests {
             b"keep",
             "{response_topic}: rejected encode must not leave a partial PUBLISH frame"
         );
-    }
-
-    #[test]
-    fn encode_publish_accepts_valid_response_topic() {
-        let delivery = PublishDelivery {
-            dup: false,
-            retain: false,
-            qos: QoS::AtMostOnce,
-            packet_id: None,
-        };
-        let message = PublishMessage {
-            topic: ByteString::from_static("req/topic"),
-            payload: Bytes::from_static(b"x"),
-            properties: PublishProperties::default().response_topic("reply/to/me"),
-        };
-        let mut buf = BytesMut::new();
-        encode_publish(&message, delivery, u32::MAX, &mut buf).expect("valid response topic encodes");
     }
 
     /// [MQTT-1.5.4-2] U+0000 in publish UTF-8 properties is rejected at plan time,
@@ -1287,26 +1229,5 @@ mod tests {
         };
         let wire_len = publish_wire_len(&message, delivery, 0).expect("body at the ceiling");
         assert_eq!(wire_len, 1 + 4 + crate::codec::utils::MAX_VARIABLE_LENGTH as usize);
-    }
-
-    #[test]
-    fn encode_publish_reuse_with_caller_clear() {
-        let message = PublishMessage {
-            topic: ByteString::from_static("telemetry/device/status"),
-            payload: Bytes::from(vec![0_u8; 64]),
-            properties: PublishProperties::default(),
-        };
-        let delivery = PublishDelivery {
-            dup: false,
-            retain: false,
-            qos: QoS::AtLeastOnce,
-            packet_id: Some(packet_id(42)),
-        };
-        let mut reused = BytesMut::with_capacity(256);
-        encode_publish(&message, delivery, 0, &mut reused).expect("first encode");
-        let first = reused.clone();
-        reused.clear();
-        encode_publish(&message, delivery, 0, &mut reused).expect("second encode");
-        assert_eq!(first, reused);
     }
 }

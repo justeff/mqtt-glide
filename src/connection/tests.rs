@@ -33,33 +33,6 @@ fn map_broker_disconnect_classifies_error_reason_codes() {
     ));
 }
 
-/// flume disconnects permanently when the last sender drops; anchor + Connection sender must survive read respawn.
-#[tokio::test]
-async fn handoff_channel_survives_read_sender_drop() {
-    use crate::codec::{InboundMessage, PublishProperties, QoS};
-    use bytes::Bytes;
-    use bytestring::ByteString;
-
-    let (tx, rx) = flume::bounded::<InboundMessage>(8);
-    let anchor = tx.clone();
-    let conn = tx;
-    drop(conn.clone()); // simulate read-task sender drop
-    assert!(!anchor.is_disconnected());
-    assert!(!rx.is_disconnected());
-    let msg = InboundMessage {
-        topic: ByteString::from_static("t"),
-        payload: Bytes::from_static(b"x"),
-        properties: PublishProperties::default(),
-        qos: QoS::AtMostOnce,
-        retain: false,
-        dup: false,
-        subscription_ids: Vec::new(),
-    };
-    anchor.send_async(msg).await.expect("send after read drop");
-    let got = rx.recv_async().await.expect("recv after read drop");
-    assert_eq!(&*got.payload, b"x");
-}
-
 #[tokio::test]
 async fn run_returns_observable_result_on_shutdown() {
     let (client, connection, mut phase) = test_connect().await;
@@ -226,13 +199,6 @@ async fn write_task_exit_cancels_read_and_joins() {
         result,
         Err(ConnectionOutcome::Application(AppError::Internal(_)))
     ));
-}
-
-#[test]
-fn generation_binding_smoke() {
-    let current = Generation(1);
-    assert!(current.accepts(Generation(1)));
-    assert!(!current.accepts(Generation(0)));
 }
 
 /// Read and Write are separate tasks; Write can progress on the control path while Read

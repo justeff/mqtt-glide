@@ -320,24 +320,6 @@ mod tests {
     }
 
     #[test]
-    fn set_max_outbound_size_matches_new_semantics() {
-        let mut via_new = V5Codec::new(0, 128);
-        let mut via_setter = V5Codec::default();
-        via_setter.set_max_outbound_size(128);
-        assert_eq!(via_new.max_outbound_size(), via_setter.max_outbound_size());
-
-        let connect = Packet::Connect(Box::new(Connect {
-            client_id: ByteString::from_static("client"),
-            ..Default::default()
-        }));
-        let mut buf_new = BytesMut::new();
-        let mut buf_set = BytesMut::new();
-        via_new.encode(connect.clone(), &mut buf_new).expect("encode via new");
-        via_setter.encode(connect, &mut buf_set).expect("encode via setter");
-        assert_eq!(buf_new, buf_set);
-    }
-
-    #[test]
     fn outbound_max_size_via_setter_rejects_oversize_ping() {
         let mut codec = V5Codec::default();
         codec.set_max_outbound_size(1);
@@ -426,23 +408,6 @@ mod tests {
         assert_eq!(codec.decode(&mut buf).unwrap(), None, "incomplete frame waits");
         buf.extend_from_slice(&[0x00]);
         assert!(matches!(codec.decode(&mut buf), Err(DecodeError::MalformedPacket(_))));
-    }
-
-    #[test]
-    fn strip_problem_info_clears_puback_diagnostics() {
-        let mut codec = V5Codec::default();
-        codec.negotiated.insert(NegotiatedLimits::STRIP_PROBLEM_INFO);
-
-        let mut buf = BytesMut::new();
-        let ack = Packet::PublishAck(crate::codec::v5::PublishAck {
-            packet_id: NonZeroU16::new(1).unwrap(),
-            reason_code: crate::codec::v5::PublishAckReason::Success,
-            properties: vec![("k", "v").into()],
-            reason_string: Some(ByteString::from_static("oops")),
-        });
-        codec.encode(ack, &mut buf).unwrap();
-        // After stripping diagnostics, Success PUBACK is Packet Identifier only (Remaining Length 2).
-        assert_eq!(buf[1], 0x02);
     }
 
     /// Every packet the codec sends after a CONNECT, with or without diagnostics.

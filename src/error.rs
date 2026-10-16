@@ -257,12 +257,6 @@ mod tests {
     }
 
     #[test]
-    fn connect_error_from_auth() {
-        let err: ConnectError = AuthError::NotAuthorized.into();
-        assert!(matches!(err, ConnectError::Auth(AuthError::NotAuthorized)));
-    }
-
-    #[test]
     fn connect_error_round_trips_connection_outcome() {
         let outcome = ConnectionOutcome::Application(AppError::Internal("lock poisoned".into()));
         let connect: ConnectError = outcome.clone().into();
@@ -271,17 +265,5 @@ mod tests {
             ConnectError::Application(AppError::Internal(message)) if message == "lock poisoned"
         ));
         assert_eq!(ConnectionOutcome::from(connect), outcome);
-    }
-
-    #[test]
-    fn error_types_are_usable_in_result() {
-        fn auth_fail() -> Result<(), AuthError> {
-            Err(AuthError::NotAuthorized)
-        }
-        fn transport_fail() -> Result<(), TransportError> {
-            Err(TransportError::Tls("cert".into()))
-        }
-        assert!(auth_fail().is_err());
-        assert!(transport_fail().is_err());
     }
 }

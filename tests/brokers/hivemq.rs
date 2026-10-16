@@ -5,53 +5,14 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use mqtt_glide::{
-    BrokerUrl, ConnectOptions, InboundMessage, MqttClient, NoopLifecycle, Publish, QoS, SessionParams, SessionPhase,
-    connect, shared_filter,
-};
-use tokio::sync::mpsc;
+use mqtt_glide::{ConnectOptions, Publish, QoS, shared_filter};
 use tokio::time::timeout;
 
-use crate::common::{NoReconnect, static_credentials, wait_for_phase};
-use crate::helpers::start_hivemq;
-
-struct Client {
-    client: MqttClient,
-    session: SessionParams,
-    inbound: mpsc::Receiver<InboundMessage>,
-    run: tokio::task::JoinHandle<Result<(), mqtt_glide::ConnectionOutcome>>,
-}
+use crate::common::NoReconnect;
+use crate::helpers::{Client, connected, start_hivemq, tcp_url};
 
 async fn client(port: u16) -> Client {
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let (tx, inbound) = mpsc::channel::<InboundMessage>(10_000);
-    let (client, connection, mut phase) = connect(
-        ConnectOptions::new(url),
-        static_credentials(),
-        NoReconnect,
-        tx,
-        NoopLifecycle,
-    )
-    .expect("connect");
-    let run = tokio::spawn(connection.run());
-    let SessionPhase::Connected { session, .. } = wait_for_phase(&mut phase, Duration::from_secs(15), |p| {
-        matches!(p, SessionPhase::Connected { .. })
-    })
-    .await
-    else {
-        unreachable!("waited for Connected");
-    };
-    Client {
-        client,
-        session,
-        inbound,
-        run,
-    }
-}
-
-async fn stop(client: Client) {
-    client.client.shutdown().await.expect("shutdown");
-    let _ = timeout(Duration::from_secs(5), client.run).await;
+    connected(ConnectOptions::new(tcp_url(port)), NoReconnect, 10_000).await
 }
 
 /// HiveMQ allows 10 unacknowledged QoS 1 publishes; a window of 64 must queue, not fail.
@@ -76,7 +37,7 @@ async fn hivemq_qos1_burst_beyond_receive_maximum() {
     .await
     .expect("burst must not hang")
     .expect("burst beyond Receive Maximum must succeed");
-    stop(publisher).await;
+    publisher.stop().await;
 }
 
 /// A retained message arrives flagged `retain` on subscribe; a later live one does not.
@@ -135,8 +96,8 @@ async fn hivemq_retain_flag_distinguishes_stored_from_live() {
         .retain(true)
         .await
         .expect("clear retained");
-    stop(subscriber).await;
-    stop(publisher).await;
+    subscriber.stop().await;
+    publisher.stop().await;
 }
 
 /// Shared subscription: two members of one group together receive every message once.
@@ -177,9 +138,9 @@ async fn hivemq_shared_subscription_splits_messages() {
     }
     assert_eq!(seen.len(), 200, "every job exactly once across the group");
 
-    stop(publisher).await;
-    stop(a).await;
-    stop(b).await;
+    publisher.stop().await;
+    a.stop().await;
+    b.stop().await;
 }
 
 /// Shutdown right after a burst still gets every PUBACK from HiveMQ before DISCONNECT.
@@ -201,7 +162,7 @@ async fn hivemq_shutdown_drains_outbound() {
             .await
             .expect("publish queued before shutdown is acknowledged");
     }
-    let _ = timeout(Duration::from_secs(5), publisher.run).await;
+    crate::helpers::join_run_after_shutdown(publisher.run).await;
 }
 
 /// Outbound Topic Aliases against brokers with small alias limits (HiveMQ: 5): eight topics
@@ -215,26 +176,14 @@ pub(crate) async fn outbound_aliases_roundtrip(port: u16, topic_prefix: &str) {
         .await
         .expect("subscribe");
 
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let (tx, _rx) = mpsc::channel::<InboundMessage>(16);
-    let (publisher, connection, mut phase) = connect(
-        ConnectOptions::new(url).outbound_topic_aliases(64),
-        static_credentials(),
+    let publisher = connected(
+        ConnectOptions::new(tcp_url(port)).outbound_topic_aliases(64),
         NoReconnect,
-        tx,
-        NoopLifecycle,
+        16,
     )
-    .expect("connect");
-    let run = tokio::spawn(connection.run());
-    let SessionPhase::Connected { session, .. } = wait_for_phase(&mut phase, Duration::from_secs(15), |p| {
-        matches!(p, SessionPhase::Connected { .. })
-    })
-    .await
-    else {
-        unreachable!("waited for Connected");
-    };
+    .await;
     assert!(
-        session.server_topic_alias_maximum > 0,
+        publisher.session.server_topic_alias_maximum > 0,
         "broker must accept aliases for this test"
     );
 
@@ -244,6 +193,7 @@ pub(crate) async fn outbound_aliases_roundtrip(port: u16, topic_prefix: &str) {
             let topic = format!("{topic_prefix}/device-{topic}/telemetry");
             let payload = format!("{round}");
             publisher
+                .client
                 .publish(topic.clone(), payload.clone())
                 .qos(QoS::AtLeastOnce)
                 .await
@@ -262,13 +212,12 @@ pub(crate) async fn outbound_aliases_roundtrip(port: u16, topic_prefix: &str) {
         );
     }
     assert!(
-        publisher.is_connected(),
+        publisher.client.is_connected(),
         "broker must not have dropped the aliasing client"
     );
 
-    publisher.shutdown().await.expect("shutdown");
-    let _ = timeout(Duration::from_secs(5), run).await;
-    stop(subscriber).await;
+    publisher.stop().await;
+    subscriber.stop().await;
 }
 
 #[tokio::test]

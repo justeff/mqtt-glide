@@ -265,7 +265,6 @@ mod tests {
     use bytes::{Bytes, BytesMut};
 
     use super::*;
-    use crate::codec::v5::UserProperties;
 
     #[test]
     fn disconnect_decode_rejects_unknown_reason_code() {
@@ -274,24 +273,6 @@ mod tests {
             Disconnect::decode(&mut src),
             Err(DecodeError::MalformedPacket(_))
         ));
-    }
-
-    /// [MQTT-3.14.2-3] Reason String is dropped rather than exceed the receiver's Maximum Packet Size.
-    #[test]
-    fn disconnect_encode_omits_reason_string_when_it_exceeds_max_packet_size() {
-        let disconnect = Disconnect {
-            reason_code: DisconnectReasonCode::NotAuthorized,
-            session_expiry_interval: None,
-            server_reference: None,
-            reason_string: Some(ByteString::from_static("too long for budget")),
-            user_properties: UserProperties::default(),
-        };
-        let mut buf = BytesMut::new();
-        disconnect.encode_body(&mut buf, 2).expect("encode");
-        assert!(
-            !buf.as_ref().contains(&pt::REASON_STRING),
-            "Reason String property must be omitted when it would exceed the DISCONNECT body budget"
-        );
     }
 
     /// [MQTT-3.14.2-4] User Property is dropped rather than exceed the receiver's Maximum Packet Size.

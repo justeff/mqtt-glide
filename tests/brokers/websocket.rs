@@ -3,43 +3,19 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use mqtt_glide::{
-    BrokerUrl, ConnectOptions, InboundMessage, MqttClient, NoopLifecycle, Publish, QoS, SessionPhase, connect,
-};
-use tokio::sync::mpsc;
+use mqtt_glide::{BrokerUrl, ConnectOptions, Publish, QoS};
 use tokio::time::timeout;
 
-use crate::common::{NoReconnect, static_credentials, wait_for_phase};
-use crate::helpers::start_mosquitto_websockets;
-
-struct Client {
-    client: MqttClient,
-    inbound: mpsc::Receiver<InboundMessage>,
-    run: tokio::task::JoinHandle<Result<(), mqtt_glide::ConnectionOutcome>>,
-}
+use crate::common::NoReconnect;
+use crate::helpers::{Client, connected, start_mosquitto_websockets};
 
 async fn client(url: &str) -> Client {
-    let url = BrokerUrl::parse(url).expect("valid url");
-    let (tx, inbound) = mpsc::channel::<InboundMessage>(10_000);
-    let (client, connection, mut phase) = connect(
-        ConnectOptions::new(url),
-        static_credentials(),
+    connected(
+        ConnectOptions::new(BrokerUrl::parse(url).expect("valid url")),
         NoReconnect,
-        tx,
-        NoopLifecycle,
+        10_000,
     )
-    .expect("connect");
-    let run = tokio::spawn(connection.run());
-    wait_for_phase(&mut phase, Duration::from_secs(10), |p| {
-        matches!(p, SessionPhase::Connected { .. })
-    })
-    .await;
-    Client { client, inbound, run }
-}
-
-async fn stop(client: Client) {
-    client.client.shutdown().await.expect("shutdown");
-    let _ = timeout(Duration::from_secs(5), client.run).await;
+    .await
 }
 
 /// Subscribe and publish over WebSocket: a QoS 1 burst plus payloads far larger than one
@@ -82,7 +58,7 @@ async fn websocket_roundtrip_burst_and_large_payloads() {
     assert_eq!(&*message.topic, "ws/big");
     assert_eq!(message.payload.len(), big.len());
     assert!(message.payload == big, "large payload must arrive intact");
-    stop(ws).await;
+    ws.stop().await;
 }
 
 /// The two transports interoperate on one broker: WebSocket publisher, TCP subscriber.
@@ -107,6 +83,6 @@ async fn websocket_publisher_reaches_tcp_subscriber() {
         .expect("delivery")
         .expect("open");
     assert_eq!(&*message.payload, b"over ws");
-    stop(ws).await;
-    stop(tcp).await;
+    ws.stop().await;
+    tcp.stop().await;
 }

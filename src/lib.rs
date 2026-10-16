@@ -59,6 +59,8 @@ mod publish;
 mod publish_window;
 mod request;
 mod stats;
+#[cfg(test)]
+mod test_util;
 #[cfg(feature = "testing")]
 pub mod testing;
 mod util;

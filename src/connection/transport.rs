@@ -321,7 +321,6 @@ where
 mod tests {
     use super::*;
     use crate::codec::V5Codec;
-    use crate::options::TlsConfig;
     use crate::util::BrokerUrl;
     use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -370,19 +369,6 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success(), "child failed: {stdout}");
         assert!(stdout.contains("ROOTS=tls:no system trust anchors found\n"), "{stdout}");
-    }
-
-    #[test]
-    fn mqtts_url_selects_tls_mode() {
-        use crate::connection::handshake::{TlsMode, resolve_tls_mode};
-
-        let mqtts = BrokerUrl::parse("mqtts://broker.example").expect("valid");
-        let options = ConnectOptions::new(mqtts);
-        assert_eq!(resolve_tls_mode(&options), TlsMode::RustlsSystemRoots);
-
-        let plain = BrokerUrl::parse("mqtt://broker.example").expect("valid");
-        let options = ConnectOptions::new(plain).tls(TlsConfig::SystemRoots);
-        assert_eq!(resolve_tls_mode(&options), TlsMode::RustlsSystemRoots);
     }
 
     /// The first byte the client puts on a fresh connection is the CONNECT Fixed Header

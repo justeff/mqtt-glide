@@ -60,17 +60,17 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
-    #[test]
-    fn shared_filter_prepends_share_prefix() {
-        assert_eq!(
-            shared_filter("my-group", "system/lifecycle/connected/+/+").expect("valid"),
-            "$share/my-group/system/lifecycle/connected/+/+"
-        );
-    }
-
-    #[test]
-    fn shared_filter_preserves_topic_wildcards() {
-        assert_eq!(shared_filter("g", "a/+/b/#").expect("valid"), "$share/g/a/+/b/#");
+    /// `$share/{group}/{topic}`, with the topic's wildcards kept as they are.
+    #[rstest]
+    #[case::lifecycle(
+        "my-group",
+        "system/lifecycle/connected/+/+",
+        "$share/my-group/system/lifecycle/connected/+/+"
+    )]
+    #[case::wildcards("g", "a/+/b/#", "$share/g/a/+/b/#")]
+    #[case::single_level("sensors", "a/+/b", "$share/sensors/a/+/b")]
+    fn shared_filter_prepends_share_prefix(#[case] group: &str, #[case] topic: &str, #[case] expected: &str) {
+        assert_eq!(shared_filter(group, topic).expect("valid"), expected);
     }
 
     /// [MQTT-4.8.2-1] A ShareName is at least one character long.
@@ -104,7 +104,6 @@ mod tests {
     #[test]
     fn shared_filter_rejects_invalid_share_name() {
         assert!(shared_filter("a/b", "t").is_err());
-        assert_eq!(shared_filter("sensors", "a/+/b").expect("ok"), "$share/sensors/a/+/b");
     }
 
     #[test]

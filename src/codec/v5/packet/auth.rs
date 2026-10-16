@@ -184,19 +184,14 @@ mod tests {
         assert_eq!(src.len(), 0);
     }
 
+    /// A non-Success AUTH must carry an Authentication Method, whether the properties are left
+    /// out or empty.
     #[rstest]
-    #[case::continue_auth_reason_only(0x18, DecodeError::MalformedPacket("invalid encoding"))]
-    #[case::reauth_reason_only(0x19, DecodeError::MalformedPacket("invalid encoding"))]
-    fn auth_decode_non_success_reason_only_rejected(#[case] reason: u8, #[case] error: DecodeError) {
-        let mut src = Bytes::from(vec![reason]);
-        let result = Auth::decode(&mut src);
-        assert_eq!(result.map_err(|e| e.to_string()), Err(error.to_string()));
-    }
-
-    #[test]
-    fn auth_decode_non_success_requires_auth_method() {
-        let mut src = Bytes::from_static(&[0x18, 0x00]);
-        let result = Auth::decode(&mut src);
+    #[case::continue_auth_reason_only(&[0x18])]
+    #[case::reauth_reason_only(&[0x19])]
+    #[case::continue_auth_empty_properties(&[0x18, 0x00])]
+    fn auth_decode_non_success_without_auth_method_rejected(#[case] wire: &'static [u8]) {
+        let result = Auth::decode(&mut Bytes::from_static(wire));
         assert_eq!(
             result.map_err(|e| e.to_string()),
             Err(DecodeError::MalformedPacket("invalid encoding").to_string())

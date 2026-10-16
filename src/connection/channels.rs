@@ -219,15 +219,16 @@ mod tests {
     use super::*;
     use nonzero_ext::nonzero;
 
-    #[test]
-    fn control_capacity_floors_at_128() {
-        assert_eq!(control_channel_capacity(nonzero!(32u16)), 128);
-        assert_eq!(control_channel_capacity(nonzero!(128u16)), 128);
-    }
-
-    #[test]
-    fn control_capacity_tracks_larger_receive_maximum() {
-        assert_eq!(control_channel_capacity(nonzero!(256u16)), 256);
-        assert_eq!(control_channel_capacity(nonzero!(1024u16)), 1024);
+    /// The control channel holds `max(128, receive_maximum)`.
+    #[rstest::rstest]
+    #[case::below_floor(nonzero!(32u16), 128)]
+    #[case::at_floor(nonzero!(128u16), 128)]
+    #[case::above_floor(nonzero!(256u16), 256)]
+    #[case::large(nonzero!(1024u16), 1024)]
+    fn control_capacity_is_receive_maximum_floored_at_128(
+        #[case] receive_maximum: NonZeroU16,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(control_channel_capacity(receive_maximum), expected);
     }
 }

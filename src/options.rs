@@ -408,41 +408,24 @@ mod tests {
         assert_eq!(COMMAND_CHANNEL_CAPACITY, 32);
     }
 
+    /// Each setter overrides its own field, and only that one: every value differs from its
+    /// default.
     #[test]
-    fn builder_overrides_receive_maximum() {
+    fn builder_overrides_limits_and_timeouts() {
         let url = BrokerUrl::parse("mqtt://broker.example").expect("valid url");
-        let custom = NonZeroU16::new(256).expect("non-zero");
-        let options = ConnectOptions::new(url).receive_maximum(custom);
-        assert_eq!(options.receive_maximum, custom);
-    }
-
-    #[test]
-    fn builder_overrides_ack_timeout() {
-        let url = BrokerUrl::parse("mqtt://broker.example").expect("valid url");
-        let options = ConnectOptions::new(url).ack_timeout(Duration::from_millis(50));
+        let receive_maximum = NonZeroU16::new(256).expect("non-zero");
+        let command_channel_capacity = NonZeroUsize::new(128).expect("non-zero");
+        let options = ConnectOptions::new(url)
+            .receive_maximum(receive_maximum)
+            .ack_timeout(Duration::from_millis(50))
+            .connect_timeout(Duration::from_millis(25))
+            .graceful_disconnect_timeout(Duration::from_millis(100))
+            .command_channel_capacity(command_channel_capacity);
+        assert_eq!(options.receive_maximum, receive_maximum);
         assert_eq!(options.ack_timeout, Duration::from_millis(50));
-    }
-
-    #[test]
-    fn builder_overrides_connect_timeout() {
-        let url = BrokerUrl::parse("mqtt://broker.example").expect("valid url");
-        let options = ConnectOptions::new(url).connect_timeout(Duration::from_millis(25));
         assert_eq!(options.connect_timeout, Duration::from_millis(25));
-    }
-
-    #[test]
-    fn builder_overrides_graceful_disconnect_timeout() {
-        let url = BrokerUrl::parse("mqtt://broker.example").expect("valid url");
-        let options = ConnectOptions::new(url).graceful_disconnect_timeout(Duration::from_millis(100));
         assert_eq!(options.graceful_disconnect_timeout, Duration::from_millis(100));
-    }
-
-    #[test]
-    fn builder_overrides_command_channel_capacity() {
-        let url = BrokerUrl::parse("mqtt://broker.example").expect("valid url");
-        let custom = NonZeroUsize::new(128).expect("non-zero");
-        let options = ConnectOptions::new(url).command_channel_capacity(custom);
-        assert_eq!(options.command_channel_capacity, custom);
+        assert_eq!(options.command_channel_capacity, command_channel_capacity);
     }
 
     #[test]

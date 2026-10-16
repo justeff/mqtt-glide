@@ -130,48 +130,20 @@ mod tests {
     use crate::codec::error::EncodeError;
 
     #[test]
-    fn variable_length_decoding() {
-        // Test valid decodes
-        assert_eq!(decode_variable_length(&[0x00]).unwrap(), Some((0, 1)));
-        assert_eq!(decode_variable_length(&[0x7F]).unwrap(), Some((127, 1)));
-        assert_eq!(decode_variable_length(&[0x80, 0x01]).unwrap(), Some((128, 2)));
-
-        // Test incomplete data
-        assert_eq!(decode_variable_length(&[0x80]).unwrap(), None);
-
-        // Test invalid length
-        let res = decode_variable_length(&[0xFF, 0xFF, 0xFF, 0xFF]);
-        assert!(matches!(res, Err(DecodeError::InvalidLength)));
-    }
-
-    #[test]
-    fn variable_length_encoding() {
-        let mut buf = BytesMut::new();
-
-        write_variable_length(127, &mut buf).unwrap();
-        assert_eq!(buf.as_ref(), &[0x7F]);
-
-        buf.clear();
-        write_variable_length(16_383, &mut buf).unwrap();
-        assert_eq!(buf.as_ref(), &[0xFF, 0x7F]);
-
-        buf.clear();
-        write_variable_length(268_435_455, &mut buf).unwrap();
-        assert_eq!(buf.as_ref(), &[0xFF, 0xFF, 0xFF, 0x7F]);
-    }
-
-    #[test]
     fn variable_length_encoding_keeps_every_bit_at_each_width() {
         // Mixed bit patterns, so a lost or shifted group shows up; one vector per width boundary.
         let cases: &[(u32, &[u8])] = &[
             (0, &[0x00]),
+            (127, &[0x7F]),
             (128, &[0x80, 0x01]),
             (321, &[0xC1, 0x02]),
+            (16_383, &[0xFF, 0x7F]),
             (16_384, &[0x80, 0x80, 0x01]),
             (1_193_046, &[0xD6, 0xE8, 0x48]),
             (2_097_151, &[0xFF, 0xFF, 0x7F]),
             (2_097_152, &[0x80, 0x80, 0x80, 0x01]),
             (11_259_375, &[0xEF, 0x9B, 0xAF, 0x05]),
+            (268_435_455, &[0xFF, 0xFF, 0xFF, 0x7F]),
         ];
         for &(value, wire) in cases {
             let mut buf = BytesMut::new();
@@ -191,6 +163,11 @@ mod tests {
         assert!(matches!(
             write_variable_length(268_435_456, &mut buf),
             Err(EncodeError::InvalidLength)
+        ));
+        // A fifth byte would be needed: more than four bytes is not a Variable Byte Integer.
+        assert!(matches!(
+            decode_variable_length(&[0xFF, 0xFF, 0xFF, 0xFF]),
+            Err(DecodeError::InvalidLength)
         ));
     }
 

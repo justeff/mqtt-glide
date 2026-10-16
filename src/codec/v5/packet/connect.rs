@@ -698,78 +698,17 @@ mod tests {
     }
 
     #[test]
-    fn connect_password_only_without_username_round_trips() {
-        let connect = Connect {
-            clean_start: true,
-            keep_alive: 60,
-            client_id: ByteString::from_static("id"),
-            username: None,
-            password: Some(Bytes::from_static(b"token")),
-            ..Default::default()
-        };
-        let mut buf = BytesMut::new();
-        let body_len = connect.encoded_body_len(1024).unwrap() as u32;
-        connect.encode_body(&mut buf, body_len).unwrap();
-        let decoded = Connect::decode(&mut buf.freeze()).unwrap();
-        assert_eq!(decoded.username, None);
-        assert_eq!(decoded.password.as_deref(), Some(b"token".as_ref()));
-    }
-
-    #[test]
-    fn connect_receive_max_or_default_uses_spec_default_when_absent() {
+    fn connect_receive_max_or_default_falls_back_to_the_spec_default() {
         let connect = Connect::default();
         assert_eq!(connect.receive_max, None);
         assert_eq!(connect.receive_max_or_default(), RECEIVE_MAX_DEFAULT);
-    }
 
-    #[test]
-    fn connect_receive_max_or_default_preserves_explicit_value() {
         let explicit = NonZeroU16::new(2).unwrap();
         let connect = Connect {
             receive_max: Some(explicit),
             ..Default::default()
         };
         assert_eq!(connect.receive_max_or_default(), explicit);
-    }
-
-    fn round_trip_connect(connect: &Connect) {
-        let mut buf = BytesMut::new();
-        let body_len = connect.encoded_body_len(u32::MAX).unwrap() as u32;
-        connect.encode_body(&mut buf, body_len).unwrap();
-        let decoded = Connect::decode(&mut buf.freeze()).unwrap();
-        assert_eq!(decoded, *connect);
-    }
-
-    #[test]
-    fn connect_client_fields_round_trip() {
-        round_trip_connect(&Connect {
-            clean_start: true,
-            keep_alive: 120,
-            client_id: ByteString::from_static("mqtt-glide-01"),
-            username: Some(ByteString::from_static("mqtt-user")),
-            password: Some(Bytes::from_static(b"mqtt-pass")),
-            receive_max: NonZeroU16::new(42),
-            ..Default::default()
-        });
-
-        round_trip_connect(&Connect {
-            clean_start: false,
-            keep_alive: 0,
-            client_id: ByteString::from_static(""),
-            username: None,
-            password: None,
-            receive_max: None,
-            ..Default::default()
-        });
-
-        round_trip_connect(&Connect::default().client_id("builder-id").receive_max(10));
-        round_trip_connect(
-            &Connect::default()
-                .client_id("builder-id")
-                .username("mqtt-user")
-                .password("mqtt-pass")
-                .receive_max(10),
-        );
     }
 
     #[test]

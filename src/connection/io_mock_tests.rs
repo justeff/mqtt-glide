@@ -314,7 +314,10 @@ async fn wait_until(flag: &AtomicBool, want: bool, label: &str) {
 /// Partial read: frame split across peer writes — decoder waits, then completes (no `TcpListener`).
 #[rstest]
 #[case::split_after_fixed_header(1)]
+#[case::split_after_remaining_length(2)]
+#[case::split_mid_topic(7)]
 #[case::split_mid_frame(8)]
+#[case::split_mid_payload(19)]
 #[tokio::test]
 async fn read_task_partial_frame_over_duplex(#[case] split_at: usize) {
     let wire = sample_qos0_publish_wire();
@@ -672,56 +675,6 @@ async fn read_task_handoff_full_then_drain() {
         .expect("second handoff");
     assert_eq!(&*second.topic, "io/mock");
     wait_until(&harness.handoff_stalled, false, "handoff_stalled cleared").await;
-
-    harness.cancel.cancel();
-    let outcome = timeout(Duration::from_secs(2), harness.join)
-        .await
-        .expect("join timeout")
-        .expect("join");
-    assert_eq!(outcome, ReadOutcome::Cancelled);
-}
-
-/// Multi-split partial frame: decoder waits across mid-topic / mid-payload splits (table #6).
-#[rstest]
-#[case::split_after_remaining_length(2)]
-#[case::split_mid_topic(7)]
-#[case::split_mid_payload(19)]
-#[tokio::test]
-async fn read_task_partial_frame_extra_split_points(#[case] split_at: usize) {
-    let wire = sample_qos0_publish_wire();
-    assert!(
-        split_at > 0 && split_at < wire.len(),
-        "split must leave a non-empty remainder"
-    );
-
-    let (task_end, mut peer) = tokio::io::duplex(256);
-    let framed = FramedRead::new(task_end, V5Codec::with_max_packet_size(0));
-    let mut harness = spawn_read_task(framed);
-
-    peer.write_all(&wire[..split_at]).await.expect("partial write");
-    peer.flush().await.expect("flush partial");
-
-    tokio::select! {
-        biased;
-        outcome = &mut harness.join => {
-            panic!("read task must stay pending on an incomplete frame, got {outcome:?}");
-        }
-        _ = tokio::time::sleep(Duration::from_millis(80)) => {}
-    }
-    assert!(
-        harness.handoff_rx.is_empty(),
-        "incomplete frame must not hand off a publish"
-    );
-
-    peer.write_all(&wire[split_at..]).await.expect("remainder write");
-    peer.flush().await.expect("flush remainder");
-
-    let message = timeout(Duration::from_secs(2), harness.handoff_rx.recv_async())
-        .await
-        .expect("handoff timeout")
-        .expect("handoff recv");
-    assert_eq!(&*message.topic, "io/mock");
-    assert_eq!(&*message.payload, b"partial-payload");
 
     harness.cancel.cancel();
     let outcome = timeout(Duration::from_secs(2), harness.join)

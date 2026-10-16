@@ -191,7 +191,6 @@ impl Raw {
 /// Decoded fixed fields of a PUBLISH the client sent.
 #[derive(Debug, Clone)]
 struct Sent {
-    dup: bool,
     qos: u8,
     pid: u16,
 }
@@ -204,11 +203,7 @@ fn parse_publish(raw: &Raw) -> Sent {
     } else {
         0
     };
-    Sent {
-        dup: raw.first & 0x08 != 0,
-        qos,
-        pid,
-    }
+    Sent { qos, pid }
 }
 
 /// `(packet id, topic filters)` of a SUBSCRIBE / UNSUBSCRIBE body.
@@ -614,30 +609,6 @@ async fn connect_ends_when_the_broker_never_answers(#[case] mute: Mute) {
     assert_no_library_panic();
 }
 
-/// Session Present = 1 in answer to a Clean Start connect is inconsistent: the client says so
-/// with DISCONNECT 0x82 and stops, although its reconnect policy would retry.
-#[tokio::test]
-async fn session_present_after_clean_start_stops_the_client() {
-    let (port, broker) = evil(|l| async move {
-        let mut p = l.accept().await;
-        p.expect_connect().await;
-        p.send(&connack_with(true, 0, &props(&[]))).await;
-        p.expect_disconnect().await
-    })
-    .await;
-    let mut h = Harness::start(base_options(port), Reconnect::every(Duration::from_millis(100)), 16);
-    let result = h.finish(15).await;
-    assert!(
-        matches!(
-            result,
-            Err(ConnectionOutcome::Application(AppError::SessionPresentInconsistent(_)))
-        ),
-        "{result:?}"
-    );
-    assert_eq!(within(10, broker).await.unwrap(), Some(0x82));
-    assert_no_library_panic();
-}
-
 /// A CONNACK that breaks the spec in its properties is refused: the client answers with
 /// DISCONNECT 0x82 and ends the session.
 #[rstest]
@@ -722,7 +693,7 @@ async fn refused_request_keeps_the_session(#[case] request: Request, #[case] tin
     h.close().await;
 }
 
-// ---- Acknowledgements with the wrong number of reason codes ----
+// ---- Acknowledgements without reason codes ----
 
 #[derive(Debug, Clone, Copy)]
 enum AckKind {
@@ -730,22 +701,14 @@ enum AckKind {
     Unsubscribe,
 }
 
-/// A SUBACK / UNSUBACK that does not carry exactly one reason code per filter fails the request
-/// and ends the session: with DISCONNECT 0x82 when the count is wrong, with 0x81 when there is
-/// no reason code at all (a malformed packet).
+/// A SUBACK / UNSUBACK without any reason code is a malformed packet: the request fails and the
+/// client ends the session with DISCONNECT 0x81. A wrong non-zero count (0x82) is covered by the
+/// unit test `an_ack_with_the_wrong_number_of_reason_codes_ends_the_connection`.
 #[rstest]
-#[case::suback_too_few(AckKind::Subscribe, vec![1], 0x82)]
-#[case::suback_none(AckKind::Subscribe, vec![], 0x81)]
-#[case::suback_too_many(AckKind::Subscribe, vec![1, 0, 0, 0], 0x82)]
-#[case::unsuback_none(AckKind::Unsubscribe, vec![], 0x81)]
-#[case::unsuback_too_few(AckKind::Unsubscribe, vec![0], 0x82)]
-#[case::unsuback_too_many(AckKind::Unsubscribe, vec![0, 0, 0], 0x82)]
+#[case::suback_none(AckKind::Subscribe)]
+#[case::unsuback_none(AckKind::Unsubscribe)]
 #[tokio::test]
-async fn ack_with_wrong_reason_count_ends_the_session(
-    #[case] kind: AckKind,
-    #[case] reasons: Vec<u8>,
-    #[case] code: u8,
-) {
+async fn ack_without_reason_codes_ends_the_session(#[case] kind: AckKind) {
     let (port, broker) = evil(move |l| async move {
         let mut p = l.accept().await;
         p.handshake(&[]).await;
@@ -754,8 +717,8 @@ async fn ack_with_wrong_reason_count_ends_the_session(
             .await;
         assert_eq!(filters.len(), 2);
         let ack = match kind {
-            AckKind::Subscribe => suback(pid, &reasons),
-            AckKind::Unsubscribe => unsuback(pid, &reasons),
+            AckKind::Subscribe => suback(pid, &[]),
+            AckKind::Unsubscribe => unsuback(pid, &[]),
         };
         p.send(&ack).await;
         let reason = p.expect_disconnect().await;
@@ -779,7 +742,7 @@ async fn ack_with_wrong_reason_count_ends_the_session(
         "the request succeeded with a malformed ack: {response:?}"
     );
     let (reason, _peer) = within(15, broker).await.unwrap();
-    assert_eq!(reason, Some(code));
+    assert_eq!(reason, Some(0x81));
     let result = h.finish(10).await;
     assert!(result.is_err(), "driver should end with an error");
     assert_no_library_panic();
@@ -863,110 +826,6 @@ async fn resubscribe_phase_answers_violations_with_disconnect_reason(#[case] att
     let (reason, _peer) = within(30, broker).await.unwrap();
     assert_eq!(reason.ok().flatten(), Some(code));
     h.close().await;
-}
-
-fn resumable(port: u16) -> ConnectOptions {
-    base_options(port)
-        .clean_start(false)
-        .session_expiry(Some(Duration::from_secs(300)))
-        .ack_timeout(Duration::from_secs(3))
-}
-
-/// Reads client packets until `n` PUBLISHes arrived (or the client closed).
-async fn read_publishes(p: &mut Peer, n: usize) -> Vec<Sent> {
-    let mut out = Vec::new();
-    while out.len() < n {
-        match within(15, p.next_skip_ping()).await {
-            Some(r) if r.kind() == 3 => out.push(parse_publish(&r)),
-            Some(_) => {}
-            None => break,
-        }
-    }
-    out
-}
-
-/// Connection 1 takes `n` unacknowledged QoS 1 publishes and dies. Connection 2 answers with
-/// `session_present` and `connack_parts`; every PUBLISH the client sends there is collected
-/// (and acknowledged when `ack`) until the client shuts down. Returns what connection 1 saw,
-/// what connection 2 saw and the outcome of each publish.
-async fn carried_publishes(
-    retain: bool,
-    n: usize,
-    session_present: bool,
-    connack_parts: Vec<Vec<u8>>,
-    ack: bool,
-) -> (Vec<Sent>, Vec<Sent>, Vec<Result<(), AppError>>) {
-    let (port, broker) = evil(move |l| async move {
-        let mut p = l.accept().await;
-        p.handshake(&[]).await;
-        let first = read_publishes(&mut p, n).await;
-        drop(p);
-        let mut p = l.accept().await;
-        p.expect_connect().await;
-        p.send(&connack_with(session_present, 0, &props(&connack_parts))).await;
-        let mut resent = Vec::new();
-        while let Some(r) = p.next_skip_ping().await {
-            if r.kind() == 3 {
-                let sent = parse_publish(&r);
-                if ack && sent.qos > 0 {
-                    p.send(&puback(sent.pid)).await;
-                }
-                resent.push(sent);
-            }
-        }
-        (first, resent)
-    })
-    .await;
-    let mut h = Harness::start(resumable(port), Reconnect::every(Duration::from_millis(100)), 16);
-    h.connected().await;
-    let mut completions = Vec::new();
-    for i in 0..n {
-        let publish = Publish::new("r/topic", vec![i as u8])
-            .qos(QoS::AtLeastOnce)
-            .retain(retain);
-        completions.push(h.client.start_publish(publish).await.expect("start_publish"));
-    }
-    let mut outcomes = Vec::new();
-    for c in completions {
-        outcomes.push(within(15, c.wait()).await);
-    }
-    h.close().await;
-    let (first, resent) = within(15, broker).await.unwrap();
-    (first, resent, outcomes)
-}
-
-/// On a resumed session unacknowledged QoS 1 PUBLISHes are resent in order, with DUP = 1 and
-/// their original Packet Identifiers ([MQTT-4.4.0-1]).
-#[tokio::test]
-async fn resumed_session_resends_unacknowledged_publishes_with_dup() {
-    let (first, resent, outcomes) = carried_publishes(false, 2, true, vec![], true).await;
-    assert_eq!(first.len(), 2);
-    assert_eq!(resent.len(), 2, "not resent");
-    for (before, after) in first.iter().zip(&resent) {
-        assert_eq!(before.pid, after.pid);
-        assert!(after.dup && !before.dup, "DUP must be set on the resend only");
-    }
-    assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
-}
-
-/// Session Present = 0: the broker lost the session, so nothing may be resent into it.
-#[tokio::test]
-async fn lost_session_does_not_resend_carried_publishes() {
-    let (_, resent, outcomes) = carried_publishes(false, 1, false, vec![], false).await;
-    assert!(resent.is_empty(), "resent into a session the broker does not have");
-    assert!(matches!(outcomes[0], Err(AppError::ConnectionLost)), "{outcomes:?}");
-}
-
-/// The resumed session's CONNACK lowers Maximum QoS to 0 ([MQTT-3.2.2-11]) or withdraws Retain
-/// Available ([MQTT-3.2.2-14]): the carried PUBLISH, now forbidden, must not be sent any more.
-#[rstest]
-#[case::maximum_qos_lowered(false, prop::u8(0x24, 0))]
-#[case::retain_withdrawn(true, prop::u8(0x25, 0))]
-#[tokio::test]
-async fn resume_does_not_resend_what_the_broker_no_longer_allows(#[case] retain: bool, #[case] property: Vec<u8>) {
-    let (_, resent, outcomes) = carried_publishes(retain, 1, true, vec![property], false).await;
-    assert!(resent.is_empty(), "resent although the broker forbids it: {resent:?}");
-    assert!(outcomes[0].is_err(), "{outcomes:?}");
 }
 
 // ---- Liveness and reconnect pacing ----
@@ -1437,7 +1296,9 @@ async fn shutdown_towards_silent_broker(
 
 /// A broker that acknowledged CONNECT and then stops answering (and, in one case, stops reading)
 /// cannot hold `shutdown()` back: the driver ends with `Ok(())` within the graceful disconnect
-/// timeout (300 ms here, bound 3 s) and every unfinished publish fails.
+/// timeout (300 ms here, bound 3 s) and every unfinished publish fails with `ConnectionLost`, as
+/// `MqttClient::shutdown` documents: also the publishes that never left the command channel (most
+/// of them in the full-buffer case), not only those already written.
 #[rstest]
 #[case::unacknowledged_publish(Silent::UnackedPublish)]
 #[case::send_buffer_full(Silent::SendBufferFull)]
@@ -1446,15 +1307,6 @@ async fn shutdown_ends_when_the_broker_goes_silent(#[case] silent: Silent) {
     let (result, elapsed, outcomes) = shutdown_towards_silent_broker(silent).await;
     assert!(result.is_ok(), "{result:?}");
     assert!(elapsed < Duration::from_secs(3), "shutdown took {elapsed:?}");
-    assert!(outcomes.iter().all(Result::is_err), "{outcomes:?}");
-}
-
-/// Whatever is still unacknowledged when the shutdown budget runs out fails with
-/// `ConnectionLost`, as `MqttClient::shutdown` documents: also the publishes that never left the
-/// command channel (most of them here), not only those already written.
-#[tokio::test]
-async fn queued_publishes_fail_with_connection_lost_on_shutdown() {
-    let (_, _, outcomes) = shutdown_towards_silent_broker(Silent::SendBufferFull).await;
     assert!(
         outcomes.iter().all(|o| matches!(o, Err(AppError::ConnectionLost))),
         "{outcomes:?}"

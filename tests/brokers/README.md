@@ -8,17 +8,13 @@ Image: `eclipse-mosquitto:2.1.2-alpine` (anonymous, reject-connect and Dynamic S
 
 | Test | Expectation |
 |------|-------------|
-| `mosquitto_connect_connack_and_disconnect` | CONNECT/CONNACK success (`SessionParams.from_connack`), then clean shutdown |
-| `mosquitto_not_authorized_invalidates_credentials` | CONNACK `AuthError::NotAuthorized` + `CredentialsProvider::invalidate` (single attempt) |
 | `mosquitto_shared_subscription_delivers_to_handoff` | `$share/{group}/{topic}` SUBACK + broker PUBLISH reaches mpsc handoff |
-| `mosquitto_qos1_publish_awaits_puback` | QoS 1 `publish().await` completes after Mosquitto PUBACK |
-| `mosquitto_publish_properties_roundtrip` | User Properties + Message Expiry Interval **property** round-trip publish → subscribe (immediate delivery; broker drop-on-expiry not asserted here) |
+| `mosquitto_publish_properties_roundtrip` | QoS 1 `send` resolves on PUBACK; User Properties + Message Expiry Interval **property** round-trip publish → subscribe (immediate delivery; broker drop-on-expiry not asserted here) |
 | `mosquitto_broker_kill_reconnects_and_emits_connected` | Broker kill → Transport disconnect → policy reconnect → Connected (newer generation) |
-| `mosquitto_auth_fail_stops_without_endless_reconnect` | Auth fail → Stopped + invalidate; no endless reconnect |
+| `mosquitto_auth_fail_stops_without_endless_reconnect` | CONNACK `AuthError::NotAuthorized` → Stopped + `CredentialsProvider::invalidate` once; no endless reconnect |
 | `mosquitto_handoff_full_keep_alive_no_spurious_reconnect` | Full handoff stall; connection stays up past keep-alive window (no spurious reconnect). Wire PINGREQ scheduling is covered by the unit keep-alive enforcer test |
 | `mosquitto_revoked_role_acl_keeps_the_client_connected` | Dynamic Security: revoking a role's subscribe ACL drops the client; the resubscribe gets 0x87 for that filter, the client stays connected with the rest and lists it in `refused_subscriptions`; restoring the ACL brings the subscription back. (A plain `acl_file` would not show this: Mosquitto grants such a SUBSCRIBE and only filters delivery.) |
 | `mosquitto_resubscribes_after_reconnect` | After reconnect, prior subscriptions deliver without re-subscribe |
-| `mosquitto_session_phase_updates_app_state_without_eventloop_poll` | App health driven solely by `SessionPhase` watch |
 | `mosquitto_handoff_survives_shutdown` | Handoff message remains receivable after `shutdown()`. Wire order PUBACK-before-DISCONNECT is covered by unit tests |
 | `mosquitto_two_parallel_connections_isolated_handoff_and_phase` | Two parallel `Connection`s: isolated handoffs via unique probe publishes; B’s phase stays Connected after A shutdown |
 

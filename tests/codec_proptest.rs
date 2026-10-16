@@ -95,16 +95,6 @@ proptest! {
     }
 
     #[test]
-    fn v5_pingreq_round_trip(_seed in any::<u8>()) {
-        round_trip_v5(Packet::PingRequest);
-    }
-
-    #[test]
-    fn v5_pingresp_round_trip(_seed in any::<u8>()) {
-        round_trip_v5(Packet::PingResponse);
-    }
-
-    #[test]
     fn v5_disconnect_round_trip(disconnect in arb_v5_disconnect()) {
         round_trip_v5(Packet::Disconnect(disconnect));
     }

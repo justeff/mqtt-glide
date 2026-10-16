@@ -385,15 +385,13 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::client::{StaticCredentials, connect};
-    use crate::codec::{ConnectAck, DecodedFrame, Packet, PublishAck, PublishAckReason, PublishProperties, QoS};
-    use crate::connection::NoopLifecycle;
+    use crate::codec::{ConnectAck, DecodedFrame, Packet, PublishProperties, QoS};
     use crate::connection::test_support::{
-        accept_connect_send_connack_with, await_connected, spawn_broker_loop, spawn_broker_once, spawn_mock_broker,
+        accept_connect_send_connack_with, spawn_broker_loop, spawn_broker_once, spawn_mock_broker,
         static_test_credentials,
     };
     use crate::error::ConnectionOutcome;
-    use crate::util::BrokerUrl;
+    use crate::test_util::{options_for, qos_id_payload, spawn_puback_broker};
 
     /// Builder defaults: anonymous creds, NoReconnect, NoopLifecycle, wait_connected, glide client id.
     #[tokio::test]
@@ -455,118 +453,19 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    /// Minimal publisher: `discard_inbound` + `connect` + `publish` QoS 1.
-    #[tokio::test]
-    async fn builder_discard_inbound_publish_qos_at_least_once_roundtrip() {
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let observed_broker = Arc::clone(&observed);
-        let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
-            let mut ack = ConnectAck::default();
-            ack.receive_max = NonZeroU16::new(8).expect("nz");
-            if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
-                return;
-            }
-            loop {
-                match framed_read.next().await {
-                    Some(Ok((DecodedFrame::Publish(packet), _))) => {
-                        observed_broker.lock().await.push((
-                            packet.meta.qos,
-                            packet.meta.packet_id,
-                            packet.message.payload.clone(),
-                        ));
-                        if packet.meta.qos == QoS::AtLeastOnce {
-                            let Some(id) = packet.meta.packet_id else {
-                                continue;
-                            };
-                            let _ = framed_write
-                                .send(Packet::PublishAck(PublishAck {
-                                    packet_id: id,
-                                    reason_code: PublishAckReason::Success,
-                                    properties: Vec::new(),
-                                    reason_string: None,
-                                }))
-                                .await;
-                        }
-                    }
-                    Some(Ok((DecodedFrame::Control(Packet::Disconnect(_)), _))) | None => break,
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
-                }
-            }
-        })
-        .await;
-
-        let client = ClientBuilder::new(format!("mqtt://127.0.0.1:{port}"))
-            .expect("url")
-            .credentials(static_test_credentials())
-            .options(|o| o.receive_maximum(NonZeroU16::new(8).expect("nz")))
-            .discard_inbound()
-            .connect()
-            .await
-            .expect("connect");
-
-        client
-            .publish("t/discard-pub", "minimal-publisher")
-            .qos(QoS::AtLeastOnce)
-            .send()
-            .await
-            .expect("publish qos1");
-
-        let frames = observed.lock().await.clone();
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].0, QoS::AtLeastOnce);
-        assert!(frames[0].1.is_some());
-        assert_eq!(&*frames[0].2, b"minimal-publisher");
-
-        client.shutdown().await.expect("shutdown");
-    }
-
-    /// Explicit handoff + `publish` QoS 1 roundtrip through the builder.
+    /// Explicit handoff + `publish` QoS 1 roundtrip through the builder, with a User Property
+    /// that reaches the wire.
     #[tokio::test]
     async fn builder_publish_with_qos_at_least_once_roundtrip() {
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let observed_broker = Arc::clone(&observed);
-        let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
-            let mut ack = ConnectAck::default();
-            ack.receive_max = NonZeroU16::new(8).expect("nz");
-            if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
-                return;
-            }
-            loop {
-                match framed_read.next().await {
-                    Some(Ok((DecodedFrame::Publish(packet), _))) => {
-                        let user_properties: Vec<(String, String)> = packet
-                            .message
-                            .properties
-                            .user_properties
-                            .iter()
-                            .map(|u| (u.name.to_string(), u.value.to_string()))
-                            .collect();
-                        observed_broker.lock().await.push((
-                            packet.meta.qos,
-                            packet.meta.packet_id,
-                            packet.message.payload.clone(),
-                            user_properties,
-                        ));
-                        if packet.meta.qos == QoS::AtLeastOnce {
-                            let Some(id) = packet.meta.packet_id else {
-                                continue;
-                            };
-                            let _ = framed_write
-                                .send(Packet::PublishAck(PublishAck {
-                                    packet_id: id,
-                                    reason_code: PublishAckReason::Success,
-                                    properties: Vec::new(),
-                                    reason_string: None,
-                                }))
-                                .await;
-                        }
-                    }
-                    Some(Ok((DecodedFrame::Control(Packet::Disconnect(_)), _))) | None => break,
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
-                }
-            }
+        let (port, observed) = spawn_puback_broker(NonZeroU16::new(8).expect("nz"), |packet| {
+            let user_properties: Vec<(String, String)> = packet
+                .message
+                .properties
+                .user_properties
+                .iter()
+                .map(|u| (u.name.to_string(), u.value.to_string()))
+                .collect();
+            (qos_id_payload(packet), user_properties)
         })
         .await;
 
@@ -597,13 +496,18 @@ mod tests {
 
         let frames = observed.lock().await.clone();
         assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].0, QoS::AtLeastOnce);
-        assert!(frames[0].1.is_some());
-        assert_eq!(&*frames[0].2, b"need-ack");
-        assert_eq!(&*frames[1].2, b"with-props");
-        assert!(frames[0].3.is_empty(), "no user property was set on the first publish");
+        let ((qos, packet_id, payload), user_properties) = &frames[0];
+        assert_eq!(*qos, QoS::AtLeastOnce);
+        assert!(packet_id.is_some());
+        assert_eq!(&**payload, b"need-ack");
+        assert!(
+            user_properties.is_empty(),
+            "no user property was set on the first publish"
+        );
+        let ((_, _, payload), user_properties) = &frames[1];
+        assert_eq!(&**payload, b"with-props");
         assert_eq!(
-            frames[1].3,
+            *user_properties,
             [("k".to_owned(), "v".to_owned())],
             "user property on the wire"
         );
@@ -621,8 +525,7 @@ mod tests {
             let _held = listener.accept().await;
             std::future::pending::<()>().await;
         });
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("url");
-        let options = ConnectOptions::new(url)
+        let options = options_for(port)
             .client_id(ClientId::from_prefix("custom"))
             .connect_timeout(Duration::from_secs(30));
 
@@ -639,32 +542,6 @@ mod tests {
         assert!(!client.is_connected(), "no CONNACK was sent");
 
         client.shutdown().await.expect("shutdown");
-    }
-
-    /// Low-level `connect` still works alongside the builder (sanity).
-    #[tokio::test]
-    async fn low_level_connect_still_available() {
-        let port = spawn_mock_broker().await;
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("url");
-        let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) = connect(
-            options,
-            StaticCredentials::new("user", "pass"),
-            NoReconnect,
-            tx,
-            NoopLifecycle,
-        )
-        .expect("connect");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
-        client
-            .publish("t/q0", "fire")
-            .send()
-            .await
-            .expect("publish qos0 default");
-        client.shutdown().await.expect("shutdown");
-        let _ = run.await;
     }
 
     /// Tokio `mpsc` is a valid [`crate::InboundSink`] for builder connect.

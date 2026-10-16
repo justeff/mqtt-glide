@@ -21,6 +21,7 @@ use mqtt_glide::{
     DisconnectReasonCode, InboundMessage, NoopLifecycle, ProtocolError, Publish, PublishMessage, QoS, SessionPhase,
     StandardReconnectPolicy, connect,
 };
+use rstest::rstest;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -60,94 +61,61 @@ async fn unreachable_broker_returns_transport_error() {
     );
 }
 
-/// Broker-sent MQTT DISCONNECT reasons map to Auth, Transport, and Protocol.
+/// Broker-sent MQTT DISCONNECT reasons map to Auth, Transport, and Protocol; only the Auth one
+/// invalidates the credentials.
+#[rstest]
+#[case::not_authorized(
+    DisconnectReasonCode::NotAuthorized,
+    |o: &ConnectionOutcome| matches!(o, ConnectionOutcome::Auth(AuthError::NotAuthorized)),
+    1
+)]
+#[case::keep_alive_timeout(
+    DisconnectReasonCode::KeepAliveTimeout,
+    |o: &ConnectionOutcome| matches!(o, ConnectionOutcome::Transport(_)),
+    0
+)]
+#[case::protocol_error(
+    DisconnectReasonCode::ProtocolError,
+    |o: &ConnectionOutcome| matches!(o, ConnectionOutcome::Protocol(ProtocolError::Violation(_))),
+    0
+)]
 #[tokio::test]
-async fn broker_disconnect_reason_classifies_auth_transport_protocol() {
-    {
-        let (port, peer) = spawn_connack_then_disconnect(DisconnectReasonCode::NotAuthorized).await;
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("disc-auth"));
-        let invalidations = Arc::new(AtomicUsize::new(0));
-        let creds = CountingInvalidate {
-            invalidations: Arc::clone(&invalidations),
-        };
-        let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
-        let (_client, connection, mut phase) = connect(options, creds, NoReconnect, tx, NoopLifecycle).expect("wiring");
-        let run = tokio::spawn(connection.run());
+async fn broker_disconnect_reason_classifies_auth_transport_protocol(
+    #[case] reason: DisconnectReasonCode,
+    #[case] expected: fn(&ConnectionOutcome) -> bool,
+    #[case] expected_invalidations: usize,
+) {
+    let (port, peer) = spawn_connack_then_disconnect(reason).await;
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("disc-reason"));
+    let invalidations = Arc::new(AtomicUsize::new(0));
+    let creds = CountingInvalidate {
+        invalidations: Arc::clone(&invalidations),
+    };
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
+    let (_client, connection, mut phase) = connect(options, creds, NoReconnect, tx, NoopLifecycle).expect("wiring");
+    let run = tokio::spawn(connection.run());
 
-        // Broker DISCONNECT right after CONNACK — watch may skip Connected.
-        let disconnected = wait_for_phase(&mut phase, Duration::from_secs(5), |event| {
-            matches!(event, SessionPhase::Disconnected(_))
-        })
-        .await;
-        assert!(matches!(
-            disconnected,
-            SessionPhase::Disconnected(ConnectionOutcome::Auth(AuthError::NotAuthorized))
-        ));
-        assert_eq!(invalidations.load(Ordering::SeqCst), 1);
+    // Broker DISCONNECT right after CONNACK — watch may skip Connected.
+    let disconnected = wait_for_phase(&mut phase, Duration::from_secs(5), |event| {
+        matches!(event, SessionPhase::Disconnected(_))
+    })
+    .await;
+    assert!(
+        matches!(&disconnected, SessionPhase::Disconnected(outcome) if expected(outcome)),
+        "{reason:?}: {disconnected:?}"
+    );
+    assert_eq!(invalidations.load(Ordering::SeqCst), expected_invalidations);
 
-        let outcome = timeout(Duration::from_secs(5), run)
-            .await
-            .expect("run join")
-            .expect("join");
-        assert!(matches!(
-            outcome,
-            Err(ConnectionOutcome::Auth(AuthError::NotAuthorized))
-        ));
-        join_peer(peer).await;
-    }
-
-    {
-        let (port, peer) = spawn_connack_then_disconnect(DisconnectReasonCode::KeepAliveTimeout).await;
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("disc-tx"));
-        let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
-        let (_client, connection, mut phase) =
-            connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
-        let run = tokio::spawn(connection.run());
-
-        let disconnected = wait_for_phase(&mut phase, Duration::from_secs(5), |event| {
-            matches!(event, SessionPhase::Disconnected(_))
-        })
-        .await;
-        assert!(matches!(
-            disconnected,
-            SessionPhase::Disconnected(ConnectionOutcome::Transport(_))
-        ));
-
-        let outcome = timeout(Duration::from_secs(5), run)
-            .await
-            .expect("run join")
-            .expect("join");
-        assert!(matches!(outcome, Err(ConnectionOutcome::Transport(_))));
-        join_peer(peer).await;
-    }
-
-    {
-        let (port, peer) = spawn_connack_then_disconnect(DisconnectReasonCode::ProtocolError).await;
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("disc-proto"));
-        let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
-        let (_client, connection, mut phase) =
-            connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
-        let run = tokio::spawn(connection.run());
-
-        let disconnected = wait_for_phase(&mut phase, Duration::from_secs(5), |event| {
-            matches!(event, SessionPhase::Disconnected(_))
-        })
-        .await;
-        assert!(matches!(
-            disconnected,
-            SessionPhase::Disconnected(ConnectionOutcome::Protocol(ProtocolError::Violation(_)))
-        ));
-
-        let outcome = timeout(Duration::from_secs(5), run)
-            .await
-            .expect("run join")
-            .expect("join");
-        assert!(matches!(outcome, Err(ConnectionOutcome::Protocol(_))));
-        join_peer(peer).await;
-    }
+    let outcome = timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run join")
+        .expect("join");
+    assert!(
+        matches!(&outcome, Err(outcome) if expected(outcome)),
+        "{reason:?}: {outcome:?}"
+    );
+    join_peer(peer).await;
 }
 
 /// Credentials that block inside `invalidate()` until the test releases the latch.

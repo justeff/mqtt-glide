@@ -287,24 +287,12 @@ impl<'a> IntoFuture for PublishBuilder<'a> {
 }
 
 #[cfg(test)]
-#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
     use std::num::NonZeroU16;
-    use std::sync::Arc;
 
-    use futures_util::{SinkExt, StreamExt};
-    use tokio::sync::Mutex;
-
-    use crate::client::{NoReconnect, connect};
-    use crate::codec::{ConnectAck, DecodedFrame, Packet, PublishAck, PublishAckReason};
-    use crate::connection::NoopLifecycle;
-    use crate::connection::test_support::{
-        accept_connect_send_connack_with, await_connected, spawn_broker_once, static_test_credentials,
-    };
-    use crate::options::ConnectOptions;
-    use crate::util::BrokerUrl;
+    use crate::test_util::{options_for, qos_id_payload, spawn_puback_broker, start};
 
     #[test]
     fn publish_defaults_and_setters() {
@@ -360,51 +348,8 @@ mod tests {
     /// `publish(topic, payload).qos(AtLeastOnce)` via `.send().await`, bare `.await` and a `Bytes` payload.
     #[tokio::test]
     async fn publish_with_qos_at_least_once_roundtrip() {
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let observed_broker = Arc::clone(&observed);
-        let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
-            let mut ack = ConnectAck::default();
-            ack.receive_max = NonZeroU16::new(8).expect("nz");
-            if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
-                return;
-            }
-            loop {
-                match framed_read.next().await {
-                    Some(Ok((DecodedFrame::Publish(packet), _))) => {
-                        observed_broker.lock().await.push((
-                            packet.meta.qos,
-                            packet.meta.packet_id,
-                            packet.message.payload.clone(),
-                        ));
-                        if packet.meta.qos == QoS::AtLeastOnce {
-                            let Some(id) = packet.meta.packet_id else {
-                                continue;
-                            };
-                            let _ = framed_write
-                                .send(Packet::PublishAck(PublishAck {
-                                    packet_id: id,
-                                    reason_code: PublishAckReason::Success,
-                                    properties: Vec::new(),
-                                    reason_string: None,
-                                }))
-                                .await;
-                        }
-                    }
-                    Some(Ok((DecodedFrame::Control(Packet::Disconnect(_)), _))) | None => break,
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
-                }
-            }
-        })
-        .await;
-
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) =
-            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (port, observed) = spawn_puback_broker(NonZeroU16::new(8).expect("nz"), qos_id_payload).await;
+        let (client, _rx, run) = start(options_for(port).receive_maximum(NonZeroU16::new(8).expect("nz"))).await;
 
         client
             .publish("t/publish-with", "fluent-qos1")

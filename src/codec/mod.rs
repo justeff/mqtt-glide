@@ -53,34 +53,7 @@ pub type V5Codec = v5::V5Codec;
 #[cfg(test)]
 mod facade_tests {
     use super::*;
-    use bytes::BytesMut;
     use bytestring::ByteString;
-
-    #[test]
-    fn encode_packet_ping_round_trips_via_decode() {
-        let mut codec = V5Codec::with_max_packet_size(0);
-        let mut buf = BytesMut::with_capacity(16);
-        codec
-            .encode_packet(Packet::PingRequest, &mut buf)
-            .expect("encode PINGREQ");
-        let frame = codec.decode_frame(&mut buf).expect("decode").expect("frame");
-        assert!(matches!(frame, DecodedFrame::Control(Packet::PingRequest)));
-    }
-
-    #[test]
-    fn encode_packet_reuses_buffer_capacity() {
-        let mut codec = V5Codec::with_max_packet_size(0);
-        let mut buf = BytesMut::with_capacity(64);
-        codec
-            .encode_packet(Packet::PingRequest, &mut buf)
-            .expect("encode PINGREQ into");
-        let cap = buf.capacity();
-        buf.clear();
-        codec
-            .encode_packet(Packet::PingRequest, &mut buf)
-            .expect("reuse encode PINGREQ");
-        assert!(buf.capacity() >= cap);
-    }
 
     #[test]
     fn undefined_code_byte_is_reported_and_malforms_a_packet() {

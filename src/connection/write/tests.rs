@@ -488,72 +488,6 @@ fn finish_publish_encode_error_maps_bad_topic_to_invalid_request(#[case] topic: 
     }
 }
 
-/// A wildcard Topic Name is refused and no PUBLISH reaches the wire ([MQTT-3.3.2-2],
-/// [MQTT-4.7.0-1]).
-#[tokio::test]
-async fn handle_publish_rejects_invalid_topic_without_wire_publish() {
-    use crate::codec::{DecodedFrame, Packet};
-
-    let (framed, peer_end) = duplex_framed_write();
-    let peer = tokio::spawn(async move {
-        let mut framed = FramedRead::new(peer_end, V5Codec::with_max_packet_size(0));
-        let mut saw_publish = false;
-        let _ = timeout(Duration::from_millis(100), async {
-            while let Some(frame) = framed.next().await {
-                if let Ok((DecodedFrame::Publish(_), _)) = frame {
-                    saw_publish = true;
-                    break;
-                }
-                if let Ok((DecodedFrame::Control(Packet::Disconnect(_)), _)) = frame {
-                    break;
-                }
-            }
-        })
-        .await;
-        saw_publish
-    });
-
-    let harness = spawn_write_task(framed, WriteSessionOverrides::default());
-
-    let (tx, rx) = oneshot::channel();
-    harness
-        .command_tx
-        .send(ClientCommand::Publish {
-            message: PublishMessage {
-                topic: ByteString::from_static("a/+"),
-                payload: Bytes::from_static(b"x"),
-                properties: PublishProperties::default(),
-            },
-            qos: QoS::AtMostOnce,
-            retain: false,
-            reply: tx,
-        })
-        .await
-        .expect("publish command");
-    let err = timeout(Duration::from_secs(1), rx)
-        .await
-        .expect("reply timeout")
-        .expect("oneshot")
-        .expect_err("wildcard topic must fail");
-    match err {
-        AppError::InvalidRequest(detail) => {
-            assert_eq!(detail, "publish topic must not contain wildcard characters");
-        }
-        other => panic!("expected InvalidRequest(wildcard), got {other:?}"),
-    }
-
-    drop(harness.command_tx);
-    drop(harness.control_tx);
-    harness.cancel.cancel();
-    let _ = timeout(Duration::from_secs(2), harness.join).await;
-
-    let saw_publish = timeout(Duration::from_secs(2), peer)
-        .await
-        .expect("peer timeout")
-        .expect("peer join");
-    assert!(!saw_publish, "rejected publish must not appear on the wire");
-}
-
 /// [MQTT-3.14.4-1/2]: protocol-error DISCONNECT is last frame; write half closes (peer EOF)
 /// before the write task waits for supervisor cancel. The DISCONNECT carries a defined Reason
 /// Code, Protocol Error ([MQTT-3.14.2-1]).
@@ -631,96 +565,6 @@ async fn protocol_disconnect_is_terminal_no_frames_after() {
         WriteOutcome::Cancelled,
         "write waits for supervisor cancel after closing the socket"
     );
-}
-
-/// [MQTT-3.2.2-11], [MQTT-3.2.2-14]: broker limits reject on the write path — no PUBLISH on the wire.
-#[tokio::test]
-async fn handle_publish_rejects_above_broker_limits_without_wire_publish() {
-    use crate::codec::{DecodedFrame, Packet, PublishMessage, PublishProperties};
-    use crate::connection::ClientCommand;
-    use bytes::Bytes;
-
-    let (framed, peer_end) = duplex_framed_write();
-    let peer = tokio::spawn(async move {
-        let mut framed = FramedRead::new(peer_end, V5Codec::with_max_packet_size(0));
-        let mut saw_publish = false;
-        // Brief window: rejected publishes must not appear; then EOF when we drop write.
-        let _ = timeout(Duration::from_millis(100), async {
-            while let Some(frame) = framed.next().await {
-                if let Ok((DecodedFrame::Publish(_), _)) = frame {
-                    saw_publish = true;
-                    break;
-                }
-                if let Ok((DecodedFrame::Control(Packet::Disconnect(_)), _)) = frame {
-                    break;
-                }
-            }
-        })
-        .await;
-        saw_publish
-    });
-
-    let harness = spawn_write_task(
-        framed,
-        WriteSessionOverrides {
-            max_qos: QoS::AtMostOnce,
-            retain_available: false,
-            ..Default::default()
-        },
-    );
-
-    let message = PublishMessage {
-        topic: ByteString::from_static("t/1"),
-        payload: Bytes::from_static(b"x"),
-        properties: PublishProperties::default(),
-    };
-
-    let (tx_qos, rx_qos) = oneshot::channel();
-    harness
-        .command_tx
-        .send(ClientCommand::Publish {
-            message: message.clone(),
-            qos: QoS::AtLeastOnce,
-            retain: false,
-            reply: tx_qos,
-        })
-        .await
-        .expect("qos publish");
-    let err = timeout(Duration::from_secs(1), rx_qos)
-        .await
-        .expect("qos reply timeout")
-        .expect("qos oneshot")
-        .expect_err("QoS above Maximum must fail");
-    assert!(matches!(err, AppError::InvalidRequest(_)), "{err:?}");
-
-    let (tx_ret, rx_ret) = oneshot::channel();
-    harness
-        .command_tx
-        .send(ClientCommand::Publish {
-            message,
-            qos: QoS::AtMostOnce,
-            retain: true,
-            reply: tx_ret,
-        })
-        .await
-        .expect("retain publish");
-    let err = timeout(Duration::from_secs(1), rx_ret)
-        .await
-        .expect("retain reply timeout")
-        .expect("retain oneshot")
-        .expect_err("retain when unavailable must fail");
-    assert!(matches!(err, AppError::InvalidRequest(_)), "{err:?}");
-
-    drop(harness.command_tx);
-    drop(harness.control_tx);
-    harness.cancel.cancel();
-    let _ = timeout(Duration::from_secs(2), harness.join).await;
-
-    let saw_publish = timeout(Duration::from_secs(2), peer)
-        .await
-        .expect("peer timeout")
-        .expect("peer join");
-    assert!(!saw_publish, "rejected publishes must not appear on the wire");
 }
 
 #[tokio::test]
@@ -1070,11 +914,52 @@ async fn shutdown_flushes_pending_inbound_publish_acks_before_disconnect() {
     assert_eq!(order[puback_pos].1, 42);
 }
 
-/// QoS 2 is refused on the write path as well (the client API refuses it first): the command
-/// is answered with `InvalidRequest` and nothing is written, although the broker would allow
-/// QoS 2 here.
+/// A publish the write path refuses is answered with `InvalidRequest` and writes nothing:
+/// a wildcard Topic Name ([MQTT-3.3.2-2], [MQTT-4.7.0-1]), a QoS above the broker's Maximum
+/// QoS ([MQTT-3.2.2-11]), retain when the broker has no Retain Available ([MQTT-3.2.2-14]),
+/// and QoS 2, refused although the broker would allow it (the client API refuses it first).
+#[rstest]
+#[case::wildcard_topic(
+    QoS::AtLeastOnce,
+    true,
+    "a/+",
+    QoS::AtMostOnce,
+    false,
+    "publish topic must not contain wildcard characters"
+)]
+#[case::qos_above_maximum(
+    QoS::AtMostOnce,
+    true,
+    "t/1",
+    QoS::AtLeastOnce,
+    false,
+    "publish QoS 1 exceeds broker Maximum QoS 0"
+)]
+#[case::retain_unavailable(
+    QoS::AtMostOnce,
+    false,
+    "t/1",
+    QoS::AtMostOnce,
+    true,
+    "retain publish is not available on this broker session"
+)]
+#[case::qos2(
+    QoS::ExactlyOnce,
+    true,
+    "t/qos2",
+    QoS::ExactlyOnce,
+    false,
+    "QoS 2 publish is not supported"
+)]
 #[tokio::test]
-async fn handle_publish_rejects_qos2_without_wire_publish() {
+async fn handle_publish_rejects_without_wire_publish(
+    #[case] max_qos: QoS,
+    #[case] retain_available: bool,
+    #[case] topic: &'static str,
+    #[case] qos: QoS,
+    #[case] retain: bool,
+    #[case] expected: &str,
+) {
     use crate::codec::{DecodedFrame, Packet};
 
     let (framed, peer_end) = duplex_framed_write();
@@ -1096,7 +981,8 @@ async fn handle_publish_rejects_qos2_without_wire_publish() {
     let harness = spawn_write_task(
         framed,
         WriteSessionOverrides {
-            max_qos: QoS::ExactlyOnce,
+            max_qos,
+            retain_available,
             ..Default::default()
         },
     );
@@ -1106,12 +992,12 @@ async fn handle_publish_rejects_qos2_without_wire_publish() {
         .command_tx
         .send(ClientCommand::Publish {
             message: PublishMessage {
-                topic: ByteString::from_static("t/qos2"),
+                topic: ByteString::from_static(topic),
                 payload: Bytes::from_static(b"x"),
                 properties: PublishProperties::default(),
             },
-            qos: QoS::ExactlyOnce,
-            retain: false,
+            qos,
+            retain,
             reply: tx,
         })
         .await
@@ -1120,8 +1006,8 @@ async fn handle_publish_rejects_qos2_without_wire_publish() {
         .await
         .expect("reply timeout")
         .expect("oneshot")
-        .expect_err("QoS 2 must fail");
-    assert!(matches!(err, AppError::InvalidRequest(_)), "{err:?}");
+        .expect_err("publish must be refused");
+    assert_eq!(err, AppError::InvalidRequest(expected.into()));
 
     drop(harness.command_tx);
     drop(harness.control_tx);
@@ -1132,7 +1018,7 @@ async fn handle_publish_rejects_qos2_without_wire_publish() {
         .await
         .expect("peer timeout")
         .expect("peer join");
-    assert_eq!(frames, 0, "a rejected QoS 2 publish must write nothing");
+    assert_eq!(frames, 0, "a refused publish must write nothing");
 }
 
 /// With the broker's Receive Maximum window full, the write task parks at most

@@ -195,6 +195,12 @@ mod tests {
     #[case::mqtt_explicit_port("mqtt://localhost:11883", "localhost", 11883, false)]
     #[case::bare_hostname("localhost", "localhost", 1883, false)]
     #[case::trailing_slash("ssl://broker.example.com/", "broker.example.com", 8883, true)]
+    // Bracketed IPv6 literals: the stored host drops the brackets so TCP connect / TLS
+    // server-name parsing see the bare address.
+    #[case::mqtt_v6_default_port("mqtt://[::1]", "::1", 1883, false)]
+    #[case::mqtt_v6_explicit_port("mqtt://[::1]:11883", "::1", 11883, false)]
+    #[case::mqtts_v6_default_port("mqtts://[2001:db8::1]", "2001:db8::1", 8883, true)]
+    #[case::mqtts_v6_explicit_port("mqtts://[2001:db8::1]:8884", "2001:db8::1", 8884, true)]
     fn parse_extracts_components(
         #[case] input: &str,
         #[case] expected_host: &str,
@@ -240,6 +246,8 @@ mod tests {
     #[case::space("mqtt://a b:1883")]
     #[case::userinfo("mqtt://user@broker:1883")]
     #[case::control("mqtt://bro\u{0}ker")]
+    #[case::ipv6_missing_close("mqtt://[::1")]
+    #[case::ipv6_trailing_garbage("mqtt://[::1]x")]
     fn parse_rejects_invalid_hosts(#[case] url: &str) {
         assert_eq!(BrokerUrl::parse(url), Err(BrokerUrlError::InvalidHost), "{url:?}");
     }
@@ -252,40 +260,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_rejects_empty_host() {
-        assert_eq!(BrokerUrl::parse("mqtt://:1883"), Err(BrokerUrlError::EmptyHost));
-    }
-
-    /// Bracketed IPv6 literals parse with default or explicit port; the stored host drops
-    /// the brackets so TCP connect / TLS server-name parsing see the bare address.
     #[rstest]
-    #[case::mqtt_v6_default_port("mqtt://[::1]", "::1", 1883, false)]
-    #[case::mqtt_v6_explicit_port("mqtt://[::1]:11883", "::1", 11883, false)]
-    #[case::mqtts_v6_default_port("mqtts://[2001:db8::1]", "2001:db8::1", 8883, true)]
-    #[case::mqtts_v6_explicit_port("mqtts://[2001:db8::1]:8884", "2001:db8::1", 8884, true)]
-    fn parse_bracketed_ipv6(
-        #[case] input: &str,
-        #[case] expected_host: &str,
-        #[case] expected_port: u16,
-        #[case] expected_tls: bool,
-    ) {
-        let addr = BrokerUrl::parse(input).expect("valid broker URL");
-        assert_eq!(addr.host(), expected_host, "host mismatch for {input}");
-        assert_eq!(addr.port(), expected_port, "port mismatch for {input}");
-        assert_eq!(addr.use_tls(), expected_tls, "tls mismatch for {input}");
-    }
-
-    #[rstest]
-    #[case::missing_close("mqtt://[::1")]
-    #[case::trailing_garbage("mqtt://[::1]x")]
-    fn parse_rejects_malformed_ipv6_brackets(#[case] input: &str) {
-        assert_eq!(BrokerUrl::parse(input), Err(BrokerUrlError::InvalidHost));
-    }
-
-    #[test]
-    fn parse_rejects_empty_ipv6_host() {
-        assert_eq!(BrokerUrl::parse("mqtt://[]:1883"), Err(BrokerUrlError::EmptyHost));
+    #[case::no_host("mqtt://:1883")]
+    #[case::empty_ipv6_brackets("mqtt://[]:1883")]
+    fn parse_rejects_empty_host(#[case] url: &str) {
+        assert_eq!(BrokerUrl::parse(url), Err(BrokerUrlError::EmptyHost), "{url:?}");
     }
 
     #[cfg(feature = "websocket")]

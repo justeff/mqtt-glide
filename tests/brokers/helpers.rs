@@ -15,7 +15,11 @@ use bytes::{Bytes, BytesMut};
 use bytestring::ByteString;
 use futures_util::{SinkExt, StreamExt};
 use mqtt_glide::codec::{Connect, DecodedFrame, Disconnect, Packet, PublishDelivery, V5Codec, encode_publish};
-use mqtt_glide::{ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, PublishMessage, PublishProperties, QoS};
+use mqtt_glide::{
+    BrokerUrl, ConnectAckReason, ConnectOptions, ConnectionOutcome, DEFAULT_MAX_PACKET_SIZE, InboundMessage,
+    MqttClient, NoopLifecycle, PublishMessage, PublishProperties, QoS, ReconnectPolicy, SessionParams, SessionPhase,
+    connect,
+};
 use testcontainers::ContainerAsync;
 use testcontainers::ContainerRequest;
 use testcontainers::GenericImage;
@@ -24,8 +28,83 @@ use testcontainers::core::{CmdWaitFor, ExecCommand, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
+
+/// A client whose driver runs and whose first CONNACK arrived (see [`connected`]).
+pub struct Client {
+    pub client: MqttClient,
+    /// Generation and session of the first `Connected` phase.
+    pub generation: u64,
+    pub session: SessionParams,
+    pub phase: watch::Receiver<SessionPhase>,
+    pub inbound: mpsc::Receiver<InboundMessage>,
+    pub run: JoinHandle<Result<(), ConnectionOutcome>>,
+}
+
+/// `mqtt://127.0.0.1:{port}`.
+pub fn tcp_url(port: u16) -> BrokerUrl {
+    BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url")
+}
+
+/// Connects with fixed credentials and `policy`, an inbound sink of `inbound_capacity`, spawns
+/// the driver and waits for the CONNACK.
+pub async fn connected(
+    options: ConnectOptions,
+    policy: impl ReconnectPolicy + 'static,
+    inbound_capacity: usize,
+) -> Client {
+    let (tx, inbound) = mpsc::channel::<InboundMessage>(inbound_capacity);
+    let (client, connection, mut phase) =
+        connect(options, crate::common::static_credentials(), policy, tx, NoopLifecycle).expect("connect wiring");
+    let run = tokio::spawn(connection.run());
+    let SessionPhase::Connected { generation, session } =
+        crate::common::wait_for_phase(&mut phase, Duration::from_secs(15), |p| {
+            matches!(
+                p,
+                SessionPhase::Connected {
+                    session: SessionParams { from_connack: true, .. },
+                    ..
+                }
+            )
+        })
+        .await
+    else {
+        unreachable!("waited for Connected");
+    };
+    Client {
+        client,
+        generation,
+        session,
+        phase,
+        inbound,
+        run,
+    }
+}
+
+impl Client {
+    /// Shuts down, checks the driver ends cleanly and hands back the inbound sink.
+    pub async fn stop(self) -> mpsc::Receiver<InboundMessage> {
+        self.client.shutdown().await.expect("shutdown");
+        join_run_after_shutdown(self.run).await;
+        self.inbound
+    }
+}
+
+/// Joins `Connection::run` after `shutdown()`: fails if the driver hangs or ends with anything
+/// but a shutdown outcome.
+pub async fn join_run_after_shutdown(run: JoinHandle<Result<(), ConnectionOutcome>>) {
+    let result = timeout(Duration::from_secs(10), run)
+        .await
+        .expect("timed out joining run after shutdown")
+        .expect("run task join");
+    assert!(
+        matches!(result, Err(ConnectionOutcome::Shutdown(_)) | Ok(())),
+        "expected shutdown outcome after disconnect, got {result:?}"
+    );
+}
 
 /// Mosquitto config used by most tests: anonymous access, no auth.
 const CONF_NO_AUTH: &str = "listener 1883\nallow_anonymous true\n";

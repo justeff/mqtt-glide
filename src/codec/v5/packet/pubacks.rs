@@ -425,31 +425,6 @@ mod tests {
         }
     }
 
-    fn round_trip_puback(ack: &PublishAck) {
-        let mut body = BytesMut::new();
-        let body_len = ack.encoded_body_len(u32::MAX).unwrap() as u32;
-        ack.encode_body(&mut body, body_len).unwrap();
-        let decoded = PublishAck::decode(&mut body.freeze()).unwrap();
-        assert_eq!(decoded, *ack);
-    }
-
-    #[test]
-    fn puback_encode_decode_round_trip() {
-        round_trip_puback(&PublishAck {
-            packet_id: NonZeroU16::new(42).unwrap(),
-            reason_code: PublishAckReason::Success,
-            properties: UserProperties::default(),
-            reason_string: None,
-        });
-
-        round_trip_puback(&PublishAck {
-            packet_id: NonZeroU16::new(7).unwrap(),
-            reason_code: PublishAckReason::NotAuthorized,
-            properties: vec![("k", "v").into()],
-            reason_string: Some(ByteString::from_static("denied")),
-        });
-    }
-
     /// [MQTT-3.4.2-2] Reason String is dropped rather than exceed the receiver's Maximum Packet Size.
     #[test]
     fn puback_encode_omits_reason_string_when_it_exceeds_max_packet_size() {

@@ -1063,6 +1063,9 @@ mod tests {
     };
     use crate::connection::{COMMAND_CHANNEL_CAPACITY, ControlMessage, Generation, NoopLifecycle};
     use crate::options::ConnectOptions;
+    use crate::test_util::{
+        options_for, puback, puback_with, qos_id_payload, recorded_at_least, spawn_puback_broker, start, start_with,
+    };
     use crate::util::BrokerUrl;
 
     /// A password keeps its bytes but never shows them, also not through the credentials holding it.
@@ -1160,7 +1163,13 @@ mod tests {
         Publish,
     }
 
-    /// Wires a client against `port` with `receive_maximum=8` and [`NoReconnect`] (single mock session).
+    /// Options against `port` with the client's Receive Maximum at 8.
+    fn client_options(port: u16) -> ConnectOptions {
+        options_for(port).receive_maximum(NonZeroU16::new(8).expect("nz"))
+    }
+
+    /// Wires a client against `port` with [`client_options`] and [`NoReconnect`] (single mock
+    /// session), without running its driver.
     async fn connect_test_client(
         port: u16,
     ) -> (
@@ -1168,8 +1177,7 @@ mod tests {
         Connection<flume::Sender<InboundMessage>>,
         watch::Receiver<SessionPhase>,
     ) {
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
+        let options = client_options(port);
         let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring")
     }
@@ -1272,48 +1280,6 @@ mod tests {
         .await
     }
 
-    /// CONNACK (with a caller-chosen `server_receive_maximum`), then record outbound PUBLISH
-    /// frames and echo PUBACK for QoS 1.
-    async fn spawn_mock_broker_record_publishes(
-        observed: Arc<tokio::sync::Mutex<Vec<(QoS, Option<NonZeroU16>, Bytes)>>>,
-        server_receive_maximum: NonZeroU16,
-    ) -> u16 {
-        spawn_broker_once(move |mut framed_read, mut framed_write| async move {
-            let mut ack = ConnectAck::default();
-            ack.receive_max = server_receive_maximum;
-            if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
-                return;
-            }
-            loop {
-                match framed_read.next().await {
-                    Some(Ok((DecodedFrame::Publish(packet), _))) => {
-                        let qos = packet.meta.qos;
-                        let packet_id = packet.meta.packet_id;
-                        let payload = packet.message.payload.clone();
-                        observed.lock().await.push((qos, packet_id, payload));
-                        if qos == QoS::AtLeastOnce {
-                            let Some(id) = packet_id else {
-                                continue;
-                            };
-                            let _ = framed_write
-                                .send(Packet::PublishAck(PublishAck {
-                                    packet_id: id,
-                                    reason_code: crate::codec::PublishAckReason::Success,
-                                    properties: Vec::new(),
-                                    reason_string: None,
-                                }))
-                                .await;
-                        }
-                    }
-                    Some(Ok((DecodedFrame::Control(Packet::Disconnect(_)), _))) | None => break,
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
-                }
-            }
-        })
-        .await
-    }
-
     /// CONNACK, then duplicate the SUBACK/UNSUBACK/PUBACK for whichever request arrives — used by
     /// [`duplicate_ack_after_completion_is_harmless`] across all three ack kinds.
     async fn spawn_duplicate_ack_broker() -> u16 {
@@ -1348,12 +1314,7 @@ mod tests {
                         let Some(id) = packet.meta.packet_id else {
                             continue;
                         };
-                        let ack = Packet::PublishAck(PublishAck {
-                            packet_id: id,
-                            reason_code: crate::codec::PublishAckReason::Success,
-                            properties: Vec::new(),
-                            reason_string: None,
-                        });
+                        let ack = puback(id);
                         let _ = framed_write.send(ack.clone()).await;
                         let _ = framed_write.send(ack).await;
                     }
@@ -1372,10 +1333,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_wins_when_command_channel_full() {
         let port = spawn_mock_broker().await;
-        let (client, connection, mut phase) = connect_test_client(port).await;
-
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         for _ in 0..COMMAND_CHANNEL_CAPACITY {
             client.try_send_noop().expect("channel has capacity");
@@ -1406,10 +1364,7 @@ mod tests {
     #[tokio::test]
     async fn subscribe_returns_per_filter_reason_codes() {
         let port = spawn_mock_broker_suback_mixed_reasons().await;
-        let (client, connection, mut phase) = connect_test_client(port).await;
-
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         let reasons = client
             .subscribe([("ok/topic", QoS::AtLeastOnce), ("denied/topic", QoS::AtLeastOnce)])
@@ -1430,16 +1385,10 @@ mod tests {
     #[tokio::test]
     async fn subscribe_times_out_without_suback() {
         let port = spawn_mock_broker().await;
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let options = ConnectOptions::new(url)
+        let options = options_for(port)
             .receive_maximum(NonZeroU16::new(8).expect("nz"))
             .ack_timeout(Duration::from_millis(50));
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) =
-            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
-
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start(options).await;
 
         let err = timeout(Duration::from_secs(2), client.subscribe([("t/1", QoS::AtMostOnce)]))
             .await
@@ -1459,10 +1408,7 @@ mod tests {
     #[tokio::test]
     async fn unsubscribe_returns_per_filter_reason_codes() {
         let port = spawn_mock_broker_suback_mixed_reasons().await;
-        let (client, connection, mut phase) = connect_test_client(port).await;
-
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         let reasons = client
             .unsubscribe(["a/b", "c/d"])
@@ -1487,12 +1433,8 @@ mod tests {
     /// without a Packet Identifier ([MQTT-2.2.1-2]).
     #[tokio::test]
     async fn qos0_publish_reaches_wire_without_packet_id() {
-        let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let port = spawn_mock_broker_record_publishes(Arc::clone(&observed), NonZeroU16::new(8).expect("nz")).await;
-        let (client, connection, mut phase) = connect_test_client(port).await;
-
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (port, observed) = spawn_puback_broker(NonZeroU16::new(8).expect("nz"), qos_id_payload).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         timeout(
             Duration::from_secs(2),
@@ -1502,18 +1444,7 @@ mod tests {
         .expect("QoS 0 publish must not hang waiting for PUBACK")
         .expect("QoS 0 publish must succeed");
 
-        let frames = timeout(Duration::from_secs(2), async {
-            loop {
-                let guard = observed.lock().await;
-                if !guard.is_empty() {
-                    return guard.clone();
-                }
-                drop(guard);
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("QoS 0 PUBLISH must appear on the wire");
+        let frames = recorded_at_least(&observed, 1).await;
 
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].0, QoS::AtMostOnce);
@@ -1529,12 +1460,8 @@ mod tests {
     /// [`qos1_publish_ignores_wrong_packet_id_puback_until_match`].
     #[tokio::test]
     async fn qos1_publish_carries_packet_id_and_completes_on_puback() {
-        let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let port = spawn_mock_broker_record_publishes(Arc::clone(&observed), NonZeroU16::new(8).expect("nz")).await;
-        let (client, connection, mut phase) = connect_test_client(port).await;
-
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (port, observed) = spawn_puback_broker(NonZeroU16::new(8).expect("nz"), qos_id_payload).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         client
             .send(Publish::from(sample_message("t/qos1", b"need-ack")).qos(QoS::AtLeastOnce))
@@ -1553,12 +1480,8 @@ mod tests {
     /// QoS 1: `try_start_publish` enqueues immediately and its completion resolves on PUBACK.
     #[tokio::test]
     async fn qos1_start_publish_completion_resolves_on_puback() {
-        let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let port = spawn_mock_broker_record_publishes(Arc::clone(&observed), NonZeroU16::new(8).expect("nz")).await;
-        let (client, connection, mut phase) = connect_test_client(port).await;
-
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (port, observed) = spawn_puback_broker(NonZeroU16::new(8).expect("nz"), qos_id_payload).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         client
             .try_start_publish(Publish::from(sample_message("t/qos1-start", b"need-ack")).qos(QoS::AtLeastOnce))
@@ -1606,11 +1529,8 @@ mod tests {
     /// wire: the next PUBLISH the broker sees is the QoS 0 one sent after it.
     #[tokio::test]
     async fn qos2_publish_never_reaches_the_wire() {
-        let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let port = spawn_mock_broker_record_publishes(Arc::clone(&observed), NonZeroU16::new(8).expect("nz")).await;
-        let (client, connection, mut phase) = connect_test_client(port).await;
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (port, observed) = spawn_puback_broker(NonZeroU16::new(8).expect("nz"), qos_id_payload).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         let result = timeout(
             Duration::from_secs(2),
@@ -1632,8 +1552,6 @@ mod tests {
     /// ([MQTT-2.2.1-3], [MQTT-4.3.2-1]).
     #[tokio::test]
     async fn in_flight_qos1_publishes_have_distinct_packet_ids_until_puback() {
-        use crate::codec::PublishAckReason;
-
         let (ids_tx, ids_rx) = oneshot::channel::<(Vec<NonZeroU16>, bool, Option<NonZeroU16>)>();
         let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
             let mut ack = ConnectAck::default();
@@ -1648,14 +1566,6 @@ mod tests {
                     }
                 }
             }
-            let puback = |packet_id| {
-                Packet::PublishAck(PublishAck {
-                    packet_id,
-                    reason_code: PublishAckReason::Success,
-                    properties: Vec::new(),
-                    reason_string: None,
-                })
-            };
             // The window of 4 fills; the fifth PUBLISH must wait for a PUBACK.
             let mut first_window = Vec::new();
             for _ in 0..4 {
@@ -1677,9 +1587,7 @@ mod tests {
             while framed_read.next().await.is_some() {}
         })
         .await;
-        let (client, connection, mut phase) = connect_test_client(port).await;
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         let completions: Vec<_> = (0..5u8)
             .map(|n| {
@@ -1712,109 +1620,6 @@ mod tests {
         let _ = run.await;
     }
 
-    /// Barrier: `publish().await` stays pending until the matching PUBACK is released; the
-    /// PUBLISH stays unacknowledged until then ([MQTT-4.3.2-3]).
-    #[tokio::test]
-    async fn qos1_publish_future_stays_pending_until_delayed_puback() {
-        let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let (release_tx, release_rx) = oneshot::channel::<()>();
-        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
-
-        let observed_broker = Arc::clone(&observed);
-        let release_slot = Arc::clone(&release_rx);
-        let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
-            if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
-                return;
-            }
-            loop {
-                match framed_read.next().await {
-                    Some(Ok((DecodedFrame::Publish(packet), _))) => {
-                        let packet_id = packet.meta.packet_id;
-                        observed_broker
-                            .lock()
-                            .await
-                            .push((packet.meta.qos, packet_id, packet.message.payload.clone()));
-                        if packet.meta.qos != QoS::AtLeastOnce {
-                            continue;
-                        }
-                        let Some(id) = packet_id else {
-                            continue;
-                        };
-                        // Hold PUBACK until the test releases the barrier.
-                        if let Some(rx) = release_slot.lock().await.take() {
-                            let _ = rx.await;
-                        }
-                        let _ = framed_write
-                            .send(Packet::PublishAck(PublishAck {
-                                packet_id: id,
-                                reason_code: crate::codec::PublishAckReason::Success,
-                                properties: Vec::new(),
-                                reason_string: None,
-                            }))
-                            .await;
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) | None => break,
-                }
-            }
-        })
-        .await;
-
-        let (client, connection, mut phase) = connect_test_client(port).await;
-
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
-
-        let client_shutdown = client.clone();
-        let publish_task = tokio::spawn(async move {
-            client
-                .send(Publish::from(sample_message("t/barrier", b"wait")).qos(QoS::AtLeastOnce))
-                .await
-        });
-
-        // Wait until the PUBLISH is on the wire (driver has sent it) while PUBACK is still held.
-        timeout(Duration::from_secs(2), async {
-            loop {
-                if !observed.lock().await.is_empty() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("QoS 1 PUBLISH must reach the wire before PUBACK");
-
-        // publish().await must stay pending until matching PUBACK, not merely after encode.
-        assert!(
-            !publish_task.is_finished(),
-            "publish().await must remain pending until the matching PUBACK is observed"
-        );
-
-        // Short timeout must elapse without completion while the barrier holds.
-        assert!(
-            timeout(Duration::from_millis(100), async {
-                while !publish_task.is_finished() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .is_err(),
-            "publish must not resolve while PUBACK is delayed"
-        );
-
-        release_tx.send(()).expect("release PUBACK barrier");
-
-        timeout(Duration::from_secs(2), async {
-            publish_task.await.expect("publish task join")
-        })
-        .await
-        .expect("publish must complete after delayed PUBACK")
-        .expect("QoS 1 publish after PUBACK");
-
-        client_shutdown.shutdown().await.expect("shutdown");
-        let _ = run.await;
-    }
-
     /// Wrong Packet Identifier PUBACK must not complete the publish; matching id does
     /// ([MQTT-4.3.2-3]).
     #[tokio::test]
@@ -1833,10 +1638,7 @@ mod tests {
                 match framed_read.next().await {
                     Some(Ok((DecodedFrame::Publish(packet), _))) => {
                         let packet_id = packet.meta.packet_id;
-                        observed_broker
-                            .lock()
-                            .await
-                            .push((packet.meta.qos, packet_id, packet.message.payload.clone()));
+                        observed_broker.lock().await.push(qos_id_payload(&packet));
                         if packet.meta.qos != QoS::AtLeastOnce {
                             continue;
                         }
@@ -1844,26 +1646,12 @@ mod tests {
                             continue;
                         };
                         let wrong_id = NonZeroU16::new(u16::from(id).wrapping_add(1).max(1)).expect("nz");
-                        let _ = framed_write
-                            .send(Packet::PublishAck(PublishAck {
-                                packet_id: wrong_id,
-                                reason_code: crate::codec::PublishAckReason::Success,
-                                properties: Vec::new(),
-                                reason_string: None,
-                            }))
-                            .await;
+                        let _ = framed_write.send(puback(wrong_id)).await;
                         // Hold matching PUBACK until the test asserts the future is still pending.
                         if let Some(rx) = release_slot.lock().await.take() {
                             let _ = rx.await;
                         }
-                        let _ = framed_write
-                            .send(Packet::PublishAck(PublishAck {
-                                packet_id: id,
-                                reason_code: crate::codec::PublishAckReason::Success,
-                                properties: Vec::new(),
-                                reason_string: None,
-                            }))
-                            .await;
+                        let _ = framed_write.send(puback(id)).await;
                     }
                     Some(Ok(_)) => {}
                     Some(Err(_)) | None => break,
@@ -1872,10 +1660,7 @@ mod tests {
         })
         .await;
 
-        let (client, connection, mut phase) = connect_test_client(port).await;
-
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         let client_shutdown = client.clone();
         let publish_task = tokio::spawn(async move {
@@ -1884,16 +1669,7 @@ mod tests {
                 .await
         });
 
-        timeout(Duration::from_secs(2), async {
-            loop {
-                if !observed.lock().await.is_empty() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("QoS 1 PUBLISH must reach the wire before PUBACK");
+        recorded_at_least(&observed, 1).await;
 
         // Wrong-id PUBACK must not complete the future.
         assert!(
@@ -1938,20 +1714,13 @@ mod tests {
             // Never PUBACK — keep the single QoS1 permit exhausted.
             while let Some(Ok(frame)) = framed_read.next().await {
                 if let (DecodedFrame::Publish(packet), _) = frame {
-                    observed_broker.lock().await.push((
-                        packet.meta.qos,
-                        packet.meta.packet_id,
-                        packet.message.payload.clone(),
-                    ));
+                    observed_broker.lock().await.push(qos_id_payload(&packet));
                 }
             }
         })
         .await;
 
-        let (client, connection, mut phase) = connect_test_client(port).await;
-
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         let client_qos0 = client.clone();
         let qos1 = tokio::spawn(async move {
@@ -2008,11 +1777,19 @@ mod tests {
         let _ = run.await;
     }
 
-    /// Full command queue → immediate `AppError::Backpressure` on `try_start_publish` (no unbounded growth).
+    /// Full command queue → immediate `AppError::Backpressure` on `try_start_publish` (no
+    /// unbounded growth), at the default capacity and at one set through the options.
+    #[rstest]
+    #[case::default_capacity(None)]
+    #[case::custom_capacity(Some(4))]
     #[tokio::test]
-    async fn publish_returns_backpressure_when_command_queue_full() {
+    async fn publish_returns_backpressure_when_command_queue_full(#[case] custom_capacity: Option<usize>) {
         let url = BrokerUrl::parse("mqtt://localhost").expect("valid url");
-        let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
+        let mut options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(8).expect("nz"));
+        if let Some(capacity) = custom_capacity {
+            options = options.command_channel_capacity(NonZeroUsize::new(capacity).expect("nz"));
+        }
+        let capacity = custom_capacity.unwrap_or(COMMAND_CHANNEL_CAPACITY);
         let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, _connection, _phase) = connect(
             options,
@@ -2023,7 +1800,7 @@ mod tests {
         )
         .expect("connect");
 
-        for _ in 0..COMMAND_CHANNEL_CAPACITY {
+        for _ in 0..capacity {
             client.try_send_noop().expect("channel has capacity");
         }
 
@@ -2036,103 +1813,9 @@ mod tests {
         );
     }
 
-    /// Builder override of command channel capacity applies to backpressure boundary.
-    #[tokio::test]
-    async fn publish_returns_backpressure_at_custom_command_queue_capacity() {
-        const CUSTOM_CAPACITY: usize = 4;
-        let url = BrokerUrl::parse("mqtt://localhost").expect("valid url");
-        let options = ConnectOptions::new(url)
-            .receive_maximum(NonZeroU16::new(8).expect("nz"))
-            .command_channel_capacity(NonZeroUsize::new(CUSTOM_CAPACITY).expect("nz"));
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, _connection, _phase) = connect(
-            options,
-            static_test_credentials(),
-            ImmediateReconnect,
-            tx,
-            NoopLifecycle,
-        )
-        .expect("connect");
-
-        for _ in 0..CUSTOM_CAPACITY {
-            client.try_send_noop().expect("channel has capacity");
-        }
-
-        let err = client
-            .try_start_publish(Publish::from(sample_message("t/bp-custom", b"x")))
-            .expect_err("full custom command channel must backpressure publish");
-        assert!(
-            matches!(err, AppError::Backpressure(_)),
-            "expected Backpressure, got {err:?}"
-        );
-    }
-
-    /// CONNACK `server_receive_maximum` caps outbound QoS 1 inflight (not only ConnectOptions).
-    /// With Receive Maximum 1 exactly one PUBLISH goes out: the initial send quota is non-zero
-    /// and no larger than Receive Maximum ([MQTT-4.9.0-1]), and the client never has more
-    /// unacknowledged QoS 1 PUBLISHes than that ([MQTT-3.3.4-7], [MQTT-4.9.0-2]).
-    #[tokio::test]
-    async fn outbound_qos1_inflight_capped_by_connack_server_receive_maximum() {
-        let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        // Broker advertises Receive Maximum = 1 and withholds PUBACK so the window stays full.
-        let observed_broker = Arc::clone(&observed);
-        let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
-            let mut ack = ConnectAck::default();
-            ack.receive_max = NonZeroU16::new(1).expect("nz");
-            if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
-                return;
-            }
-            // Intentionally no PUBACK — keep the server Receive Maximum window full.
-            while let Some(Ok(frame)) = framed_read.next().await {
-                if let (DecodedFrame::Publish(packet), _) = frame {
-                    observed_broker.lock().await.push((
-                        packet.meta.qos,
-                        packet.meta.packet_id,
-                        packet.message.payload.clone(),
-                    ));
-                }
-            }
-        })
-        .await;
-
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        // Client CONNECT Receive Maximum is large; CONNACK server window must win for outbound.
-        let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(64).expect("nz"));
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) =
-            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
-
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
-
-        let client_shutdown = client.clone();
-        let client2 = client.clone();
-        let first = tokio::spawn(async move {
-            client
-                .send(Publish::from(sample_message("t/a", b"1")).qos(QoS::AtLeastOnce))
-                .await
-        });
-        tokio::task::yield_now().await;
-        let second = tokio::spawn(async move {
-            client2
-                .send(Publish::from(sample_message("t/b", b"2")).qos(QoS::AtLeastOnce))
-                .await
-        });
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let on_wire = observed.lock().await.len();
-        assert_eq!(
-            on_wire, 1,
-            "with CONNACK server_receive_maximum=1 and withheld PUBACK, exactly one QoS1 PUBLISH may be on the wire; saw {on_wire}"
-        );
-
-        first.abort();
-        second.abort();
-        client_shutdown.shutdown().await.expect("shutdown");
-        let _ = run.await;
-    }
-
-    /// CONNACK `server_receive_maximum=1` with withheld PUBACK: a second QoS1 `publish` waits
+    /// CONNACK `server_receive_maximum=1` with withheld PUBACK, while the client's own Receive
+    /// Maximum is 64: exactly one QoS 1 PUBLISH goes out, so the initial send quota is non-zero and
+    /// no larger than the broker's Receive Maximum ([MQTT-4.9.0-1]). A second QoS1 `publish` waits
     /// for a window slot ([MQTT-4.9.0-2], [MQTT-3.3.4-7]) instead of failing, and stays off the wire.
     #[tokio::test]
     async fn qos1_publish_waits_for_window_when_inflight_exhausted() {
@@ -2158,14 +1841,8 @@ mod tests {
         })
         .await;
 
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let options = ConnectOptions::new(url).receive_maximum(NonZeroU16::new(64).expect("nz"));
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) =
-            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
-
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let options = options_for(port).receive_maximum(NonZeroU16::new(64).expect("nz"));
+        let (client, _rx, run) = start(options).await;
 
         let first = tokio::spawn({
             let client = client.clone();
@@ -2241,16 +1918,10 @@ mod tests {
         })
         .await;
 
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let options = ConnectOptions::new(url)
+        let options = options_for(port)
             .receive_maximum(NonZeroU16::new(64).expect("nz"))
             .ack_timeout(Duration::from_secs(2));
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) =
-            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
-
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start(options).await;
 
         let publish_task = tokio::spawn({
             let client = client.clone();
@@ -2315,10 +1986,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_ack_after_completion_is_harmless(#[case] kind: AckKind) {
         let port = spawn_duplicate_ack_broker().await;
-        let (client, connection, mut phase) = connect_test_client(port).await;
-
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         match kind {
             AckKind::Subscribe => {
@@ -2375,20 +2043,13 @@ mod tests {
     #[case::publish(AckKind::Publish)]
     #[tokio::test]
     async fn stale_generation_ack_does_not_complete_live_waiter(#[case] kind: AckKind) {
-        let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let port = spawn_mock_broker_record_publishes(Arc::clone(&observed), NonZeroU16::new(8).expect("nz")).await;
+        let (port, observed) = spawn_puback_broker(NonZeroU16::new(8).expect("nz"), qos_id_payload).await;
         let (client, run, control, live_generation) = connect_with_live_generation(port).await;
         // Commands are handled in order: once a QoS 0 PUBLISH queued after the insert is on the
         // wire, the waiter is registered, so the stale ack below meets a live waiter.
         let waiter_registered = || async {
             client.publish("t/sync", "after-insert").await.expect("QoS 0 marker");
-            timeout(Duration::from_secs(2), async {
-                while observed.lock().await.is_empty() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("marker PUBLISH reaches the wire");
+            recorded_at_least(&observed, 1).await;
         };
 
         let packet_id = NonZeroU16::new(42).expect("nz");
@@ -2499,10 +2160,7 @@ mod tests {
         })
         .await;
 
-        let (client, connection, mut phase) = connect_test_client(port).await;
-
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         let err = timeout(
             Duration::from_secs(3),
@@ -2515,64 +2173,6 @@ mod tests {
         assert!(
             matches!(err, AppError::ConnectionLost),
             "expected AppError::ConnectionLost after peer drop, got {err:?}"
-        );
-
-        let _ = run.await;
-    }
-
-    /// Graceful `shutdown` with a QoS1 waiter the broker never acknowledges → `ConnectionLost`
-    /// once the graceful budget runs out (live `graceful_disconnect`).
-    #[tokio::test]
-    async fn qos1_publish_waiter_gets_connection_lost_on_graceful_shutdown() {
-        use tokio::sync::Notify;
-
-        let first_publish = Arc::new(Notify::new());
-        let first_publish_broker = Arc::clone(&first_publish);
-        let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
-            if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
-                return;
-            }
-            // Withhold PUBACK so the QoS1 waiter stays open until graceful_disconnect.
-            while let Some(Ok(frame)) = framed_read.next().await {
-                if matches!(frame, (DecodedFrame::Publish(_), _)) {
-                    first_publish_broker.notify_one();
-                }
-            }
-        })
-        .await;
-
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let options = ConnectOptions::new(url).graceful_disconnect_timeout(Duration::from_millis(100));
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) =
-            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
-
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
-
-        let publish = tokio::spawn({
-            let client = client.clone();
-            async move {
-                client
-                    .send(Publish::from(sample_message("t/shutdown", b"x")).qos(QoS::AtLeastOnce))
-                    .await
-            }
-        });
-        timeout(Duration::from_secs(2), first_publish.notified())
-            .await
-            .expect("broker must observe first QoS1 PUBLISH before shutdown");
-
-        client.shutdown().await.expect("shutdown");
-        let err = timeout(Duration::from_secs(3), publish)
-            .await
-            .expect("QoS1 waiter must complete on graceful shutdown")
-            .expect("publish task join")
-            .expect_err("open QoS1 publish must fail when shutdown drains waiters");
-
-        assert_eq!(
-            err,
-            AppError::ConnectionLost,
-            "graceful_disconnect must fail waiters as ConnectionLost, got {err:?}"
         );
 
         let _ = run.await;
@@ -2613,14 +2213,7 @@ mod tests {
                         }
                         continue;
                     }
-                    let _ = framed_write
-                        .send(Packet::PublishAck(PublishAck {
-                            packet_id: id,
-                            reason_code: crate::codec::PublishAckReason::Success,
-                            properties: Vec::new(),
-                            reason_string: None,
-                        }))
-                        .await;
+                    let _ = framed_write.send(puback(id)).await;
                 }
             }
         })
@@ -2628,8 +2221,7 @@ mod tests {
     }
 
     fn resumable_options(port: u16) -> ConnectOptions {
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        ConnectOptions::new(url)
+        options_for(port)
             .client_id(crate::ClientId::try_new("resume-test").expect("client id"))
             .clean_start(false)
             .session_expiry(Some(Duration::from_secs(60)))
@@ -2644,17 +2236,7 @@ mod tests {
     async fn unacked_qos1_is_resent_with_dup_on_session_resume() {
         let seen: SeenPublishes = Arc::default();
         let port = spawn_resume_broker(Arc::clone(&seen), true).await;
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) = connect(
-            resumable_options(port),
-            static_test_credentials(),
-            ImmediateReconnect,
-            tx,
-            NoopLifecycle,
-        )
-        .expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start_with(resumable_options(port), ImmediateReconnect).await;
 
         let first = client
             .try_start_publish(Publish::new("t/resume", "a").qos(QoS::AtLeastOnce))
@@ -2731,17 +2313,7 @@ mod tests {
             }
         })
         .await;
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) = connect(
-            resumable_options(port),
-            static_test_credentials(),
-            ImmediateReconnect,
-            tx,
-            NoopLifecycle,
-        )
-        .expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start_with(resumable_options(port), ImmediateReconnect).await;
 
         let error = timeout(
             Duration::from_secs(3),
@@ -2809,30 +2381,13 @@ mod tests {
                         // Hold the PUBACK: nothing else may arrive meanwhile.
                         let early = timeout(Duration::from_millis(100), framed_read.next()).await;
                         assert!(early.is_err(), "PUBLISH beyond Receive Maximum 1: {early:?}");
-                        let _ = framed_write
-                            .send(Packet::PublishAck(PublishAck {
-                                packet_id: id,
-                                reason_code: crate::codec::PublishAckReason::Success,
-                                properties: Vec::new(),
-                                reason_string: None,
-                            }))
-                            .await;
+                        let _ = framed_write.send(puback(id)).await;
                     }
                 }
             }
         })
         .await;
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) = connect(
-            resumable_options(port),
-            static_test_credentials(),
-            ImmediateReconnect,
-            tx,
-            NoopLifecycle,
-        )
-        .expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start_with(resumable_options(port), ImmediateReconnect).await;
 
         let completions: Vec<_> = ["a", "b", "c"]
             .into_iter()
@@ -2869,17 +2424,7 @@ mod tests {
     async fn unacked_qos1_fails_when_broker_lost_the_session() {
         let seen: SeenPublishes = Arc::default();
         let port = spawn_resume_broker(Arc::clone(&seen), false).await;
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) = connect(
-            resumable_options(port),
-            static_test_credentials(),
-            ImmediateReconnect,
-            tx,
-            NoopLifecycle,
-        )
-        .expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start_with(resumable_options(port), ImmediateReconnect).await;
 
         let first = client
             .try_start_publish(Publish::new("t/resume", "a").qos(QoS::AtLeastOnce))
@@ -2910,18 +2455,7 @@ mod tests {
     async fn unacked_qos1_fails_on_connection_loss_with_clean_start() {
         let seen: SeenPublishes = Arc::default();
         let port = spawn_resume_broker(Arc::clone(&seen), false).await;
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) = connect(
-            ConnectOptions::new(url),
-            static_test_credentials(),
-            ImmediateReconnect,
-            tx,
-            NoopLifecycle,
-        )
-        .expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start_with(options_for(port), ImmediateReconnect).await;
 
         let first = client
             .try_start_publish(Publish::new("t/clean", "a").qos(QoS::AtLeastOnce))
@@ -2976,14 +2510,7 @@ mod tests {
                     } else {
                         crate::codec::PublishAckReason::Success
                     };
-                    let _ = framed_write
-                        .send(Packet::PublishAck(PublishAck {
-                            packet_id: id,
-                            reason_code,
-                            properties: Vec::new(),
-                            reason_string: None,
-                        }))
-                        .await;
+                    let _ = framed_write.send(puback_with(id, reason_code)).await;
                     if index == 0 {
                         return; // drop the connection right after the rejection
                     }
@@ -2991,17 +2518,7 @@ mod tests {
             }
         })
         .await;
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) = connect(
-            resumable_options(port),
-            static_test_credentials(),
-            ImmediateReconnect,
-            tx,
-            NoopLifecycle,
-        )
-        .expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start_with(resumable_options(port), ImmediateReconnect).await;
 
         let err = timeout(
             Duration::from_secs(3),
@@ -3091,14 +2608,7 @@ mod tests {
                             continue;
                         }
                         tokio::time::sleep(ack_delay).await;
-                        let _ = framed_write
-                            .send(Packet::PublishAck(PublishAck {
-                                packet_id: id,
-                                reason_code: crate::codec::PublishAckReason::Success,
-                                properties: Vec::new(),
-                                reason_string: None,
-                            }))
-                            .await;
+                        let _ = framed_write.send(puback(id)).await;
                         events.lock().await.push("puback");
                     }
                     (DecodedFrame::Control(Packet::Disconnect(_)), _) => {
@@ -3112,30 +2622,13 @@ mod tests {
         .await
     }
 
-    /// Waits until the drain broker has recorded `n` events (it runs on its own task).
-    async fn drain_events(events: &tokio::sync::Mutex<Vec<&'static str>>, n: usize) -> Vec<&'static str> {
-        timeout(Duration::from_secs(2), async {
-            loop {
-                let seen = events.lock().await.clone();
-                if seen.len() >= n {
-                    return seen;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("broker did not record {n} events"))
-    }
-
     /// Shutdown right after a QoS 1 publish waits for its delayed PUBACK instead of failing it,
     /// and DISCONNECT goes out only after that.
     #[tokio::test]
     async fn shutdown_waits_for_outbound_puback() {
         let events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let port = spawn_drain_broker(0, Duration::from_millis(100), false, Arc::clone(&events)).await;
-        let (client, connection, mut phase) = connect_test_client(port).await;
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         let completion = client
             .try_start_publish(Publish::new("t/drain", "x").qos(QoS::AtLeastOnce))
@@ -3146,7 +2639,7 @@ mod tests {
             .await
             .expect("publish enqueued before shutdown must complete on its PUBACK");
         let _ = timeout(Duration::from_secs(3), run).await.expect("driver stops");
-        assert_eq!(drain_events(&events, 3).await, ["publish", "puback", "disconnect"]);
+        assert_eq!(recorded_at_least(&events, 3).await, ["publish", "puback", "disconnect"]);
     }
 
     /// Inbound messages the broker sends while the client drains reach the app instead of
@@ -3155,18 +2648,7 @@ mod tests {
     async fn shutdown_delivers_inbound_received_during_drain() {
         let events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let port = spawn_drain_broker(100, Duration::from_millis(20), false, Arc::clone(&events)).await;
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let (tx, rx) = flume::bounded::<InboundMessage>(256);
-        let (client, connection, mut phase) = connect(
-            ConnectOptions::new(url),
-            static_test_credentials(),
-            NoReconnect,
-            tx,
-            NoopLifecycle,
-        )
-        .expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, rx, run) = start(options_for(port)).await;
 
         let completion = client
             .try_start_publish(Publish::new("t/drain", "x").qos(QoS::AtLeastOnce))
@@ -3184,11 +2666,8 @@ mod tests {
     /// Commands still queued when shutdown is requested are sent, and new ones are refused.
     #[tokio::test]
     async fn shutdown_sends_queued_publishes_and_refuses_new_ones() {
-        let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let port = spawn_mock_broker_record_publishes(Arc::clone(&observed), NonZeroU16::new(8).expect("nz")).await;
-        let (client, connection, mut phase) = connect_test_client(port).await;
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (port, observed) = spawn_puback_broker(NonZeroU16::new(8).expect("nz"), qos_id_payload).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         // Queue without yielding, so the write task has not seen them before shutdown.
         let completions: Vec<_> = (0..5u8)
@@ -3212,22 +2691,24 @@ mod tests {
     }
 
     /// A broker that never acknowledges cannot hold shutdown past the graceful budget; the
-    /// publish fails with `ConnectionLost` and DISCONNECT is still attempted.
+    /// publish fails with `ConnectionLost` and DISCONNECT is still attempted. The publish is
+    /// either still queued when shutdown starts, or already on the wire.
+    #[rstest]
+    #[case::queued_at_shutdown(false)]
+    #[case::on_the_wire_at_shutdown(true)]
     #[tokio::test]
-    async fn shutdown_drain_is_bounded_by_graceful_budget() {
+    async fn shutdown_drain_is_bounded_by_graceful_budget(#[case] on_the_wire: bool) {
         let events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let port = spawn_drain_broker(0, Duration::ZERO, true, Arc::clone(&events)).await;
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let options = ConnectOptions::new(url).graceful_disconnect_timeout(Duration::from_millis(200));
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) =
-            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let options = options_for(port).graceful_disconnect_timeout(Duration::from_millis(200));
+        let (client, _rx, run) = start(options).await;
 
         let completion = client
             .try_start_publish(Publish::new("t/drain", "x").qos(QoS::AtLeastOnce))
             .expect("enqueue");
+        if on_the_wire {
+            assert_eq!(recorded_at_least(&events, 1).await, ["publish"]);
+        }
         let started = std::time::Instant::now();
         client.shutdown().await.expect("shutdown");
         let err = completion.wait().await.expect_err("never-acked publish must fail");
@@ -3237,7 +2718,7 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "drain must respect the budget"
         );
-        assert_eq!(drain_events(&events, 2).await, ["publish", "disconnect"]);
+        assert_eq!(recorded_at_least(&events, 2).await, ["publish", "disconnect"]);
     }
 
     /// Publishes that never reached the wire (parked behind a full Receive Maximum window, or
@@ -3271,32 +2752,14 @@ mod tests {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         return;
                     }
-                    let _ = framed_write
-                        .send(Packet::PublishAck(PublishAck {
-                            packet_id: id,
-                            reason_code: crate::codec::PublishAckReason::Success,
-                            properties: Vec::new(),
-                            reason_string: None,
-                        }))
-                        .await;
+                    let _ = framed_write.send(puback(id)).await;
                 }
             }
         })
         .await;
 
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let options = ConnectOptions::new(url).command_channel_capacity(NonZeroUsize::new(64).expect("nz"));
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) = connect(
-            options,
-            static_test_credentials(),
-            ImmediateReconnect,
-            tx,
-            NoopLifecycle,
-        )
-        .expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let options = options_for(port).command_channel_capacity(NonZeroUsize::new(64).expect("nz"));
+        let (client, _rx, run) = start_with(options, ImmediateReconnect).await;
 
         let completions: Vec<_> = (0..40u8)
             .map(|i| {
@@ -3354,18 +2817,7 @@ mod tests {
         })
         .await;
 
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) = connect(
-            ConnectOptions::new(url),
-            static_test_credentials(),
-            NoReconnect,
-            tx,
-            NoopLifecycle,
-        )
-        .expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start(options_for(port)).await;
 
         let completions: Vec<_> = (0..3u8)
             .map(|i| {
@@ -3414,8 +2866,7 @@ mod tests {
             }
         }
 
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let options = ConnectOptions::new(url).fail_fast_when_disconnected(true);
+        let options = options_for(port).fail_fast_when_disconnected(true);
         let (tx, _rx) = flume::bounded::<InboundMessage>(4);
         let (client, connection, mut phase) =
             connect(options, static_test_credentials(), SlowReconnect, tx, NoopLifecycle).expect("connect wiring");
@@ -3477,8 +2928,7 @@ mod tests {
             let _held = listener.accept().await;
             std::future::pending::<()>().await;
         });
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let options = ConnectOptions::new(url)
+        let options = options_for(port)
             .command_channel_capacity(NonZeroUsize::new(1).expect("nz"))
             .ack_timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(10));
@@ -3537,18 +2987,7 @@ mod tests {
         })
         .await;
 
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let (tx, rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) = connect(
-            ConnectOptions::new(url),
-            static_test_credentials(),
-            NoReconnect,
-            tx,
-            NoopLifecycle,
-        )
-        .expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, rx, run) = start(options_for(port)).await;
 
         let first = timeout(Duration::from_secs(2), rx.recv_async())
             .await
@@ -3595,28 +3034,13 @@ mod tests {
             }
         })
         .await;
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let options = ConnectOptions::new(url).outbound_topic_aliases(8);
-        let (client, connection, mut phase) =
-            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let options = options_for(port).outbound_topic_aliases(8);
+        let (client, _rx, run) = start(options).await;
 
         for topic in ["dev/a", "dev/a", "dev/b", "dev/a", "dev/c", "dev/c"] {
             client.publish(topic, "x").await.expect("publish");
         }
-        let frames = timeout(Duration::from_secs(2), async {
-            loop {
-                let frames = seen.lock().await.clone();
-                if frames.len() == 6 {
-                    return frames;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("all frames");
+        let frames = recorded_at_least(&seen, 6).await;
         let expected = [
             ("dev/a", Some(1)), // bind a→1
             ("", Some(1)),      // reuse
@@ -3652,28 +3076,13 @@ mod tests {
             }
         })
         .await;
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let options = ConnectOptions::new(url).outbound_topic_aliases(8);
-        let (client, connection, mut phase) =
-            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let options = options_for(port).outbound_topic_aliases(8);
+        let (client, _rx, run) = start(options).await;
 
         for _ in 0..2 {
             client.publish("dev/a", "x").await.expect("publish");
         }
-        let frames = timeout(Duration::from_secs(2), async {
-            loop {
-                let frames = seen.lock().await.clone();
-                if frames.len() == 2 {
-                    return frames;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("both frames");
+        let frames = recorded_at_least(&seen, 2).await;
         assert_eq!(frames, [("dev/a".to_owned(), None), ("dev/a".to_owned(), None)]);
 
         client.shutdown().await.expect("shutdown");
@@ -3685,18 +3094,7 @@ mod tests {
     #[tokio::test]
     async fn publish_refuses_a_topic_longer_than_65535_bytes() {
         let port = spawn_mock_broker().await;
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) = connect(
-            ConnectOptions::new(url),
-            static_test_credentials(),
-            NoReconnect,
-            tx,
-            NoopLifecycle,
-        )
-        .expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start(options_for(port)).await;
 
         let error = client
             .publish("t".repeat(65_536), "x")
@@ -3748,22 +3146,6 @@ mod tests {
         .await
     }
 
-    async fn start_against(port: u16) -> (MqttClient, tokio::task::JoinHandle<Result<(), ConnectionOutcome>>) {
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) = connect(
-            ConnectOptions::new(url),
-            static_test_credentials(),
-            NoReconnect,
-            tx,
-            NoopLifecycle,
-        )
-        .expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
-        (client, run)
-    }
-
     /// [MQTT-3.2.2-15]: a SUBSCRIBE or UNSUBSCRIBE over the broker's Maximum Packet Size, or
     /// with a topic filter over 65535 bytes, is refused like such a publish; the session stays.
     #[tokio::test]
@@ -3772,7 +3154,7 @@ mod tests {
         ack.max_packet_size = Some(64);
         let (disconnect_tx, _disconnect_rx) = oneshot::channel();
         let port = spawn_reason_count_broker(ack, 0, disconnect_tx).await;
-        let (client, run) = start_against(port).await;
+        let (client, _rx, run) = start(options_for(port)).await;
 
         for filter in ["t".repeat(100), "t".repeat(65_536)] {
             let error = client
@@ -3810,7 +3192,7 @@ mod tests {
     ) {
         let (disconnect_tx, disconnect_rx) = oneshot::channel();
         let port = spawn_reason_count_broker(ConnectAck::default(), extra, disconnect_tx).await;
-        let (client, run) = start_against(port).await;
+        let (client, _rx, run) = start(options_for(port)).await;
 
         let filters = [("a", QoS::AtLeastOnce), ("b", QoS::AtLeastOnce)];
         let result = match kind {
@@ -3860,13 +3242,8 @@ mod tests {
             while framed_read.next().await.is_some() {}
         })
         .await;
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let (tx, rx) = flume::bounded::<InboundMessage>(4);
-        let options = ConnectOptions::new(url).topic_alias_maximum(4);
-        let (client, connection, mut phase) =
-            connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let options = options_for(port).topic_alias_maximum(4);
+        let (client, rx, run) = start(options).await;
 
         for payload in ["first", "second"] {
             let message = timeout(Duration::from_secs(2), rx.recv_async())
@@ -3924,9 +3301,7 @@ mod tests {
             }
         })
         .await;
-        let (client, connection, mut phase) = connect_test_client(port).await;
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         let err = client
             .publish("t/limited", "x")
@@ -4003,18 +3378,7 @@ mod tests {
             }
         })
         .await;
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let (tx, rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) = connect(
-            ConnectOptions::new(url),
-            static_test_credentials(),
-            NoReconnect,
-            tx,
-            NoopLifecycle,
-        )
-        .expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, rx, run) = start(options_for(port)).await;
 
         client
             .subscribe_with_id(7, [("plant/+/alarm", QoS::AtMostOnce)])
@@ -4068,9 +3432,7 @@ mod tests {
             }
         })
         .await;
-        let (client, connection, mut phase) = connect_test_client(port).await;
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         let err = client
             .subscribe_with_id(3, [("a/#", QoS::AtMostOnce)])
@@ -4122,18 +3484,7 @@ mod tests {
             }
         })
         .await;
-        let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-        let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-        let (client, connection, mut phase) = connect(
-            ConnectOptions::new(url),
-            static_test_credentials(),
-            ImmediateReconnect,
-            tx,
-            NoopLifecycle,
-        )
-        .expect("connect wiring");
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start_with(options_for(port), ImmediateReconnect).await;
 
         client
             .subscribe_with_id(1, [("a/#", QoS::AtMostOnce)])
@@ -4254,17 +3605,7 @@ mod tests {
             }
             while let Some(Ok((frame, _))) = framed_read.next().await {
                 let (kind, reply) = match &frame {
-                    DecodedFrame::Publish(packet) => (
-                        PUBLISH_TYPE,
-                        packet.meta.packet_id.map(|packet_id| {
-                            Packet::PublishAck(PublishAck {
-                                packet_id,
-                                reason_code: crate::codec::PublishAckReason::Success,
-                                properties: Vec::new(),
-                                reason_string: None,
-                            })
-                        }),
-                    ),
+                    DecodedFrame::Publish(packet) => (PUBLISH_TYPE, packet.meta.packet_id.map(puback)),
                     DecodedFrame::Control(Packet::Subscribe(sub)) => (
                         Packet::Subscribe(sub.clone()).packet_type() >> 4,
                         Some(Packet::SubscribeAck(SubscribeAck {
@@ -4296,9 +3637,7 @@ mod tests {
         })
         .await;
 
-        let (client, connection, mut phase) = connect_test_client(port).await;
-        let run = tokio::spawn(connection.run());
-        await_connected(&mut phase).await;
+        let (client, _rx, run) = start(client_options(port)).await;
 
         client
             .subscribe([("t/auth", QoS::AtLeastOnce)])
@@ -4458,26 +3797,6 @@ mod tests {
             .unwrap_or_else(|_| panic!("stats did not settle: {:?}", client.stats()))
         }
 
-        /// Wires a client with a roomy inbound sink and spawns its driver.
-        async fn start(
-            options: ConnectOptions,
-        ) -> (
-            MqttClient,
-            flume::Receiver<InboundMessage>,
-            tokio::task::JoinHandle<Result<(), ConnectionOutcome>>,
-        ) {
-            let (tx, rx) = flume::bounded::<InboundMessage>(8);
-            let (client, connection, mut phase) =
-                connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
-            let run = tokio::spawn(connection.run());
-            await_connected(&mut phase).await;
-            (client, rx, run)
-        }
-
-        fn options_for(port: u16) -> ConnectOptions {
-            ConnectOptions::new(BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url"))
-        }
-
         /// Only PUBLISHes carrying the DUP flag are duplicates; the others are not.
         #[tokio::test]
         async fn inbound_duplicates_counts_only_publishes_with_dup_set() {
@@ -4520,17 +3839,7 @@ mod tests {
         async fn resumed_session_counts_every_resent_publish() {
             let seen: SeenPublishes = Arc::default();
             let port = spawn_resume_broker(Arc::clone(&seen), true).await;
-            let (tx, _rx) = flume::bounded::<InboundMessage>(4);
-            let (client, connection, mut phase) = connect(
-                resumable_options(port),
-                static_test_credentials(),
-                ImmediateReconnect,
-                tx,
-                NoopLifecycle,
-            )
-            .expect("connect wiring");
-            let run = tokio::spawn(connection.run());
-            await_connected(&mut phase).await;
+            let (client, _rx, run) = start_with(resumable_options(port), ImmediateReconnect).await;
 
             let completions: Vec<_> = ["a", "b"]
                 .into_iter()
@@ -4578,13 +3887,9 @@ mod tests {
                     return;
                 };
                 let _ = ack_rx.await;
-                let puback = Packet::PublishAck(PublishAck {
-                    packet_id: first.meta.packet_id.expect("QoS 1 packet id"),
-                    reason_code: PublishAckReason::Success,
-                    properties: Vec::new(),
-                    reason_string: None,
-                });
-                let _ = framed_write.send(puback).await;
+                let _ = framed_write
+                    .send(puback(first.meta.packet_id.expect("QoS 1 packet id")))
+                    .await;
                 while framed_read.next().await.is_some() {}
             })
             .await;
@@ -4649,13 +3954,9 @@ mod tests {
                 let mut reasons = reasons.into_iter();
                 while let Some(Ok(frame)) = framed_read.next().await {
                     if let (DecodedFrame::Publish(packet), _) = frame {
-                        let puback = Packet::PublishAck(PublishAck {
-                            packet_id: packet.meta.packet_id.expect("QoS 1 packet id"),
-                            reason_code: reasons.next().expect("three publishes"),
-                            properties: Vec::new(),
-                            reason_string: None,
-                        });
-                        if framed_write.send(puback).await.is_err() {
+                        let packet_id = packet.meta.packet_id.expect("QoS 1 packet id");
+                        let reason = reasons.next().expect("three publishes");
+                        if framed_write.send(puback_with(packet_id, reason)).await.is_err() {
                             return;
                         }
                     }
@@ -4734,12 +4035,7 @@ mod tests {
                     };
                     count(&read_by_broker, wire_len(len));
                     let _ = publish_len_tx.send(wire_len(len));
-                    let puback = encoded(Packet::PublishAck(PublishAck {
-                        packet_id: publish.meta.packet_id.expect("QoS 1 packet id"),
-                        reason_code: PublishAckReason::Success,
-                        properties: Vec::new(),
-                        reason_string: None,
-                    }));
+                    let puback = encoded(puback(publish.meta.packet_id.expect("QoS 1 packet id")));
                     count(&written_by_broker, puback.len() as u64);
 
                     let mut inbound = bytes::BytesMut::new();

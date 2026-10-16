@@ -609,22 +609,6 @@ mod tests {
     use crate::codec::QoS;
 
     #[test]
-    fn registry_upsert_remove_and_snapshot() {
-        let mut registry = SubscriptionRegistry::default();
-        let opts = SubscriptionOptions {
-            qos: QoS::AtLeastOnce,
-            ..SubscriptionOptions::default()
-        };
-        registry.upsert([(ByteString::from_static("a/b"), opts)]);
-        let snap = registry.snapshot();
-        assert_eq!(snap.len(), 1);
-        assert_eq!(&*snap[0].0, "a/b");
-
-        registry.remove([ByteString::from_static("a/b")]);
-        assert!(registry.snapshot().is_empty());
-    }
-
-    #[test]
     fn subscribe_ack_registry_only_records_granted_filters() {
         let mut registry = SubscriptionRegistry::default();
         let opts = SubscriptionOptions::default();

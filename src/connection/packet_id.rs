@@ -305,6 +305,7 @@ mod tests {
         let mut pots = InflightPots::new(nonzero!(2u16));
         let publish_a = pots.alloc_publish().expect("publish a");
         let publish_b = pots.alloc_publish().expect("publish b");
+        assert!(matches!(pots.alloc_publish(), Err(AppError::Backpressure(_))));
         let subscribe = pots.alloc_subscribe().expect("subscribe must still allocate");
 
         assert_ne!(subscribe, publish_a);
@@ -357,17 +358,6 @@ mod tests {
         let subscribe = pots.alloc_subscribe().expect("subscribe");
         pots.release_publish(publish);
         assert!(!pots.publish_contains(publish));
-        assert!(pots.subscribe_contains(subscribe));
-    }
-
-    #[test]
-    fn publish_capacity_does_not_block_subscribe_allocation() {
-        let mut pots = InflightPots::new(nonzero!(1u16));
-        let _publish = pots.alloc_publish().expect("publish");
-        assert!(matches!(pots.alloc_publish(), Err(AppError::Backpressure(_))));
-        let subscribe = pots
-            .alloc_subscribe()
-            .expect("subscribe independent of publish capacity");
         assert!(pots.subscribe_contains(subscribe));
     }
 

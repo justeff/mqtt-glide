@@ -173,7 +173,6 @@ mod tests {
     use crate::codec::v5::{DisconnectReasonCode, ToReasonCode};
     use bytes::{BufMut, BytesMut};
 
-    use crate::codec::error::EncodeError;
     use crate::codec::publish::{PublishDelivery, PublishMessage, PublishProperties};
     use crate::codec::utils::Encode;
     use crate::codec::v5::encode::encode_publish;
@@ -187,12 +186,6 @@ mod tests {
         body.put_u8(0); // Property Length 0
         body.put(payload);
         body.freeze()
-    }
-
-    #[test]
-    fn publish_decode_qos0_ok() {
-        let result = PublishPacket::decode(topic_and_prop0_payload(b"data"), QOS0_FLAGS);
-        assert!(result.is_ok());
     }
 
     #[test]
@@ -300,26 +293,13 @@ mod tests {
         assert!(matches!(result, Err(DecodeError::MalformedPacket(_))));
     }
 
-    #[test]
-    fn publish_decode_qos0_packet_identifier_prefix_rejected() {
+    #[rstest::rstest]
+    #[case::high_bit_set(0x8001)]
+    #[case::low(0x1234)]
+    fn publish_decode_qos0_packet_identifier_prefix_rejected(#[case] packet_id: u16) {
         let mut body = BytesMut::new();
         ByteString::from_static("topic").encode(&mut body).unwrap();
-        body.put_u16(0x8001);
-        body.put_u8(0);
-        body.put_slice(b"data");
-
-        let result = PublishPacket::decode(body.freeze(), QOS0_FLAGS);
-        assert_eq!(
-            result.map_err(|e| e.to_string()),
-            Err(DecodeError::MalformedPacket("QoS 0 PUBLISH must not include packet identifier").to_string())
-        );
-    }
-
-    #[test]
-    fn publish_decode_qos0_low_packet_identifier_prefix_rejected() {
-        let mut body = BytesMut::new();
-        ByteString::from_static("topic").encode(&mut body).unwrap();
-        body.put_u16(0x1234);
+        body.put_u16(packet_id);
         body.put_u8(0);
         body.put_slice(b"data");
 
@@ -395,29 +375,6 @@ mod tests {
         );
     }
 
-    /// A QoS 0 PUBLISH goes out with DUP 0 ([MQTT-4.3.1-1], [MQTT-3.3.1-2]).
-    #[test]
-    fn publish_encode_qos0_wire_dup_flag_clear() {
-        let message = PublishMessage {
-            topic: ByteString::from_static("t"),
-            payload: Bytes::from_static(b"p"),
-            properties: PublishProperties::default(),
-        };
-        let delivery = PublishDelivery {
-            dup: false,
-            retain: false,
-            qos: QoS::AtMostOnce,
-            packet_id: None,
-        };
-        let mut buf = BytesMut::new();
-        encode_publish(&message, delivery, u32::MAX, &mut buf).expect("encode");
-        assert_eq!(
-            buf[0] & 0b1000,
-            0,
-            "QoS 0 outbound PUBLISH must set DUP flag to 0 on the wire"
-        );
-    }
-
     #[test]
     fn publish_decode_accepts_empty_topic_with_alias() {
         // Topic Name length 0 + Topic Alias property 1
@@ -426,26 +383,6 @@ mod tests {
         assert!(publish.message.topic.is_empty());
         assert_eq!(publish.wire_topic_alias.map(NonZeroU16::get), Some(1));
         assert_eq!(publish.message.payload.as_ref(), b"d");
-    }
-
-    #[test]
-    fn publish_encode_rejects_empty_topic_without_alias() {
-        let message = PublishMessage {
-            topic: ByteString::new(),
-            payload: Bytes::from_static(b"data"),
-            properties: PublishProperties::default(),
-        };
-        let delivery = PublishDelivery {
-            dup: false,
-            retain: false,
-            qos: QoS::AtMostOnce,
-            packet_id: None,
-        };
-        let mut buf = BytesMut::new();
-        assert!(matches!(
-            encode_publish(&message, delivery, 1024, &mut buf),
-            Err(EncodeError::MalformedPacket)
-        ));
     }
 
     #[test]

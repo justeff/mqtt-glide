@@ -461,28 +461,6 @@ mod tests {
     }
 
     #[test]
-    fn connack_unknown_reason_code_round_trips() {
-        let ack = ConnectAck {
-            session_present: false,
-            reason_code: ConnectAckReason::Unknown(141),
-            receive_max: RECEIVE_MAX_DEFAULT,
-            max_qos: QoS::AtMostOnce,
-            retain_available: false,
-            wildcard_subscription_available: false,
-            subscription_identifiers_available: false,
-            shared_subscription_available: false,
-            topic_alias_max: 0,
-            ..Default::default()
-        };
-        let body_len = ack.encoded_body_len(99999).unwrap() as u32;
-        let mut buf = BytesMut::with_capacity(body_len as usize);
-        ack.encode_body(&mut buf, body_len).unwrap();
-        let decoded = ConnectAck::decode(&mut buf.freeze()).unwrap();
-        assert_eq!(decoded.reason_code, ConnectAckReason::Unknown(141));
-        assert_eq!(u8::from(decoded.reason_code), 141);
-    }
-
-    #[test]
     fn connack_decodes_every_property_from_spec_wire_bytes() {
         // Identifiers spelled out from §3.2.2.3, not taken from `property_type`.
         #[rustfmt::skip]

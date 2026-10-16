@@ -490,81 +490,6 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::codec::v5::{DecodedFrame, Packet, V5Codec};
-    use tokio_util::codec::Decoder;
-    use tokio_util::codec::Encoder;
-
-    #[test]
-    fn test_sub() {
-        let pkt = Subscribe {
-            packet_id: 12.try_into().unwrap(),
-            id: Some(10.try_into().unwrap()),
-            user_properties: vec![("a", "1").into()],
-            topic_filters: vec![("test".into(), SubscriptionOptions::default())],
-        };
-
-        let body_len = pkt.encoded_body_len(99999).unwrap() as u32;
-        let mut buf = BytesMut::with_capacity(body_len as usize);
-        pkt.encode_body(&mut buf, body_len).unwrap();
-        assert_eq!(buf.len(), body_len as usize);
-        assert_eq!(pkt, Subscribe::decode(&mut buf.freeze()).unwrap());
-
-        let pkt = Unsubscribe {
-            packet_id: 12.try_into().unwrap(),
-            user_properties: vec![("a", "1").into()],
-            topic_filters: vec!["test".into()],
-        };
-
-        let body_len = pkt.encoded_body_len(99999).unwrap() as u32;
-        let mut buf = BytesMut::with_capacity(body_len as usize);
-        pkt.encode_body(&mut buf, body_len).unwrap();
-        assert_eq!(buf.len(), body_len as usize);
-        assert_eq!(pkt, Unsubscribe::decode(&mut buf.freeze()).unwrap());
-    }
-
-    #[test]
-    fn test_sub_pkt() {
-        let pkt = Packet::Subscribe(Subscribe {
-            packet_id: 12.try_into().unwrap(),
-            id: None,
-            user_properties: vec![("a", "1").into()],
-            topic_filters: vec![("test".into(), SubscriptionOptions::default())],
-        });
-        let mut codec = V5Codec::default();
-
-        let mut buf = BytesMut::new();
-        codec.encode(pkt.clone(), &mut buf).unwrap();
-
-        assert_eq!(
-            DecodedFrame::Control(pkt.clone()),
-            codec.decode(&mut buf).unwrap().unwrap().0
-        );
-    }
-
-    #[test]
-    fn test_sub_ack() {
-        let ack = SubscribeAck {
-            packet_id: NonZeroU16::new(1).unwrap(),
-            properties: vec![("prop1", "val1").into(), ("prop2", "val2").into()],
-            reason_string: None,
-            status: vec![SubscribeAckReason::GrantedQos0],
-        };
-        let body_len = ack.encoded_body_len(99999).unwrap() as u32;
-        let mut buf = BytesMut::with_capacity(body_len as usize);
-        ack.encode_body(&mut buf, body_len).unwrap();
-        assert_eq!(ack, SubscribeAck::decode(&mut buf.freeze()).unwrap());
-
-        let ack = UnsubscribeAck {
-            packet_id: NonZeroU16::new(1).unwrap(),
-            properties: vec![("prop1", "val1").into(), ("prop2", "val2").into()],
-            reason_string: None,
-            status: vec![UnsubscribeAckReason::Success],
-        };
-        let body_len = ack.encoded_body_len(99999).unwrap() as u32;
-        let mut buf = BytesMut::with_capacity(body_len as usize);
-        ack.encode_body(&mut buf, body_len).unwrap();
-        assert_eq!(ack, UnsubscribeAck::decode(&mut buf.freeze()).unwrap());
-    }
 
     /// Dispatch target for [`subscribe_family_decode_rejects_malformed_packet`]: SUBSCRIBE,
     /// UNSUBSCRIBE, and their acks share identical malformed-payload rules but decode to
@@ -584,6 +509,11 @@ mod tests {
     // [MQTT-3.8.3-1] / [MQTT-3.10.3-1] Topic Filters must be UTF-8 Encoded Strings
     #[case::subscribe_invalid_utf8_topic_filter(SubscribeFamily::Subscribe, vec![0x12, 0x34, 0x00, 0x00, 0x02, 0xC0, 0x80, 0x00])]
     #[case::unsubscribe_invalid_utf8_topic_filter(SubscribeFamily::Unsubscribe, vec![0x12, 0x34, 0x00, 0x00, 0x02, 0xC0, 0x80])]
+    // A Topic Filter is at least one character long (§4.7.3)
+    #[case::subscribe_empty_topic_filter_string(SubscribeFamily::Subscribe, vec![0x12, 0x34, 0x00, 0x00, 0x00])]
+    // SUBACK / UNSUBACK carry one reason code per Topic Filter, so at least one
+    #[case::suback_empty_reason_codes(SubscribeFamily::SubscribeAck, vec![0x12, 0x34, 0x00])]
+    #[case::unsuback_empty_reason_codes(SubscribeFamily::UnsubscribeAck, vec![0x12, 0x34, 0x00])]
     // Reason code 0x7F is not a defined SUBACK/UNSUBACK reason
     #[case::suback_invalid_reason_code(SubscribeFamily::SubscribeAck, vec![0x12, 0x34, 0x00, 0x7F])]
     #[case::unsuback_invalid_reason_code(SubscribeFamily::UnsubscribeAck, vec![0x12, 0x34, 0x00, 0x7F])]
@@ -604,33 +534,6 @@ mod tests {
             }
         };
         assert!(rejected_as_malformed);
-    }
-
-    #[test]
-    fn subscribe_rejects_empty_filter_string() {
-        let mut src = Bytes::from_static(&[0x12, 0x34, 0x00, 0x00, 0x00]);
-        assert!(matches!(
-            Subscribe::decode(&mut src),
-            Err(DecodeError::MalformedPacket(_))
-        ));
-    }
-
-    #[test]
-    fn suback_rejects_empty_reason_codes() {
-        let mut src = Bytes::from_static(&[0x12, 0x34, 0x00]);
-        assert!(matches!(
-            SubscribeAck::decode(&mut src),
-            Err(DecodeError::MalformedPacket("invalid encoding"))
-        ));
-    }
-
-    #[test]
-    fn unsuback_rejects_empty_reason_codes() {
-        let mut src = Bytes::from_static(&[0x12, 0x34, 0x00]);
-        assert!(matches!(
-            UnsubscribeAck::decode(&mut src),
-            Err(DecodeError::MalformedPacket("invalid encoding"))
-        ));
     }
 
     #[test]

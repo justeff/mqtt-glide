@@ -17,15 +17,14 @@ use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use common::static_credentials;
 use mqtt_glide::{
-    AppError, BrokerUrl, ClientId, ConnectOptions, Connection, ConnectionOutcome, InboundMessage, MqttClient,
-    NoopLifecycle, Publish, QoS, ReconnectPolicy, SessionPhase, connect,
+    AppError, ClientId, ConnectOptions, ConnectionOutcome, InboundMessage, MqttClient, Publish, QoS, ReconnectPolicy,
+    SessionPhase,
 };
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+use helpers::Client as Session;
 use mqtt_glide::testing::FaultProxy;
 
 /// Reconnect fast on transport / protocol loss; stop otherwise.
@@ -40,33 +39,12 @@ impl ReconnectPolicy for FastReconnect {
     }
 }
 
-struct Session {
-    client: MqttClient,
-    phase: watch::Receiver<SessionPhase>,
-    run: JoinHandle<Result<(), ConnectionOutcome>>,
-    inbound: mpsc::Receiver<InboundMessage>,
-}
-
 fn options(port: u16) -> ConnectOptions {
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("broker url");
-    ConnectOptions::new(url)
+    ConnectOptions::new(helpers::tcp_url(port))
 }
 
 async fn start(options: ConnectOptions) -> Session {
-    let (tx, inbound) = mpsc::channel::<InboundMessage>(10_000);
-    let (client, connection, mut phase): (_, Connection<_>, _) =
-        connect(options, static_credentials(), FastReconnect, tx, NoopLifecycle).expect("connect wiring");
-    let run = tokio::spawn(connection.run());
-    await_phase(&mut phase, "initial connect", |p| {
-        matches!(p, SessionPhase::Connected { .. })
-    })
-    .await;
-    Session {
-        client,
-        phase,
-        run,
-        inbound,
-    }
+    helpers::connected(options, FastReconnect, 10_000).await
 }
 
 async fn await_phase(
@@ -78,11 +56,6 @@ async fn await_phase(
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
         .unwrap_or_else(|_| panic!("phase watch closed while waiting for {label}"));
-}
-
-async fn stop(session: Session) {
-    session.client.shutdown().await.expect("shutdown");
-    let _ = timeout(Duration::from_secs(5), session.run).await;
 }
 
 /// Observer connected straight to the broker, subscribed to `filter` at QoS 1.
@@ -190,9 +163,9 @@ async fn reset_mid_burst_resumed_session_delivers_everything() {
     );
     assert!(proxy.accepted() >= 2, "the reset must have forced a reconnect");
 
-    stop(session).await;
+    session.stop().await;
     while watcher.inbound.try_recv().is_ok() {}
-    stop(watcher).await;
+    watcher.stop().await;
 }
 
 /// Clean session: an RST mid-burst may fail in-flight publishes, but nothing hangs, every
@@ -241,8 +214,8 @@ async fn reset_mid_burst_clean_session_reports_truthfully() {
         .qos(QoS::AtLeastOnce)
         .await
         .expect("client works again after the reset");
-    stop(session).await;
-    stop(watcher).await;
+    session.stop().await;
+    watcher.stop().await;
 }
 
 /// A link that silently stops forwarding (no FIN, no RST) is detected by the keep-alive
@@ -280,7 +253,7 @@ async fn stalled_link_is_detected_by_keep_alive() {
         .publish("faults/stall", "after")
         .await
         .expect("publish after recovery");
-    stop(session).await;
+    session.stop().await;
 }
 
 /// Every byte in its own TCP write: packets split at arbitrary boundaries in both
@@ -321,7 +294,7 @@ async fn byte_by_byte_link_round_trips() {
         assert_eq!(message.payload.len(), *size);
         assert!(message.payload.iter().enumerate().all(|(b, v)| *v == (b % 251) as u8));
     }
-    stop(session).await;
+    session.stop().await;
 }
 
 /// High latency: a pipelined QoS 1 burst overlaps round trips instead of paying one per
@@ -350,37 +323,7 @@ async fn pipelined_burst_overlaps_round_trips_on_slow_link() {
         elapsed < Duration::from_secs(5),
         "burst must pipeline, took {elapsed:?}"
     );
-    stop(session).await;
-}
-
-/// Shutdown over a dead link still finishes within the graceful budget.
-#[tokio::test]
-async fn shutdown_on_stalled_link_respects_budget() {
-    let Some((_broker, broker_port)) = helpers::start_mosquitto().await else {
-        return;
-    };
-    let proxy = FaultProxy::start(([127, 0, 0, 1], broker_port).into())
-        .await
-        .expect("fault proxy");
-    let session = start(options(proxy.port()).graceful_disconnect_timeout(Duration::from_millis(300))).await;
-
-    proxy.set_stalled(true);
-    let completion = session
-        .client
-        .try_start_publish(Publish::new("faults/shutdown", "x").qos(QoS::AtLeastOnce))
-        .expect("enqueue");
-    let started = Instant::now();
-    session.client.shutdown().await.expect("shutdown");
-    let result = timeout(Duration::from_secs(3), session.run)
-        .await
-        .expect("driver stops");
-    assert!(
-        started.elapsed() < Duration::from_millis(1_500),
-        "budget exceeded: {:?}",
-        started.elapsed()
-    );
-    assert!(matches!(result, Ok(Err(ConnectionOutcome::Shutdown(_))) | Ok(Ok(()))));
-    assert!(matches!(completion.wait().await, Err(AppError::ConnectionLost)));
+    session.stop().await;
 }
 
 /// While the broker side refuses connections the client keeps retrying; once it accepts
@@ -418,7 +361,7 @@ async fn refused_reconnects_recover() {
         .publish("faults/refused", "back")
         .await
         .expect("publish after recovery");
-    stop(session).await;
+    session.stop().await;
 }
 
 /// Topic Aliases are per connection: after an RST the client must bind the alias again
@@ -453,15 +396,15 @@ async fn reset_with_topic_aliases_rebinds_on_the_new_connection() {
     assert_eq!(seen.len(), 1_000, "every aliased publish must reach the broker");
     assert!(session.client.is_connected(), "broker must not have rejected an alias");
 
-    stop(session).await;
-    stop(watcher).await;
+    session.stop().await;
+    watcher.stop().await;
 }
 
 /// Subscribes and publishes 20 messages of growing size over `url` after `slice` was
 /// applied, and checks every echo arrives intact.
 #[cfg(feature = "websocket")]
 async fn websocket_roundtrip_over_sliced_link(url: String, proxy: &FaultProxy, slice: impl FnOnce(&FaultProxy)) {
-    let mut session = start(ConnectOptions::new(BrokerUrl::parse(&url).expect("ws url"))).await;
+    let mut session = start(ConnectOptions::new(mqtt_glide::BrokerUrl::parse(&url).expect("ws url"))).await;
     // Slice only after the HTTP upgrade: tungstenite rejects a handshake that arrives in
     // more than 64 reads averaging under 128 bytes as a slowloris attempt. Everything after
     // the upgrade (WebSocket frames, MQTT packets) is what these tests are about.
@@ -489,7 +432,7 @@ async fn websocket_roundtrip_over_sliced_link(url: String, proxy: &FaultProxy, s
         assert_eq!(message.payload.len(), i * 211);
         assert!(message.payload.iter().enumerate().all(|(b, v)| *v == (b % 251) as u8));
     }
-    stop(session).await;
+    session.stop().await;
 }
 
 /// WebSocket over a link that forwards single bytes in both directions (HiveMQ): WebSocket
@@ -535,7 +478,7 @@ async fn websocket_reset_mid_burst_resumed_session_delivers_everything() {
     let proxy = FaultProxy::start(([127, 0, 0, 1], ws_port).into())
         .await
         .expect("fault proxy");
-    let url = BrokerUrl::parse(&format!("ws://127.0.0.1:{}/mqtt", proxy.port())).expect("ws url");
+    let url = mqtt_glide::BrokerUrl::parse(&format!("ws://127.0.0.1:{}/mqtt", proxy.port())).expect("ws url");
     let session = start(
         ConnectOptions::new(url)
             .client_id(ClientId::try_new("faults-ws-resume").expect("client id"))
@@ -554,6 +497,6 @@ async fn websocket_reset_mid_burst_resumed_session_delivers_everything() {
     .await;
     assert_eq!(seen.len(), 1_000);
     assert!(proxy.accepted() >= 2, "the reset must have forced a reconnect");
-    stop(session).await;
-    stop(watcher).await;
+    session.stop().await;
+    watcher.stop().await;
 }

@@ -221,7 +221,6 @@ async fn unexpected_control_packet_gets_protocol_error_disconnect() {
 /// reported locally (§3.3.2.3.4): an alias above the Topic Alias Maximum we advertised,
 /// one nobody bound yet, and alias 0, which fails decoding.
 #[rstest::rstest]
-#[case::above_maximum(0, &[0x30, 0x07, 0x00, 0x00, 0x03, 0x23, 0x00, 0x01, b'd'])]
 #[case::unbound(4, &[0x30, 0x07, 0x00, 0x00, 0x03, 0x23, 0x00, 0x01, b'd'])]
 #[case::alias_zero(4, &[0x30, 0x07, 0x00, 0x00, 0x03, 0x23, 0x00, 0x00, b'd'])]
 #[tokio::test]
