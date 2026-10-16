@@ -32,6 +32,8 @@ mqtt-glide = { version = "0.2", features = ["websocket"] }
 
 Then connect with `ws://broker:8080/mqtt` or `wss://broker/mqtt`.
 
+Minimum supported Rust version: **1.88**. It is raised only in a minor release (before 1.0: a `0.x` bump), never in a patch release, and every raise is listed in the changelog.
+
 Inbound messages go into any `InboundSink`; `tokio::sync::mpsc::Sender` works out of the box. To hand them to a `flume::Sender` instead, enable the `flume` feature. It ties your build to flume 0.12, so a flume upgrade in mqtt-glide is a breaking change for you:
 
 ```toml
@@ -359,6 +361,8 @@ Each delivery is an `InboundMessage`: `topic`, `payload`, `properties`, plus `re
 
 Shared filters: build with `shared_filter(group, topic)` (validates ShareName).
 
+A service that Kubernetes (or systemd) stops with SIGTERM loses nothing it acknowledged if it unsubscribes a shared group first, calls `shutdown()`, and keeps handling messages until the inbound channel ends: the channel closes once the driver has finished. [`graceful_shutdown.rs`](examples/graceful_shutdown.rs) shows the sequence, including when to skip the unsubscribe (persistent sessions).
+
 Granted subscriptions are remembered and restored on reconnect whenever the broker holds no session for the client (Clean Start, or CONNACK without Session Present), **before** `SessionPhase::Connected` is published. Each `subscribe` call is repeated as its own SUBSCRIBE, so a broker that caps the filters per SUBSCRIBE (AWS IoT Core: 8) accepts the restore as it accepted the original; up to ten wait for their SUBACK at once. After a reconnect, `Connected` therefore means "connected, and every filter the broker allows is subscribed again"; on the first connect it only means "connected", and readiness is your own `subscribe` returning granted reason codes.
 
 If the broker refuses a restored filter (for example after an ACL change), the connection stays up, and the other subscriptions and publishing keep working. The filter appears in `client.refused_subscriptions()`, a watch with the SUBACK reason code and Reason String, and is logged at `warn`. The client asks for it again on the same connection, first after about 5 s, then doubling up to every 5 minutes, until the broker grants it or you `unsubscribe` it, so a fixed ACL needs no restart. A non-empty list makes a good "degraded" health check. Only a broker that does not answer the SUBSCRIBE at all within `ack_timeout` makes the client reconnect.
@@ -385,6 +389,7 @@ Broader flows live under [`examples/`](examples/) and are the better starting po
 | [`request_response.rs`](examples/request_response.rs) | `client.requester(topic)` + `request(..).await`, answering with `Publish::reply_to` |
 | [`tls.rs`](examples/tls.rs) | `mqtts://`, rustls system roots, `connect_timeout` / `ack_timeout` |
 | [`hooks.rs`](examples/hooks.rs) | `CredentialsProvider`, `LifecycleHook`, `mark_live()` |
+| [`graceful_shutdown.rs`](examples/graceful_shutdown.rs) | SIGTERM handling: unsubscribe a shared group, `shutdown()`, drain the channel until it ends |
 
 ### Defaults and semantics
 

@@ -57,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `examples/graceful_shutdown.rs`: leaving on SIGTERM without losing acknowledged messages (unsubscribe a shared group, `shutdown()`, drain the inbound channel until it ends), and a written MSRV policy in the README
 - The builder's states `builder::InboundSinkUnset`, `InboundSinkReady<S>` and `InboundSinkDiscard` are documented API, so a function can return a partly configured `ClientBuilder`
 - `CredentialsProvider` for `Arc<T>`, so several clients can share one provider (a token cache, say), as `ReconnectPolicy` already allowed
 - `stats` feature: `MqttClient::stats()` returns a `ClientStats` snapshot of what the connection did since `connect`, across reconnects (sessions, failed attempts and losses, publishes per QoS in and out, PUBACKs accepted and rejected, publishes waiting for an ack or a Receive Maximum slot, queued commands, duplicates received, inbound sink stalls and their duration, bytes each way), for the application to export to whatever metrics system it uses. No dependencies; without the feature the counting compiles away

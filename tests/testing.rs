@@ -130,6 +130,36 @@ async fn injects_messages_and_balances_shared_subscriptions() {
     assert_eq!(got, [2, 2], "each job goes to exactly one worker, in turn");
 }
 
+/// The shutdown sequence of `examples/graceful_shutdown.rs`: a worker leaving a shared group
+/// unsubscribes, shuts down, and its inbound channel ends once the driver has finished, while
+/// the rest of the group takes over.
+#[tokio::test]
+async fn a_worker_leaving_a_shared_group_hands_over_and_its_channel_ends() {
+    let broker = TestBroker::start().await.expect("broker");
+    let (a, mut a_rx) = client(&broker.url(), "worker-a").await;
+    let (b, mut b_rx) = client(&broker.url(), "worker-b").await;
+    for worker in [&a, &b] {
+        worker
+            .subscribe([("$share/workers/jobs", QoS::AtLeastOnce)])
+            .await
+            .expect("subscribe");
+    }
+
+    a.unsubscribe(["$share/workers/jobs"]).await.expect("unsubscribe");
+    a.shutdown().await.expect("shutdown");
+    tokio::time::timeout(WAIT, async { while a_rx.recv().await.is_some() {} })
+        .await
+        .expect("the channel ends once the driver has finished");
+
+    for job in 0..4 {
+        broker.publish(Publish::new("jobs", format!("job-{job}")).qos(QoS::AtLeastOnce));
+    }
+    for _ in 0..4 {
+        next(&mut b_rx).await;
+    }
+    assert_eq!(broker.connected_clients(), ["worker-b"]);
+}
+
 #[tokio::test]
 async fn a_dropped_client_reconnects_resubscribes_and_its_will_goes_out() {
     let broker = TestBroker::start().await.expect("broker");
