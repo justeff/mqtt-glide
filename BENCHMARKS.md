@@ -2,7 +2,7 @@
 
 Absolute numbers for mqtt-glide, rumqttc-v5-next, and LabOverWire mqtt5 against the same broker, same payload, same harness. Nothing here is a paired A/B: every number is measured on its own and only means something together with the conditions it was measured under.
 
-Versions: mqtt-glide `main` (pre-0.3; the crate still says 0.2.0), `rumqttc-v5-next` 0.33.3, `mqtt5` 0.48.0. Payload 256 B, median of 5 runs, 50 000-message bursts. The headline scenario is a service sharing one client between many tasks (`outbound_concurrent`); the other scenarios model other shapes of use. Read [How to read this page](#how-to-read-this-page) before quoting any single number.
+Versions: mqtt-glide 0.3.0, `rumqttc-v5-next` 0.33.3, `mqtt5` 0.48.0. Payload 256 B, median of 5 runs, 50 000-message bursts. The headline scenario is a service sharing one client between many tasks (`outbound_concurrent`); the other scenarios model other shapes of use. Read [How to read this page](#how-to-read-this-page) before quoting any single number.
 
 ## How to read this page
 

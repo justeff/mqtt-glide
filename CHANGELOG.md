@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-17
+
 ### Changed (breaking)
 
 - New publish API. `Publish` is an owned value carrying topic, payload, QoS, retain and properties (`Publish::new(topic, payload).qos(..).retain(..)`; `From<PublishMessage>` as QoS 0). Migration:

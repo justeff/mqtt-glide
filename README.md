@@ -14,20 +14,20 @@ MQTT 5 only, QoS 0 and 1, over TCP, TLS or (opt-in) WebSocket. No MQTT 3.1.1, no
 
 ```toml
 [dependencies]
-mqtt-glide = "0.2"
+mqtt-glide = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 ```
 
 TLS goes through rustls. Enable **exactly one** crypto provider: `tls-rustls-aws-lc` (default) or `tls-rustls-ring`. Prefer pinning the choice in dependents. The client builds its `ClientConfig` with `builder_with_provider` and does not rely on a process-global rustls default, so enabling both features (or `--all-features`) is rejected.
 
 ```toml
-mqtt-glide = { version = "0.2", default-features = false, features = ["tls-rustls-ring"] }
+mqtt-glide = { version = "0.3", default-features = false, features = ["tls-rustls-ring"] }
 ```
 
 MQTT over WebSocket (for networks that only let HTTP(S) out, or brokers behind an HTTP ingress) is behind the optional `websocket` feature; it adds `tokio-tungstenite` for the handshake and framing only:
 
 ```toml
-mqtt-glide = { version = "0.2", features = ["websocket"] }
+mqtt-glide = { version = "0.3", features = ["websocket"] }
 ```
 
 Then connect with `ws://broker:8080/mqtt` or `wss://broker/mqtt`.
@@ -37,7 +37,7 @@ Minimum supported Rust version: **1.88**. It is raised only in a minor release (
 Inbound messages go into any `InboundSink`; `tokio::sync::mpsc::Sender` works out of the box. To hand them to a `flume::Sender` instead, enable the `flume` feature. It ties your build to flume 0.12, so a flume upgrade in mqtt-glide is a breaking change for you:
 
 ```toml
-mqtt-glide = { version = "0.2", features = ["flume"] }
+mqtt-glide = { version = "0.3", features = ["flume"] }
 flume = "0.12"
 ```
 
@@ -167,7 +167,7 @@ When a full application queue blocks the same loop that sends `PINGREQ`, a slow 
 
 ### What it costs
 
-No MQTT 3.1.1 and no QoS 2: both are out of scope, not pending. If you need either, rumqttc remains the better fit. Unacknowledged QoS 1 publishes are kept in memory only: they are resent after a reconnect into a resumed session (see [No session](#no-session)), but not after a process restart. Cross-process session resume needs a stable client ID (`.client_id("…")?` or `ClientId::try_new`) plus `clean_start(false)` and a non-zero `session_expiry`. rumqttc is also the far more widely deployed crate; this one is 0.2.x, and the API can still move.
+No MQTT 3.1.1 and no QoS 2: both are out of scope, not pending. If you need either, rumqttc remains the better fit. Unacknowledged QoS 1 publishes are kept in memory only: they are resent after a reconnect into a resumed session (see [No session](#no-session)), but not after a process restart. Cross-process session resume needs a stable client ID (`.client_id("…")?` or `ClientId::try_new`) plus `clean_start(false)` and a non-zero `session_expiry`. rumqttc is also the far more widely deployed crate; this one is 0.3.x, and the API can still move.
 
 ## Upgrading from 0.2
 
