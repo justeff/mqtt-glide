@@ -301,10 +301,9 @@ pub async fn start_hivemq_with_websocket() -> Option<(ContainerAsync<GenericImag
     if skip_without_docker() {
         return None;
     }
-    use testcontainers::core::ContainerPort;
-
+    // The image already exposes 8000 (as "8000", without "/tcp"). Exposing it again as
+    // "8000/tcp" makes Docker bind the same host port twice ("address already in use").
     let container = GenericImage::new("hivemq/hivemq-ce", "2026.5")
-        .with_exposed_port(ContainerPort::Tcp(8000))
         .with_wait_for(WaitFor::message_on_stdout("Started HiveMQ in"))
         .start()
         .await
