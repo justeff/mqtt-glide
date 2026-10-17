@@ -14,12 +14,20 @@ keywords = ["mqtt", "mqtt5", "tokio", "async", "client"]
 categories = ["network-programming", "asynchronous"]
 # Keep the crates.io tarball lean; benches/tests stay in git for CI.
 exclude = [
+    "/.github/",
+    "/.gitignore",
     "/benches/",
     "/conformance/",
     "/fuzz/",
     "/tests/",
+    "/rustfmt.toml",
     "/BENCHMARKS.md",
+    "/CONFORMANCE.md",
     "/CONTRIBUTING.md",
+    # Unit test modules, all behind #[cfg(test)].
+    "/src/**/*tests.rs",
+    "/src/connection/test_support.rs",
+    "/src/test_util.rs",
 ]
 
 [lints.rust]
