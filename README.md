@@ -365,7 +365,7 @@ Each delivery is an `InboundMessage`: `topic`, `payload`, `properties`, plus `re
 | `unsubscribe(filters)` | `UnsubscribeResponse`: per-filter `UNSUBACK` reason codes plus `reason_string` and `user_properties`. Accepts `["topic"]` / `Vec` / any `IntoIterator`. |
 | `shutdown()` | Graceful drain, then `DISCONNECT`: queued commands are sent, outbound QoS 1 waits for its `PUBACK`s, inbound keeps being delivered and acknowledged meanwhile. New commands fail with `AppError::ShuttingDown`. Bounded by `graceful_disconnect_timeout`; `shutdown()` itself returns once shutdown is requested. |
 
-Shared filters: build with `shared_filter(group, topic)` (validates ShareName).
+Shared filters: build with `shared_filter(group, topic)` (validates ShareName). To route inbound messages by filter, `topic_matches(filter, topic)` applies the MQTT matching rules (`+`, `#`, `$`-topics, `$share/…`); Subscription Identifiers (`subscribe_with_id`) let the broker do it instead.
 
 A service that Kubernetes (or systemd) stops with SIGTERM loses nothing it acknowledged if it unsubscribes a shared group first, calls `shutdown()`, and keeps handling messages until the inbound channel ends: the channel closes once the driver has finished. [`graceful_shutdown.rs`](examples/graceful_shutdown.rs) shows the sequence, including when to skip the unsubscribe (persistent sessions).
 
@@ -501,7 +501,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 |------|:------:|-------|
 | MQTT 5 wire (`CONNECT`…`DISCONNECT`, QoS 0/1) | ✅ | MQTT 3.1.1 out of scope |
 | Shared subscriptions (`$share/…`) | ✅ | Caller builds the filter; `shared_filter` validates ShareName |
-| Topic filter wildcards | ✅ | Client validates `+` / `#` placement before encode |
+| Topic filter wildcards | ✅ | Client validates `+` / `#` placement before encode; `topic_matches` matches a topic against a filter |
 | Publish properties (expiry, user props, content type, `response_topic`, `correlation_data`) | ✅ | On `PublishProperties` (a message holds them as `Properties`, allocated only when set); setters on `Publish` |
 | TLS (rustls + system roots) | ✅ | Feature-selected crypto provider |
 | Reconnect / credentials hooks | ✅ | Traits + optional helpers |

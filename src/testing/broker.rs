@@ -21,6 +21,7 @@ use crate::codec::{
     PublishDelivery, PublishMessage, PublishProperties, QoS, SubscribeAck, SubscribeAckReason, UnsubscribeAck,
     UnsubscribeAckReason, UserProperties, UserProperty, V5Codec, WillMessage, encode_publish,
 };
+use crate::util::topic_matches;
 
 /// The PUBACK a [`TestBroker`] answers a QoS 1 PUBLISH with; see [`TestBroker::ack_publishes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -729,55 +730,4 @@ fn split_shared(filter: &ByteString) -> (Option<ByteString>, ByteString) {
         return (Some(group.into()), inner.into());
     }
     (None, filter.clone())
-}
-
-/// MQTT topic matching (§4.7): `+` one level, `#` the rest; wildcards at the start do not
-/// match topics beginning with `$` ([MQTT-4.7.2-1]).
-fn topic_matches(filter: &str, topic: &str) -> bool {
-    if topic.starts_with('$') && (filter.starts_with('+') || filter.starts_with('#')) {
-        return false;
-    }
-    let mut topic_levels = topic.split('/');
-    for level in filter.split('/') {
-        match level {
-            "#" => return true,
-            "+" => {
-                if topic_levels.next().is_none() {
-                    return false;
-                }
-            }
-            exact => {
-                if topic_levels.next() != Some(exact) {
-                    return false;
-                }
-            }
-        }
-    }
-    topic_levels.next().is_none()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::topic_matches;
-
-    #[test]
-    fn topic_matching_follows_the_wildcard_rules() {
-        for (filter, topic, expected) in [
-            ("a/b", "a/b", true),
-            ("a/b", "a/c", false),
-            ("a/+", "a/b", true),
-            ("a/+", "a/b/c", false),
-            ("a/#", "a", true),
-            ("a/#", "a/b/c", true),
-            ("#", "a/b", true),
-            ("+/+", "a/b", true),
-            ("+", "a/b", false),
-            ("#", "$SYS/x", false),
-            ("+/x", "$SYS/x", false),
-            ("$SYS/#", "$SYS/x", true),
-            ("a/+/c", "a//c", true),
-        ] {
-            assert_eq!(topic_matches(filter, topic), expected, "{filter} vs {topic}");
-        }
-    }
 }

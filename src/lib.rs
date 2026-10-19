@@ -93,7 +93,7 @@ pub use request::{DEFAULT_REQUEST_TIMEOUT, RequestBuilder, Requester};
 pub use stats::{ClientStats, ConnectionStats, InboundStats, OutboundStats};
 pub use util::{
     BrokerUrl, BrokerUrlError, ClientId, ClientIdError, HttpProxy, ShareNameError, is_shared_subscription_filter,
-    shared_filter, validate_share_name,
+    shared_filter, topic_matches, validate_share_name,
 };
 
 // Compile README code samples as doctests (`cargo test --doc`).
