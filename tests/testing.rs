@@ -382,3 +382,109 @@ async fn a_client_whose_session_was_taken_over_does_not_take_it_back() {
     assert_eq!(broker.connect_count(), 2, "no immediate reconnect");
     assert!(second.is_connected());
 }
+
+async fn persistent_client(url: &str, id: &str) -> (MqttClient, mpsc::Receiver<InboundMessage>) {
+    let (tx, rx) = mpsc::channel(64);
+    let client = ClientBuilder::new(url)
+        .expect("url")
+        .client_id(id)
+        .expect("client id")
+        .inbound_sink(tx)
+        .reconnect(StandardReconnectPolicy::new(
+            Duration::from_millis(20),
+            Duration::from_millis(200),
+        ))
+        .options(|options| options.clean_start(false).session_expiry(Some(Duration::from_secs(60))))
+        .connect()
+        .await
+        .expect("connect");
+    (client, rx)
+}
+
+/// A client with a session gets the QoS 1 messages that arrived while it was away, without
+/// subscribing again; QoS 0 ones are not kept.
+#[tokio::test]
+async fn a_resumed_session_receives_what_arrived_while_away() {
+    let broker = TestBroker::start().await.expect("broker");
+    let (worker, mut inbox) = persistent_client(&broker.url(), "worker").await;
+    worker
+        .subscribe([("jobs/#", QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe");
+
+    broker.refuse_connections(Some(ConnectAckReason::ServerUnavailable));
+    broker.drop_client("worker");
+    assert!(broker.has_session("worker"));
+    broker.publish(Publish::new("jobs/1", "kept").qos(QoS::AtLeastOnce));
+    broker.publish(Publish::new("jobs/2", "not kept"));
+    broker.refuse_connections(None);
+
+    let message = next(&mut inbox).await;
+    assert_eq!((&*message.topic, &message.payload[..]), ("jobs/1", &b"kept"[..]));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), inbox.recv())
+            .await
+            .is_err(),
+        "a QoS 0 message is not kept for an absent client"
+    );
+    assert_eq!(broker.subscriptions("worker"), ["jobs/#"], "restored with the session");
+}
+
+/// A PUBACK lost on the way: the client resends the publish with DUP into its resumed
+/// session, and the broker sees it twice.
+#[tokio::test]
+async fn a_publish_whose_puback_was_lost_is_resent_with_dup() {
+    let broker = TestBroker::start().await.expect("broker");
+    let (dispatcher, _rx) = persistent_client(&broker.url(), "dispatcher").await;
+
+    broker.withhold_pubacks(true);
+    let completion = dispatcher
+        .publish("vehicle/1/cmd", "unlock")
+        .qos(QoS::AtLeastOnce)
+        .ack_timeout(None)
+        .start()
+        .await
+        .expect("queued");
+    assert_eq!(broker.wait_for_publishes(1, WAIT).await.len(), 1);
+
+    broker.withhold_pubacks(false);
+    broker.drop_client("dispatcher");
+    let response = tokio::time::timeout(WAIT, completion.wait_for(None))
+        .await
+        .expect("acknowledged after the resend")
+        .expect("accepted");
+    assert!(response.resent());
+    let received = broker.received();
+    assert_eq!(received.len(), 2, "the broker got it twice");
+    assert_eq!((received[0].dup, received[1].dup), (false, true));
+    assert_eq!(received[0].payload, received[1].payload);
+}
+
+/// Without a Session Expiry Interval the session ends with the connection; Clean Start
+/// discards a kept one.
+#[tokio::test]
+async fn sessions_end_without_expiry_or_with_clean_start() {
+    let broker = TestBroker::start().await.expect("broker");
+    let (_plain, _rx) = client(&broker.url(), "plain").await;
+    broker.drop_client("plain");
+    assert!(!broker.has_session("plain"));
+
+    let (persistent, _rx) = persistent_client(&broker.url(), "fresh").await;
+    persistent
+        .subscribe([("a/#", QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe");
+    persistent.shutdown().await.expect("shutdown");
+    tokio::time::timeout(WAIT, async {
+        while !broker.has_session("fresh") {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("session kept after a clean DISCONNECT");
+    let (_restarted, _rx) = client(&broker.url(), "fresh").await;
+    assert!(
+        broker.subscriptions("fresh").is_empty(),
+        "Clean Start dropped the session"
+    );
+}

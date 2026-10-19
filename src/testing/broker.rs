@@ -82,6 +82,8 @@ pub struct ReceivedPublish {
     pub qos: QoS,
     /// RETAIN flag.
     pub retain: bool,
+    /// DUP flag: the client sent it again after a reconnect into a resumed session.
+    pub dup: bool,
     /// MQTT 5 properties (User Properties, Content Type, Correlation Data, ...).
     pub properties: PublishProperties,
 }
@@ -115,6 +117,10 @@ struct State {
     /// Topic filters every SUBSCRIBE gets refused, with the reason code to answer.
     refused_filters: HashMap<String, SubscribeAckReason>,
     shared_cursor: usize,
+    /// Sessions of disconnected clients, by Client Identifier.
+    sessions: HashMap<String, Session>,
+    /// Accept QoS 1 PUBLISHes without answering them (PUBACKs lost on the way).
+    withhold_pubacks: bool,
 }
 
 struct Conn {
@@ -123,6 +129,97 @@ struct Conn {
     subscriptions: Vec<Subscription>,
     will: Option<WillMessage>,
     task: Option<JoinHandle<()>>,
+    /// QoS 1 deliveries to this client not yet acknowledged, in send order.
+    unacked: Vec<(NonZeroU16, Delivery)>,
+    next_packet_id: u16,
+    /// Session Expiry Interval from CONNECT (or a later DISCONNECT); 0 ends the session with
+    /// the connection.
+    session_expiry: u32,
+}
+
+/// What a broker keeps of a client while it is disconnected (§4.1).
+struct Session {
+    subscriptions: Vec<Subscription>,
+    unacked: Vec<(NonZeroU16, Delivery)>,
+    next_packet_id: u16,
+    /// QoS 1 messages that matched while the client was away.
+    queued: Vec<Delivery>,
+    /// `None`: never (Session Expiry Interval 0xFFFFFFFF).
+    expires_at: Option<tokio::time::Instant>,
+}
+
+impl Session {
+    fn expired(&self, now: tokio::time::Instant) -> bool {
+        self.expires_at.is_some_and(|at| at <= now)
+    }
+}
+
+impl Conn {
+    fn new(client_id: String, tx: mpsc::UnboundedSender<Outgoing>, task: Option<JoinHandle<()>>) -> Self {
+        Self {
+            client_id,
+            tx,
+            subscriptions: Vec::new(),
+            will: None,
+            task,
+            unacked: Vec::new(),
+            next_packet_id: 0,
+            session_expiry: 0,
+        }
+    }
+
+    /// Sends a PUBLISH; a QoS 1 one gets a free Packet Identifier and waits for its PUBACK.
+    fn deliver(&mut self, delivery: Delivery) {
+        let packet_id = (delivery.qos != QoS::AtMostOnce).then(|| {
+            loop {
+                self.next_packet_id = self.next_packet_id.checked_add(1).unwrap_or(1);
+                let id = NonZeroU16::new(self.next_packet_id).expect("non-zero");
+                if !self.unacked.iter().any(|(used, _)| *used == id) {
+                    break id;
+                }
+            }
+        });
+        if let Some(id) = packet_id {
+            self.unacked.push((id, delivery.clone()));
+        }
+        let _ = self.tx.send(Outgoing::Publish {
+            delivery,
+            packet_id,
+            dup: false,
+        });
+    }
+
+    /// Ends the connection; returns the session to keep, if its expiry allows one.
+    fn into_session(self, now: tokio::time::Instant) -> Option<(String, Session)> {
+        if self.session_expiry == 0 || self.client_id.is_empty() {
+            return None;
+        }
+        let expires_at =
+            (self.session_expiry != u32::MAX).then(|| now + Duration::from_secs(u64::from(self.session_expiry)));
+        Some((
+            self.client_id,
+            Session {
+                subscriptions: self.subscriptions,
+                unacked: self.unacked,
+                next_packet_id: self.next_packet_id,
+                queued: Vec::new(),
+                expires_at,
+            },
+        ))
+    }
+}
+
+impl State {
+    /// Removes connection `id`, keeping its session; returns its Will and task.
+    fn end_connection(&mut self, id: u64) -> Option<(Option<WillMessage>, Option<JoinHandle<()>>)> {
+        let mut conn = self.connections.remove(&id)?;
+        let will = conn.will.take();
+        let task = conn.task.take();
+        if let Some((client_id, session)) = conn.into_session(tokio::time::Instant::now()) {
+            self.sessions.insert(client_id, session);
+        }
+        Some((will, task))
+    }
 }
 
 #[derive(Clone)]
@@ -143,7 +240,11 @@ struct Delivery {
 
 enum Outgoing {
     Packet(Packet),
-    Publish(Delivery),
+    Publish {
+        delivery: Delivery,
+        packet_id: Option<NonZeroU16>,
+        dup: bool,
+    },
     Close,
 }
 
@@ -173,16 +274,8 @@ impl TestBroker {
                     match state.connections.get_mut(&id) {
                         Some(conn) => conn.task = Some(task),
                         None => {
-                            state.connections.insert(
-                                id,
-                                Conn {
-                                    client_id: String::new(),
-                                    tx: mpsc::unbounded_channel().0,
-                                    subscriptions: Vec::new(),
-                                    will: None,
-                                    task: Some(task),
-                                },
-                            );
+                            let conn = Conn::new(String::new(), mpsc::unbounded_channel().0, Some(task));
+                            state.connections.insert(id, conn);
                         }
                     }
                 }
@@ -364,7 +457,7 @@ impl TestBroker {
     }
 
     fn drop_where(&self, mut select: impl FnMut(&Conn) -> bool) -> usize {
-        let dropped: Vec<Conn> = {
+        let (count, dropped) = {
             let mut state = lock(&self.shared);
             let ids: Vec<u64> = state
                 .connections
@@ -372,18 +465,38 @@ impl TestBroker {
                 .filter(|(_, conn)| select(conn))
                 .map(|(id, _)| *id)
                 .collect();
-            ids.iter().filter_map(|id| state.connections.remove(id)).collect()
+            let count = ids
+                .iter()
+                .filter(|id| state.connections.get(id).is_some_and(|conn| !conn.client_id.is_empty()))
+                .count();
+            let dropped: Vec<_> = ids.iter().filter_map(|id| state.end_connection(*id)).collect();
+            (count, dropped)
         };
-        let count = dropped.iter().filter(|conn| !conn.client_id.is_empty()).count();
-        for mut conn in dropped {
-            if let Some(task) = conn.task.take() {
+        for (will, task) in dropped {
+            if let Some(task) = task {
                 task.abort();
             }
-            if let Some(will) = conn.will.take() {
+            if let Some(will) = will {
                 route(&self.shared, None, will_delivery(will));
             }
         }
         count
+    }
+
+    /// Keeps accepting QoS 1 PUBLISHes but stops answering them (`false`: answer again), as if
+    /// every PUBACK got lost on the way. Messages are still recorded and routed. Drop the
+    /// client afterwards to see it resend them, with DUP, into its resumed session.
+    pub fn withhold_pubacks(&self, withhold: bool) {
+        lock(&self.shared).withhold_pubacks = withhold;
+    }
+
+    /// Whether the broker keeps a session for the disconnected client `client_id`: it
+    /// connected with a Session Expiry Interval above 0, and that interval has not run out.
+    pub fn has_session(&self, client_id: &str) -> bool {
+        lock(&self.shared)
+            .sessions
+            .get(client_id)
+            .is_some_and(|session| !session.expired(tokio::time::Instant::now()))
     }
 
     /// Sends every connected client a DISCONNECT with `reason`, then closes the connections.
@@ -474,30 +587,47 @@ async fn serve(shared: Arc<Shared>, id: u64, stream: TcpStream) {
             .map(|(other, _)| *other)
             .collect();
         for other in taken_over {
-            if let Some(conn) = state.connections.remove(&other) {
+            if let Some(conn) = state.connections.get(&other) {
                 let _ = conn.tx.send(Outgoing::Packet(Packet::Disconnect(Disconnect::new(
                     DisconnectReasonCode::SessionTakenOver,
                 ))));
                 let _ = conn.tx.send(Outgoing::Close);
             }
+            // Its Will is not published: the client is still there (§3.1.4).
+            state.end_connection(other);
         }
-        state.connections.insert(
-            id,
-            Conn {
-                client_id: client_id.clone(),
-                tx: tx.clone(),
-                subscriptions: Vec::new(),
-                will: connect.will_message.clone(),
-                task,
-            },
-        );
+        // Clean Start discards a kept session; otherwise an unexpired one resumes (§3.1.2.4).
+        let kept = state.sessions.remove(&client_id);
+        let resumed = kept.filter(|session| !connect.clean_start && !session.expired(tokio::time::Instant::now()));
+        let mut conn = Conn::new(client_id.clone(), tx.clone(), task);
+        conn.will = connect.will_message.clone();
+        conn.session_expiry = connect.session_expiry_interval;
+        let _ = tx.send(Outgoing::Packet(Packet::ConnectAck(Box::new(ConnectAck {
+            session_present: resumed.is_some(),
+            max_qos: QoS::AtLeastOnce,
+            assigned_client_id: assigned.map(ByteString::from),
+            ..ConnectAck::default()
+        }))));
+        if let Some(session) = resumed {
+            conn.subscriptions = session.subscriptions;
+            conn.next_packet_id = session.next_packet_id;
+            // Unacknowledged deliveries again with their Packet Identifiers and DUP, in
+            // order, then what queued up meanwhile ([MQTT-4.4.0-1]).
+            conn.unacked = session.unacked;
+            for (packet_id, delivery) in &conn.unacked {
+                let _ = tx.send(Outgoing::Publish {
+                    delivery: delivery.clone(),
+                    packet_id: Some(*packet_id),
+                    dup: true,
+                });
+            }
+            for delivery in session.queued {
+                conn.deliver(delivery);
+            }
+        }
+        state.connections.insert(id, conn);
         state.connects += 1;
     }
-    let _ = tx.send(Outgoing::Packet(Packet::ConnectAck(Box::new(ConnectAck {
-        max_qos: QoS::AtLeastOnce,
-        assigned_client_id: assigned.map(ByteString::from),
-        ..ConnectAck::default()
-    }))));
     shared.changed.notify_waiters();
 
     let mut clean_disconnect = false;
@@ -515,18 +645,24 @@ async fn serve(shared: Arc<Shared>, id: u64, stream: TcpStream) {
                     payload: delivery.message.payload.clone(),
                     qos: delivery.qos,
                     retain: delivery.retain,
+                    dup: packet.meta.dup,
                     properties: delivery.message.properties.clone().into(),
                 };
                 if let Some(packet_id) = packet.meta.packet_id {
-                    let answer = lock(&shared).ack_with.clone();
+                    let (answer, withhold) = {
+                        let state = lock(&shared);
+                        (state.ack_with.clone(), state.withhold_pubacks)
+                    };
                     let ack = answer.map_or_else(|| PubAck::new(PublishAckReason::Success), |answer| answer(&received));
                     let accepted = ack.accepts();
-                    let _ = tx.send(Outgoing::Packet(Packet::PublishAck(PublishAck {
-                        packet_id,
-                        reason_code: ack.reason,
-                        reason_string: ack.reason_string,
-                        properties: ack.user_properties,
-                    })));
+                    if !withhold {
+                        let _ = tx.send(Outgoing::Packet(Packet::PublishAck(PublishAck {
+                            packet_id,
+                            reason_code: ack.reason,
+                            reason_string: ack.reason_string,
+                            properties: ack.user_properties,
+                        })));
+                    }
                     if !accepted {
                         continue;
                     }
@@ -582,8 +718,10 @@ async fn serve(shared: Arc<Shared>, id: u64, stream: TcpStream) {
                     properties: Vec::new(),
                     reason_string: None,
                 })));
-                for delivery in retained {
-                    let _ = tx.send(Outgoing::Publish(delivery));
+                if let Some(conn) = lock(&shared).connections.get_mut(&id) {
+                    for delivery in retained {
+                        conn.deliver(delivery);
+                    }
                 }
                 shared.changed.notify_waiters();
             }
@@ -618,18 +756,28 @@ async fn serve(shared: Arc<Shared>, id: u64, stream: TcpStream) {
             DecodedFrame::Control(Packet::PingRequest) => {
                 let _ = tx.send(Outgoing::Packet(Packet::PingResponse));
             }
+            DecodedFrame::Control(Packet::PublishAck(ack)) => {
+                if let Some(conn) = lock(&shared).connections.get_mut(&id) {
+                    conn.unacked.retain(|(packet_id, _)| *packet_id != ack.packet_id);
+                }
+            }
             DecodedFrame::Control(Packet::Disconnect(disconnect)) => {
                 clean_disconnect = disconnect.reason_code != DisconnectReasonCode::DisconnectWithWillMessage;
+                // The client may change its Session Expiry Interval when it leaves (§3.14.2.2.2).
+                if let Some(expiry) = disconnect.session_expiry_interval
+                    && let Some(conn) = lock(&shared).connections.get_mut(&id)
+                {
+                    conn.session_expiry = expiry;
+                }
                 break;
             }
-            // PUBACKs for deliveries need no bookkeeping here (no redelivery).
             DecodedFrame::Control(_) => {}
         }
     }
 
     let will = {
         let mut state = lock(&shared);
-        state.connections.remove(&id).and_then(|conn| conn.will)
+        state.end_connection(id).and_then(|(will, _)| will)
     };
     if let Some(will) = will.filter(|_| !clean_disconnect) {
         route(&shared, Some(id), will_delivery(will));
@@ -645,18 +793,17 @@ fn unregister(shared: &Shared, id: u64) {
 async fn write_loop(mut write: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Outgoing>) {
     let mut codec = V5Codec::default();
     let mut buf = BytesMut::new();
-    let mut next_id: u16 = 0;
     while let Some(outgoing) = rx.recv().await {
         buf.clear();
         let encoded = match outgoing {
             Outgoing::Packet(packet) => codec.encode_packet(packet, &mut buf).is_ok(),
-            Outgoing::Publish(delivery) => {
-                let packet_id = (delivery.qos != QoS::AtMostOnce).then(|| {
-                    next_id = next_id.checked_add(1).unwrap_or(1);
-                    NonZeroU16::new(next_id).expect("non-zero")
-                });
+            Outgoing::Publish {
+                delivery,
+                packet_id,
+                dup,
+            } => {
                 let wire = PublishDelivery {
-                    dup: false,
+                    dup,
                     retain: delivery.retain,
                     qos: delivery.qos,
                     packet_id,
@@ -710,14 +857,32 @@ fn route(shared: &Shared, from: Option<u64>, delivery: Delivery) {
     if !groups.is_empty() {
         state.shared_cursor += 1;
     }
+    // Forwarded as a live message: RETAIN only on deliveries caused by a subscribe.
+    let forward = |qos: QoS| Delivery {
+        qos: delivery.qos.min(qos),
+        retain: false,
+        message: delivery.message.clone(),
+    };
     for (id, qos) in targets {
-        if let Some(conn) = state.connections.get(&id) {
-            let _ = conn.tx.send(Outgoing::Publish(Delivery {
-                qos: delivery.qos.min(qos),
-                // Forwarded as a live message: RETAIN only on deliveries caused by a subscribe.
-                retain: false,
-                message: delivery.message.clone(),
-            }));
+        if let Some(conn) = state.connections.get_mut(&id) {
+            conn.deliver(forward(qos));
+        }
+    }
+    // Disconnected clients with a session keep their QoS 1 messages until they return
+    // (shared groups deliver to their connected members only).
+    let now = tokio::time::Instant::now();
+    state.sessions.retain(|_, session| !session.expired(now));
+    for session in state.sessions.values_mut() {
+        let best = session
+            .subscriptions
+            .iter()
+            .filter(|sub| sub.group.is_none() && topic_matches(&sub.filter, &topic))
+            .map(|sub| sub.qos)
+            .max();
+        if let Some(qos) = best
+            && delivery.qos.min(qos) == QoS::AtLeastOnce
+        {
+            session.queued.push(forward(qos));
         }
     }
 }
