@@ -17,20 +17,34 @@ use crate::util::BrokerUrl;
 /// [MQTT-4.13.2-1] DISCONNECT reason codes ≥0x80 classify as session/network termination.
 #[test]
 fn map_broker_disconnect_classifies_error_reason_codes() {
-    use crate::codec::DisconnectReasonCode;
+    use crate::codec::{Disconnect, DisconnectReasonCode};
 
+    let disconnect = |reason_code| Disconnect {
+        reason_code,
+        reason_string: Some("rolling update".into()),
+        ..Disconnect::default()
+    };
     assert!(matches!(
-        map_broker_disconnect_outcome(DisconnectReasonCode::NotAuthorized),
+        map_broker_disconnect_outcome(&disconnect(DisconnectReasonCode::NotAuthorized)),
         ConnectionOutcome::Auth(AuthError::NotAuthorized)
     ));
     assert!(matches!(
-        map_broker_disconnect_outcome(DisconnectReasonCode::UnspecifiedError),
-        ConnectionOutcome::Transport(_)
-    ));
-    assert!(matches!(
-        map_broker_disconnect_outcome(DisconnectReasonCode::ProtocolError),
+        map_broker_disconnect_outcome(&disconnect(DisconnectReasonCode::ProtocolError)),
         ConnectionOutcome::Protocol(_)
     ));
+    let taken_over = map_broker_disconnect_outcome(&disconnect(DisconnectReasonCode::SessionTakenOver));
+    assert_eq!(
+        taken_over,
+        ConnectionOutcome::Transport(TransportError::BrokerDisconnect {
+            reason: DisconnectReasonCode::SessionTakenOver,
+            reason_string: Some("rolling update".into()),
+            server_reference: None,
+        })
+    );
+    assert_eq!(
+        taken_over.to_string(),
+        "broker DISCONNECT: SessionTakenOver (rolling update)"
+    );
 }
 
 #[tokio::test]

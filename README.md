@@ -171,7 +171,7 @@ No MQTT 3.1.1 and no QoS 2: both are out of scope, not pending. If you need eith
 
 ## Upgrading from 0.3
 
-Awaiting a publish now returns `Result<PublishResponse, PublishError>` instead of `Result<(), AppError>`: the response carries the PUBACK (reason code, Reason String, User Properties, whether it answers a resend), the error carries the `AppError` plus `delivery`, whether the broker can have the message. `PublishError` converts into `AppError`, so `publish(..).await?` in a function returning `AppError` needs no change; code that matches `Err(AppError::…)` on a publish matches `err.error` instead. The [CHANGELOG](CHANGELOG.md#unreleased) has the details.
+Awaiting a publish now returns `Result<PublishResponse, PublishError>` instead of `Result<(), AppError>`: the response carries the PUBACK (reason code, Reason String, User Properties, whether it answers a resend), the error carries the `AppError` plus `delivery`, whether the broker can have the message. `PublishError` converts into `AppError`, so `publish(..).await?` in a function returning `AppError` needs no change; code that matches `Err(AppError::…)` on a publish matches `err.error` instead. A broker DISCONNECT is now `TransportError::BrokerDisconnect { reason, .. }` and a refused CONNACK `TransportError::ConnectRefused { reason, .. }`, with the reason code as a field, no longer text inside `TransportError::Connection` or `ProtocolError::Violation`. The [CHANGELOG](CHANGELOG.md#unreleased) has the details.
 
 ## Upgrading from 0.2
 
@@ -220,7 +220,7 @@ The default policy is `NoReconnect`: one connect attempt, and a dropped connecti
 
 ### A new client ID every process (by default)
 
-Without an explicit `client_id`, the builder mints a fresh UUID (`ClientId::from_prefix("glide")`). That ID is reused for reconnects inside the same process. For broker-side session resume across restarts, set a stable ID with `.client_id("my-service")?` (or `.client_id(ClientId::try_new("my-service")?)` on `ConnectOptions`) together with `clean_start(false)` and a non-zero `session_expiry`.
+Without an explicit `client_id`, the builder mints a fresh UUID (`ClientId::from_prefix("glide")`). That ID is reused for reconnects inside the same process. For broker-side session resume across restarts, set a stable ID with `.client_id("my-service")?` (or `.client_id(ClientId::try_new("my-service")?)` on `ConnectOptions`) together with `clean_start(false)` and a non-zero `session_expiry`. Two processes must not share one ID: the broker hands the session to whichever connected last and ends the other connection with 0x8E Session taken over. `StandardReconnectPolicy` then waits its long delay rather than taking the session straight back, but during a rolling update one ID per pod (with a short `session_expiry`) avoids the takeover altogether.
 
 ### No session
 

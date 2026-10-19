@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | `client.publish(t, p).await?` (`AppError`) | unchanged |
   | `Ok(())` | `Ok(response)`: `response.reason()` (`Success` / `NoMatchingSubscribers`, `None` for QoS 0), `reason_string()`, `user_properties()`, `resent()` |
   | `Err(AppError::PublishTimeout(_))` | `Err(PublishError { error: AppError::PublishTimeout(_), delivery, .. })`, or `err.error` |
+- A broker DISCONNECT that is neither an authentication failure nor a protocol error is now `TransportError::BrokerDisconnect { reason, reason_string, server_reference }` instead of `TransportError::Connection(String)` with the reason in the text, so a `ReconnectPolicy` can match the reason code (0x8E Session taken over, 0x8B Server shutting down, ...)
+- A CONNACK refusal other than an authentication failure is now `TransportError::ConnectRefused { reason, reason_string, server_reference }` instead of `ProtocolError::Violation(String)` (0x8A Banned, 0x89 Server busy, 0x9F Connection rate exceeded, ...); `ConnectError::Transport` at the first connect. The standard policy treats it as before (the reconnect delay)
+- `StandardReconnectPolicy` waits its long delay (`max_auth_backoff`, at least the reconnect delay) after 0x8E Session taken over instead of reconnecting at once. Two clients with the same Client Identifier, as during a rolling update, used to take the session from each other in turns
 
 ### Added
 

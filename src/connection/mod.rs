@@ -827,26 +827,7 @@ impl<H: InboundSink> Connection<H> {
             Ok(ReadOutcome::PeerClosed) => {
                 ConnectionOutcome::Transport(TransportError::Connection("peer closed".into()))
             }
-            Ok(ReadOutcome::BrokerDisconnect(disconnect)) => {
-                let detail = broker_detail(
-                    disconnect.reason_string.as_deref(),
-                    disconnect.server_reference.as_deref(),
-                );
-                match map_broker_disconnect_outcome(disconnect.reason_code) {
-                    ConnectionOutcome::Transport(TransportError::Connection(message)) => {
-                        ConnectionOutcome::Transport(TransportError::Connection(message + &detail))
-                    }
-                    ConnectionOutcome::Protocol(ProtocolError::Violation(message)) => {
-                        ConnectionOutcome::Protocol(ProtocolError::Violation(message + &detail))
-                    }
-                    other => {
-                        if !detail.is_empty() {
-                            tracing::warn!(reason = ?disconnect.reason_code, detail = %detail, "broker DISCONNECT");
-                        }
-                        other
-                    }
-                }
-            }
+            Ok(ReadOutcome::BrokerDisconnect(disconnect)) => map_broker_disconnect_outcome(&disconnect),
             Ok(ReadOutcome::Transport(error)) => ConnectionOutcome::Transport(error),
             Ok(ReadOutcome::Protocol(error)) => ConnectionOutcome::Protocol(error),
             Err(join_err) => ConnectionOutcome::Application(AppError::TaskJoin(join_err.to_string())),
@@ -903,22 +884,37 @@ pub(crate) fn broker_detail(reason_string: Option<&str>, server_reference: Optio
     detail
 }
 
-/// Maps a broker DISCONNECT reason to a typed connection outcome.
-pub(crate) fn map_broker_disconnect_outcome(reason: DisconnectReasonCode) -> ConnectionOutcome {
+/// Maps a broker DISCONNECT to a typed connection outcome.
+pub(crate) fn map_broker_disconnect_outcome(disconnect: &crate::codec::Disconnect) -> ConnectionOutcome {
+    let reason = disconnect.reason_code;
     match reason {
         DisconnectReasonCode::NotAuthorized | DisconnectReasonCode::BadAuthenticationMethod => {
+            let detail = broker_detail(
+                disconnect.reason_string.as_deref(),
+                disconnect.server_reference.as_deref(),
+            );
+            if !detail.is_empty() {
+                tracing::warn!(?reason, detail = %detail, "broker DISCONNECT");
+            }
             ConnectionOutcome::Auth(AuthError::NotAuthorized)
-        }
-        DisconnectReasonCode::KeepAliveTimeout => {
-            ConnectionOutcome::Transport(TransportError::Connection("broker keep-alive timeout".into()))
         }
         DisconnectReasonCode::ProtocolError
         | DisconnectReasonCode::MalformedPacket
         | DisconnectReasonCode::TopicAliasInvalid
         | DisconnectReasonCode::PacketTooLarge => {
-            ConnectionOutcome::Protocol(ProtocolError::Violation(format!("broker DISCONNECT: {reason:?}")))
+            let detail = broker_detail(
+                disconnect.reason_string.as_deref(),
+                disconnect.server_reference.as_deref(),
+            );
+            ConnectionOutcome::Protocol(ProtocolError::Violation(format!(
+                "broker DISCONNECT: {reason:?}{detail}"
+            )))
         }
-        _ => ConnectionOutcome::Transport(TransportError::Connection(format!("broker DISCONNECT: {reason:?}"))),
+        _ => ConnectionOutcome::Transport(TransportError::BrokerDisconnect {
+            reason,
+            reason_string: disconnect.reason_string.clone(),
+            server_reference: disconnect.server_reference.clone(),
+        }),
     }
 }
 

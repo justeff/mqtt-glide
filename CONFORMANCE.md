@@ -405,7 +405,7 @@ covered by the statement that binds the client.
 | Statement | Status | Evidence |
 |---|---|---|
 | **[MQTT-4.13.1-1]** When a Server detects a Malformed Packet or Protocol Error, and a Reason Code is given in the specification, it MUST close the Network Connection. | — server obligation |  |
-| **[MQTT-4.13.2-1]** The CONNACK and DISCONNECT packets allow a Reason Code of 0x80 or greater to indicate that the Network Connection will be closed. If a Reason Code of 0x80 or greater is specified, then the Network Connection MUST be closed whether or not the CONNACK or DISCONNECT is sent. | ✅ tested | `connack_unspecified_error_maps_to_protocol_outcome` (src/connection/handshake.rs)<br>`map_broker_disconnect_classifies_error_reason_codes` (src/connection/tests.rs) |
+| **[MQTT-4.13.2-1]** The CONNACK and DISCONNECT packets allow a Reason Code of 0x80 or greater to indicate that the Network Connection will be closed. If a Reason Code of 0x80 or greater is specified, then the Network Connection MUST be closed whether or not the CONNACK or DISCONNECT is sent. | ✅ tested | `connack_refusal_keeps_its_reason_code` (src/connection/handshake.rs)<br>`map_broker_disconnect_classifies_error_reason_codes` (src/connection/tests.rs) |
 
 ## 6.0
 

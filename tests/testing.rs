@@ -7,7 +7,7 @@ use mqtt_glide::{
     AppError, ClientBuilder, ConnectError, InboundMessage, MqttClient, Publish, QoS, StandardReconnectPolicy,
     Subscription,
 };
-use mqtt_glide::{ConnectAckReason, ProtocolError, PublishAckReason, SubscribeAckReason};
+use mqtt_glide::{ConnectAckReason, PublishAckReason, SubscribeAckReason, TransportError};
 use tokio::sync::mpsc;
 
 const WAIT: Duration = Duration::from_secs(2);
@@ -292,8 +292,14 @@ async fn refusals_and_rejections_reach_the_application() {
         .connect()
         .await;
     assert!(
-        matches!(&refused, Err(ConnectError::Protocol(ProtocolError::Violation(msg))) if msg.contains("ServerUnavailable")),
-        "a CONNACK refusal surfaces as a connect error naming the reason: {:?}",
+        matches!(
+            &refused,
+            Err(ConnectError::Transport(TransportError::ConnectRefused {
+                reason: ConnectAckReason::ServerUnavailable,
+                ..
+            }))
+        ),
+        "a CONNACK refusal surfaces as a connect error with its reason code: {:?}",
         refused.err()
     );
 }
@@ -324,4 +330,55 @@ async fn fault_proxy_resets_connections_on_demand() {
         .collect();
     assert_eq!(payloads, ["before", "after"]);
     assert_eq!(proxy.accepted(), 2);
+}
+
+/// A second client with the same Client Identifier takes the session (0x8E). The first one
+/// sees the typed reason and, with the standard policy, waits its long delay instead of
+/// taking the session straight back.
+#[tokio::test]
+async fn a_client_whose_session_was_taken_over_does_not_take_it_back() {
+    use mqtt_glide::{ConnectionOutcome, DisconnectReasonCode, SessionPhase};
+
+    let broker = TestBroker::start().await.expect("broker");
+    // Reconnect delay 20 ms, long delay (taken after a takeover) 5 s.
+    let first = ClientBuilder::new(broker.url())
+        .expect("url")
+        .client_id("vcom-dispatch")
+        .expect("client id")
+        .discard_inbound()
+        .reconnect(StandardReconnectPolicy::new(
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+        ))
+        .connect()
+        .await
+        .expect("connect");
+    let mut phase = first.session_phase();
+    let (second, _rx2) = client(&broker.url(), "vcom-dispatch").await;
+
+    let outcome = tokio::time::timeout(WAIT, async {
+        loop {
+            if let SessionPhase::Disconnected(outcome) = phase.borrow_and_update().clone() {
+                return outcome;
+            }
+            phase.changed().await.expect("phase");
+        }
+    })
+    .await
+    .expect("first client disconnected");
+    assert!(
+        matches!(
+            outcome,
+            ConnectionOutcome::Transport(TransportError::BrokerDisconnect {
+                reason: DisconnectReasonCode::SessionTakenOver,
+                ..
+            })
+        ),
+        "{outcome:?}"
+    );
+
+    // Without the long delay the first client is back within 20 ms and takes the session.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(broker.connect_count(), 2, "no immediate reconnect");
+    assert!(second.is_connected());
 }

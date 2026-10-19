@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::client::ReconnectPolicy;
-use crate::error::ConnectionOutcome;
+use crate::codec::DisconnectReasonCode;
+use crate::error::{ConnectionOutcome, TransportError};
 
 /// Consecutive auth failures before switching to the max auth backoff delay.
 pub const DEFAULT_AUTH_FAILURE_THRESHOLD: u32 = 10;
@@ -75,14 +76,23 @@ impl StandardReconnectPolicyInner {
 /// [`ConnectionOutcome::Transport`] then returns `Duration::ZERO` once, if the session
 /// stayed up for at least the reconnect delay; subsequent transport failures, and a session
 /// that dropped sooner, use the configured reconnect delay.
-/// Protocol outcomes (e.g. broker DISCONNECT) always use the fixed delay.
+/// Protocol outcomes (e.g. a broker DISCONNECT for a protocol error) always use the fixed
+/// delay.
+///
+/// # Session taken over
+///
+/// After a broker DISCONNECT with 0x8E Session taken over (another client connected with the
+/// same Client Identifier, as during a rolling update), the policy waits the long delay
+/// (`max_auth_backoff`, at least the reconnect delay) instead of reconnecting at once, which
+/// would take the session back and start the two clients trading it.
 #[derive(Debug, Clone)]
 pub struct StandardReconnectPolicy {
     inner: Arc<StandardReconnectPolicyInner>,
 }
 
 impl StandardReconnectPolicy {
-    /// Builds a policy with the given reconnect delay and auth backoff cap.
+    /// Builds a policy with the given reconnect delay and the long delay used after
+    /// repeated auth failures and after a session takeover.
     ///
     /// Uses [`DEFAULT_AUTH_FAILURE_THRESHOLD`] for the auth-streak switchover.
     pub fn new(reconnect_delay: Duration, max_auth_backoff: Duration) -> Self {
@@ -166,6 +176,15 @@ impl ReconnectPolicy for StandardReconnectPolicy {
                     self.inner.reconnect_delay,
                     self.inner.max_auth_backoff,
                 ))
+            }
+            // Another client connected with this Client Identifier. Reconnecting at once would
+            // take the session back from it, and the two would trade it for good.
+            ConnectionOutcome::Transport(TransportError::BrokerDisconnect {
+                reason: DisconnectReasonCode::SessionTakenOver,
+                ..
+            }) => {
+                self.inner.take_live_since();
+                Some(self.inner.max_auth_backoff.max(self.inner.reconnect_delay))
             }
             ConnectionOutcome::Transport(_) => {
                 let live_since = self.inner.take_live_since();
@@ -273,6 +292,30 @@ mod tests {
             p.mark_live_ago(Duration::from_secs(4));
             assert_eq!(p.delay_after(&transport()), Some(Duration::from_secs(5)));
         }
+    }
+
+    /// Another client took the session: back off long, even after a live session, so the two
+    /// do not take it from each other in turns. Other broker DISCONNECTs reconnect as before.
+    #[test]
+    fn session_taken_over_waits_the_long_delay() {
+        let disconnect = |reason| {
+            ConnectionOutcome::Transport(TransportError::BrokerDisconnect {
+                reason,
+                reason_string: None,
+                server_reference: None,
+            })
+        };
+        let p = policy();
+        p.mark_live_ago(Duration::from_secs(60));
+        assert_eq!(
+            p.delay_after(&disconnect(DisconnectReasonCode::SessionTakenOver)),
+            Some(Duration::from_secs(600))
+        );
+        p.mark_live_ago(Duration::from_secs(60));
+        assert_eq!(
+            p.delay_after(&disconnect(DisconnectReasonCode::ServerShuttingDown)),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]

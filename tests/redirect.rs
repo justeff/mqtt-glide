@@ -12,7 +12,7 @@ use futures_util::SinkExt;
 use mqtt_glide::codec::{ConnectAck, ConnectAckReason, Disconnect, Packet};
 use mqtt_glide::{
     BrokerUrl, ClientId, ConnectOptions, ConnectionOutcome, DisconnectReasonCode, InboundMessage, NoopLifecycle,
-    ReconnectPolicy, SessionPhase, connect,
+    ReconnectPolicy, SessionPhase, TransportError, connect,
 };
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -131,15 +131,16 @@ async fn connack_redirect_is_reported_when_not_followed() {
     )
     .expect("wiring");
     let outcome = timeout(Duration::from_secs(5), connection.run()).await.expect("run");
-    let message = format!("{outcome:?}");
-    assert!(
-        matches!(outcome, Err(ConnectionOutcome::Protocol(_))),
-        "refusal expected, got {message}"
-    );
-    assert!(
-        message.contains("elsewhere.example.com"),
-        "reference reported: {message}"
-    );
+    let Err(ConnectionOutcome::Transport(TransportError::ConnectRefused {
+        reason,
+        server_reference,
+        ..
+    })) = &outcome
+    else {
+        panic!("refusal expected, got {outcome:?}");
+    };
+    assert_eq!(*reason, ConnectAckReason::ServerMoved);
+    assert_eq!(server_reference.as_deref(), Some("elsewhere.example.com"));
     join_peer(origin).await;
 }
 
@@ -297,7 +298,16 @@ async fn redirects_in_a_row_are_capped() {
     )
     .expect("wiring");
     let outcome = timeout(Duration::from_secs(5), connection.run()).await.expect("run");
-    assert!(matches!(outcome, Err(ConnectionOutcome::Protocol(_))), "{outcome:?}");
+    assert!(
+        matches!(
+            outcome,
+            Err(ConnectionOutcome::Transport(TransportError::ConnectRefused {
+                reason: ConnectAckReason::UseAnotherServer,
+                ..
+            }))
+        ),
+        "{outcome:?}"
+    );
     assert_eq!(connects.load(Ordering::SeqCst), 6, "first attempt plus five redirects");
     origin.abort();
 }

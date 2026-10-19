@@ -24,13 +24,48 @@ pub enum AuthError {
     Provider(String),
 }
 
-/// Transport-level failure (TCP, TLS, DNS).
+/// Transport-level failure (TCP, TLS, DNS), or the broker refusing or ending the connection.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum TransportError {
     /// The TCP connection could not be established or was reset.
     #[error("connection failed: {0}")]
     Connection(String),
+    /// The broker refused the connection: a CONNACK with a reason code of 0x80 or above
+    /// (§3.2.2.2) other than an authentication failure ([`ConnectionOutcome::Auth`]), for
+    /// example 0x88 Server unavailable, 0x89 Server busy, 0x8A Banned or 0x9F Connection rate
+    /// exceeded.
+    #[error(
+        "broker refused the connection: {reason:?}{}",
+        crate::connection::broker_detail(reason_string.as_deref(), server_reference.as_deref())
+    )]
+    #[non_exhaustive]
+    ConnectRefused {
+        /// CONNACK Reason Code.
+        reason: crate::codec::ConnectAckReason,
+        /// Broker's diagnostic text, if it sent one.
+        reason_string: Option<bytestring::ByteString>,
+        /// Server Reference, if the broker named another server.
+        server_reference: Option<bytestring::ByteString>,
+    },
+    /// The broker ended the connection with a DISCONNECT (§3.14) whose reason is neither an
+    /// authentication failure ([`ConnectionOutcome::Auth`]) nor a protocol error
+    /// ([`ConnectionOutcome::Protocol`]): for example 0x8B Server shutting down, 0x89 Server
+    /// busy or 0x8E Session taken over (another client connected with this Client
+    /// Identifier).
+    #[error(
+        "broker DISCONNECT: {reason:?}{}",
+        crate::connection::broker_detail(reason_string.as_deref(), server_reference.as_deref())
+    )]
+    #[non_exhaustive]
+    BrokerDisconnect {
+        /// DISCONNECT Reason Code.
+        reason: crate::codec::DisconnectReasonCode,
+        /// Broker's diagnostic text, if it sent one.
+        reason_string: Option<bytestring::ByteString>,
+        /// Server Reference, if the broker named another server.
+        server_reference: Option<bytestring::ByteString>,
+    },
     /// TLS handshake or certificate validation failed.
     #[error("tls error: {0}")]
     Tls(String),

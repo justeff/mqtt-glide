@@ -8,7 +8,7 @@ use bytestring::ByteString;
 
 use crate::client::Password;
 use crate::codec::{Connect, ConnectAck, ConnectAckReason, QoS, WillMessage};
-use crate::error::{AppError, AuthError, ConnectionOutcome, ProtocolError};
+use crate::error::{AppError, AuthError, ConnectionOutcome, TransportError};
 use crate::options::{ConnectOptions, TlsConfig};
 
 /// Session parameters captured from a successful CONNACK.
@@ -166,8 +166,8 @@ pub(crate) fn apply_connack(client_keep_alive: Duration, ack: &ConnectAck) -> Re
     if ack.reason_code != ConnectAckReason::Success {
         return Err(connack_failure_outcome(
             ack.reason_code,
-            ack.reason_string.as_deref(),
-            ack.server_reference.as_deref(),
+            ack.reason_string.clone(),
+            ack.server_reference.clone(),
         ));
     }
 
@@ -193,18 +193,22 @@ pub(crate) fn apply_connack(client_keep_alive: Duration, ack: &ConnectAck) -> Re
 /// Maps a non-success CONNACK reason to a typed connection outcome.
 pub(crate) fn connack_failure_outcome(
     reason: ConnectAckReason,
-    reason_string: Option<&str>,
-    server_reference: Option<&str>,
+    reason_string: Option<ByteString>,
+    server_reference: Option<ByteString>,
 ) -> ConnectionOutcome {
-    let detail = super::broker_detail(reason_string, server_reference);
     match reason {
         ConnectAckReason::NotAuthorized | ConnectAckReason::BadUserNameOrPassword => {
+            let detail = super::broker_detail(reason_string.as_deref(), server_reference.as_deref());
             if !detail.is_empty() {
                 tracing::warn!(reason = ?reason, detail = %detail, "CONNACK refused credentials");
             }
             ConnectionOutcome::Auth(AuthError::NotAuthorized)
         }
-        other => ConnectionOutcome::Protocol(ProtocolError::Violation(format!("CONNACK rejected: {other:?}{detail}"))),
+        reason => ConnectionOutcome::Transport(TransportError::ConnectRefused {
+            reason,
+            reason_string,
+            server_reference,
+        }),
     }
 }
 
@@ -519,9 +523,20 @@ mod tests {
 
     /// [MQTT-4.13.2-1] CONNACK reason codes ≥0x80 classify as session/network termination.
     #[test]
-    fn connack_unspecified_error_maps_to_protocol_outcome() {
-        let outcome = connack_failure_outcome(ConnectAckReason::UnspecifiedError, Some("maintenance"), None);
-        assert!(matches!(outcome, ConnectionOutcome::Protocol(_)));
+    fn connack_refusal_keeps_its_reason_code() {
+        let outcome = connack_failure_outcome(ConnectAckReason::Banned, Some("maintenance".into()), None);
+        assert_eq!(
+            outcome,
+            ConnectionOutcome::Transport(TransportError::ConnectRefused {
+                reason: ConnectAckReason::Banned,
+                reason_string: Some("maintenance".into()),
+                server_reference: None,
+            })
+        );
+        assert_eq!(
+            outcome.to_string(),
+            "broker refused the connection: Banned (maintenance)"
+        );
     }
 
     // ── TLS decision ────────────────────────────────────────────────────────
