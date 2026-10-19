@@ -1168,8 +1168,8 @@ mod tests {
     use super::*;
     use crate::ack::PublishError;
     use crate::codec::{
-        ConnectAck, DecodedFrame, InboundMessage, Packet, PublishAck, PublishMessage, PublishProperties, QoS,
-        SubscribeAck, SubscribeAckReason, UnsubscribeAck, UnsubscribeAckReason,
+        ConnectAck, DecodedFrame, InboundMessage, Packet, PublishAck, PublishMessage, QoS, SubscribeAck,
+        SubscribeAckReason, UnsubscribeAck, UnsubscribeAckReason,
     };
     use crate::connection::test_support::{
         NoReconnect, accept_connect_send_connack, accept_connect_send_connack_with, await_connected, spawn_broker_once,
@@ -1351,7 +1351,7 @@ mod tests {
         PublishMessage {
             topic: ByteString::from(topic.to_owned()),
             payload: Bytes::from_static(payload),
-            properties: PublishProperties::default(),
+            properties: Default::default(),
         }
     }
 
@@ -3990,7 +3990,7 @@ mod tests {
                         "in/dup",
                         b"x",
                         NonZeroU16::new(id).expect("nz"),
-                        PublishProperties::default(),
+                        crate::codec::PublishProperties::default(),
                         dup,
                     )
                     .await;

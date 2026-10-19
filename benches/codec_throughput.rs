@@ -30,7 +30,7 @@ fn publish_message(topic: &'static str, properties: PublishProperties) -> Publis
     PublishMessage {
         topic: ByteString::from_static(topic),
         payload: Bytes::from(vec![0u8; PAYLOAD_LEN]),
-        properties,
+        properties: properties.into(),
     }
 }
 

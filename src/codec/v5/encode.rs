@@ -417,7 +417,7 @@ mod tests {
         let message = PublishMessage {
             topic: ByteString::from_static("topic"),
             payload: (0..255).collect::<Vec<u8>>().into(),
-            properties: PublishProperties::default(),
+            properties: Default::default(),
         };
         let delivery = PublishDelivery {
             dup: true,
@@ -630,7 +630,7 @@ mod tests {
             &PublishMessage {
                 topic: ByteString::from_static("topic"),
                 payload: Bytes::from_static(b"data"),
-                properties: PublishProperties::default(),
+                properties: Default::default(),
             },
             PublishDelivery {
                 dup: true,
@@ -645,7 +645,7 @@ mod tests {
             &PublishMessage {
                 topic: ByteString::from_static("topic"),
                 payload: Bytes::from_static(b"data"),
-                properties: PublishProperties::default(),
+                properties: Default::default(),
             },
             PublishDelivery {
                 dup: false,
@@ -673,7 +673,7 @@ mod tests {
         let message = PublishMessage {
             topic: ByteString::from_static("topic"),
             payload: Bytes::from_static(b"data"),
-            properties: PublishProperties::default(),
+            properties: Default::default(),
         };
         let delivery = PublishDelivery {
             dup: true,
@@ -1004,7 +1004,7 @@ mod tests {
         let message = PublishMessage {
             topic: ByteString::from(topic),
             payload: Bytes::from_static(b"x"),
-            properties: PublishProperties::default(),
+            properties: Default::default(),
         };
         let mut buf = BytesMut::from(&b"keep"[..]);
         let err = encode_publish(&message, delivery, u32::MAX, &mut buf).expect_err(topic);
@@ -1035,7 +1035,7 @@ mod tests {
         let message = PublishMessage {
             topic: ByteString::from_static("req/topic"),
             payload: Bytes::from_static(b"x"),
-            properties: PublishProperties::default().response_topic(response_topic),
+            properties: PublishProperties::default().response_topic(response_topic).into(),
         };
         let mut buf = BytesMut::from(&b"keep"[..]);
         let err = encode_publish(&message, delivery, u32::MAX, &mut buf).expect_err(response_topic);
@@ -1066,7 +1066,7 @@ mod tests {
         let message = PublishMessage {
             topic: ByteString::from_static("topic/a"),
             payload: Bytes::from_static(b"x"),
-            properties,
+            properties: properties.into(),
         };
         let mut buf = BytesMut::from(&b"keep"[..]);
         let err = encode_publish(&message, delivery, u32::MAX, &mut buf).expect_err("nul property");
@@ -1087,7 +1087,7 @@ mod tests {
         let message = PublishMessage {
             topic: ByteString::from_static("t"),
             payload: Bytes::from(vec![0u8; crate::codec::utils::MAX_VARIABLE_LENGTH as usize]),
-            properties: PublishProperties::default(),
+            properties: Default::default(),
         };
         let delivery = PublishDelivery {
             dup: false,
@@ -1206,7 +1206,7 @@ mod tests {
         let message = PublishMessage {
             topic: ByteString::from_static("t"),
             payload: Bytes::from_static(&[7; 100]),
-            properties: PublishProperties::default(),
+            properties: Default::default(),
         };
         let wire_len = publish_wire_len(&message, delivery, 0).unwrap() as u32;
         let mut buf = BytesMut::new();

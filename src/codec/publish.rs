@@ -94,12 +94,100 @@ impl PublishProperties {
     }
 }
 
+/// The [`PublishProperties`] of a message, allocated only when it has some.
+///
+/// Read and change it like a [`PublishProperties`] (it derefs to one, so
+/// `message.properties.content_type` works as usual); build it from one with `.into()`. Most
+/// messages carry no properties: keeping them out of line keeps every message small, and a
+/// message moves through several queues and futures between `publish()` and the socket.
+#[derive(Clone, Default)]
+pub struct Properties(Option<Box<PublishProperties>>);
+
+/// What an empty [`Properties`] derefs to.
+static NO_PROPERTIES: PublishProperties = PublishProperties {
+    correlation_data: None,
+    message_expiry_interval: None,
+    content_type: None,
+    user_properties: Vec::new(),
+    payload_format_indicator: false,
+    response_topic: None,
+};
+
+impl Properties {
+    /// Whether no property is set.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        **self == NO_PROPERTIES
+    }
+
+    /// The properties as a plain [`PublishProperties`].
+    #[inline]
+    pub fn into_inner(self) -> PublishProperties {
+        self.0.map(|properties| *properties).unwrap_or_default()
+    }
+}
+
+impl std::ops::Deref for Properties {
+    type Target = PublishProperties;
+
+    #[inline]
+    fn deref(&self) -> &PublishProperties {
+        self.0.as_deref().unwrap_or(&NO_PROPERTIES)
+    }
+}
+
+impl std::ops::DerefMut for Properties {
+    /// Allocates on first use, even if nothing is changed.
+    #[inline]
+    fn deref_mut(&mut self) -> &mut PublishProperties {
+        self.0.get_or_insert_with(Box::default)
+    }
+}
+
+impl From<PublishProperties> for Properties {
+    #[inline]
+    fn from(properties: PublishProperties) -> Self {
+        if properties == NO_PROPERTIES {
+            Self(None)
+        } else {
+            Self(Some(Box::new(properties)))
+        }
+    }
+}
+
+impl From<Properties> for PublishProperties {
+    #[inline]
+    fn from(properties: Properties) -> Self {
+        properties.into_inner()
+    }
+}
+
+impl PartialEq for Properties {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for Properties {}
+
+impl PartialEq<PublishProperties> for Properties {
+    fn eq(&self, other: &PublishProperties) -> bool {
+        **self == *other
+    }
+}
+
+impl std::fmt::Debug for Properties {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
 /// Application PUBLISH message: topic, payload, and transferable v5 properties.
 #[derive(PartialEq, Eq, Clone)]
 pub struct PublishMessage {
     pub topic: ByteString,
     pub payload: Bytes,
-    pub properties: PublishProperties,
+    pub properties: Properties,
 }
 
 impl PublishMessage {
@@ -123,14 +211,14 @@ impl PublishMessage {
         Self {
             topic: topic.into(),
             payload: payload.into(),
-            properties: PublishProperties::default(),
+            properties: Properties::default(),
         }
     }
 
     /// Replaces transferable MQTT 5 PUBLISH properties.
     #[inline]
     pub fn properties(mut self, properties: PublishProperties) -> Self {
-        self.properties = properties;
+        self.properties = properties.into();
         self
     }
 }
@@ -159,7 +247,7 @@ pub struct InboundMessage {
     /// Application payload.
     pub payload: Bytes,
     /// Transferable MQTT 5 properties.
-    pub properties: PublishProperties,
+    pub properties: Properties,
     /// QoS the broker delivered the message with (at most the subscription's QoS).
     pub qos: QoS,
     /// RETAIN flag: a retained message sent because of a subscription (or forwarded as-is
@@ -259,6 +347,30 @@ pub struct PublishDelivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A message without properties holds none, reads as the default, and only allocates
+    /// once one is set.
+    #[test]
+    fn properties_allocate_only_when_set() {
+        let mut properties = Properties::default();
+        assert!(properties.0.is_none() && properties.is_empty());
+        assert_eq!(properties.content_type, None);
+        assert_eq!(Properties::from(PublishProperties::default()).0, None);
+
+        properties.content_type = Some("text/plain".into());
+        assert!(properties.0.is_some() && !properties.is_empty());
+        assert_eq!(properties, PublishProperties::default().content_type("text/plain"));
+        assert_eq!(
+            properties.clone().into_inner(),
+            PublishProperties::default().content_type("text/plain")
+        );
+
+        // Equal by content, however they are stored.
+        let mut touched = Properties::default();
+        let _ = &mut *touched;
+        assert!(touched.0.is_some());
+        assert_eq!(touched, Properties::default());
+    }
 
     #[test]
     fn publish_message_new_accepts_str_payload() {

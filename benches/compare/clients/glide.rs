@@ -11,8 +11,8 @@ use bytestring::ByteString;
 use mqtt_glide::Password;
 use mqtt_glide::{
     AuthError, BrokerUrl, ClientId as GlideClientId, ConnectOptions, ConnectionOutcome, CredentialsProvider,
-    InboundMessage, MqttClient, NoopLifecycle, Publish, PublishMessage, PublishProperties, QoS, ReconnectPolicy,
-    SessionParams, SessionPhase, connect,
+    InboundMessage, MqttClient, NoopLifecycle, Publish, PublishMessage, QoS, ReconnectPolicy, SessionParams,
+    SessionPhase, connect,
 };
 use tokio::task::JoinHandle;
 
@@ -204,7 +204,7 @@ fn publish_message(payload: &[u8]) -> PublishMessage {
     PublishMessage {
         topic: ByteString::from_static(OUTBOUND_TOPIC),
         payload: Bytes::copy_from_slice(payload),
-        properties: PublishProperties::default(),
+        properties: Default::default(),
     }
 }
 

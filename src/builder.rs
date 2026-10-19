@@ -627,7 +627,7 @@ mod tests {
         let stub = || InboundMessage {
             topic: ByteString::from_static("t"),
             payload: Bytes::new(),
-            properties: PublishProperties::default(),
+            properties: Default::default(),
             qos: QoS::AtMostOnce,
             retain: false,
             dup: false,

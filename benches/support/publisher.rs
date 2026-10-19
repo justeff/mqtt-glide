@@ -8,7 +8,7 @@ use bytes::BytesMut;
 use bytestring::ByteString;
 use futures_util::{SinkExt, StreamExt};
 use mqtt_glide::codec::{Connect, DecodedFrame, Disconnect, Packet, PublishDelivery, V5Codec, encode_publish};
-use mqtt_glide::{ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, PublishMessage, PublishProperties, QoS};
+use mqtt_glide::{ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, PublishMessage, QoS};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -121,7 +121,7 @@ impl PersistentPublisher {
         let message = PublishMessage {
             topic: ByteString::from(topic.to_owned()),
             payload: payload.to_vec().into(),
-            properties: PublishProperties::default(),
+            properties: Default::default(),
         };
         let delivery = PublishDelivery {
             dup: false,

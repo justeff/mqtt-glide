@@ -68,7 +68,7 @@ mod tests {
     use bytestring::ByteString;
 
     use super::*;
-    use crate::codec::{PublishMessage, PublishPacket, PublishPacketMeta, PublishProperties, QoS};
+    use crate::codec::{PublishMessage, PublishPacket, PublishPacketMeta, QoS};
     use crate::error::{AppError, ProtocolError};
 
     fn publish_with_alias(alias: Option<NonZeroU16>) -> PublishPacket {
@@ -76,7 +76,7 @@ mod tests {
             message: PublishMessage {
                 topic: ByteString::from_static("t/1"),
                 payload: Bytes::from_static(b"x"),
-                properties: PublishProperties::default(),
+                properties: Default::default(),
             },
             meta: PublishPacketMeta {
                 dup: false,

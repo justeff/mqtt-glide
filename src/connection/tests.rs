@@ -231,7 +231,7 @@ async fn write_task_exit_cancels_read_and_joins() {
 /// accept work (`PingReq`).
 #[tokio::test]
 async fn write_can_progress_while_handoff_stalls() {
-    use crate::codec::{InboundMessage, PublishProperties, QoS};
+    use crate::codec::{InboundMessage, QoS};
     use crate::connection::ControlMessage;
     use bytes::Bytes;
     use bytestring::ByteString;
@@ -240,7 +240,7 @@ async fn write_can_progress_while_handoff_stalls() {
         InboundMessage {
             topic: ByteString::from_static(topic),
             payload: Bytes::from_static(payload),
-            properties: PublishProperties::default(),
+            properties: Default::default(),
             qos: QoS::AtMostOnce,
             retain: false,
             dup: false,
@@ -300,7 +300,7 @@ async fn write_can_progress_while_handoff_stalls() {
 /// proves the idle client sends PINGREQ ([MQTT-3.1.2-20]).
 #[tokio::test]
 async fn keep_alive_survives_handoff_stall_without_spurious_reconnect() {
-    use crate::codec::{InboundMessage, PublishProperties, QoS};
+    use crate::codec::{InboundMessage, QoS};
     use bytes::Bytes;
     use bytestring::ByteString;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -317,7 +317,7 @@ async fn keep_alive_survives_handoff_stall_without_spurious_reconnect() {
         .send_async(InboundMessage {
             topic: ByteString::from_static("fill"),
             payload: Bytes::from_static(b"1"),
-            properties: PublishProperties::default(),
+            properties: Default::default(),
             qos: QoS::AtMostOnce,
             retain: false,
             dup: false,

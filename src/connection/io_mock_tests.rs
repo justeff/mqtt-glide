@@ -24,8 +24,8 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
 use crate::codec::{
-    DecodedFrame, DisconnectReasonCode, InboundMessage, Packet, PublishDelivery, PublishMessage, PublishProperties,
-    QoS, V5Codec, encode_publish,
+    DecodedFrame, DisconnectReasonCode, InboundMessage, Packet, PublishDelivery, PublishMessage, QoS, V5Codec,
+    encode_publish,
 };
 use crate::connection::packet_id::InflightPots;
 use crate::connection::read::{ReadDoneSignal, ReadOutcome, ReadSession};
@@ -39,7 +39,7 @@ fn sample_qos0_publish_wire() -> Bytes {
     let message = PublishMessage {
         topic: ByteString::from_static("io/mock"),
         payload: Bytes::from_static(b"partial-payload"),
-        properties: PublishProperties::default(),
+        properties: Default::default(),
     };
     let delivery = PublishDelivery {
         dup: false,
@@ -699,7 +699,7 @@ async fn read_task_cut_off_by_shutdown_does_not_puback_unaccepted_publish() {
         let message = PublishMessage {
             topic: ByteString::from_static("io/mock"),
             payload: Bytes::from_static(b"p"),
-            properties: PublishProperties::default(),
+            properties: Default::default(),
         };
         let mut buf = BytesMut::new();
         encode_publish(&message, delivery, u32::MAX, &mut buf).expect("encode qos1 publish");

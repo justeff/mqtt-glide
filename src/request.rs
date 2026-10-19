@@ -308,7 +308,8 @@ mod tests {
             properties: PublishProperties {
                 correlation_data: correlation.map(Bytes::from_static),
                 ..PublishProperties::default()
-            },
+            }
+            .into(),
             qos: QoS::AtMostOnce,
             retain: false,
             dup: false,

@@ -17,8 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use mqtt_glide::codec::{Connect, DecodedFrame, Disconnect, Packet, PublishDelivery, V5Codec, encode_publish};
 use mqtt_glide::{
     BrokerUrl, ConnectAckReason, ConnectOptions, ConnectionOutcome, DEFAULT_MAX_PACKET_SIZE, InboundMessage,
-    MqttClient, NoopLifecycle, PublishMessage, PublishProperties, QoS, ReconnectPolicy, SessionParams, SessionPhase,
-    connect,
+    MqttClient, NoopLifecycle, PublishMessage, QoS, ReconnectPolicy, SessionParams, SessionPhase, connect,
 };
 use testcontainers::ContainerAsync;
 use testcontainers::ContainerRequest;
@@ -349,7 +348,7 @@ pub async fn publish_qos0_via_raw_session(port: u16, client_id: &str, topic: &st
     let message = PublishMessage {
         topic: ByteString::from(topic.to_owned()),
         payload: Bytes::copy_from_slice(payload),
-        properties: PublishProperties::default(),
+        properties: Default::default(),
     };
     let delivery = PublishDelivery {
         dup: false,
@@ -410,7 +409,7 @@ pub async fn publish_qos1_via_raw_session(port: u16, client_id: &str, topic: &st
     let message = PublishMessage {
         topic: ByteString::from(topic.to_owned()),
         payload: Bytes::copy_from_slice(payload),
-        properties: PublishProperties::default(),
+        properties: Default::default(),
     };
     let delivery = PublishDelivery {
         dup: false,

@@ -28,7 +28,7 @@ pub use error::{DecodeError, EncodeError, UnknownCode};
     allow(unused_imports, reason = "used by tests and benches")
 )]
 pub use publish::{
-    InboundMessage, PublishDelivery, PublishMessage, PublishPacket, PublishPacketMeta, PublishProperties,
+    InboundMessage, Properties, PublishDelivery, PublishMessage, PublishPacket, PublishPacketMeta, PublishProperties,
 };
 pub use types::QoS;
 

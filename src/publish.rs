@@ -118,7 +118,7 @@ macro_rules! publish_setters {
         /// Replaces all MQTT 5 properties, including User Properties and expiry set earlier.
         #[inline]
         pub fn properties(mut self, properties: PublishProperties) -> Self {
-            self.inner_mut().message.properties = properties;
+            self.inner_mut().message.properties = properties.into();
             self
         }
     };

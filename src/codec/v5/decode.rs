@@ -112,7 +112,7 @@ mod tests {
     use std::num::{NonZeroU16, NonZeroU32};
 
     use super::*;
-    use crate::codec::publish::{PublishMessage, PublishPacket, PublishPacketMeta, PublishProperties};
+    use crate::codec::publish::{PublishMessage, PublishPacket, PublishPacketMeta};
     use crate::codec::types::QoS;
     use crate::codec::utils::decode_variable_length;
     use crate::codec::v5::UserProperties;
@@ -261,7 +261,7 @@ mod tests {
                 message: PublishMessage {
                     topic: ByteString::from_static("topic"),
                     payload: Bytes::from_static(b"data"),
-                    properties: PublishProperties::default(),
+                    properties: Default::default(),
                 },
                 meta: PublishPacketMeta {
                     dup: true,
@@ -280,7 +280,7 @@ mod tests {
                 message: PublishMessage {
                     topic: ByteString::from_static("topic"),
                     payload: Bytes::from_static(b"data"),
-                    properties: PublishProperties::default(),
+                    properties: Default::default(),
                 },
                 meta: PublishPacketMeta {
                     dup: false,

@@ -76,9 +76,9 @@ pub use ack::{
     UnsubscribeResponse,
 };
 pub use codec::{
-    ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, DisconnectReasonCode, InboundMessage, PublishAckReason, PublishMessage,
-    PublishProperties, QoS, RetainHandling, SubscribeAckReason, SubscriptionOptions, UnknownCode, UnsubscribeAckReason,
-    UserProperties, UserProperty, WillMessage,
+    ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, DisconnectReasonCode, InboundMessage, Properties, PublishAckReason,
+    PublishMessage, PublishProperties, QoS, RetainHandling, SubscribeAckReason, SubscriptionOptions, UnknownCode,
+    UnsubscribeAckReason, UserProperties, UserProperty, WillMessage,
 };
 pub use connection::{Connection, LifecycleHook, NoopLifecycle, SessionParams, SessionPhase};
 pub use error::{AppError, AuthError, ConnectError, ConnectionOutcome, ProtocolError, ShutdownError, TransportError};

@@ -429,7 +429,8 @@ fn will_delivery(will: WillMessage) -> Delivery {
                 user_properties: will.user_properties,
                 payload_format_indicator: will.payload_format_indicator.unwrap_or(false),
                 response_topic: will.response_topic,
-            },
+            }
+            .into(),
         },
         qos: will.qos,
         retain: will.retain,
@@ -513,7 +514,7 @@ async fn serve(shared: Arc<Shared>, id: u64, stream: TcpStream) {
                     payload: delivery.message.payload.clone(),
                     qos: delivery.qos,
                     retain: delivery.retain,
-                    properties: delivery.message.properties.clone(),
+                    properties: delivery.message.properties.clone().into(),
                 };
                 if let Some(packet_id) = packet.meta.packet_id {
                     let answer = lock(&shared).ack_with.clone();

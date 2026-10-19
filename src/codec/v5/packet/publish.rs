@@ -68,7 +68,8 @@ impl PublishPacket {
                     user_properties: props.user_properties,
                     payload_format_indicator: props.payload_format_indicator,
                     response_topic: props.response_topic,
-                },
+                }
+                .into(),
             },
             meta: PublishPacketMeta {
                 dup,
@@ -351,7 +352,7 @@ mod tests {
         let message = PublishMessage {
             topic: ByteString::from_static("ab"),
             payload: Bytes::from_static(b"x"),
-            properties: PublishProperties::default(),
+            properties: Default::default(),
         };
         let delivery = PublishDelivery {
             dup: false,
@@ -417,7 +418,8 @@ mod tests {
                         user_properties: vec![("k", "v").into()],
                         payload_format_indicator: true,
                         response_topic: Some(ByteString::from_static("r/1")),
-                    },
+                    }
+                    .into(),
                 },
                 meta: PublishPacketMeta {
                     dup: false,

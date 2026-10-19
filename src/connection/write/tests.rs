@@ -1,7 +1,6 @@
 use super::*;
 use crate::codec::{
-    DisconnectReasonCode, PublishAckReason, PublishDelivery, PublishMessage, PublishProperties, QoS, V5Codec,
-    encode_publish,
+    DisconnectReasonCode, PublishAckReason, PublishDelivery, PublishMessage, QoS, V5Codec, encode_publish,
 };
 use crate::connection::ClientCommand;
 use crate::connection::publish_reply;
@@ -478,7 +477,7 @@ fn finish_publish_encode_error_maps_bad_topic_to_invalid_request(#[case] topic: 
     let message = PublishMessage {
         topic: ByteString::from(topic),
         payload: Bytes::from_static(b"x"),
-        properties: PublishProperties::default(),
+        properties: Default::default(),
     };
     let mut buf = BytesMut::new();
     let err = encode_publish(&message, delivery, u32::MAX, &mut buf).expect_err(topic);
@@ -685,7 +684,7 @@ async fn cancelled_qos1_publish_keeps_packet_id_until_puback() {
     let message = PublishMessage {
         topic: ByteString::from_static("t/cancel"),
         payload: Bytes::from_static(b"x"),
-        properties: PublishProperties::default(),
+        properties: Default::default(),
     };
     let (reply_tx, reply_ticket) = publish_reply(true);
     let reply_rx = reply_ticket.rx;
@@ -796,7 +795,7 @@ async fn closed_publish_reply_before_encode_skips_packet_id_alloc() {
     let message = PublishMessage {
         topic: ByteString::from_static("t/pre-cancel"),
         payload: Bytes::from_static(b"x"),
-        properties: PublishProperties::default(),
+        properties: Default::default(),
     };
     let (reply_tx, reply_ticket) = publish_reply(true);
     drop(reply_ticket);
@@ -1004,7 +1003,7 @@ async fn handle_publish_rejects_without_wire_publish(
             message: PublishMessage {
                 topic: ByteString::from_static(topic),
                 payload: Bytes::from_static(b"x"),
-                properties: PublishProperties::default(),
+                properties: Default::default(),
             },
             qos,
             retain,
@@ -1054,7 +1053,7 @@ async fn full_parked_queue_leaves_commands_in_the_channel() {
         message: PublishMessage {
             topic: ByteString::from_static("t/parked"),
             payload: Bytes::from_static(b"x"),
-            properties: PublishProperties::default(),
+            properties: Default::default(),
         },
         qos: QoS::AtLeastOnce,
         retain: false,
@@ -1126,7 +1125,7 @@ async fn graceful_disconnect_sends_publishes_parked_behind_a_freed_window() {
         message: PublishMessage {
             topic: ByteString::from_static("t/parked"),
             payload: Bytes::from_static(b"x"),
-            properties: PublishProperties::default(),
+            properties: Default::default(),
         },
         qos: QoS::AtLeastOnce,
         retain: false,

@@ -171,7 +171,7 @@ No MQTT 3.1.1 and no QoS 2: both are out of scope, not pending. If you need eith
 
 ## Upgrading from 0.3
 
-Awaiting a publish now returns `Result<PublishResponse, PublishError>` instead of `Result<(), AppError>`: the response carries the PUBACK (reason code, Reason String, User Properties, whether it answers a resend), the error carries the `AppError` plus `delivery`, whether the broker can have the message. `PublishError` converts into `AppError`, so `publish(..).await?` in a function returning `AppError` needs no change; code that matches `Err(AppError::…)` on a publish matches `err.error` instead. A broker DISCONNECT is now `TransportError::BrokerDisconnect { reason, .. }` and a refused CONNACK `TransportError::ConnectRefused { reason, .. }`, with the reason code as a field, no longer text inside `TransportError::Connection` or `ProtocolError::Violation`. The [CHANGELOG](CHANGELOG.md#unreleased) has the details.
+Awaiting a publish now returns `Result<PublishResponse, PublishError>` instead of `Result<(), AppError>`: the response carries the PUBACK (reason code, Reason String, User Properties, whether it answers a resend), the error carries the `AppError` plus `delivery`, whether the broker can have the message. `PublishError` converts into `AppError`, so `publish(..).await?` in a function returning `AppError` needs no change; code that matches `Err(AppError::…)` on a publish matches `err.error` instead. A message's `properties` field is a `Properties` that derefs to `PublishProperties`: reading and changing it is unchanged, a struct literal needs `props.into()`. A broker DISCONNECT is now `TransportError::BrokerDisconnect { reason, .. }` and a refused CONNACK `TransportError::ConnectRefused { reason, .. }`, with the reason code as a field, no longer text inside `TransportError::Connection` or `ProtocolError::Violation`. The [CHANGELOG](CHANGELOG.md#unreleased) has the details.
 
 ## Upgrading from 0.2
 
@@ -502,7 +502,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | MQTT 5 wire (`CONNECT`…`DISCONNECT`, QoS 0/1) | ✅ | MQTT 3.1.1 out of scope |
 | Shared subscriptions (`$share/…`) | ✅ | Caller builds the filter; `shared_filter` validates ShareName |
 | Topic filter wildcards | ✅ | Client validates `+` / `#` placement before encode |
-| Publish properties (expiry, user props, content type, `response_topic`, `correlation_data`) | ✅ | On `PublishProperties`; setters on `Publish` |
+| Publish properties (expiry, user props, content type, `response_topic`, `correlation_data`) | ✅ | On `PublishProperties` (a message holds them as `Properties`, allocated only when set); setters on `Publish` |
 | TLS (rustls + system roots) | ✅ | Feature-selected crypto provider |
 | Reconnect / credentials hooks | ✅ | Traits + optional helpers |
 | Enqueue-before-ack + `InboundSink` | ✅ | Product backpressure policy |

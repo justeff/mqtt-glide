@@ -157,7 +157,7 @@ pub(crate) async fn spawn_mock_broker_keepalive_enforcer(
         let message = PublishMessage {
             topic: bytestring::ByteString::from_static(topic),
             payload: bytes::Bytes::from_static(payload),
-            properties: crate::codec::PublishProperties::default(),
+            properties: Default::default(),
         };
         let delivery = PublishDelivery {
             dup: false,
@@ -278,7 +278,7 @@ pub(crate) async fn send_inbound_qos1_publish_dup(
     let message = PublishMessage {
         topic: bytestring::ByteString::from(topic.to_owned()),
         payload: bytes::Bytes::copy_from_slice(payload),
-        properties,
+        properties: properties.into(),
     };
     let delivery = PublishDelivery {
         dup,

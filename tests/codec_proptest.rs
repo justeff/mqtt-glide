@@ -704,7 +704,7 @@ fn arb_v5_publish(
                 PublishMessage {
                     topic: ByteString::from(topic),
                     payload,
-                    properties,
+                    properties: properties.into(),
                 },
                 PublishDelivery {
                     dup: dup && has_id, // QoS 0: [MQTT-3.3.1-2]
