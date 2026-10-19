@@ -176,8 +176,36 @@ pub(crate) struct InflightPublish {
     pub(super) resent: bool,
     /// Message + retain flag, kept only for resumable sessions.
     pub(super) resend: Option<(PublishMessage, bool)>,
+    /// Lifetime the message started with, to count down on a resend.
+    pub(super) expiry: Option<ExpiryClock>,
     /// Position in send order (see [`PublishWaiters`]).
     pub(super) seq: u64,
+}
+
+/// The Message Expiry Interval a publish was first sent with, and when. A resend carries what
+/// is left of it, as a broker does when it forwards a message ([MQTT-3.3.2-6]): resending the
+/// full interval would let the message outlive its lifetime by the time the reconnect took.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExpiryClock {
+    first_sent: tokio::time::Instant,
+    interval: u32,
+}
+
+impl ExpiryClock {
+    /// For a message about to be sent for the first time, if it has an expiry.
+    fn start(message: &PublishMessage) -> Option<Self> {
+        message.properties.message_expiry_interval.map(|interval| Self {
+            first_sent: tokio::time::Instant::now(),
+            interval,
+        })
+    }
+
+    /// Seconds left, at least 1: a resend is owed to the session ([MQTT-4.4.0-1]) even when
+    /// the lifetime has run out, and then expires at the broker at once.
+    pub(crate) fn remaining(self) -> u32 {
+        let elapsed = u32::try_from(self.first_sent.elapsed().as_secs()).unwrap_or(u32::MAX);
+        self.interval.saturating_sub(elapsed).max(1)
+    }
 }
 
 /// Unacknowledged QoS-1 PUBLISH carried from one connection to the next of a resumed
@@ -188,6 +216,8 @@ pub(crate) struct CarriedPublish {
     pub(crate) message: PublishMessage,
     pub(crate) retain: bool,
     pub(crate) reply: PublishReply,
+    /// Lifetime the message started with ([`ExpiryClock`]).
+    pub(crate) expiry: Option<ExpiryClock>,
     /// Original send order ([MQTT-4.6.0-1]).
     pub(crate) seq: u64,
 }
@@ -245,9 +275,34 @@ impl PublishWaiters {
         }
     }
 
-    /// Registers an encoded QoS-1 publish (`resent`: a DUP resend after a reconnect); keeps
-    /// the message when the session is resumable.
-    pub(super) fn insert_sent(&mut self, packet_id: NonZeroU16, publish: PendingOutboundPublish, resent: bool) {
+    /// Registers a QoS-1 publish encoded for the first time; keeps the message when the
+    /// session is resumable.
+    pub(super) fn insert_sent(&mut self, packet_id: NonZeroU16, publish: PendingOutboundPublish) {
+        let expiry = if self.keep_messages {
+            ExpiryClock::start(&publish.message)
+        } else {
+            None
+        };
+        self.register(packet_id, publish, false, expiry);
+    }
+
+    /// Registers a QoS-1 publish resent with DUP after a reconnect.
+    pub(super) fn insert_resent(
+        &mut self,
+        packet_id: NonZeroU16,
+        publish: PendingOutboundPublish,
+        expiry: Option<ExpiryClock>,
+    ) {
+        self.register(packet_id, publish, true, expiry);
+    }
+
+    fn register(
+        &mut self,
+        packet_id: NonZeroU16,
+        publish: PendingOutboundPublish,
+        resent: bool,
+        expiry: Option<ExpiryClock>,
+    ) {
         let resend = self.keep_messages.then_some((publish.message, publish.retain));
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -257,6 +312,7 @@ impl PublishWaiters {
                 reply: publish.reply,
                 resent,
                 resend,
+                expiry,
                 seq,
             },
         );
@@ -284,6 +340,7 @@ impl PublishWaiters {
                 reply,
                 resent: false,
                 resend: None,
+                expiry: None,
                 seq,
             },
         );

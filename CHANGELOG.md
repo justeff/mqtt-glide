@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A CONNACK refusal other than an authentication failure is now `TransportError::ConnectRefused { reason, reason_string, server_reference }` instead of `ProtocolError::Violation(String)` (0x8A Banned, 0x89 Server busy, 0x9F Connection rate exceeded, ...); `ConnectError::Transport` at the first connect. The standard policy treats it as before (the reconnect delay)
 - `StandardReconnectPolicy` waits its long delay (`max_auth_backoff`, at least the reconnect delay) after 0x8E Session taken over instead of reconnecting at once. Two clients with the same Client Identifier, as during a rolling update, used to take the session from each other in turns
 
+### Changed
+
+- A QoS 1 publish resent after a reconnect carries what is left of its Message Expiry Interval, counted from the first transmission (at least 1 s), as a broker does when it forwards a message. It used to carry the full interval again, so a message could outlive its lifetime by however long the reconnect took
+
 ### Added
 
 - `PublishResponse`: the PUBACK of a QoS 1 publish, also when it succeeds. 0x00 Success and 0x10 No Matching Subscribers are told apart, and the Reason String and User Properties come along; they used to be dropped unless the broker rejected the message. `resent` is set when the PUBACK answers a DUP resend after a reconnect, so the message may have reached subscribers twice

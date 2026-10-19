@@ -378,7 +378,7 @@ where
         return finish_publish_encode_error(Some(publish.reply), &publish.message, error);
     }
     publish_waiters.stats.publish_sent(QoS::AtLeastOnce);
-    publish_waiters.insert_sent(packet_id, publish, false);
+    publish_waiters.insert_sent(packet_id, publish);
     Ok(())
 }
 
@@ -444,7 +444,7 @@ fn resend_unacked<W>(
     framed: &mut FramedWrite<W, V5Codec>,
     inflight: &mut InflightPots,
     publish_waiters: &mut PublishWaiters,
-    entry: CarriedPublish,
+    mut entry: CarriedPublish,
 ) -> Result<(), WriteOutcome>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -454,6 +454,9 @@ where
     if !inflight.reserve_publish(entry.packet_id) {
         entry.reply.send(Err(AppError::ConnectionLost));
         return Ok(());
+    }
+    if let Some(expiry) = entry.expiry {
+        entry.message.properties.message_expiry_interval = Some(expiry.remaining());
     }
     let delivery = PublishDelivery {
         dup: true,
@@ -466,7 +469,7 @@ where
         return finish_publish_encode_error(Some(entry.reply), &entry.message, error);
     }
     publish_waiters.stats.publish_resent();
-    publish_waiters.insert_sent(
+    publish_waiters.insert_resent(
         entry.packet_id,
         PendingOutboundPublish {
             message: entry.message,
@@ -474,7 +477,7 @@ where
             retain: entry.retain,
             reply: entry.reply,
         },
-        true,
+        entry.expiry,
     );
     Ok(())
 }

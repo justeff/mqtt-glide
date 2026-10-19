@@ -2410,6 +2410,84 @@ mod tests {
         let _ = run.await;
     }
 
+    /// A resend carries what is left of the Message Expiry Interval, counted from the first
+    /// transmission ([MQTT-3.3.2-6] applied to the client's own resend), at least 1 s; a
+    /// message without one is resent without one.
+    #[tokio::test]
+    async fn resend_counts_down_the_message_expiry() {
+        let seen: Arc<tokio::sync::Mutex<Vec<(usize, Bytes, Option<u32>)>>> = Arc::default();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port = {
+            let seen = Arc::clone(&seen);
+            crate::connection::test_support::spawn_broker_loop(move |mut framed_read, mut framed_write| {
+                let seen = Arc::clone(&seen);
+                let connections = Arc::clone(&connections);
+                async move {
+                    let index = connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if index > 0 {
+                        // The reconnect takes a while: the resend happens over a second later.
+                        tokio::time::sleep(Duration::from_millis(1_100)).await;
+                    }
+                    let mut ack = ConnectAck::default();
+                    ack.session_present = index > 0;
+                    if !accept_connect_send_connack_with(&mut framed_read, &mut framed_write, ack).await {
+                        return;
+                    }
+                    let mut received = 0;
+                    while let Some(Ok(frame)) = framed_read.next().await {
+                        let (DecodedFrame::Publish(packet), _) = frame else {
+                            continue;
+                        };
+                        let id = packet.meta.packet_id.expect("QoS 1 packet id");
+                        let expiry = packet.message.properties.message_expiry_interval;
+                        seen.lock().await.push((index, packet.message.payload.clone(), expiry));
+                        received += 1;
+                        if index == 0 {
+                            if received == 3 {
+                                return; // drop the connection with all three unacknowledged
+                            }
+                            continue;
+                        }
+                        let _ = framed_write.send(puback(id)).await;
+                    }
+                }
+            })
+            .await
+        };
+        let (client, _rx, run) = start_with(resumable_options(port), ImmediateReconnect).await;
+
+        let completions = [("short", Some(2)), ("long", Some(100)), ("none", None)].map(|(payload, expiry)| {
+            let mut publish = Publish::new("t/expiry", payload).qos(QoS::AtLeastOnce);
+            if let Some(seconds) = expiry {
+                publish = publish.message_expiry(seconds);
+            }
+            client.try_start_publish(publish).expect("enqueue")
+        });
+        for completion in completions {
+            let response = timeout(Duration::from_secs(5), completion.wait())
+                .await
+                .expect("resolves after the resend")
+                .expect("acknowledged");
+            assert!(response.resent());
+        }
+
+        let frames = seen.lock().await.clone();
+        let expiry_of = |connection: usize, payload: &str| {
+            frames
+                .iter()
+                .find(|(index, body, _)| *index == connection && &body[..] == payload.as_bytes())
+                .unwrap_or_else(|| panic!("{payload} on connection {connection}: {frames:?}"))
+                .2
+        };
+        assert_eq!(expiry_of(0, "short"), Some(2));
+        assert_eq!(expiry_of(1, "short"), Some(1), "2 s minus over 1 s");
+        assert_eq!(expiry_of(1, "long"), Some(99));
+        assert_eq!(expiry_of(1, "none"), None);
+
+        client.shutdown().await.expect("shutdown");
+        let _ = run.await;
+    }
+
     /// [MQTT-3.2.2-11], [MQTT-3.2.2-14]: a broker that resumes the session with a lower Maximum
     /// QoS, or without Retain, does not get the unacknowledged publish again; it fails like a
     /// new one would.

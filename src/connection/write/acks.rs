@@ -226,6 +226,7 @@ pub(super) fn fail_waiters_for_outcome(
                 message,
                 retain,
                 reply: entry.reply,
+                expiry: entry.expiry,
                 seq: entry.seq,
             });
         }
