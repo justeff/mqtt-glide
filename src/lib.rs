@@ -26,6 +26,7 @@
 //! - `testing`: the in-process `testing::TestBroker` and `testing::FaultProxy` for tests of
 //!   applications; meant for `[dev-dependencies]`.
 //! - `stats`: `MqttClient::stats` returns counters of what the connection did.
+//! - `flume`: `InboundSink` for `flume::Sender<InboundMessage>`; ties your build to flume 0.12.
 //!
 //! Crate overview: see the [repository README](https://github.com/justeff/mqtt-glide).
 //! Spec coverage: `CONFORMANCE.md` in the repository.

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-19
+
 ### Changed (breaking)
 
 - A publish reports what the broker answered and, when it fails, whether the broker can have the message. Every awaited publish (`publish(..).await`, `send`, `PublishBuilder::send`, `PublishCompletion::wait`) returns `Result<PublishResponse, PublishError>` instead of `Result<(), AppError>`; `PublishWindow::push` / `drain` and `publish_batch` return `Result<(), PublishError>`, `PublishWindow::wait_one` returns `Result<PublishResponse, PublishError>`, and the enqueue-only `start_publish` / `try_start_publish` (`PublishBuilder::start` / `try_start`) return `Result<PublishCompletion, PublishError>`, always with `Delivery::NotSent`. `PublishError` converts into `AppError`, so `publish(..).await?` in a function returning `AppError` compiles unchanged. Migration:

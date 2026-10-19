@@ -14,20 +14,20 @@ MQTT 5 only, QoS 0 and 1, over TCP, TLS or (opt-in) WebSocket. No MQTT 3.1.1, no
 
 ```toml
 [dependencies]
-mqtt-glide = "0.3"
+mqtt-glide = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 ```
 
 TLS goes through rustls. Enable **exactly one** crypto provider: `tls-rustls-aws-lc` (default) or `tls-rustls-ring`. Prefer pinning the choice in dependents. The client builds its `ClientConfig` with `builder_with_provider` and does not rely on a process-global rustls default, so enabling both features (or `--all-features`) is rejected.
 
 ```toml
-mqtt-glide = { version = "0.3", default-features = false, features = ["tls-rustls-ring"] }
+mqtt-glide = { version = "0.4", default-features = false, features = ["tls-rustls-ring"] }
 ```
 
 MQTT over WebSocket (for networks that only let HTTP(S) out, or brokers behind an HTTP ingress) is behind the optional `websocket` feature; it adds `tokio-tungstenite` for the handshake and framing only:
 
 ```toml
-mqtt-glide = { version = "0.3", features = ["websocket"] }
+mqtt-glide = { version = "0.4", features = ["websocket"] }
 ```
 
 Then connect with `ws://broker:8080/mqtt` or `wss://broker/mqtt`.
@@ -37,7 +37,7 @@ Minimum supported Rust version: **1.88**. It is raised only in a minor release (
 Inbound messages go into any `InboundSink`; `tokio::sync::mpsc::Sender` works out of the box. To hand them to a `flume::Sender` instead, enable the `flume` feature. It ties your build to flume 0.12, so a flume upgrade in mqtt-glide is a breaking change for you:
 
 ```toml
-mqtt-glide = { version = "0.3", features = ["flume"] }
+mqtt-glide = { version = "0.4", features = ["flume"] }
 flume = "0.12"
 ```
 
@@ -167,11 +167,17 @@ When a full application queue blocks the same loop that sends `PINGREQ`, a slow 
 
 ### What it costs
 
-No MQTT 3.1.1 and no QoS 2: both are out of scope, not pending. If you need either, rumqttc remains the better fit. Unacknowledged QoS 1 publishes are kept in memory only: they are resent after a reconnect into a resumed session (see [No session](#no-session)), but not after a process restart. Cross-process session resume needs a stable client ID (`.client_id("…")?` or `ClientId::try_new`) plus `clean_start(false)` and a non-zero `session_expiry`. rumqttc is also the far more widely deployed crate; this one is 0.3.x, and the API can still move.
+No MQTT 3.1.1 and no QoS 2: both are out of scope, not pending. If you need either, rumqttc remains the better fit. Unacknowledged QoS 1 publishes are kept in memory only: they are resent after a reconnect into a resumed session (see [No session](#no-session)), but not after a process restart. Cross-process session resume needs a stable client ID (`.client_id("…")?` or `ClientId::try_new`) plus `clean_start(false)` and a non-zero `session_expiry`. rumqttc is also the far more widely deployed crate; this one is 0.4.x, and the API can still move.
 
 ## Upgrading from 0.3
 
-Awaiting a publish now returns `Result<PublishResponse, PublishError>` instead of `Result<(), AppError>`: the response carries the PUBACK (reason code, Reason String, User Properties, whether it answers a resend), the error carries the `AppError` plus `delivery`, whether the broker can have the message. `PublishError` converts into `AppError`, so `publish(..).await?` in a function returning `AppError` needs no change; code that matches `Err(AppError::…)` on a publish matches `err.error` instead. A message's `properties` field is a `Properties` that derefs to `PublishProperties`: reading and changing it is unchanged, a struct literal needs `props.into()`. A broker DISCONNECT is now `TransportError::BrokerDisconnect { reason, .. }` and a refused CONNACK `TransportError::ConnectRefused { reason, .. }`, with the reason code as a field, no longer text inside `TransportError::Connection` or `ProtocolError::Violation`. `TlsConfig` is a struct now: `TlsConfig::SystemRoots` becomes `TlsConfig::system_roots()`. The builder reconnects by default (`StandardReconnectPolicy::default()`); add `.reconnect(NoReconnect)` to keep the old behaviour. The [CHANGELOG](CHANGELOG.md#unreleased) has the details.
+- **Publish results:** awaiting a publish returns `Result<PublishResponse, PublishError>` instead of `Result<(), AppError>`. The response carries the PUBACK (reason code, Reason String, User Properties, whether it answers a resend); the error carries the `AppError` plus `delivery`, whether the broker can have the message. `PublishError` converts into `AppError`, so `publish(..).await?` in a function returning `AppError` needs no change; code that matches `Err(AppError::…)` on a publish matches `err.error` instead.
+- **Message properties:** a message's `properties` field is a `Properties` that derefs to `PublishProperties`. Reading and changing it is unchanged; a struct literal needs `props.into()`.
+- **Broker reasons:** a broker DISCONNECT is `TransportError::BrokerDisconnect { reason, .. }` and a refused CONNACK `TransportError::ConnectRefused { reason, .. }`, with the reason code as a field instead of text inside `TransportError::Connection` or `ProtocolError::Violation`.
+- **TLS:** `TlsConfig` is a struct; `TlsConfig::SystemRoots` becomes `TlsConfig::system_roots()`.
+- **Reconnect:** the builder reconnects by default (`StandardReconnectPolicy::default()`); `.reconnect(NoReconnect)` keeps the old behaviour.
+
+The [CHANGELOG](CHANGELOG.md#040---2026-10-19) has the details.
 
 ## Upgrading from 0.2
 
@@ -450,7 +456,7 @@ The `testing` feature (meant for `[dev-dependencies]`, no extra dependencies) le
 
 ```toml
 [dev-dependencies]
-mqtt-glide = { version = "0.3", features = ["testing"] }
+mqtt-glide = { version = "0.4", features = ["testing"] }
 ```
 
 A test for a service that switches lights on command and reports their state:
@@ -501,7 +507,7 @@ With the `stats` feature, `client.stats()` returns what the connection has done 
 The crate does not choose a metrics system for you. Read the snapshot on each scrape (a few dozen atomic loads) and hand the numbers to Prometheus, OpenTelemetry or a log line. Without the feature the counting is compiled out. With it on, each counted event is a plain atomic store on the task that owns the counter; in an interleaved on/off comparison, throughput did not change and CPU per message stayed within about 2% in all but one of six cells, at the size of the run-to-run spread ([Cost of the `stats` feature](BENCHMARKS.md#cost-of-the-stats-feature)).
 
 ```toml
-mqtt-glide = { version = "0.3", features = ["stats"] }
+mqtt-glide = { version = "0.4", features = ["stats"] }
 ```
 
 ```rust,no_run
