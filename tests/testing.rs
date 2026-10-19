@@ -488,3 +488,37 @@ async fn sessions_end_without_expiry_or_with_clean_start() {
         "Clean Start dropped the session"
     );
 }
+
+/// The builder reconnects by default, while a broker that is not there at all still fails the
+/// first connect at once instead of being retried behind the caller's back.
+#[tokio::test]
+async fn the_builder_reconnects_by_default_but_fails_the_first_connect_at_once() {
+    let broker = TestBroker::start().await.expect("broker");
+    let client = ClientBuilder::new(broker.url())
+        .expect("url")
+        .discard_inbound()
+        .connect()
+        .await
+        .expect("connect");
+    broker.drop_connections();
+    assert!(
+        broker.wait_for_connects(2, WAIT).await,
+        "reconnected after the default delay"
+    );
+    client.shutdown().await.expect("shutdown");
+
+    let port = broker.port();
+    drop(broker);
+    let started = std::time::Instant::now();
+    let refused = ClientBuilder::new(format!("mqtt://127.0.0.1:{port}"))
+        .expect("url")
+        .discard_inbound()
+        .connect()
+        .await;
+    assert!(
+        matches!(refused, Err(ConnectError::Transport(TransportError::Connection(_)))),
+        "{:?}",
+        refused.err()
+    );
+    assert!(started.elapsed() < Duration::from_millis(500), "no retry before Err");
+}

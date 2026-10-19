@@ -226,8 +226,8 @@ impl<T: ReconnectPolicy + ?Sized> ReconnectPolicy for Arc<T> {
 
 /// Never reconnects — a single connect attempt then stop.
 ///
-/// Default [`ReconnectPolicy`] for [`ClientBuilder`]. Useful for tests and
-/// one-shot connections.
+/// For tests and one-shot tools whose dropped connection should stay dropped; pass it to
+/// [`ClientBuilder::reconnect`], which otherwise uses [`crate::StandardReconnectPolicy::default`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoReconnect;
 

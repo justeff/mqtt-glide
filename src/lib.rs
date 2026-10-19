@@ -88,7 +88,9 @@ pub use options::{
     COMMAND_CHANNEL_CAPACITY, ConnectOptions, DEFAULT_ACK_TIMEOUT, DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_GRACEFUL_DISCONNECT_TIMEOUT, DEFAULT_RECEIVE_MAXIMUM,
 };
-pub use policies::{DEFAULT_AUTH_FAILURE_THRESHOLD, StandardReconnectPolicy};
+pub use policies::{
+    DEFAULT_AUTH_FAILURE_THRESHOLD, DEFAULT_MAX_AUTH_BACKOFF, DEFAULT_RECONNECT_DELAY, StandardReconnectPolicy,
+};
 pub use request::{DEFAULT_REQUEST_TIMEOUT, RequestBuilder, Requester};
 #[cfg(feature = "stats")]
 pub use stats::{ClientStats, ConnectionStats, InboundStats, OutboundStats};

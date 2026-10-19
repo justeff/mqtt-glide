@@ -11,6 +11,13 @@ use crate::error::{ConnectionOutcome, TransportError};
 /// Consecutive auth failures before switching to the max auth backoff delay.
 pub const DEFAULT_AUTH_FAILURE_THRESHOLD: u32 = 10;
 
+/// Reconnect delay of [`StandardReconnectPolicy::default`].
+pub const DEFAULT_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+/// Long delay of [`StandardReconnectPolicy::default`], after repeated auth failures and after a
+/// session takeover.
+pub const DEFAULT_MAX_AUTH_BACKOFF: Duration = Duration::from_secs(30);
+
 /// Computes the back-off delay after an authentication failure.
 ///
 /// Returns `reconnect_delay` for the first [`DEFAULT_AUTH_FAILURE_THRESHOLD`] - 1
@@ -51,8 +58,10 @@ impl StandardReconnectPolicyInner {
 /// instance can be passed to [`connect`](crate::connect) while the app retains a
 /// handle for [`mark_live`](Self::mark_live) and subscribe-auth recording.
 ///
-/// Use [`Self::new`] for defaults, or [`Self::with_auth_failure_threshold`] to
-/// override the auth-streak switchover.
+/// [`Self::default`] is the [`ClientBuilder`](crate::ClientBuilder) default:
+/// [`DEFAULT_RECONNECT_DELAY`] (1 s) and [`DEFAULT_MAX_AUTH_BACKOFF`] (30 s). Use [`Self::new`]
+/// for other delays, or [`Self::with_auth_failure_threshold`] to override the auth-streak
+/// switchover.
 ///
 /// Apps that need different behaviour implement [`ReconnectPolicy`](crate::ReconnectPolicy)
 /// directly.
@@ -88,6 +97,12 @@ impl StandardReconnectPolicyInner {
 #[derive(Debug, Clone)]
 pub struct StandardReconnectPolicy {
     inner: Arc<StandardReconnectPolicyInner>,
+}
+
+impl Default for StandardReconnectPolicy {
+    fn default() -> Self {
+        Self::new(DEFAULT_RECONNECT_DELAY, DEFAULT_MAX_AUTH_BACKOFF)
+    }
 }
 
 impl StandardReconnectPolicy {

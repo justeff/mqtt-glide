@@ -56,14 +56,14 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::client::{
-    AnonymousCredentials, CredentialsProvider, MqttClient, NoReconnect, ReconnectPolicy, SharedCredentials,
-    connect_with_shared,
+    AnonymousCredentials, CredentialsProvider, MqttClient, ReconnectPolicy, SharedCredentials, connect_with_shared,
 };
 use crate::codec::{InboundMessage, QoS};
 use crate::connection::{LifecycleHook, NoopLifecycle, SessionParams, SessionPhase};
 use crate::error::{AppError, ConnectError, ConnectionOutcome, TransportError};
 use crate::inbound_sink::{InboundSink, OnInboundSink};
 use crate::options::ConnectOptions;
+use crate::policies::StandardReconnectPolicy;
 use crate::util::{BrokerUrl, BrokerUrlError, ClientId, ClientIdError};
 
 /// Builder state: no inbound handoff chosen yet, so [`ClientBuilder::connect`] is unavailable.
@@ -91,7 +91,8 @@ struct BuilderConfig {
 /// Fluent builder that applies defaults and connects (spawns the connection driver).
 ///
 /// Defaults (when not overridden):
-/// - reconnect: [`NoReconnect`]
+/// - reconnect: [`StandardReconnectPolicy::default`] (1 s between attempts, 30 s after repeated
+///   auth failures or a session takeover); the first connect still fails at once with `Err`
 /// - lifecycle: [`crate::NoopLifecycle`]
 /// - credentials: [`AnonymousCredentials`] (CONNECT without username/password)
 /// - `client_id`: [`ClientId::from_prefix`]`("glide")` when `options.client_id` is `None`
@@ -132,7 +133,7 @@ impl ClientBuilder<InboundSinkUnset> {
             config: BuilderConfig {
                 options,
                 credentials: SharedCredentials::new(AnonymousCredentials),
-                reconnect: Arc::new(NoReconnect),
+                reconnect: Arc::new(StandardReconnectPolicy::default()),
                 lifecycle: Arc::new(NoopLifecycle),
                 wait_connected: true,
             },
@@ -184,7 +185,9 @@ impl<H> ClientBuilder<H> {
         self
     }
 
-    /// Sets the reconnect policy (replaces the default [`NoReconnect`]).
+    /// Sets the reconnect policy (replaces the default [`StandardReconnectPolicy::default`]).
+    ///
+    /// [`NoReconnect`](crate::NoReconnect) makes a dropped connection stay dropped.
     pub fn reconnect(mut self, reconnect: impl ReconnectPolicy + 'static) -> Self {
         self.config.reconnect = Arc::new(reconnect);
         self
@@ -393,7 +396,7 @@ mod tests {
     use crate::error::ConnectionOutcome;
     use crate::test_util::{options_for, qos_id_payload, spawn_puback_broker};
 
-    /// Builder defaults: anonymous creds, NoReconnect, NoopLifecycle, wait_connected, glide client id.
+    /// Builder defaults: anonymous creds, NoopLifecycle, wait_connected, glide client id.
     #[tokio::test]
     async fn builder_applies_defaults_and_connects() {
         let observed_client_id = Arc::new(Mutex::new(None));

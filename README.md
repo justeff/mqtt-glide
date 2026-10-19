@@ -171,7 +171,7 @@ No MQTT 3.1.1 and no QoS 2: both are out of scope, not pending. If you need eith
 
 ## Upgrading from 0.3
 
-Awaiting a publish now returns `Result<PublishResponse, PublishError>` instead of `Result<(), AppError>`: the response carries the PUBACK (reason code, Reason String, User Properties, whether it answers a resend), the error carries the `AppError` plus `delivery`, whether the broker can have the message. `PublishError` converts into `AppError`, so `publish(..).await?` in a function returning `AppError` needs no change; code that matches `Err(AppError::…)` on a publish matches `err.error` instead. A message's `properties` field is a `Properties` that derefs to `PublishProperties`: reading and changing it is unchanged, a struct literal needs `props.into()`. A broker DISCONNECT is now `TransportError::BrokerDisconnect { reason, .. }` and a refused CONNACK `TransportError::ConnectRefused { reason, .. }`, with the reason code as a field, no longer text inside `TransportError::Connection` or `ProtocolError::Violation`. `TlsConfig` is a struct now: `TlsConfig::SystemRoots` becomes `TlsConfig::system_roots()`. The [CHANGELOG](CHANGELOG.md#unreleased) has the details.
+Awaiting a publish now returns `Result<PublishResponse, PublishError>` instead of `Result<(), AppError>`: the response carries the PUBACK (reason code, Reason String, User Properties, whether it answers a resend), the error carries the `AppError` plus `delivery`, whether the broker can have the message. `PublishError` converts into `AppError`, so `publish(..).await?` in a function returning `AppError` needs no change; code that matches `Err(AppError::…)` on a publish matches `err.error` instead. A message's `properties` field is a `Properties` that derefs to `PublishProperties`: reading and changing it is unchanged, a struct literal needs `props.into()`. A broker DISCONNECT is now `TransportError::BrokerDisconnect { reason, .. }` and a refused CONNACK `TransportError::ConnectRefused { reason, .. }`, with the reason code as a field, no longer text inside `TransportError::Connection` or `ProtocolError::Violation`. `TlsConfig` is a struct now: `TlsConfig::SystemRoots` becomes `TlsConfig::system_roots()`. The builder reconnects by default (`StandardReconnectPolicy::default()`); add `.reconnect(NoReconnect)` to keep the old behaviour. The [CHANGELOG](CHANGELOG.md#unreleased) has the details.
 
 ## Upgrading from 0.2
 
@@ -212,11 +212,7 @@ Why split read and write? A stalled handoff must not freeze keep-alive. The read
 
 ## Defaults worth changing before production
 
-The builder defaults are chosen for a predictable first run, not for a long-lived service. Four of them will surprise you:
-
-### No reconnect
-
-The default policy is `NoReconnect`: one connect attempt, and a dropped connection stays dropped. Pass `.reconnect(StandardReconnectPolicy::new(delay, max_auth_backoff))` or your own `ReconnectPolicy` if the process should outlive a broker restart.
+The builder defaults are chosen for a predictable first run, not for a long-lived service. Three of them will surprise you:
 
 ### A new client ID every process (by default)
 
@@ -243,7 +239,7 @@ A caller that stops waiting earlier (its `ack_timeout` ran out during a long rec
 
 | Setting | Default | Change it when |
 |---------|--------:|----------------|
-| reconnect policy | `NoReconnect` | the process must outlive a broker restart |
+| reconnect policy | `StandardReconnectPolicy::default()`: 1 s between attempts, 30 s after repeated auth failures or a session takeover; the first connect fails at once | other delays (`StandardReconnectPolicy::new`), or `NoReconnect` for a one-shot tool whose dropped connection should stay dropped |
 | `client_id` | random UUID | you need session resume across restarts (`.client_id("…")?`) |
 | `clean_start` / `session_expiry` | `true` / unset | same (needs the stable `client_id` too) |
 | `topic_alias_maximum` / `outbound_topic_aliases` | `0` / `0` | long topics published or received often: aliases replace the topic bytes after the first message per connection |
