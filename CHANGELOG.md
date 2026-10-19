@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `testing::TestBroker::ack_publishes` answers QoS 1 publishes with a chosen PUBACK (`testing::PubAck`: reason code, Reason String, User Properties), per message through a closure
+
 ## [0.3.0] - 2026-10-17
 
 ### Changed (breaking)

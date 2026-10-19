@@ -3,7 +3,8 @@
 //! - [`TestBroker`]: a small in-process MQTT 5 broker on a local port, so code that uses an
 //!   [`MqttClient`](crate::MqttClient) can be tested without a container. It routes publishes
 //!   between its clients, keeps retained messages, publishes Wills, records everything clients
-//!   publish, and lets a test refuse connections, reject publishes or drop every connection.
+//!   publish, and lets a test refuse connections, answer publishes with a chosen PUBACK (or
+//!   reject them) or drop every connection.
 //! - [`FaultProxy`]: a TCP proxy in front of any broker that injects network faults on demand
 //!   (latency, a silent stall, packets split at arbitrary bytes, connection resets, refused
 //!   connects).
@@ -35,5 +36,5 @@
 mod broker;
 mod fault_proxy;
 
-pub use broker::{ReceivedPublish, TestBroker};
+pub use broker::{PubAck, ReceivedPublish, TestBroker};
 pub use fault_proxy::FaultProxy;

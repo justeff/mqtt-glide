@@ -19,8 +19,53 @@ use crate::Publish;
 use crate::codec::{
     ConnectAck, ConnectAckReason, DecodedFrame, Disconnect, DisconnectReasonCode, Packet, PublishAck, PublishAckReason,
     PublishDelivery, PublishMessage, PublishProperties, QoS, SubscribeAck, SubscribeAckReason, UnsubscribeAck,
-    UnsubscribeAckReason, V5Codec, WillMessage, encode_publish,
+    UnsubscribeAckReason, UserProperties, UserProperty, V5Codec, WillMessage, encode_publish,
 };
+
+/// The PUBACK a [`TestBroker`] answers a QoS 1 PUBLISH with; see [`TestBroker::ack_publishes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PubAck {
+    /// Reason code: 0x00 or 0x10 accept the message, 0x80 and above reject it.
+    pub reason: PublishAckReason,
+    /// Reason String.
+    pub reason_string: Option<ByteString>,
+    /// User Properties.
+    pub user_properties: UserProperties,
+}
+
+impl PubAck {
+    /// A PUBACK with `reason` and no properties.
+    pub fn new(reason: PublishAckReason) -> Self {
+        Self {
+            reason,
+            reason_string: None,
+            user_properties: Vec::new(),
+        }
+    }
+
+    /// Sets the Reason String.
+    #[must_use]
+    pub fn reason_string(mut self, reason_string: impl Into<ByteString>) -> Self {
+        self.reason_string = Some(reason_string.into());
+        self
+    }
+
+    /// Adds a User Property.
+    #[must_use]
+    pub fn user_property(mut self, name: impl Into<ByteString>, value: impl Into<ByteString>) -> Self {
+        self.user_properties
+            .push(UserProperty::from((name.into(), value.into())));
+        self
+    }
+
+    /// Whether the broker keeps the message (reason code below 0x80).
+    fn accepts(&self) -> bool {
+        u8::from(self.reason) < 0x80
+    }
+}
+
+type AckFn = Arc<dyn Fn(&ReceivedPublish) -> PubAck + Send + Sync>;
 
 /// A PUBLISH a client sent to the [`TestBroker`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +109,8 @@ struct State {
     received: Vec<ReceivedPublish>,
     connects: usize,
     refuse_with: Option<ConnectAckReason>,
-    reject_with: Option<PublishAckReason>,
+    /// Answer to QoS 1 PUBLISHes; `None`: Success.
+    ack_with: Option<AckFn>,
     /// Topic filters every SUBSCRIBE gets refused, with the reason code to answer.
     refused_filters: HashMap<String, SubscribeAckReason>,
     shared_cursor: usize,
@@ -260,10 +306,34 @@ impl TestBroker {
         lock(&self.shared).refuse_with = reason;
     }
 
-    /// Answers every following QoS 1 PUBLISH with `reason` instead of Success, and does not
-    /// route it (`None`: accept again). Use a code of 0x80 or above to test rejections.
+    /// Answers every following QoS 1 PUBLISH with the PUBACK `answer` returns for it, for
+    /// example to test how an application reads a Reason String, User Properties or 0x10
+    /// No Matching Subscribers. A reason code of 0x80 or above rejects the message: it is
+    /// neither recorded nor routed. Replaces any earlier answer; [`Self::reject_publishes`]
+    /// with `None` goes back to plain Success.
+    ///
+    /// ```
+    /// use mqtt_glide::PublishAckReason;
+    /// use mqtt_glide::testing::{PubAck, TestBroker};
+    ///
+    /// # async fn demo(broker: TestBroker) {
+    /// broker.ack_publishes(|publish| {
+    ///     if publish.topic.starts_with("vehicle/offline/") {
+    ///         PubAck::new(PublishAckReason::Success).reason_string("Q")
+    ///     } else {
+    ///         PubAck::new(PublishAckReason::NoMatchingSubscribers)
+    ///     }
+    /// });
+    /// # }
+    /// ```
+    pub fn ack_publishes(&self, answer: impl Fn(&ReceivedPublish) -> PubAck + Send + Sync + 'static) {
+        lock(&self.shared).ack_with = Some(Arc::new(answer));
+    }
+
+    /// Answers every following QoS 1 PUBLISH with `reason` instead of Success (`None`: accept
+    /// again). A code of 0x80 or above rejects: the message is neither recorded nor routed.
     pub fn reject_publishes(&self, reason: Option<PublishAckReason>) {
-        lock(&self.shared).reject_with = reason;
+        lock(&self.shared).ack_with = reason.map(|reason| -> AckFn { Arc::new(move |_| PubAck::new(reason)) });
     }
 
     /// Answers every following SUBSCRIBE to exactly `filter` (as the client sends it, with any
@@ -437,25 +507,29 @@ async fn serve(shared: Arc<Shared>, id: u64, stream: TcpStream) {
                     qos: packet.meta.qos,
                     retain: packet.meta.retain,
                 };
-                let reject = lock(&shared).reject_with;
-                if let Some(packet_id) = packet.meta.packet_id {
-                    let _ = tx.send(Outgoing::Packet(Packet::PublishAck(PublishAck {
-                        packet_id,
-                        reason_code: reject.unwrap_or(PublishAckReason::Success),
-                        ..PublishAck::default()
-                    })));
-                }
-                if reject.is_some() && delivery.qos != QoS::AtMostOnce {
-                    continue;
-                }
-                lock(&shared).received.push(ReceivedPublish {
+                let received = ReceivedPublish {
                     client_id: client_id.clone(),
                     topic: delivery.message.topic.clone(),
                     payload: delivery.message.payload.clone(),
                     qos: delivery.qos,
                     retain: delivery.retain,
                     properties: delivery.message.properties.clone(),
-                });
+                };
+                if let Some(packet_id) = packet.meta.packet_id {
+                    let answer = lock(&shared).ack_with.clone();
+                    let ack = answer.map_or_else(|| PubAck::new(PublishAckReason::Success), |answer| answer(&received));
+                    let accepted = ack.accepts();
+                    let _ = tx.send(Outgoing::Packet(Packet::PublishAck(PublishAck {
+                        packet_id,
+                        reason_code: ack.reason,
+                        reason_string: ack.reason_string,
+                        properties: ack.user_properties,
+                    })));
+                    if !accepted {
+                        continue;
+                    }
+                }
+                lock(&shared).received.push(received);
                 route(&shared, Some(id), delivery);
                 shared.changed.notify_waiters();
             }
