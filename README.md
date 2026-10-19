@@ -470,7 +470,7 @@ The `TestBroker` checks your service, not mqtt-glide: it shares the crate's code
 With the `stats` feature, `client.stats()` returns what the connection has done since `connect`, across reconnects:
 
 - **Connection:** sessions established, failed attempts, lost sessions, keep-alive pings.
-- **Outbound:** publishes per QoS, resends after a reconnect, PUBACKs accepted and rejected, and right now: publishes waiting for their PUBACK, publishes waiting for a slot in the broker's Receive Maximum, commands queued for the connection.
+- **Outbound:** publishes per QoS, resends after a reconnect, PUBACKs accepted and rejected, PUBACKs that came after the caller gave up (`late_acks`), and right now: publishes waiting for their PUBACK, publishes waiting for a slot in the broker's Receive Maximum, commands queued for the connection.
 - **Inbound:** publishes per QoS, duplicates, how often and how long the inbound sink was full.
 - **Bytes** in each direction.
 

@@ -71,6 +71,12 @@ mod imp {
         pub publishes_acked: u64,
         /// QoS 1 PUBLISHes the broker refused (a PUBACK reason code of 0x80 or above).
         pub publishes_rejected: u64,
+        /// PUBACKs that arrived after the caller had stopped waiting: its acknowledgement
+        /// timeout ran out (the publish was reported as
+        /// [`Delivery::Unknown`](crate::Delivery::Unknown)), or it dropped the completion.
+        /// Included in `publishes_acked` / `publishes_rejected`. A steady count means the
+        /// acknowledgement timeout is shorter than the broker's answers take.
+        pub late_acks: u64,
         /// QoS 1 PUBLISHes on the wire waiting for their PUBACK, right now. Stays at the
         /// broker's Receive Maximum while the broker is the bottleneck.
         pub awaiting_ack: u64,
@@ -134,6 +140,7 @@ mod imp {
         publishes_resent: AtomicU64,
         publishes_acked: AtomicU64,
         publishes_rejected: AtomicU64,
+        late_acks: AtomicU64,
         awaiting_ack: AtomicU64,
         awaiting_quota: AtomicU64,
         bytes: AtomicU64,
@@ -186,6 +193,7 @@ mod imp {
                     publishes_resent: get(&write.publishes_resent),
                     publishes_acked: get(&write.publishes_acked),
                     publishes_rejected: get(&write.publishes_rejected),
+                    late_acks: get(&write.late_acks),
                     awaiting_ack: get(&write.awaiting_ack),
                     awaiting_quota: get(&write.awaiting_quota),
                     commands_queued: commands_queued as u64,
@@ -262,6 +270,12 @@ mod imp {
                 },
                 1,
             );
+        }
+
+        /// A PUBACK for a publish whose caller had stopped waiting.
+        #[inline]
+        pub(crate) fn late_ack(&self) {
+            add(&self.0.write.0.late_acks, 1);
         }
 
         /// Current window state of the write task (zero once the session ended).
@@ -406,6 +420,8 @@ mod noop {
         pub(crate) fn publish_resent(&self) {}
         #[inline(always)]
         pub(crate) fn publish_ack(&self, _reason: PublishAckReason) {}
+        #[inline(always)]
+        pub(crate) fn late_ack(&self) {}
         #[inline(always)]
         pub(crate) fn outbound_window(&self, _awaiting_ack: usize, _awaiting_quota: usize) {}
         #[inline(always)]

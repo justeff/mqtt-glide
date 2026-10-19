@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `PublishError` with `Delivery`: `NotSent` (never written, publishing again cannot duplicate it), `Unknown` (written but not acknowledged: connection lost, session ended, or timed out after the write) or `Rejected` (PUBACK 0x80 or above); `PublishError::may_have_been_delivered`. A QoS 1 publish whose caller timed out before it was written is never written afterwards, and its timeout says `NotSent`; the decision is atomic between the caller and the write task, so it cannot race the write. QoS 0 keeps no such state, to keep its throughput: its timeout says `Unknown`
 - Per-publish acknowledgement timeout: `PublishBuilder::ack_timeout(Option<Duration>)` and `PublishCompletion::wait_for(Option<Duration>)`; `None` waits until the PUBACK arrives or the publish fails for good
 - `topic_matches(filter, topic)`: the MQTT Topic Filter matching rules (§4.7: `+`, `#` including the parent level, no wildcard match for `$` topics, `$share/<group>/` filters), for applications that route inbound messages by filter
+- `ClientStats::outbound.late_acks` (`stats` feature): PUBACKs that arrived after the caller had stopped waiting, i.e. publishes reported as `Delivery::Unknown` that the broker answered after all. A steady count means the acknowledgement timeout is too short for the broker
 - `testing::TestBroker::ack_publishes` answers QoS 1 publishes with a chosen PUBACK (`testing::PubAck`: reason code, Reason String, User Properties), per message through a closure
 
 ## [0.3.0] - 2026-10-17

@@ -146,3 +146,37 @@ async fn shows_publishes_waiting_for_their_ack() {
     let stats = stats_until(&app, |stats| stats.outbound.awaiting_ack == 0).await;
     assert_eq!(stats.outbound.publishes_acked, 3);
 }
+
+/// A PUBACK that arrives after its caller gave up counts as a late ack: the caller was told
+/// `Unknown`, the broker had accepted the message.
+#[tokio::test]
+async fn counts_pubacks_that_arrive_after_the_caller_gave_up() {
+    let broker = TestBroker::start().await.expect("broker");
+    let proxy = FaultProxy::start(([127, 0, 0, 1], broker.port()).into())
+        .await
+        .expect("proxy");
+    let (app, _rx) = client(proxy.url(), "app", 16).await;
+
+    proxy.set_stalled(true);
+    let error = app
+        .publish("t", "x")
+        .qos(QoS::AtLeastOnce)
+        .ack_timeout(Some(Duration::from_millis(100)))
+        .await
+        .expect_err("stalled");
+    assert_eq!(error.delivery, mqtt_glide::Delivery::Unknown);
+    // Dropped once written (dropped before, it would not be sent at all).
+    let completion = app
+        .publish("t", "y")
+        .qos(QoS::AtLeastOnce)
+        .start()
+        .await
+        .expect("queued");
+    stats_until(&app, |stats| stats.outbound.publishes_qos1 == 2).await;
+    drop(completion);
+    assert_eq!(app.stats().outbound.late_acks, 0);
+
+    proxy.set_stalled(false);
+    let stats = stats_until(&app, |stats| stats.outbound.publishes_acked == 2).await;
+    assert_eq!(stats.outbound.late_acks, 2, "a timed-out and a dropped completion");
+}

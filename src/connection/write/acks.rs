@@ -40,6 +40,9 @@ pub(crate) fn complete_publish_ack(
     };
     inflight.release_publish(ack.packet_id);
     waiters.stats.publish_ack(ack.reason_code);
+    if entry.reply.is_closed() {
+        waiters.stats.late_ack();
+    }
     entry.reply.send(publish_ack_to_result(ack, entry.resent));
 }
 
