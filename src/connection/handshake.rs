@@ -9,7 +9,7 @@ use bytestring::ByteString;
 use crate::client::Password;
 use crate::codec::{Connect, ConnectAck, ConnectAckReason, QoS, WillMessage};
 use crate::error::{AppError, AuthError, ConnectionOutcome, TransportError};
-use crate::options::{ConnectOptions, TlsConfig};
+use crate::options::ConnectOptions;
 
 /// Session parameters captured from a successful CONNACK.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,13 +38,13 @@ pub struct SessionParams {
     pub session_present: bool,
 }
 
-/// Whether the connector must negotiate TLS with system roots.
+/// Whether the connector negotiates TLS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsMode {
     /// Plain TCP (`mqtt://` without explicit TLS config).
     PlainTcp,
-    /// TLS via rustls using the OS trust store (`mqtts`/`ssl` or [`TlsConfig::SystemRoots`]).
-    RustlsSystemRoots,
+    /// TLS via rustls (`mqtts`/`ssl`/`wss` URL or [`crate::TlsConfig`] set).
+    Rustls,
 }
 
 /// Credentials material for CONNECT username/password.
@@ -212,10 +212,10 @@ pub(crate) fn connack_failure_outcome(
     }
 }
 
-/// Resolves whether the transport must use TLS (rustls / system roots).
+/// Resolves whether the transport must use TLS.
 pub fn resolve_tls_mode(options: &ConnectOptions) -> TlsMode {
-    if options.tls == Some(TlsConfig::SystemRoots) || options.broker_url.use_tls() {
-        TlsMode::RustlsSystemRoots
+    if options.tls.is_some() || options.broker_url.use_tls() {
+        TlsMode::Rustls
     } else {
         TlsMode::PlainTcp
     }
@@ -274,7 +274,8 @@ mod tests {
     use super::*;
     use crate::codec::{ConnectAck, ConnectAckReason, QoS, RECEIVE_MAX_DEFAULT, WillMessage};
     use crate::error::AppError;
-    use crate::options::{ConnectOptions, DEFAULT_RECEIVE_MAXIMUM, TlsConfig};
+    use crate::options::{ConnectOptions, DEFAULT_RECEIVE_MAXIMUM};
+    use crate::tls::TlsConfig;
     use crate::util::{BrokerUrl, ClientId};
 
     // ── CONNECT from ConnectOptions + credentials ─────────────────────────────
@@ -541,20 +542,20 @@ mod tests {
 
     // ── TLS decision ────────────────────────────────────────────────────────
 
-    /// `mqtts`/`ssl` or `TlsConfig::SystemRoots` selects rustls system-roots path.
+    /// `mqtts`/`ssl` or any `TlsConfig` selects rustls.
     #[test]
-    fn tls_mode_uses_rustls_system_roots_when_required() {
+    fn tls_mode_uses_rustls_when_required() {
         let mqtts = BrokerUrl::parse("mqtts://broker.example").expect("valid");
         let options = ConnectOptions::new(mqtts);
-        assert_eq!(resolve_tls_mode(&options), TlsMode::RustlsSystemRoots);
+        assert_eq!(resolve_tls_mode(&options), TlsMode::Rustls);
 
         let ssl = BrokerUrl::parse("ssl://broker.example").expect("valid");
         let options = ConnectOptions::new(ssl);
-        assert_eq!(resolve_tls_mode(&options), TlsMode::RustlsSystemRoots);
+        assert_eq!(resolve_tls_mode(&options), TlsMode::Rustls);
 
         let plain = BrokerUrl::parse("mqtt://broker.example").expect("valid");
-        let options = ConnectOptions::new(plain).tls(TlsConfig::SystemRoots);
-        assert_eq!(resolve_tls_mode(&options), TlsMode::RustlsSystemRoots);
+        let options = ConnectOptions::new(plain).tls(TlsConfig::system_roots());
+        assert_eq!(resolve_tls_mode(&options), TlsMode::Rustls);
 
         let plain = BrokerUrl::parse("mqtt://broker.example").expect("valid");
         let options = ConnectOptions::new(plain);

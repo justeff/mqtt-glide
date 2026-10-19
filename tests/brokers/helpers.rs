@@ -165,6 +165,38 @@ pub async fn start_mosquitto() -> Option<(ContainerAsync<GenericImage>, u16)> {
     Some((container, port))
 }
 
+/// Mosquitto with only a TLS listener that requires a client certificate from the test CA.
+const CONF_TLS: &str = "listener 8883\nallow_anonymous true\ncafile /certs/ca.pem\ncertfile /certs/server.pem\nkeyfile /certs/server.key\nrequire_certificate true\n";
+
+/// Starts a Mosquitto container with the TLS listener of [`CONF_TLS`] (certificates from
+/// `tests/certs`) and returns the container and the mapped host port.
+///
+/// Returns `None` (after a skip message) when Docker is unavailable.
+pub async fn start_mosquitto_tls() -> Option<(ContainerAsync<GenericImage>, u16)> {
+    if skip_without_docker() {
+        return None;
+    }
+    use testcontainers::core::ContainerPort;
+
+    let certs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs");
+    // The image only exposes 1883; the TLS port has to be exposed explicitly.
+    let mut image = GenericImage::new("eclipse-mosquitto", "2.1.2-alpine")
+        .with_exposed_port(ContainerPort::Tcp(8883))
+        .with_wait_for(WaitFor::message_on_stderr("mosquitto version"))
+        .with_wait_for(WaitFor::message_on_stderr(" running"))
+        .with_copy_to("/mosquitto-test.conf", CONF_TLS.as_bytes().to_vec())
+        .with_cmd(["mosquitto", "-c", "/mosquitto-test.conf"]);
+    for name in ["ca.pem", "server.pem", "server.key"] {
+        image = image.with_copy_to(format!("/certs/{name}"), certs.join(name));
+    }
+    let container = image.start().await.expect("failed to start Mosquitto container (TLS)");
+    let port = container
+        .get_host_port_ipv4(8883)
+        .await
+        .expect("mapped mosquitto TLS port");
+    Some((container, port))
+}
+
 /// Starts a Mosquitto container that rejects all CONNECT attempts with
 /// `ConnAck(NotAuthorized)`. Used to test auth-failure handling.
 ///

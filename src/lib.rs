@@ -63,6 +63,7 @@ mod stats;
 mod test_util;
 #[cfg(feature = "testing")]
 pub mod testing;
+mod tls;
 mod util;
 
 pub use client::{
@@ -85,12 +86,13 @@ pub use error::{AppError, AuthError, ConnectError, ConnectionOutcome, ProtocolEr
 pub use inbound_sink::{InboundSink, InboundSinkClosed, InboundTrySendError, OnInboundSink};
 pub use options::{
     COMMAND_CHANNEL_CAPACITY, ConnectOptions, DEFAULT_ACK_TIMEOUT, DEFAULT_CONNECT_TIMEOUT,
-    DEFAULT_GRACEFUL_DISCONNECT_TIMEOUT, DEFAULT_RECEIVE_MAXIMUM, TlsConfig,
+    DEFAULT_GRACEFUL_DISCONNECT_TIMEOUT, DEFAULT_RECEIVE_MAXIMUM,
 };
 pub use policies::{DEFAULT_AUTH_FAILURE_THRESHOLD, StandardReconnectPolicy};
 pub use request::{DEFAULT_REQUEST_TIMEOUT, RequestBuilder, Requester};
 #[cfg(feature = "stats")]
 pub use stats::{ClientStats, ConnectionStats, InboundStats, OutboundStats};
+pub use tls::{TlsConfig, TlsConfigError};
 pub use util::{
     BrokerUrl, BrokerUrlError, ClientId, ClientIdError, HttpProxy, ShareNameError, is_shared_subscription_filter,
     shared_filter, topic_matches, validate_share_name,

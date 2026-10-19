@@ -16,6 +16,7 @@ Image: `eclipse-mosquitto:2.1.2-alpine` (anonymous, reject-connect and Dynamic S
 | `mosquitto_revoked_role_acl_keeps_the_client_connected` | Dynamic Security: revoking a role's subscribe ACL drops the client; the resubscribe gets 0x87 for that filter, the client stays connected with the rest and lists it in `refused_subscriptions`; restoring the ACL brings the subscription back. (A plain `acl_file` would not show this: Mosquitto grants such a SUBSCRIBE and only filters delivery.) |
 | `mosquitto_resubscribes_after_reconnect` | After reconnect, prior subscriptions deliver without re-subscribe |
 | `mosquitto_handoff_survives_shutdown` | Handoff message remains receivable after `shutdown()`. Wire order PUBACK-before-DISCONNECT is covered by unit tests |
+| `mosquitto_mutual_tls_with_a_private_ca` | TLS listener with `require_certificate true` and the test CA (`tests/certs`): `TlsConfig::ca_pem_file` + `client_auth_pem_files` connects, subscribes and receives; without a client certificate the connect fails |
 | `mosquitto_two_parallel_connections_isolated_handoff_and_phase` | Two parallel `Connection`s: isolated handoffs via unique probe publishes; B’s phase stays Connected after A shutdown |
 
 Requires a Docker-compatible API (Podman works when `DOCKER_HOST` points at the machine).

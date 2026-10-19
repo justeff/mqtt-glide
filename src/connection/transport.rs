@@ -4,8 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use rustls::RootCertStore;
-use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf, split};
 use tokio::net::TcpStream;
 use tokio::time::timeout_at;
@@ -23,6 +21,7 @@ use crate::codec::v5::ToReasonCode;
 use crate::codec::{ConnectAck, DecodeError, DecodedFrame, DisconnectReasonCode, Packet, V5Codec};
 use crate::error::{ConnectionOutcome, ProtocolError, TransportError};
 use crate::options::ConnectOptions;
+use crate::tls::TlsConfig;
 
 type TlsIo = TlsStream<TcpStream>;
 #[cfg(feature = "websocket")]
@@ -188,8 +187,11 @@ async fn tls_connect(
     tcp_stream: TcpStream,
     deadline: Instant,
 ) -> Result<TlsIo, ConnectionOutcome> {
-    let connector = rustls_connector()?;
-    let server_name = tls_server_name(options.broker_url.host())?;
+    let default = TlsConfig::default();
+    let tls = options.tls.as_ref().unwrap_or(&default);
+    let tls_error = |message| ConnectionOutcome::Transport(TransportError::Tls(message));
+    let connector = TlsConnector::from(Arc::new(tls.client_config().map_err(tls_error)?));
+    let server_name = tls.server_name_for(options.broker_url.host()).map_err(tls_error)?;
     match timeout_at(
         tokio::time::Instant::from_std(deadline),
         connector.connect(server_name, tcp_stream),
@@ -203,62 +205,6 @@ async fn tls_connect(
             options.connect_timeout
         )))),
     }
-}
-
-/// Crypto provider selected by the active `tls-rustls-*` Cargo feature.
-fn selected_crypto_provider() -> rustls::crypto::CryptoProvider {
-    #[cfg(feature = "tls-rustls-aws-lc")]
-    {
-        rustls::crypto::aws_lc_rs::default_provider()
-    }
-    #[cfg(feature = "tls-rustls-ring")]
-    {
-        rustls::crypto::ring::default_provider()
-    }
-}
-
-fn rustls_connector() -> Result<TlsConnector, ConnectionOutcome> {
-    let mut root_store = RootCertStore::empty();
-    let cert_result = rustls_native_certs::load_native_certs();
-    for cert in cert_result.certs {
-        if let Err(error) = root_store.add(cert) {
-            return Err(ConnectionOutcome::Transport(TransportError::Tls(format!(
-                "invalid system trust anchor: {error}"
-            ))));
-        }
-    }
-
-    if root_store.is_empty() {
-        let detail = cert_result
-            .errors
-            .first()
-            .map(|error| error.to_string())
-            .unwrap_or_else(|| "no system trust anchors found".into());
-        return Err(ConnectionOutcome::Transport(TransportError::Tls(detail)));
-    }
-
-    // Explicit provider: MQTT TLS works even if the host process also enables
-    // another rustls crypto feature (no reliance on process-global install_default).
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(selected_crypto_provider()))
-        .with_safe_default_protocol_versions()
-        .map_err(|error| {
-            ConnectionOutcome::Transport(TransportError::Tls(format!(
-                "rustls protocol versions unavailable for selected crypto provider: {error}"
-            )))
-        })?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    Ok(TlsConnector::from(Arc::new(config)))
-}
-
-fn tls_server_name(host: &str) -> Result<ServerName<'static>, ConnectionOutcome> {
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return Ok(ServerName::IpAddress(ip.into()));
-    }
-
-    ServerName::try_from(host.to_owned())
-        .map_err(|_| ConnectionOutcome::Transport(TransportError::Tls(format!("invalid TLS server name: {host}"))))
 }
 
 /// The CONNACK, or why there is none: with the DISCONNECT reason when the broker sent a
@@ -323,53 +269,6 @@ mod tests {
     use crate::codec::V5Codec;
     use crate::util::BrokerUrl;
     use tokio_util::codec::{FramedRead, FramedWrite};
-
-    #[test]
-    fn tls_server_name_accepts_ip_literal() {
-        let name = tls_server_name("127.0.0.1").expect("ip literal");
-        assert!(matches!(name, ServerName::IpAddress(_)));
-    }
-
-    #[test]
-    fn tls_server_name_accepts_dns_host() {
-        let name = tls_server_name("broker.example.com").expect("dns host");
-        assert!(matches!(name, ServerName::DnsName(_)));
-    }
-
-    /// Set in the child run of `rustls_connector_fails_without_trust_anchors`.
-    #[cfg(unix)]
-    const ROOTS_CHILD: &str = "MQTT_GLIDE_ROOTS_CHILD";
-
-    /// No trust anchor is a TLS error, never a connector that trusts nothing (or everything).
-    /// The system store comes from `SSL_CERT_FILE` when it is set, so the test runs itself again
-    /// in a child process with it pointing at an empty file: the environment of this process
-    /// stays untouched for the tests running next to it.
-    #[cfg(unix)]
-    #[test]
-    fn rustls_connector_fails_without_trust_anchors() {
-        if std::env::var_os(ROOTS_CHILD).is_some() {
-            match rustls_connector() {
-                Ok(_) => println!("ROOTS=ok"),
-                Err(ConnectionOutcome::Transport(TransportError::Tls(message))) => println!("ROOTS=tls:{message}"),
-                Err(other) => println!("ROOTS=other:{other:?}"),
-            }
-            return;
-        }
-        let name = module_path!()
-            .split_once("::")
-            .map(|(_, path)| format!("{path}::rustls_connector_fails_without_trust_anchors"))
-            .expect("module path");
-        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
-            .env(ROOTS_CHILD, "1")
-            .env("SSL_CERT_FILE", "/dev/null")
-            .env_remove("SSL_CERT_DIR")
-            .output()
-            .expect("run child");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "child failed: {stdout}");
-        assert!(stdout.contains("ROOTS=tls:no system trust anchors found\n"), "{stdout}");
-    }
 
     /// The first byte the client puts on a fresh connection is the CONNECT Fixed Header
     /// ([MQTT-3.1.0-1]).

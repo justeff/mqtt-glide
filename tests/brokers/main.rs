@@ -9,6 +9,7 @@
 
 mod helpers;
 mod hivemq;
+mod tls;
 #[cfg(feature = "websocket")]
 mod websocket;
 

@@ -72,8 +72,8 @@ jobs:
         run: cargo test --lib --features testing,stats ${{ matrix.args }}
       - name: connection, redirect, proxy, codec properties (${{ matrix.name }})
         run: cargo test --test connection --test redirect --test proxy --test codec_proptest ${{ matrix.args }}
-      - name: testing helpers, publish outcomes, hostile peers (${{ matrix.name }})
-        run: cargo test --test testing --test publish_outcome --test hostile --features testing ${{ matrix.args }}
+      - name: testing helpers, publish outcomes, hostile peers, TLS (${{ matrix.name }})
+        run: cargo test --test testing --test publish_outcome --test hostile --test tls --features testing ${{ matrix.args }}
       - name: doctests (${{ matrix.name }})
         run: cargo test --doc --features testing,stats ${{ matrix.args }}
       - name: stats (${{ matrix.name }})

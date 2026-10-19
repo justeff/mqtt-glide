@@ -171,7 +171,7 @@ No MQTT 3.1.1 and no QoS 2: both are out of scope, not pending. If you need eith
 
 ## Upgrading from 0.3
 
-Awaiting a publish now returns `Result<PublishResponse, PublishError>` instead of `Result<(), AppError>`: the response carries the PUBACK (reason code, Reason String, User Properties, whether it answers a resend), the error carries the `AppError` plus `delivery`, whether the broker can have the message. `PublishError` converts into `AppError`, so `publish(..).await?` in a function returning `AppError` needs no change; code that matches `Err(AppError::…)` on a publish matches `err.error` instead. A message's `properties` field is a `Properties` that derefs to `PublishProperties`: reading and changing it is unchanged, a struct literal needs `props.into()`. A broker DISCONNECT is now `TransportError::BrokerDisconnect { reason, .. }` and a refused CONNACK `TransportError::ConnectRefused { reason, .. }`, with the reason code as a field, no longer text inside `TransportError::Connection` or `ProtocolError::Violation`. The [CHANGELOG](CHANGELOG.md#unreleased) has the details.
+Awaiting a publish now returns `Result<PublishResponse, PublishError>` instead of `Result<(), AppError>`: the response carries the PUBACK (reason code, Reason String, User Properties, whether it answers a resend), the error carries the `AppError` plus `delivery`, whether the broker can have the message. `PublishError` converts into `AppError`, so `publish(..).await?` in a function returning `AppError` needs no change; code that matches `Err(AppError::…)` on a publish matches `err.error` instead. A message's `properties` field is a `Properties` that derefs to `PublishProperties`: reading and changing it is unchanged, a struct literal needs `props.into()`. A broker DISCONNECT is now `TransportError::BrokerDisconnect { reason, .. }` and a refused CONNACK `TransportError::ConnectRefused { reason, .. }`, with the reason code as a field, no longer text inside `TransportError::Connection` or `ProtocolError::Violation`. `TlsConfig` is a struct now: `TlsConfig::SystemRoots` becomes `TlsConfig::system_roots()`. The [CHANGELOG](CHANGELOG.md#unreleased) has the details.
 
 ## Upgrading from 0.2
 
@@ -382,6 +382,34 @@ If the broker refuses a restored filter (for example after an ACL change), the c
 | `LifecycleHook` | Sync `Connected` / `Disconnected` side effects on the driver task; keep short (no await). `ClientBuilder` already waits for the first `Connected`. For async waits use the [`SessionPhase`](https://docs.rs/mqtt-glide/latest/mqtt_glide/enum.SessionPhase.html) watch (`client.session_phase()`, any client) and `client.is_connected()` for a snapshot |
 | `InboundSink` | Injectable inbound handoff; built-ins: `tokio::mpsc`, `OnInboundSink` (`.on_inbound`), `flume` (feature). Custom sinks **MUST** be cancel-safe |
 
+### TLS
+
+An `mqtts://` (or `wss://`) URL verifies the broker against the operating system's root certificates. `ConnectOptions::tls(TlsConfig)` changes that for brokers on a private PKI and for brokers that want client certificates:
+
+```rust,no_run
+# async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+use mqtt_glide::{ClientBuilder, TlsConfig};
+
+let tls = TlsConfig::ca_pem_file("/etc/mqtt/ca.pem")
+    .client_auth_pem_files("/etc/mqtt/tls.crt", "/etc/mqtt/tls.key");
+let client = ClientBuilder::new("mqtts://broker.internal:8883")?
+    .options(|o| o.tls(tls))
+    .discard_inbound()
+    .connect()
+    .await?;
+# let _ = client;
+# Ok(())
+# }
+```
+
+- **Trust:** `ca_pem(bytes)` / `ca_pem_file(path)` trust that CA instead of the system roots; `.with_system_roots()` trusts both. The broker certificate is always verified; there is no option to skip that.
+- **Client certificate (mutual TLS):** `client_auth_pem(chain, key)` / `client_auth_pem_files(chain, key)`; PKCS#8, PKCS#1 and SEC1 keys. The configuration's copy of the key is wiped from memory when it is dropped and never shows in `Debug`.
+- **Rotation:** the `*_file` variants read the files on every connect, so a certificate renewed on disk (a Kubernetes Secret updated by cert-manager) is used from the next reconnect on. A missing file fails that attempt with `TransportError::Tls` naming the path.
+- **ALPN:** `.alpn(["x-amzn-mqtt-ca"])`, e.g. for AWS IoT Core on port 443.
+- **Server name:** `.server_name("broker.internal")` verifies the certificate against that name and sends it as SNI while the URL still says where to connect (a bare IP, a port-forward).
+
+PEM given as bytes is checked when the `TlsConfig` is built (`TlsConfigError`); files are checked when they are read.
+
 ### Examples
 
 Broader flows live under [`examples/`](examples/) and are the better starting point than copying README snippets. Run any of them with `cargo run --example <name>`; they connect to `MQTT_GLIDE_BROKER` (default `mqtt://127.0.0.1:1883`).
@@ -393,7 +421,7 @@ Broader flows live under [`examples/`](examples/) and are the better starting po
 | [`publish.rs`](examples/publish.rs) | `publish`, `Publish::new` + `send`, `publish_batch`, Will Message, shared filter |
 | [`pipeline.rs`](examples/pipeline.rs) | `publish_window` + `.push(Publish::new(..))` / `.drain()` (mixed topics) |
 | [`request_response.rs`](examples/request_response.rs) | `client.requester(topic)` + `request(..).await`, answering with `Publish::reply_to` |
-| [`tls.rs`](examples/tls.rs) | `mqtts://`, rustls system roots, `connect_timeout` / `ack_timeout` |
+| [`tls.rs`](examples/tls.rs) | `mqtts://` with system roots, or `TlsConfig` with a private CA, client certificate and ALPN |
 | [`hooks.rs`](examples/hooks.rs) | `CredentialsProvider`, `LifecycleHook`, `mark_live()` |
 | [`graceful_shutdown.rs`](examples/graceful_shutdown.rs) | SIGTERM handling: unsubscribe a shared group, `shutdown()`, drain the channel until it ends |
 
@@ -503,7 +531,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | Shared subscriptions (`$share/…`) | ✅ | Caller builds the filter; `shared_filter` validates ShareName |
 | Topic filter wildcards | ✅ | Client validates `+` / `#` placement before encode; `topic_matches` matches a topic against a filter |
 | Publish properties (expiry, user props, content type, `response_topic`, `correlation_data`) | ✅ | On `PublishProperties` (a message holds them as `Properties`, allocated only when set); setters on `Publish` |
-| TLS (rustls + system roots) | ✅ | Feature-selected crypto provider |
+| TLS (rustls) | ✅ | System roots by default; `TlsConfig` for a private CA, client certificates (mutual TLS), ALPN and a server name override. Feature-selected crypto provider |
 | Reconnect / credentials hooks | ✅ | Traits + optional helpers |
 | Enqueue-before-ack + `InboundSink` | ✅ | Product backpressure policy |
 | Cap / Receive Maximum flow control | ✅ | See [Flow control](#flow-control) |

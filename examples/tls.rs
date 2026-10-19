@@ -1,29 +1,50 @@
-//! TLS connect via `mqtts://` (rustls + OS trust store / [`TlsConfig::SystemRoots`](mqtt_glide::TlsConfig::SystemRoots)).
+//! TLS connect via `mqtts://`: the OS trust store by default, or a [`TlsConfig`] with a
+//! private CA, a client certificate (mutual TLS) and ALPN.
 //!
 //! Raise `connect_timeout` for slower TLS dials; `ack_timeout` is shown at the default (5s). It
 //! bounds the wait for PUBACK / SUBACK / UNSUBACK and for room in the command channel, not
 //! waits on your own channels.
 //!
-//! The broker certificate **MUST** chain to the OS trust store. A local Mosquitto with a
-//! self-signed (or private-CA) cert will fail unless that CA is trusted by the OS. On
-//! `test.mosquitto.org`, use port **8886** (Let's Encrypt); port **8883** uses a private CA
-//! and will not verify with system roots.
+//! Without further settings the broker certificate **MUST** chain to the OS trust store. On
+//! `test.mosquitto.org`, port **8886** has a Let's Encrypt certificate:
 //!
 //! ```shell
 //! MQTT_GLIDE_BROKER=mqtts://test.mosquitto.org:8886 cargo run --example tls
 //! ```
+//!
+//! A broker on a private CA, optionally asking for a client certificate and ALPN (all PEM files;
+//! re-read on every reconnect, so rotated certificates are picked up):
+//!
+//! ```shell
+//! MQTT_GLIDE_BROKER=mqtts://broker.internal:8883 \
+//! MQTT_GLIDE_CA=ca.pem MQTT_GLIDE_CLIENT_CERT=client.pem MQTT_GLIDE_CLIENT_KEY=client.key \
+//! MQTT_GLIDE_ALPN=x-amzn-mqtt-ca cargo run --example tls
+//! ```
 
 use std::time::Duration;
 
-use mqtt_glide::{ClientBuilder, QoS};
+use mqtt_glide::{ClientBuilder, QoS, TlsConfig};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broker = std::env::var("MQTT_GLIDE_BROKER").unwrap_or_else(|_| "mqtts://test.mosquitto.org:8886".into());
+    let var = |name| std::env::var(name).ok();
+
+    let mut tls = match var("MQTT_GLIDE_CA") {
+        Some(ca) => TlsConfig::ca_pem_file(ca),
+        None => TlsConfig::system_roots(),
+    };
+    if let (Some(cert), Some(key)) = (var("MQTT_GLIDE_CLIENT_CERT"), var("MQTT_GLIDE_CLIENT_KEY")) {
+        tls = tls.client_auth_pem_files(cert, key);
+    }
+    if let Some(alpn) = var("MQTT_GLIDE_ALPN") {
+        tls = tls.alpn(alpn.split(','))?;
+    }
 
     let client = ClientBuilder::new(&broker)?
         .options(|o| {
-            o.connect_timeout(Duration::from_secs(10))
+            o.tls(tls)
+                .connect_timeout(Duration::from_secs(10))
                 .ack_timeout(Duration::from_secs(5))
         })
         .discard_inbound()

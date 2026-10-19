@@ -344,7 +344,7 @@ impl<H: InboundSink> Connection<H> {
                 let dialed = dial_or_cancel(&self.cancel, transport::dial_tcp(options, deadline)).await;
                 self.session_after_dial(dialed, deadline).await
             }
-            (TlsMode::RustlsSystemRoots, false) => {
+            (TlsMode::Rustls, false) => {
                 let dialed = dial_or_cancel(&self.cancel, transport::dial_tls(options, deadline)).await;
                 self.session_after_dial(dialed, deadline).await
             }
@@ -354,7 +354,7 @@ impl<H: InboundSink> Connection<H> {
                 self.session_after_dial(dialed, deadline).await
             }
             #[cfg(feature = "websocket")]
-            (TlsMode::RustlsSystemRoots, true) => {
+            (TlsMode::Rustls, true) => {
                 let dialed = dial_or_cancel(&self.cancel, transport::dial_wss(options, deadline)).await;
                 self.session_after_dial(dialed, deadline).await
             }

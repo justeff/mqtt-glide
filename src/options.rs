@@ -8,6 +8,7 @@ use std::time::Duration;
 use nonzero_ext::nonzero;
 
 use crate::codec::{DEFAULT_MAX_PACKET_SIZE, QoS, WillMessage};
+use crate::tls::TlsConfig;
 use crate::util::{BrokerUrl, ClientId, HttpProxy};
 
 /// Default capacity of the bounded application command/data path to the write task.
@@ -46,14 +47,6 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`ConnectOptions::graceful_disconnect_timeout`].
 pub const DEFAULT_GRACEFUL_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// TLS trust configuration for broker connections.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TlsConfig {
-    /// Use the operating system's trusted root certificate store.
-    SystemRoots,
-}
-
 /// Broker endpoint and session parameters for [`crate::connect`].
 ///
 /// Prefer the fluent setters to build. Fields are `pub` so the driver
@@ -83,7 +76,8 @@ pub struct ConnectOptions {
     pub session_expiry: Option<Duration>,
     /// Whether `TCP_NODELAY` is enabled on the underlying socket.
     pub tcp_nodelay: bool,
-    /// Explicit TLS trust configuration, if set (overrides scheme-only hint).
+    /// TLS settings; set, they turn on TLS even for an `mqtt://` / `ws://` URL. `None` with an
+    /// `mqtts://` / `wss://` URL means [`TlsConfig::system_roots`].
     pub tls: Option<TlsConfig>,
     /// Deadline for awaiting PUBACK / SUBACK / UNSUBACK ([`DEFAULT_ACK_TIMEOUT`] when unset).
     pub ack_timeout: Duration,
@@ -282,7 +276,9 @@ impl ConnectOptions {
         self
     }
 
-    /// Sets explicit TLS trust configuration (overrides scheme-only hint).
+    /// Connects over TLS with these settings: custom CA, client certificate, ALPN, server name.
+    ///
+    /// Turns on TLS even for an `mqtt://` / `ws://` URL.
     pub fn tls(mut self, tls: TlsConfig) -> Self {
         self.tls = Some(tls);
         self
