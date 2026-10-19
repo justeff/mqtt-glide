@@ -8,6 +8,7 @@ use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 use tokio_util::codec::FramedWrite;
 
+use crate::ack::PublishResponse;
 use crate::codec::{
     EncodeError, Packet, PublishDelivery, PublishMessage, QoS, Subscribe, SubscriptionOptions, Unsubscribe, V5Codec,
     topic_filter_bytes_invalid,
@@ -274,7 +275,7 @@ where
         return Ok(());
     }
     if publish.qos == QoS::ExactlyOnce {
-        let _ = publish
+        publish
             .reply
             .send(Err(AppError::InvalidRequest("QoS 2 publish is not supported".into())));
         return Ok(());
@@ -282,11 +283,15 @@ where
     if let Err(error) =
         validate_publish_against_broker_limits(publish.qos, publish.retain, limits.max_qos, limits.retain_available)
     {
-        let _ = publish.reply.send(Err(error));
+        publish.reply.send(Err(error));
         return Ok(());
     }
 
     if publish.qos == QoS::AtMostOnce {
+        // The caller gave up meanwhile and was told it was not sent.
+        if !publish.reply.claim_write() {
+            return Ok(());
+        }
         let delivery = PublishDelivery {
             dup: false,
             retain: publish.retain,
@@ -294,10 +299,11 @@ where
             packet_id: None,
         };
         if let Err(error) = feed_publish(framed, &mut publish_waiters.aliases, &publish.message, delivery) {
+            publish.reply.unclaim_write();
             return finish_publish_encode_error(Some(publish.reply), &publish.message, error);
         }
         publish_waiters.stats.publish_sent(QoS::AtMostOnce);
-        let _ = publish.reply.send(Ok(()));
+        publish.reply.send(Ok(PublishResponse::written()));
         return Ok(());
     }
 
@@ -351,10 +357,15 @@ where
     let packet_id = match inflight.alloc_publish() {
         Ok(id) => id,
         Err(error) => {
-            let _ = publish.reply.send(Err(error));
+            publish.reply.send(Err(error));
             return Ok(());
         }
     };
+    // The caller gave up meanwhile and was told it was not sent.
+    if !publish.reply.claim_write() {
+        inflight.release_publish(packet_id);
+        return Ok(());
+    }
     let delivery = PublishDelivery {
         dup: false,
         retain: publish.retain,
@@ -363,10 +374,11 @@ where
     };
     if let Err(error) = feed_publish(framed, &mut publish_waiters.aliases, &publish.message, delivery) {
         inflight.release_publish(packet_id);
+        publish.reply.unclaim_write();
         return finish_publish_encode_error(Some(publish.reply), &publish.message, error);
     }
     publish_waiters.stats.publish_sent(QoS::AtLeastOnce);
-    publish_waiters.insert_sent(packet_id, publish);
+    publish_waiters.insert_sent(packet_id, publish, false);
     Ok(())
 }
 
@@ -411,7 +423,7 @@ where
             limits.max_qos,
             limits.retain_available,
         ) {
-            let _ = entry.reply.send(Err(error));
+            entry.reply.send(Err(error));
             continue;
         }
         if inflight.has_publish_capacity() && publish_waiters.resend_parked.is_empty() {
@@ -440,7 +452,7 @@ where
     // The id can only be taken if a SUBSCRIBE got it while this one waited: nothing to resend
     // it under, so it is lost like a publish of a dropped connection.
     if !inflight.reserve_publish(entry.packet_id) {
-        let _ = entry.reply.send(Err(AppError::ConnectionLost));
+        entry.reply.send(Err(AppError::ConnectionLost));
         return Ok(());
     }
     let delivery = PublishDelivery {
@@ -462,6 +474,7 @@ where
             retain: entry.retain,
             reply: entry.reply,
         },
+        true,
     );
     Ok(())
 }
@@ -704,13 +717,13 @@ pub(super) fn finish_publish_encode_error(
             let detail =
                 publish_topic_invalid_reason(message.topic.as_ref()).unwrap_or("invalid publish packet fields");
             if let Some(reply) = reply {
-                let _ = reply.send(Err(AppError::InvalidRequest(detail.into())));
+                reply.send(Err(AppError::InvalidRequest(detail.into())));
             }
             Ok(())
         }
         EncodeError::PacketIdRequired => {
             if let Some(reply) = reply {
-                let _ = reply.send(Err(AppError::InvalidRequest(
+                reply.send(Err(AppError::InvalidRequest(
                     "publish packet identifier is required for QoS > 0".into(),
                 )));
             }
@@ -720,7 +733,7 @@ pub(super) fn finish_publish_encode_error(
         // limit: this publish cannot be sent, the connection is fine (the encoder wrote nothing).
         EncodeError::InvalidLength => {
             if let Some(reply) = reply {
-                let _ = reply.send(Err(AppError::InvalidRequest(
+                reply.send(Err(AppError::InvalidRequest(
                     "publish field too long: a topic, string or binary property over 65535 bytes, or a packet over 268435455 bytes".into(),
                 )));
             }
@@ -728,7 +741,7 @@ pub(super) fn finish_publish_encode_error(
         }
         EncodeError::OverMaxPacketSize { size, max } => {
             if let Some(reply) = reply {
-                let _ = reply.send(Err(AppError::InvalidRequest(format!(
+                reply.send(Err(AppError::InvalidRequest(format!(
                     "publish exceeds maximum packet size ({size} > {max})"
                 ))));
             }
@@ -737,7 +750,7 @@ pub(super) fn finish_publish_encode_error(
         other => {
             let outcome = map_encode_error(other);
             if let Some(reply) = reply {
-                let _ = reply.send(Err(app_error_from_write_outcome(&outcome)));
+                reply.send(Err(app_error_from_write_outcome(&outcome)));
             }
             Err(outcome)
         }

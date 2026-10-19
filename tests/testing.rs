@@ -279,7 +279,7 @@ async fn refusals_and_rejections_reach_the_application() {
         .qos(QoS::AtLeastOnce)
         .await
         .expect_err("rejected");
-    match error {
+    match error.error {
         AppError::PublishRejected(rejection) => assert_eq!(rejection.reason, PublishAckReason::NotAuthorized),
         other => panic!("expected PublishRejected, got {other:?}"),
     }

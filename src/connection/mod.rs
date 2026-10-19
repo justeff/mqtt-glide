@@ -44,8 +44,8 @@ pub(crate) use crate::options::COMMAND_CHANNEL_CAPACITY;
 use channels::CONTROL_CHANNEL_CAPACITY;
 pub(crate) use channels::control_channel_capacity;
 pub(crate) use channels::{
-    ClientCommand, CommandReceiver, CommandSender, ControlMessage, ControlReceiver, PublishReply, SubscribeReply,
-    UnsubscribeReply,
+    Abandoned, ClientCommand, CommandReceiver, CommandSender, ControlMessage, ControlReceiver, PublishReply,
+    PublishTicket, SubscribeReply, UnsubscribeReply, publish_reply,
 };
 pub use handshake::SessionParams;
 pub(crate) use handshake::validate_will_message;
@@ -231,10 +231,10 @@ impl<H: InboundSink> Connection<H> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take_all();
         for entry in unacked {
-            let _ = entry.reply.send(Err(AppError::ConnectionLost));
+            entry.reply.send(Err(AppError::ConnectionLost));
         }
         for publish in unsent {
-            let _ = publish.reply.send(Err(AppError::ConnectionLost));
+            publish.reply.send(Err(AppError::ConnectionLost));
         }
     }
 
@@ -248,7 +248,7 @@ impl<H: InboundSink> Connection<H> {
                 .unacked,
         );
         for entry in unacked {
-            let _ = entry.reply.send(Err(AppError::ConnectionLost));
+            entry.reply.send(Err(AppError::ConnectionLost));
         }
     }
 

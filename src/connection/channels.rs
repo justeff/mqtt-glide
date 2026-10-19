@@ -1,6 +1,8 @@
 //! Per-connection channel types and capacities.
 
 use std::num::NonZeroU16;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use bytestring::ByteString;
 use tokio::sync::{mpsc, oneshot};
@@ -102,8 +104,137 @@ pub(crate) type SubscribeReply = oneshot::Sender<Result<crate::ack::SubscribeRes
 /// Reply channel for [`ClientCommand::Unsubscribe`].
 pub(crate) type UnsubscribeReply = oneshot::Sender<Result<crate::ack::UnsubscribeResponse, AppError>>;
 
-/// Reply channel for [`ClientCommand::Publish`].
-pub(crate) type PublishReply = oneshot::Sender<Result<(), AppError>>;
+/// Completion value of a publish, sent by the write task.
+pub(crate) type PublishResult = Result<crate::ack::PublishResponse, AppError>;
+
+const QUEUED: u8 = 0;
+const WRITTEN: u8 = 1;
+const ABANDONED: u8 = 2;
+
+/// Whether a QoS 1 publish has been written, shared by its [`PublishReply`] (write task) and
+/// [`PublishTicket`] (caller): `Queued -> Written` by the write task, `Queued -> Abandoned`
+/// by a caller that stops waiting. Whichever switch wins decides whether a timed-out publish
+/// was sent, so the caller's answer cannot race the write.
+///
+/// QoS 0 goes without it: the extra allocation and shared cache line would cost QoS 0 a
+/// measurable share of its throughput, and a QoS 0 caller rarely acts on the difference.
+#[derive(Debug, Default)]
+struct WriteState(AtomicU8);
+
+/// Reply side of [`ClientCommand::Publish`], held by the write task.
+#[derive(Debug)]
+pub(crate) struct PublishReply {
+    tx: oneshot::Sender<PublishResult>,
+    state: Option<Arc<WriteState>>,
+}
+
+/// Caller side of [`ClientCommand::Publish`].
+#[derive(Debug)]
+pub(crate) struct PublishTicket {
+    pub(crate) rx: oneshot::Receiver<PublishResult>,
+    state: Option<Arc<WriteState>>,
+}
+
+/// What a caller that stopped waiting learns about its publish ([`PublishTicket::abandon`]).
+#[derive(Debug)]
+pub(crate) enum Abandoned {
+    /// Not written yet, and now it never will be.
+    NotWritten,
+    /// Written already, or possibly being written (QoS 0 keeps no write state).
+    MaybeWritten,
+    /// The result arrived meanwhile after all.
+    Completed(PublishResult),
+}
+
+/// Creates the two ends for one publish; `track_write` keeps the write state (QoS 1).
+pub(crate) fn publish_reply(track_write: bool) -> (PublishReply, PublishTicket) {
+    let (tx, rx) = oneshot::channel();
+    let state = track_write.then(|| Arc::new(WriteState::default()));
+    (
+        PublishReply {
+            tx,
+            state: state.clone(),
+        },
+        PublishTicket { rx, state },
+    )
+}
+
+impl PublishReply {
+    /// Whether the caller stopped waiting (gave up or dropped its completion).
+    #[inline]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+            || self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.0.load(Ordering::Acquire) == ABANDONED)
+    }
+
+    /// Claims the publish for writing, right before it is encoded. `false` when the caller
+    /// gave up first: it has been told the publish was not sent, so it must not be written.
+    #[inline]
+    pub(crate) fn claim_write(&self) -> bool {
+        if self.tx.is_closed() {
+            return false;
+        }
+        let Some(state) = &self.state else {
+            return true;
+        };
+        match state
+            .0
+            .compare_exchange(QUEUED, WRITTEN, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => true,
+            Err(current) => current == WRITTEN,
+        }
+    }
+
+    /// Undoes [`Self::claim_write`] when encoding failed before any byte was written.
+    #[inline]
+    pub(crate) fn unclaim_write(&self) {
+        if let Some(state) = &self.state {
+            let _ = state
+                .0
+                .compare_exchange(WRITTEN, QUEUED, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+
+    /// Completes the publish; the caller may be gone already.
+    #[inline]
+    pub(crate) fn send(self, result: PublishResult) {
+        let _ = self.tx.send(result);
+    }
+}
+
+impl PublishTicket {
+    /// Stops waiting after a timeout. A publish not yet written is never written afterwards.
+    pub(crate) fn abandon(&mut self) -> Abandoned {
+        if let Some(state) = &self.state {
+            return match state
+                .0
+                .compare_exchange(QUEUED, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => Abandoned::NotWritten,
+                Err(_) => Abandoned::MaybeWritten,
+            };
+        }
+        // QoS 0 replies right when it writes: closing first means the write task skips it
+        // from now on, but one being written at this very moment cannot be told apart.
+        self.rx.close();
+        match self.rx.try_recv() {
+            Ok(result) => Abandoned::Completed(result),
+            Err(_) => Abandoned::MaybeWritten,
+        }
+    }
+
+    /// Whether the publish was written to a connection. Always `false` for QoS 0: it
+    /// completes with `Ok` when written, so an error means it was not.
+    pub(crate) fn written(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(|state| state.0.load(Ordering::Acquire) == WRITTEN)
+    }
+}
 
 /// Application commands routed to the write task over a bounded channel.
 #[derive(Debug)]
@@ -200,7 +331,7 @@ pub(crate) fn fail_queued_commands(command_rx: &mut CommandReceiver, refused: &A
     while let Ok(command) = command_rx.try_recv() {
         match command {
             ClientCommand::Publish { reply, .. } => {
-                let _ = reply.send(Err(AppError::ConnectionLost));
+                reply.send(Err(AppError::ConnectionLost));
             }
             ClientCommand::Subscribe { reply, .. } => {
                 let _ = reply.send(Err(refused.clone()));

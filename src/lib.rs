@@ -71,7 +71,10 @@ pub use client::{
 };
 // Application-facing message and option types. Wire-level packet types, the codec and the
 // encode helpers stay internal.
-pub use ack::{PublishRejection, RefusedSubscription, SubscribeResponse, UnsubscribeResponse};
+pub use ack::{
+    Delivery, PublishError, PublishRejection, PublishResponse, RefusedSubscription, SubscribeResponse,
+    UnsubscribeResponse,
+};
 pub use codec::{
     ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, DisconnectReasonCode, InboundMessage, PublishAckReason, PublishMessage,
     PublishProperties, QoS, RetainHandling, SubscribeAckReason, SubscriptionOptions, UnknownCode, UnsubscribeAckReason,

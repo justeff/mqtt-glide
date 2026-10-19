@@ -16,7 +16,8 @@ use zeroize::Zeroizing;
 
 use crate::codec::{QoS, RetainHandling, SubscriptionOptions};
 use crate::connection::{
-    ClientCommand, CommandSender, Connection, ConnectionChannels, LifecycleHook, SessionPhase, control_channel_capacity,
+    Abandoned, ClientCommand, CommandSender, Connection, ConnectionChannels, LifecycleHook, PublishTicket,
+    SessionPhase, control_channel_capacity, publish_reply,
 };
 use crate::error::{AppError, AuthError, ConnectError, ConnectionOutcome};
 use crate::inbound_sink::InboundSink;
@@ -303,21 +304,79 @@ impl SharedCredentials {
 /// The acknowledgement timeout starts only when [`Self::wait`] is polled.
 #[derive(Debug)]
 pub struct PublishCompletion {
-    reply_rx: oneshot::Receiver<Result<(), AppError>>,
-    ack_timeout: Duration,
+    ticket: PublishTicket,
+    ack_timeout: Option<Duration>,
 }
 
 impl PublishCompletion {
-    /// Waits for the outbound PUBLISH to complete.
+    /// Waits for the outbound PUBLISH to complete and returns the broker's answer.
     ///
     /// QoS 0 completes after the PUBLISH is encoded into the connection write buffer (not
     /// necessarily flushed or broker-received). QoS 1 completes after the matching PUBACK.
-    /// If completion does not arrive before the configured acknowledgement timeout, this
-    /// returns [`AppError::PublishTimeout`].
+    /// Waits up to the acknowledgement timeout ([`ConnectOptions::ack_timeout`], or the one
+    /// set with [`PublishBuilder::ack_timeout`]), then fails with
+    /// [`AppError::PublishTimeout`]. For QoS 1 the
+    /// [`PublishError::delivery`](crate::PublishError::delivery) of a timeout says whether the
+    /// publish had been written (QoS 0: always `Unknown`); one that had not is never written
+    /// afterwards.
+    // Not `async`: returns the `wait_for` future itself, so the hot path keeps one layer.
     #[inline]
-    pub async fn wait(self) -> Result<(), AppError> {
-        await_ack(self.ack_timeout, self.reply_rx, AckKind::Publish).await
+    pub fn wait(self) -> impl Future<Output = Result<crate::ack::PublishResponse, crate::ack::PublishError>> + Send {
+        let ack_timeout = self.ack_timeout;
+        self.wait_for(ack_timeout)
     }
+
+    /// Like [`Self::wait`] with its own timeout; `None` waits until the PUBACK arrives or the
+    /// publish fails for good (connection given up, session ended, shutdown).
+    pub async fn wait_for(
+        self,
+        ack_timeout: Option<Duration>,
+    ) -> Result<crate::ack::PublishResponse, crate::ack::PublishError> {
+        use crate::ack::{Delivery, PublishError};
+
+        let PublishCompletion { mut ticket, .. } = self;
+        let received = match ack_timeout {
+            Some(deadline) => match timeout(deadline, &mut ticket.rx).await {
+                Ok(received) => received,
+                Err(_elapsed) => {
+                    let delivery = match ticket.abandon() {
+                        Abandoned::NotWritten => Delivery::NotSent,
+                        Abandoned::MaybeWritten => Delivery::Unknown,
+                        Abandoned::Completed(result) => return completed(result, &ticket),
+                    };
+                    return Err(PublishError {
+                        error: AppError::PublishTimeout(deadline),
+                        delivery,
+                    });
+                }
+            },
+            None => (&mut ticket.rx).await,
+        };
+        match received {
+            Ok(result) => completed(result, &ticket),
+            // The driver dropped the publish without an answer (its task ended).
+            Err(_closed) => completed(Err(AppError::CommandChannelClosed), &ticket),
+        }
+    }
+}
+
+/// Turns the write task's answer into the caller's result, classifying a failure.
+fn completed(
+    result: Result<crate::ack::PublishResponse, AppError>,
+    ticket: &PublishTicket,
+) -> Result<crate::ack::PublishResponse, crate::ack::PublishError> {
+    use crate::ack::{Delivery, PublishError};
+
+    result.map_err(|error| {
+        let delivery = if matches!(error, AppError::PublishRejected(_)) {
+            Delivery::Rejected
+        } else if ticket.written() {
+            Delivery::Unknown
+        } else {
+            Delivery::NotSent
+        };
+        PublishError { error, delivery }
+    })
 }
 
 /// Cloneable command handle — sends application commands over a bounded channel.
@@ -337,7 +396,7 @@ pub struct MqttClient {
     /// Priority graceful-shutdown signal — not starved by a full command channel.
     shutdown_notify: CancellationToken,
     /// Deadline waiting for PUBACK / SUBACK / UNSUBACK (from [`ConnectOptions::ack_timeout`]).
-    ack_timeout: Duration,
+    pub(crate) ack_timeout: Duration,
     /// Set by the driver between Connected and Disconnected.
     connected: Arc<AtomicBool>,
     /// Set by [`Self::shutdown`]. Checked on every command, so it is a plain atomic:
@@ -573,7 +632,10 @@ impl MqttClient {
     /// (not necessarily flushed or broker-received), the matching `PUBACK` for QoS 1.
     /// QoS 1 publishes beyond the broker's Receive Maximum wait for a free slot.
     /// Both waits are bounded by [`ConnectOptions::ack_timeout`]
-    /// ([`AppError::Backpressure`] / [`AppError::PublishTimeout`]).
+    /// ([`AppError::Backpressure`] / [`AppError::PublishTimeout`]); the wait for completion can
+    /// be set per publish with [`PublishBuilder::ack_timeout`]. Returns the broker's
+    /// [`PublishResponse`](crate::PublishResponse), or a [`PublishError`](crate::PublishError)
+    /// that says whether the broker can have the message.
     ///
     /// `topic` / `payload` take the same types as [`Publish::new`].
     ///
@@ -601,11 +663,32 @@ impl MqttClient {
     /// Sends a ready [`Publish`] (or a [`PublishMessage`](crate::PublishMessage) as QoS 0) and waits for completion.
     ///
     /// Same waiting and errors as awaiting [`Self::publish`].
-    pub async fn send(&self, publish: impl Into<Publish>) -> Result<(), AppError> {
+    // Not `async`: returns the `send_with` future itself, so the hot path keeps one layer.
+    #[inline]
+    pub fn send(
+        &self,
+        publish: impl Into<Publish>,
+    ) -> impl Future<Output = Result<crate::ack::PublishResponse, crate::ack::PublishError>> + Send + '_ {
+        self.send_with(publish.into(), Some(self.ack_timeout))
+    }
+
+    /// [`Self::send`] with the completion bounded by `ack_timeout` (see
+    /// [`PublishCompletion::wait_for`]).
+    pub(crate) async fn send_with(
+        &self,
+        publish: Publish,
+        ack_timeout: Option<Duration>,
+    ) -> Result<crate::ack::PublishResponse, crate::ack::PublishError> {
+        use crate::ack::PublishError;
+
         // Flat on purpose: one future layer and a sync `try_send` on the hot path.
-        let (command, completion) = self.publish_command(publish.into())?;
-        if let Some(command) = self.try_send_or_return(command)? {
-            Box::pin(self.wait_for_room(command)).await?;
+        let (command, completion) = self
+            .publish_command(publish, ack_timeout)
+            .map_err(PublishError::not_sent)?;
+        if let Some(command) = self.try_send_or_return(command).map_err(PublishError::not_sent)? {
+            Box::pin(self.wait_for_room(command))
+                .await
+                .map_err(PublishError::not_sent)?;
         }
         completion.wait().await
     }
@@ -618,10 +701,24 @@ impl MqttClient {
     /// [`AppError::InvalidRequest`]. Call [`PublishCompletion::wait`] to observe the
     /// result; `packet_id` / `dup` are assigned by the connection driver.
     #[inline]
-    pub fn try_start_publish(&self, publish: impl Into<Publish>) -> Result<PublishCompletion, AppError> {
-        let (command, completion) = self.publish_command(publish.into())?;
-        self.try_send_command(command)?;
-        Ok(completion)
+    pub fn try_start_publish(
+        &self,
+        publish: impl Into<Publish>,
+    ) -> Result<PublishCompletion, crate::ack::PublishError> {
+        self.try_start_publish_with(publish.into(), Some(self.ack_timeout))
+    }
+
+    pub(crate) fn try_start_publish_with(
+        &self,
+        publish: Publish,
+        ack_timeout: Option<Duration>,
+    ) -> Result<PublishCompletion, crate::ack::PublishError> {
+        let enqueue = || {
+            let (command, completion) = self.publish_command(publish, ack_timeout)?;
+            self.try_send_command(command)?;
+            Ok(completion)
+        };
+        enqueue().map_err(crate::ack::PublishError::not_sent)
     }
 
     /// Enqueues a PUBLISH and returns its completion handle without waiting for the
@@ -629,32 +726,48 @@ impl MqttClient {
     /// channel ([`AppError::Backpressure`] after that), then returns. Call
     /// [`PublishCompletion::wait`] to observe the result. [`Self::try_start_publish`] fails at
     /// once on a full channel instead.
-    pub async fn start_publish(&self, publish: impl Into<Publish>) -> Result<PublishCompletion, AppError> {
-        let (command, completion) = self.publish_command(publish.into())?;
-        if let Some(command) = self.try_send_or_return(command)? {
-            Box::pin(self.wait_for_room(command)).await?;
+    #[inline]
+    pub fn start_publish(
+        &self,
+        publish: impl Into<Publish>,
+    ) -> impl Future<Output = Result<PublishCompletion, crate::ack::PublishError>> + Send + '_ {
+        self.start_publish_with(publish.into(), Some(self.ack_timeout))
+    }
+
+    pub(crate) async fn start_publish_with(
+        &self,
+        publish: Publish,
+        ack_timeout: Option<Duration>,
+    ) -> Result<PublishCompletion, crate::ack::PublishError> {
+        use crate::ack::PublishError;
+
+        let (command, completion) = self
+            .publish_command(publish, ack_timeout)
+            .map_err(PublishError::not_sent)?;
+        if let Some(command) = self.try_send_or_return(command).map_err(PublishError::not_sent)? {
+            Box::pin(self.wait_for_room(command))
+                .await
+                .map_err(PublishError::not_sent)?;
         }
         Ok(completion)
     }
 
-    fn publish_command(&self, publish: Publish) -> Result<(ClientCommand, PublishCompletion), AppError> {
+    fn publish_command(
+        &self,
+        publish: Publish,
+        ack_timeout: Option<Duration>,
+    ) -> Result<(ClientCommand, PublishCompletion), AppError> {
         if publish.qos == QoS::ExactlyOnce {
             return Err(AppError::InvalidRequest("QoS 2 publish is not supported".into()));
         }
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply, ticket) = publish_reply(publish.qos == QoS::AtLeastOnce);
         let command = ClientCommand::Publish {
             message: publish.message,
             qos: publish.qos,
             retain: publish.retain,
-            reply: reply_tx,
+            reply,
         };
-        Ok((
-            command,
-            PublishCompletion {
-                reply_rx,
-                ack_timeout: self.ack_timeout,
-            },
-        ))
+        Ok((command, PublishCompletion { ticket, ack_timeout }))
     }
 
     /// Starts a sliding-window pipeline over [`Self::start_publish`] (no task per message).
@@ -686,7 +799,9 @@ impl MqttClient {
     ///
     /// Each item carries its own QoS / retain / properties ([`Publish`]; a bare
     /// [`PublishMessage`](crate::PublishMessage) is QoS 0). An empty iterator completes immediately. Stops at the
-    /// first error (same as [`PublishWindow::drain`]).
+    /// first error (same as [`PublishWindow::drain`]); which message failed, and what became of the
+    /// later ones, the error does not say. Start the publishes yourself
+    /// ([`Self::start_publish`]) and wait on each completion where that matters.
     ///
     /// # Examples
     ///
@@ -705,7 +820,7 @@ impl MqttClient {
         &self,
         messages: impl IntoIterator<Item = impl Into<Publish>>,
         window: NonZeroUsize,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), crate::ack::PublishError> {
         let mut pipe = self.publish_window(window);
         for message in messages {
             pipe.push(message).await?;
@@ -880,7 +995,6 @@ impl MqttClient {
 }
 
 enum AckKind {
-    Publish,
     Subscribe,
     Unsubscribe,
 }
@@ -894,7 +1008,6 @@ async fn await_ack<T>(
         Ok(Ok(result)) => result,
         Ok(Err(_closed)) => Err(AppError::CommandChannelClosed),
         Err(_elapsed) => match kind {
-            AckKind::Publish => Err(AppError::PublishTimeout(deadline)),
             AckKind::Subscribe => Err(AppError::SubscribeAckTimeout(deadline)),
             AckKind::Unsubscribe => Err(AppError::UnsubscribeAckTimeout(deadline)),
         },
@@ -1053,6 +1166,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+    use crate::ack::PublishError;
     use crate::codec::{
         ConnectAck, DecodedFrame, InboundMessage, Packet, PublishAck, PublishMessage, PublishProperties, QoS,
         SubscribeAck, SubscribeAckReason, UnsubscribeAck, UnsubscribeAckReason,
@@ -1510,19 +1624,35 @@ mod tests {
         let publish = || Publish::new("t/qos2", "x").qos(QoS::ExactlyOnce);
         assert!(matches!(
             client.try_start_publish(publish()),
-            Err(AppError::InvalidRequest(_))
+            Err(PublishError {
+                error: AppError::InvalidRequest(_),
+                delivery: crate::Delivery::NotSent,
+                ..
+            })
         ));
         let started = timeout(Duration::from_secs(1), client.start_publish(publish()))
             .await
             .expect("rejected without waiting for a connection");
-        assert!(matches!(started, Err(AppError::InvalidRequest(_))));
+        assert!(matches!(
+            started,
+            Err(PublishError {
+                error: AppError::InvalidRequest(_),
+                ..
+            })
+        ));
         let sent = timeout(
             Duration::from_secs(1),
             client.publish("t/qos2", "x").qos(QoS::ExactlyOnce),
         )
         .await
         .expect("rejected without waiting for a connection");
-        assert!(matches!(sent, Err(AppError::InvalidRequest(_))));
+        assert!(matches!(
+            sent,
+            Err(PublishError {
+                error: AppError::InvalidRequest(_),
+                ..
+            })
+        ));
     }
 
     /// A QoS 2 publish on a live connection fails with `InvalidRequest` and nothing reaches the
@@ -1538,7 +1668,16 @@ mod tests {
         )
         .await
         .expect("a QoS 2 publish fails at once");
-        assert!(matches!(result, Err(AppError::InvalidRequest(_))), "{result:?}");
+        assert!(
+            matches!(
+                result,
+                Err(PublishError {
+                    error: AppError::InvalidRequest(_),
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
         client.publish("t/after", "marker").await.expect("qos 0 publish");
         client.shutdown().await.expect("shutdown");
         let _ = run.await;
@@ -1808,9 +1947,10 @@ mod tests {
             .try_start_publish(Publish::from(sample_message("t/bp", b"x")))
             .expect_err("full command channel must backpressure publish");
         assert!(
-            matches!(err, AppError::Backpressure(_)),
+            matches!(err.error, AppError::Backpressure(_)),
             "expected Backpressure, got {err:?}"
         );
+        assert_eq!(err.delivery, crate::Delivery::NotSent, "{err:?}");
     }
 
     /// CONNACK `server_receive_maximum=1` with withheld PUBACK, while the client's own Receive
@@ -2114,9 +2254,10 @@ mod tests {
             AckKind::Publish => {
                 use crate::codec::PublishAckReason;
 
-                let (reply_tx, reply_rx) = oneshot::channel();
+                let (reply, ticket) = crate::connection::publish_reply(true);
+                let reply_rx = ticket.rx;
                 client
-                    .try_insert_publish_waiter(packet_id, reply_tx)
+                    .try_insert_publish_waiter(packet_id, reply)
                     .expect("insert publish waiter on live write task");
                 waiter_registered().await;
 
@@ -2171,7 +2312,7 @@ mod tests {
         .expect_err("open QoS 1 publish must fail with a typed error");
 
         assert!(
-            matches!(err, AppError::ConnectionLost),
+            matches!(err.error, AppError::ConnectionLost),
             "expected AppError::ConnectionLost after peer drop, got {err:?}"
         );
 
@@ -2228,7 +2369,8 @@ mod tests {
     }
 
     /// Session Present after reconnect: both PUBLISHes are resent in order, with their
-    /// original ids and DUP set, and the callers' completions resolve on the new PUBACKs.
+    /// original ids and DUP set, and the callers' completions resolve on the new PUBACKs,
+    /// marked as answers to a resend.
     /// Covers [MQTT-4.4.0-1] (resend with original ids), [MQTT-4.6.0-1] (original order),
     /// [MQTT-3.3.1-1] (DUP 1 on re-delivery), [MQTT-4.3.2-2] (first transmission has DUP 0) and
     /// [MQTT-3.1.2-23] (the unacknowledged PUBLISHes survive the closed connection).
@@ -2244,13 +2386,13 @@ mod tests {
         let second = client
             .try_start_publish(Publish::new("t/resume", "b").qos(QoS::AtLeastOnce))
             .expect("enqueue b");
-        timeout(Duration::from_secs(3), async {
-            first.wait().await?;
-            second.wait().await
+        let responses = timeout(Duration::from_secs(3), async {
+            Ok::<_, PublishError>((first.wait().await?, second.wait().await?))
         })
         .await
         .expect("completions must resolve after resend")
         .expect("resent publishes must be acknowledged");
+        assert!(responses.0.resent() && responses.1.resent(), "{responses:?}");
 
         let frames = seen.lock().await.clone();
         let first_conn: Vec<_> = frames.iter().filter(|f| f.0 == 0).collect();
@@ -2322,7 +2464,7 @@ mod tests {
         .await
         .expect("completion resolves on the resumed session")
         .expect_err("the resumed session does not allow it");
-        assert!(matches!(error, AppError::InvalidRequest(_)), "{error:?}");
+        assert!(matches!(error.error, AppError::InvalidRequest(_)), "{error:?}");
         let frames = seen.lock().await.clone();
         assert_eq!(frames.len(), 1, "sent once, not again: {frames:?}");
 
@@ -2437,7 +2579,8 @@ mod tests {
                 .await
                 .expect("completion must resolve")
                 .expect_err("publish from a discarded session must fail");
-            assert!(matches!(err, AppError::ConnectionLost), "got {err:?}");
+            assert!(matches!(err.error, AppError::ConnectionLost), "got {err:?}");
+            assert_eq!(err.delivery, crate::Delivery::Unknown, "it was written");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
@@ -2467,7 +2610,8 @@ mod tests {
             .await
             .expect("completion must resolve")
             .expect_err("clean session loss must fail the publish");
-        assert!(matches!(err, AppError::ConnectionLost), "got {err:?}");
+        assert!(matches!(err.error, AppError::ConnectionLost), "got {err:?}");
+        assert_eq!(err.delivery, crate::Delivery::Unknown, "it was written");
 
         client.shutdown().await.expect("shutdown");
         let _ = run.await;
@@ -2527,7 +2671,7 @@ mod tests {
         .await
         .expect("PUBACK arrives")
         .expect_err("broker rejects the publish");
-        let AppError::PublishRejected(rejection) = err else {
+        let AppError::PublishRejected(rejection) = err.error else {
             panic!("expected PublishRejected, got {err:?}");
         };
         assert_eq!(rejection.reason, crate::codec::PublishAckReason::NotAuthorized);
@@ -2679,7 +2823,16 @@ mod tests {
             .collect();
         client.shutdown().await.expect("shutdown");
         let refused = client.publish("t/late", "x").await;
-        assert!(matches!(refused, Err(AppError::ShuttingDown)), "got {refused:?}");
+        assert!(
+            matches!(
+                refused,
+                Err(PublishError {
+                    error: AppError::ShuttingDown,
+                    ..
+                })
+            ),
+            "got {refused:?}"
+        );
         for completion in completions {
             completion
                 .wait()
@@ -2712,7 +2865,7 @@ mod tests {
         let started = std::time::Instant::now();
         client.shutdown().await.expect("shutdown");
         let err = completion.wait().await.expect_err("never-acked publish must fail");
-        assert!(matches!(err, AppError::ConnectionLost), "got {err:?}");
+        assert!(matches!(err.error, AppError::ConnectionLost), "got {err:?}");
         let _ = timeout(Duration::from_secs(3), run).await.expect("driver stops");
         assert!(
             started.elapsed() < Duration::from_secs(1),
@@ -2778,7 +2931,13 @@ mod tests {
         }
 
         assert!(
-            matches!(results[0], Err(AppError::ConnectionLost)),
+            matches!(
+                results[0],
+                Err(PublishError {
+                    error: AppError::ConnectionLost,
+                    ..
+                })
+            ),
             "the publish sent on the lost connection fails in a Clean Start session: {:?}",
             results[0]
         );
@@ -2831,7 +2990,13 @@ mod tests {
                 .await
                 .expect("resolves");
             assert!(
-                matches!(result, Err(AppError::ConnectionLost)),
+                matches!(
+                    result,
+                    Err(PublishError {
+                        error: AppError::ConnectionLost,
+                        ..
+                    })
+                ),
                 "publish {i}: {result:?}"
             );
         }
@@ -2871,7 +3036,13 @@ mod tests {
         let (client, connection, mut phase) =
             connect(options, static_test_credentials(), SlowReconnect, tx, NoopLifecycle).expect("connect wiring");
         assert!(!client.is_connected(), "not connected before the driver runs");
-        assert!(matches!(client.publish("t/ff", "x").await, Err(AppError::NotConnected)));
+        assert!(matches!(
+            client.publish("t/ff", "x").await,
+            Err(PublishError {
+                error: AppError::NotConnected,
+                ..
+            })
+        ));
 
         let run = tokio::spawn(connection.run());
         await_connected(&mut phase).await;
@@ -2889,7 +3060,7 @@ mod tests {
             .qos(QoS::AtLeastOnce)
             .await
             .expect_err("publish during backoff must fail fast");
-        assert!(matches!(err, AppError::NotConnected), "got {err:?}");
+        assert!(matches!(err.error, AppError::NotConnected), "got {err:?}");
         assert!(started.elapsed() < Duration::from_millis(100), "no ack_timeout wait");
         let err = client
             .subscribe([("t/#", QoS::AtMostOnce)])
@@ -2912,7 +3083,7 @@ mod tests {
         assert!(!client.is_connected());
         let err = client.publish("t/q", "x").await.expect_err("nobody encodes it");
         assert!(
-            matches!(err, AppError::PublishTimeout(_)),
+            matches!(err.error, AppError::PublishTimeout(_)),
             "queued, then timed out: {err:?}"
         );
     }
@@ -2952,7 +3123,16 @@ mod tests {
             .await
             .expect("waiter released promptly")
             .expect("join");
-        assert!(matches!(result, Err(AppError::ShuttingDown)), "got {result:?}");
+        assert!(
+            matches!(
+                result,
+                Err(PublishError {
+                    error: AppError::ShuttingDown,
+                    ..
+                })
+            ),
+            "got {result:?}"
+        );
         let _ = timeout(Duration::from_secs(2), run).await;
     }
 
@@ -3100,7 +3280,7 @@ mod tests {
             .publish("t".repeat(65_536), "x")
             .await
             .expect_err("oversized topic");
-        assert!(matches!(error, AppError::InvalidRequest(_)), "{error:?}");
+        assert!(matches!(error.error, AppError::InvalidRequest(_)), "{error:?}");
         assert!(client.is_connected());
         client.publish("t", "x").await.expect("session still usable");
 
@@ -3308,7 +3488,7 @@ mod tests {
             .qos(QoS::AtLeastOnce)
             .await
             .expect_err("broker rejects");
-        let AppError::PublishRejected(rejection) = err else {
+        let AppError::PublishRejected(rejection) = err.error else {
             panic!("expected PublishRejected, got {err:?}");
         };
         assert_eq!(rejection.reason, crate::codec::PublishAckReason::QuotaExceeded);

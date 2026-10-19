@@ -162,16 +162,20 @@ When a full application queue blocks the same loop that sends `PINGREQ`, a slow 
 | `manual_acks` plus an explicit `ack(..)` call | `PUBACK` follows sink acceptance; nothing to call |
 | Connection state inferred from polled events | `LifecycleHook`, or the `SessionPhase` watch (`client.session_phase()`) |
 | `publish(..)` resolves when the request is queued for the event loop | `publish(..)` resolves when the frame is encoded into the write buffer (QoS 0; not necessarily flushed) or when `PUBACK` arrives (QoS 1) |
-| A refused publish shows up as a polled `PubAck` you must match yourself | `AppError::PublishRejected` with the reason code, Reason String and User Properties |
+| The `PubAck` (reason code, Reason String) shows up in the poll loop, to be matched to the publish yourself | `publish(..).await` returns it: `PublishResponse` on success, `AppError::PublishRejected` inside the `PublishError` on refusal |
 | Request/response: match your own correlation data in the poll loop | `client.requester(topic)` then `request(..).await` |
 
 ### What it costs
 
 No MQTT 3.1.1 and no QoS 2: both are out of scope, not pending. If you need either, rumqttc remains the better fit. Unacknowledged QoS 1 publishes are kept in memory only: they are resent after a reconnect into a resumed session (see [No session](#no-session)), but not after a process restart. Cross-process session resume needs a stable client ID (`.client_id("…")?` or `ClientId::try_new`) plus `clean_start(false)` and a non-zero `session_expiry`. rumqttc is also the far more widely deployed crate; this one is 0.3.x, and the API can still move.
 
+## Upgrading from 0.3
+
+Awaiting a publish now returns `Result<PublishResponse, PublishError>` instead of `Result<(), AppError>`: the response carries the PUBACK (reason code, Reason String, User Properties, whether it answers a resend), the error carries the `AppError` plus `delivery`, whether the broker can have the message. `PublishError` converts into `AppError`, so `publish(..).await?` in a function returning `AppError` needs no change; code that matches `Err(AppError::…)` on a publish matches `err.error` instead. The [CHANGELOG](CHANGELOG.md#unreleased) has the details.
+
 ## Upgrading from 0.2
 
-The biggest changes: a new publish API (`client.publish(topic, payload).qos(..)`, and an owned `Publish` for `send`), inbound messages delivered as `InboundMessage` (with `retain`, `dup` and `qos`), the non-blocking enqueue renamed to `try_start_publish` while `start_publish` now waits for room, and `#[non_exhaustive]` on most public enums and response types, so a `match` on them needs a wildcard arm. A filter the broker refuses to restore after a reconnect no longer makes the client reconnect; watch `refused_subscriptions()` instead. The [CHANGELOG](CHANGELOG.md#unreleased) has a migration table from the old calls to the new ones.
+The biggest changes: a new publish API (`client.publish(topic, payload).qos(..)`, and an owned `Publish` for `send`), inbound messages delivered as `InboundMessage` (with `retain`, `dup` and `qos`), the non-blocking enqueue renamed to `try_start_publish` while `start_publish` now waits for room, and `#[non_exhaustive]` on most public enums and response types, so a `match` on them needs a wildcard arm. A filter the broker refuses to restore after a reconnect no longer makes the client reconnect; watch `refused_subscriptions()` instead. The [CHANGELOG](CHANGELOG.md#030---2026-10-17) has a migration table from the old calls to the new ones.
 
 ## Architecture
 
@@ -231,7 +235,7 @@ What happens to your publishes when the connection drops and the client reconnec
 | Never sent (parked behind Receive Maximum, or still queued) | sent on the next connection | sent on the next connection |
 | QoS 1 sent, `PUBACK` missing | fails with `AppError::ConnectionLost` | resent in order with its original packet id and `DUP` set ([MQTT-4.4.0-1]); fails with `ConnectionLost` if CONNACK reports no session |
 
-A caller that stops waiting earlier (its `ack_timeout` ran out during a long reconnect backoff) gets `PublishTimeout`, but the publish is not withdrawn: a never-sent one is dropped, an unacknowledged one in a resumed session is still resent. Retrying on that timeout can therefore deliver twice, as usual for QoS 1. Keep `ack_timeout` above your reconnect delay, or wait on a `PublishCompletion` yourself, if that matters.
+A caller that stops waiting earlier (its `ack_timeout` ran out during a long reconnect backoff) gets `PublishTimeout`, and `PublishError::delivery` says which case it hit. For QoS 1, `Delivery::NotSent`: the publish had not been written, and it never will be, so publishing it again cannot duplicate it. `Delivery::Unknown`: it had been written; an unacknowledged one in a resumed session is still resent, so publishing it again yourself can deliver it twice. QoS 0 keeps no write state (it would cost QoS 0 throughput), so its timeout says `Unknown`; one not yet written is still never written afterwards. To wait for the PUBACK however long a reconnect takes, use `.ack_timeout(None)` on the publish, or `PublishCompletion::wait_for(None)`.
 
 ### Capacities sized for a few connections, not a pipeline
 
@@ -337,7 +341,9 @@ Power (same semantics, more control): [`connect`](https://docs.rs/mqtt-glide/lat
 | `client.requester(topic)` → `request(topic, payload)` | Request / response | Subscribes once to `topic` (QoS 1, restored on reconnect); each request carries it as Response Topic with fresh Correlation Data and resolves with the matching `InboundMessage`. Setters: `.qos()`, `.timeout()` (default 10 s, then `AppError::ResponseTimeout`), `.user_property()`, `.content_type()`, `.message_expiry()`. Responses never reach the inbound sink. |
 | `Publish::reply_to(&request, payload)` | Answering side | `Some(Publish)` addressed to the request's Response Topic with its Correlation Data copied; `None` if the request carried no Response Topic. |
 
-QoS 2 is rejected (`AppError::InvalidRequest`). Packet ID / `dup` are assigned by the driver. A QoS 1 publish the broker refuses (PUBACK reason 0x80+) fails with `AppError::PublishRejected(PublishRejection)`: `reason`, `reason_string` and `user_properties` as the broker sent them.
+QoS 2 is rejected (`AppError::InvalidRequest`). Packet ID / `dup` are assigned by the driver.
+
+A completed publish returns a `PublishResponse`: for QoS 1 the PUBACK's `reason()` (`Success` or `NoMatchingSubscribers`), `reason_string()` and `user_properties()` as the broker sent them, and `resent()` when the PUBACK answers a DUP resend after a reconnect (the message may then have reached subscribers twice). QoS 0 has no acknowledgement: `reason()` is `None`. A failed publish returns a `PublishError`: the `error` (`AppError`), and `delivery`: `NotSent` (never written; publishing again cannot duplicate it), `Unknown` (written, no PUBACK, so it may be at the broker; also any QoS 0 timeout) or `Rejected` (the broker refused it with reason 0x80+, `AppError::PublishRejected(PublishRejection)` with the reason code, Reason String and User Properties). `start` / `try_start` / `start_publish` / `try_start_publish` fail only before anything was sent (`Delivery::NotSent`). Set a per-publish acknowledgement timeout with `.ack_timeout(Some(d))`, or `None` to wait until the PUBACK or a definite failure.
 
 ### Inbound handoff
 

@@ -40,12 +40,15 @@ pub(crate) fn complete_publish_ack(
     };
     inflight.release_publish(ack.packet_id);
     waiters.stats.publish_ack(ack.reason_code);
-    let _ = entry.reply.send(publish_ack_to_result(ack));
+    entry.reply.send(publish_ack_to_result(ack, entry.resent));
 }
 
-pub(super) fn publish_ack_to_result(ack: PublishAck) -> Result<(), AppError> {
+/// Success codes (0x00, 0x10) complete with the whole PUBACK; 0x80 and above reject.
+pub(super) fn publish_ack_to_result(ack: PublishAck, resent: bool) -> Result<crate::ack::PublishResponse, AppError> {
     match ack.reason_code {
-        PublishAckReason::Success | PublishAckReason::NoMatchingSubscribers => Ok(()),
+        reason @ (PublishAckReason::Success | PublishAckReason::NoMatchingSubscribers) => Ok(
+            crate::ack::PublishResponse::acked(reason, ack.reason_string, ack.properties, resent),
+        ),
         reason => Err(AppError::PublishRejected(Box::new(crate::ack::PublishRejection {
             reason,
             reason_string: ack.reason_string,
@@ -174,13 +177,13 @@ pub(super) fn fail_all_waiters(
     }
     for (id, entry) in publish_waiters.by_id.drain() {
         inflight.release_publish(id);
-        let _ = entry.reply.send(Err(error.clone()));
+        entry.reply.send(Err(error.clone()));
     }
     for parked in publish_waiters.parked.drain(..) {
-        let _ = parked.reply.send(Err(error.clone()));
+        parked.reply.send(Err(error.clone()));
     }
     for carried in publish_waiters.resend_parked.drain(..) {
-        let _ = carried.reply.send(Err(error.clone()));
+        carried.reply.send(Err(error.clone()));
     }
 }
 

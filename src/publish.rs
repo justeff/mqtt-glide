@@ -2,13 +2,14 @@
 
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
+use std::time::Duration;
 
 use bytes::Bytes;
 use bytestring::ByteString;
 
+use crate::ack::{PublishError, PublishResponse};
 use crate::client::{MqttClient, PublishCompletion};
 use crate::codec::{InboundMessage, PublishMessage, PublishProperties, QoS};
-use crate::error::AppError;
 
 /// One outbound PUBLISH: topic, payload, QoS, retain flag and MQTT 5 properties.
 ///
@@ -46,7 +47,7 @@ pub struct Publish {
 macro_rules! publish_setters {
     () => {
         /// Sets the QoS (default [`QoS::AtMostOnce`]). QoS 2 is rejected when sent
-        /// ([`AppError::InvalidRequest`]).
+        /// ([`AppError::InvalidRequest`](crate::AppError::InvalidRequest)).
         #[inline]
         pub fn qos(mut self, qos: QoS) -> Self {
             self.inner_mut().qos = qos;
@@ -234,12 +235,18 @@ impl From<PublishMessage> for Publish {
 pub struct PublishBuilder<'a> {
     client: &'a MqttClient,
     publish: Publish,
+    /// `None`: the client's [`ConnectOptions::ack_timeout`](crate::ConnectOptions::ack_timeout).
+    ack_timeout: Option<Option<Duration>>,
 }
 
 impl<'a> PublishBuilder<'a> {
     #[inline]
     pub(crate) fn new(client: &'a MqttClient, publish: Publish) -> Self {
-        Self { client, publish }
+        Self {
+            client,
+            publish,
+            ack_timeout: None,
+        }
     }
 
     publish_setters!();
@@ -249,24 +256,44 @@ impl<'a> PublishBuilder<'a> {
         &mut self.publish
     }
 
+    /// How long to wait for completion (the PUBACK for QoS 1) instead of
+    /// [`ConnectOptions::ack_timeout`](crate::ConnectOptions::ack_timeout); `None` waits until
+    /// the PUBACK arrives or the publish fails for good. Waiting for room in the command channel
+    /// stays bounded by the client's timeout.
+    #[inline]
+    pub fn ack_timeout(mut self, ack_timeout: Option<Duration>) -> Self {
+        self.ack_timeout = Some(ack_timeout);
+        self
+    }
+
+    #[inline]
+    fn effective_ack_timeout(&self) -> Option<Duration> {
+        self.ack_timeout.unwrap_or(Some(self.client.ack_timeout))
+    }
+
     /// Sends and waits for completion (same as `.await`, without boxing).
     #[inline]
-    pub fn send(self) -> impl Future<Output = Result<(), AppError>> + Send + 'a {
-        self.client.send(self.publish)
+    pub fn send(self) -> impl Future<Output = Result<PublishResponse, PublishError>> + Send + 'a {
+        let ack_timeout = self.effective_ack_timeout();
+        self.client.send_with(self.publish, ack_timeout)
     }
 
     /// Enqueues, waiting for room in the command channel, and returns the completion without
     /// waiting for it; see [`MqttClient::start_publish`](crate::MqttClient::start_publish).
+    /// An error here is always [`Delivery::NotSent`](crate::Delivery::NotSent).
     #[inline]
-    pub fn start(self) -> impl Future<Output = Result<PublishCompletion, AppError>> + Send + 'a {
-        self.client.start_publish(self.publish)
+    pub fn start(self) -> impl Future<Output = Result<PublishCompletion, PublishError>> + Send + 'a {
+        let ack_timeout = self.effective_ack_timeout();
+        self.client.start_publish_with(self.publish, ack_timeout)
     }
 
     /// Enqueues without waiting at all; see
     /// [`MqttClient::try_start_publish`](crate::MqttClient::try_start_publish).
+    /// An error here is always [`Delivery::NotSent`](crate::Delivery::NotSent).
     #[inline]
-    pub fn try_start(self) -> Result<PublishCompletion, AppError> {
-        self.client.try_start_publish(self.publish)
+    pub fn try_start(self) -> Result<PublishCompletion, PublishError> {
+        let ack_timeout = self.effective_ack_timeout();
+        self.client.try_start_publish_with(self.publish, ack_timeout)
     }
 
     /// Returns the built [`Publish`] without sending it.
@@ -277,8 +304,8 @@ impl<'a> PublishBuilder<'a> {
 }
 
 impl<'a> IntoFuture for PublishBuilder<'a> {
-    type Output = Result<(), AppError>;
-    type IntoFuture = Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + 'a>>;
+    type Output = Result<PublishResponse, PublishError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Result<PublishResponse, PublishError>> + Send + 'a>>;
 
     #[inline]
     fn into_future(self) -> Self::IntoFuture {

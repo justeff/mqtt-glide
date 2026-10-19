@@ -7,8 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- A publish reports what the broker answered and, when it fails, whether the broker can have the message. Every awaited publish (`publish(..).await`, `send`, `PublishBuilder::send`, `PublishCompletion::wait`) returns `Result<PublishResponse, PublishError>` instead of `Result<(), AppError>`; `PublishWindow::push` / `drain` and `publish_batch` return `Result<(), PublishError>`, `PublishWindow::wait_one` returns `Result<PublishResponse, PublishError>`, and the enqueue-only `start_publish` / `try_start_publish` (`PublishBuilder::start` / `try_start`) return `Result<PublishCompletion, PublishError>`, always with `Delivery::NotSent`. `PublishError` converts into `AppError`, so `publish(..).await?` in a function returning `AppError` compiles unchanged. Migration:
+
+  | 0.3 | 0.4 |
+  |---|---|
+  | `client.publish(t, p).await?` (`AppError`) | unchanged |
+  | `Ok(())` | `Ok(response)`: `response.reason()` (`Success` / `NoMatchingSubscribers`, `None` for QoS 0), `reason_string()`, `user_properties()`, `resent()` |
+  | `Err(AppError::PublishTimeout(_))` | `Err(PublishError { error: AppError::PublishTimeout(_), delivery, .. })`, or `err.error` |
+
 ### Added
 
+- `PublishResponse`: the PUBACK of a QoS 1 publish, also when it succeeds. 0x00 Success and 0x10 No Matching Subscribers are told apart, and the Reason String and User Properties come along; they used to be dropped unless the broker rejected the message. `resent` is set when the PUBACK answers a DUP resend after a reconnect, so the message may have reached subscribers twice
+- `PublishError` with `Delivery`: `NotSent` (never written, publishing again cannot duplicate it), `Unknown` (written but not acknowledged: connection lost, session ended, or timed out after the write) or `Rejected` (PUBACK 0x80 or above); `PublishError::may_have_been_delivered`. A QoS 1 publish whose caller timed out before it was written is never written afterwards, and its timeout says `NotSent`; the decision is atomic between the caller and the write task, so it cannot race the write. QoS 0 keeps no such state, to keep its throughput: its timeout says `Unknown`
+- Per-publish acknowledgement timeout: `PublishBuilder::ack_timeout(Option<Duration>)` and `PublishCompletion::wait_for(Option<Duration>)`; `None` waits until the PUBACK arrives or the publish fails for good
 - `testing::TestBroker::ack_publishes` answers QoS 1 publishes with a chosen PUBACK (`testing::PubAck`: reason code, Reason String, User Properties), per message through a closure
 
 ## [0.3.0] - 2026-10-17

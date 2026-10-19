@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 
+use crate::ack::{PublishError, PublishResponse};
 use crate::client::{MqttClient, PublishCompletion};
 use crate::error::AppError;
 use crate::publish::Publish;
@@ -82,7 +83,13 @@ impl<'a> PublishWindow<'a> {
     /// Accepts a [`Publish`] (or a [`PublishMessage`](crate::PublishMessage) as QoS 0).
     /// Errors from the oldest completion surface here; QoS 2 → [`AppError::InvalidRequest`];
     /// no command-channel room within the ack timeout → [`AppError::Backpressure`].
-    pub async fn push(&mut self, publish: impl Into<Publish>) -> Result<(), AppError> {
+    ///
+    /// On an error, `publish` was not enqueued. The error's
+    /// [`delivery`](crate::PublishError::delivery) describes the publish that failed, which
+    /// can be an earlier one waited on to make room. Where each message's outcome matters, start
+    /// the publishes yourself ([`PublishBuilder::start`](crate::PublishBuilder::start)) and wait
+    /// on each completion.
+    pub async fn push(&mut self, publish: impl Into<Publish>) -> Result<(), PublishError> {
         let publish = publish.into();
         self.ensure_slot().await?;
         let completion = self.client.start_publish(publish).await?;
@@ -93,26 +100,27 @@ impl<'a> PublishWindow<'a> {
     /// Awaits and removes the oldest in-flight completion.
     ///
     /// Returns [`AppError::Internal`] when the window is empty.
-    pub async fn wait_one(&mut self) -> Result<(), AppError> {
-        let completion = self
-            .in_flight
-            .pop_front()
-            .ok_or_else(|| AppError::Internal("publish window wait_one called with no in-flight publishes".into()))?;
+    pub async fn wait_one(&mut self) -> Result<PublishResponse, PublishError> {
+        let completion = self.in_flight.pop_front().ok_or_else(|| {
+            PublishError::not_sent(AppError::Internal(
+                "publish window wait_one called with no in-flight publishes".into(),
+            ))
+        })?;
         completion.wait().await
     }
 
     /// Awaits all remaining in-flight completions (FIFO). Consumes the window.
     ///
     /// Stops at the first error; remaining completions are dropped (enqueued publishes continue
-    /// in the driver).
-    pub async fn drain(mut self) -> Result<(), AppError> {
+    /// in the driver), so the error says nothing about the publishes after the failed one.
+    pub async fn drain(mut self) -> Result<(), PublishError> {
         while let Some(completion) = self.in_flight.pop_front() {
             completion.wait().await?;
         }
         Ok(())
     }
 
-    async fn ensure_slot(&mut self) -> Result<(), AppError> {
+    async fn ensure_slot(&mut self) -> Result<(), PublishError> {
         while self.in_flight.len() >= self.capacity {
             self.wait_one().await?;
         }

@@ -88,7 +88,16 @@ async fn commands_queued_in_the_backoff_fail_when_shutdown_stops_the_driver() {
         .expect("join");
     assert!(result.is_ok(), "{result:?}");
     let publish = timeout(Duration::from_secs(1), publish.wait()).await.expect("answered");
-    assert!(matches!(publish, Err(AppError::ConnectionLost)), "{publish:?}");
+    assert!(
+        matches!(
+            publish,
+            Err(crate::PublishError {
+                error: AppError::ConnectionLost,
+                ..
+            })
+        ),
+        "{publish:?}"
+    );
     let subscribe = timeout(Duration::from_secs(1), subscribe)
         .await
         .expect("answered")

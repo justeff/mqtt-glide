@@ -674,7 +674,8 @@ async fn refused_request_keeps_the_session(#[case] request: Request, #[case] tin
     let result = match request {
         Request::Publish(topic) => within(10, h.client.publish(topic, vec![0u8; 100]).qos(QoS::AtLeastOnce))
             .await
-            .map(drop),
+            .map(drop)
+            .map_err(AppError::from),
         Request::Subscribe(filter) => within(10, h.client.subscribe([(filter, QoS::AtLeastOnce)]))
             .await
             .map(drop),
@@ -922,7 +923,10 @@ async fn unacknowledged_requests_resolve_with_timeouts() {
     for _ in 0..5 {
         let r = within(10, h.client.publish("t", "x").qos(QoS::AtLeastOnce)).await;
         assert!(
-            matches!(r, Err(AppError::PublishTimeout(_) | AppError::Backpressure(_))),
+            matches!(
+                &r,
+                Err(e) if matches!(e.error, AppError::PublishTimeout(_) | AppError::Backpressure(_))
+            ),
             "{r:?}"
         );
     }
@@ -1287,7 +1291,7 @@ async fn shutdown_towards_silent_broker(
     let elapsed = started.elapsed();
     let mut outcomes = Vec::new();
     for c in completions {
-        outcomes.push(within(10, c.wait()).await);
+        outcomes.push(within(10, c.wait()).await.map(drop).map_err(AppError::from));
     }
     broker.abort();
     assert_no_library_panic();

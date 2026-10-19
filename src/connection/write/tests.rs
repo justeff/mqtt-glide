@@ -4,6 +4,7 @@ use crate::codec::{
     encode_publish,
 };
 use crate::connection::ClientCommand;
+use crate::connection::publish_reply;
 use crate::connection::{ControlMessage, Generation};
 use bytes::Bytes;
 use bytestring::ByteString;
@@ -261,7 +262,8 @@ async fn fail_waiters_for_outcome_maps_transport_not_command_channel_closed() {
     let mut publish_waiters = PublishWaiters::new();
     let mut inflight = InflightPots::new(nonzero!(4u16));
     let id = inflight.alloc_publish().expect("alloc");
-    let (tx, rx) = oneshot::channel();
+    let (tx, ticket) = publish_reply(true);
+    let rx = ticket.rx;
     publish_waiters.insert(id, tx);
 
     let outcome = WriteOutcome::Transport(TransportError::Connection("broken pipe".into()));
@@ -315,7 +317,8 @@ async fn shutdown_fail_all_waiters_releases_subscribe_unsubscribe_and_publish() 
         },
     );
     let publish_id = inflight.alloc_publish().expect("alloc publish");
-    let (publish_tx, publish_rx) = oneshot::channel();
+    let (publish_tx, publish_ticket) = publish_reply(true);
+    let publish_rx = publish_ticket.rx;
     publish_waiters.insert(publish_id, publish_tx);
 
     let error = app_error_from_write_outcome(&WriteOutcome::Shutdown);
@@ -479,7 +482,8 @@ fn finish_publish_encode_error_maps_bad_topic_to_invalid_request(#[case] topic: 
     };
     let mut buf = BytesMut::new();
     let err = encode_publish(&message, delivery, u32::MAX, &mut buf).expect_err(topic);
-    let (reply_tx, reply_rx) = oneshot::channel();
+    let (reply_tx, reply_ticket) = publish_reply(true);
+    let reply_rx = reply_ticket.rx;
     finish_publish_encode_error(Some(reply_tx), &message, err).expect("session must stay up");
     let app_err = reply_rx.blocking_recv().expect("reply").expect_err("must reject");
     match app_err {
@@ -572,7 +576,8 @@ async fn complete_publish_ack_ignores_stale_generation_without_releasing_waiter(
     let mut waiters = PublishWaiters::new();
     let mut inflight = InflightPots::new(nonzero!(4u16));
     let id = inflight.alloc_publish().expect("alloc");
-    let (tx, mut rx) = oneshot::channel();
+    let (tx, ticket) = publish_reply(true);
+    let mut rx = ticket.rx;
     waiters.insert(id, tx);
 
     complete_publish_ack(
@@ -612,7 +617,7 @@ async fn complete_publish_ack_ignores_stale_generation_without_releasing_waiter(
     );
     assert!(waiters.is_empty());
     assert!(!inflight.publish_contains(id));
-    assert!(matches!(rx.await, Ok(Ok(()))));
+    assert!(matches!(rx.await, Ok(Ok(_))));
 }
 
 #[tokio::test]
@@ -620,7 +625,8 @@ async fn complete_publish_ack_maps_failure_reason_to_publish_rejected() {
     let mut waiters = PublishWaiters::new();
     let mut inflight = InflightPots::new(nonzero!(4u16));
     let id = inflight.alloc_publish().expect("alloc");
-    let (tx, rx) = oneshot::channel();
+    let (tx, ticket) = publish_reply(true);
+    let rx = ticket.rx;
     waiters.insert(id, tx);
 
     complete_publish_ack(
@@ -681,7 +687,8 @@ async fn cancelled_qos1_publish_keeps_packet_id_until_puback() {
         payload: Bytes::from_static(b"x"),
         properties: PublishProperties::default(),
     };
-    let (reply_tx, reply_rx) = oneshot::channel();
+    let (reply_tx, reply_ticket) = publish_reply(true);
+    let reply_rx = reply_ticket.rx;
     harness
         .command_tx
         .try_send(ClientCommand::Publish {
@@ -702,7 +709,8 @@ async fn cancelled_qos1_publish_keeps_packet_id_until_puback() {
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
 
-    let (reply2_tx, mut reply2_rx) = oneshot::channel();
+    let (reply2_tx, reply2_ticket) = publish_reply(true);
+    let mut reply2_rx = reply2_ticket.rx;
     harness
         .command_tx
         .try_send(ClientCommand::Publish {
@@ -790,8 +798,8 @@ async fn closed_publish_reply_before_encode_skips_packet_id_alloc() {
         payload: Bytes::from_static(b"x"),
         properties: PublishProperties::default(),
     };
-    let (reply_tx, reply_rx) = oneshot::channel();
-    drop(reply_rx);
+    let (reply_tx, reply_ticket) = publish_reply(true);
+    drop(reply_ticket);
     harness
         .command_tx
         .try_send(ClientCommand::Publish {
@@ -806,7 +814,8 @@ async fn closed_publish_reply_before_encode_skips_packet_id_alloc() {
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
 
-    let (reply2_tx, reply2_rx) = oneshot::channel();
+    let (reply2_tx, reply2_ticket) = publish_reply(true);
+    let reply2_rx = reply2_ticket.rx;
     harness
         .command_tx
         .try_send(ClientCommand::Publish {
@@ -987,7 +996,8 @@ async fn handle_publish_rejects_without_wire_publish(
         },
     );
 
-    let (tx, rx) = oneshot::channel();
+    let (tx, ticket) = publish_reply(true);
+    let rx = ticket.rx;
     harness
         .command_tx
         .send(ClientCommand::Publish {
@@ -1054,13 +1064,13 @@ async fn full_parked_queue_leaves_commands_in_the_channel() {
     let channel_capacity = harness.command_tx.max_capacity();
     let mut replies = Vec::new();
     for n in 0..1 + MAX_PARKED_PUBLISHES + channel_capacity {
-        let (tx, rx) = oneshot::channel();
-        replies.push(rx);
+        let (tx, ticket) = publish_reply(true);
+        replies.push(ticket.rx);
         let sent = timeout(Duration::from_secs(2), harness.command_tx.send(publish(tx))).await;
         assert!(matches!(sent, Ok(Ok(()))), "publish {n} must still fit");
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let (tx, _rx) = oneshot::channel();
+    let (tx, _ticket) = publish_reply(true);
     assert!(
         matches!(
             harness.command_tx.try_send(publish(tx)),
@@ -1111,7 +1121,7 @@ async fn graceful_disconnect_sends_publishes_parked_behind_a_freed_window() {
     let mut publish_waiters = PublishWaiters::new();
     // The window has room again, yet a publish still waits in the parked queue.
     let mut inflight = InflightPots::new(nonzero!(1u16));
-    let (reply, _reply_rx) = oneshot::channel();
+    let (reply, _reply_ticket) = publish_reply(true);
     publish_waiters.parked.push_back(PendingOutboundPublish {
         message: PublishMessage {
             topic: ByteString::from_static("t/parked"),

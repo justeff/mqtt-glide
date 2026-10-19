@@ -87,7 +87,9 @@ pub enum AppError {
     #[error("unsubscribe acknowledgement timed out after {0:?}")]
     UnsubscribeAckTimeout(Duration),
     /// The publish did not complete before the deadline: no PUBACK arrived for QoS 1, or a
-    /// QoS 0 publish was not written yet (it waited out a reconnect, say).
+    /// QoS 0 publish was not written yet (it waited out a reconnect, say). The
+    /// [`PublishError::delivery`](crate::PublishError::delivery) it comes with says which for
+    /// QoS 1 (QoS 0: always `Unknown`); a publish that was not written by then never is.
     #[error("publish did not complete within {0:?}")]
     PublishTimeout(Duration),
     /// Caller request was invalid (e.g. empty subscribe filter list).
@@ -97,8 +99,9 @@ pub enum AppError {
     #[error("send failed: {0}")]
     SendFailed(String),
     /// The connection ended while the request waited for its acknowledgement (or to be
-    /// sent): it may or may not have reached the broker. Raised whichever side of the
-    /// connection noticed the loss first.
+    /// sent): it may or may not have reached the broker (for a publish,
+    /// [`PublishError::delivery`](crate::PublishError::delivery) tells). Raised whichever side
+    /// of the connection noticed the loss first.
     #[error("connection lost before acknowledgement")]
     ConnectionLost,
     /// Broker PUBACK completed the packet id with a non-success reason code (boxed: it

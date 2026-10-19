@@ -73,7 +73,7 @@ jobs:
       - name: connection, redirect, proxy, codec properties (${{ matrix.name }})
         run: cargo test --test connection --test redirect --test proxy --test codec_proptest ${{ matrix.args }}
       - name: testing helpers (${{ matrix.name }})
-        run: cargo test --test testing --features testing ${{ matrix.args }}
+        run: cargo test --test testing --test publish_outcome --features testing ${{ matrix.args }}
       - name: stats (${{ matrix.name }})
         run: cargo test --test stats --features testing,stats ${{ matrix.args }}
       - name: brokers (${{ matrix.name }})

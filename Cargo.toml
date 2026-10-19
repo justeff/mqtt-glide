@@ -52,6 +52,11 @@ path = "tests/testing.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "publish_outcome"
+path = "tests/publish_outcome.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "stats"
 path = "tests/stats.rs"
 required-features = ["testing", "stats"]

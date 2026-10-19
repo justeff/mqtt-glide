@@ -172,6 +172,8 @@ pub(crate) struct PublishWaiters {
 #[derive(Debug)]
 pub(crate) struct InflightPublish {
     pub(super) reply: PublishReply,
+    /// Sent again with DUP after a reconnect ([`crate::PublishResponse::resent`]).
+    pub(super) resent: bool,
     /// Message + retain flag, kept only for resumable sessions.
     pub(super) resend: Option<(PublishMessage, bool)>,
     /// Position in send order (see [`PublishWaiters`]).
@@ -243,8 +245,9 @@ impl PublishWaiters {
         }
     }
 
-    /// Registers an encoded QoS-1 publish; keeps the message when the session is resumable.
-    pub(super) fn insert_sent(&mut self, packet_id: NonZeroU16, publish: PendingOutboundPublish) {
+    /// Registers an encoded QoS-1 publish (`resent`: a DUP resend after a reconnect); keeps
+    /// the message when the session is resumable.
+    pub(super) fn insert_sent(&mut self, packet_id: NonZeroU16, publish: PendingOutboundPublish, resent: bool) {
         let resend = self.keep_messages.then_some((publish.message, publish.retain));
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -252,6 +255,7 @@ impl PublishWaiters {
             packet_id,
             InflightPublish {
                 reply: publish.reply,
+                resent,
                 resend,
                 seq,
             },
@@ -278,6 +282,7 @@ impl PublishWaiters {
             packet_id,
             InflightPublish {
                 reply,
+                resent: false,
                 resend: None,
                 seq,
             },

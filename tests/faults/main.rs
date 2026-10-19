@@ -121,7 +121,7 @@ async fn burst_with_fault(
     }
     let mut results = Vec::with_capacity(completions.len());
     for completion in completions {
-        results.push(completion.wait().await);
+        results.push(completion.wait().await.map(drop).map_err(AppError::from));
     }
     results
 }
