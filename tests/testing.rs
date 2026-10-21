@@ -522,3 +522,50 @@ async fn the_builder_reconnects_by_default_but_fails_the_first_connect_at_once()
     );
     assert!(started.elapsed() < Duration::from_millis(500), "no retry before Err");
 }
+
+/// Response Information comes only when asked for, and a requester can build on it.
+#[tokio::test]
+async fn response_information_is_a_prefix_for_response_topics() {
+    use mqtt_glide::SessionPhase;
+
+    let broker = TestBroker::start().await.expect("broker");
+    let response_information = |client: &MqttClient| match &*client.session_phase().borrow() {
+        SessionPhase::Connected { session, .. } => session.response_information.clone(),
+        other => panic!("not connected: {other:?}"),
+    };
+
+    let (plain, _rx) = client(&broker.url(), "plain").await;
+    assert_eq!(response_information(&plain), None);
+
+    let (responder, mut responder_rx) = client(&broker.url(), "responder").await;
+    responder
+        .subscribe([("service/time", QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe");
+    let (tx, _rx) = mpsc::channel(8);
+    let asking = ClientBuilder::new(broker.url())
+        .expect("url")
+        .client_id("asking")
+        .expect("client id")
+        .options(|options| options.request_response_information(true))
+        .inbound_sink(tx)
+        .connect()
+        .await
+        .expect("connect");
+    let prefix = response_information(&asking).expect("Response Information");
+    assert_eq!(&*prefix, "responses/asking");
+
+    let requester = asking.requester(format!("{prefix}/time")).await.expect("requester");
+    let request = tokio::spawn(async move { requester.request("service/time", "now?").await });
+    let incoming = next(&mut responder_rx).await;
+    assert_eq!(
+        incoming.properties.response_topic.as_deref(),
+        Some("responses/asking/time")
+    );
+    responder
+        .send(Publish::reply_to(&incoming, "noon").expect("reply"))
+        .await
+        .expect("reply");
+    let response = request.await.expect("join").expect("response");
+    assert_eq!(&response.payload[..], b"noon");
+}

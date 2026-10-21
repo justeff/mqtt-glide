@@ -152,6 +152,13 @@ pub struct ConnectOptions {
     /// Default `false`: a redirect is then reported like any other refusal or disconnect (its
     /// Server Reference is in the error text).
     pub follow_server_redirects: bool,
+    /// Ask the broker for Response Information in CONNACK (§3.1.2.11.6): a topic prefix for
+    /// response topics, often one that only this client may subscribe to. The answer is
+    /// [`SessionParams::response_information`](crate::SessionParams::response_information);
+    /// a broker may send none.
+    ///
+    /// Default `false`.
+    pub request_response_information: bool,
     /// Reach the broker through an HTTP proxy (`CONNECT` tunnel); see [`HttpProxy`].
     ///
     /// Default `None`: connect directly. Not read from `HTTP(S)_PROXY`; set it explicitly.
@@ -187,6 +194,7 @@ impl ConnectOptions {
             max_packet_size: NonZeroU32::new(DEFAULT_MAX_PACKET_SIZE).expect("DEFAULT_MAX_PACKET_SIZE non-zero"),
             fail_fast_when_disconnected: false,
             follow_server_redirects: false,
+            request_response_information: false,
             http_proxy: None,
             topic_alias_maximum: 0,
             outbound_topic_aliases: 0,
@@ -215,6 +223,12 @@ impl ConnectOptions {
     /// Sets [`Self::follow_server_redirects`].
     pub fn follow_server_redirects(mut self, follow: bool) -> Self {
         self.follow_server_redirects = follow;
+        self
+    }
+
+    /// Sets [`Self::request_response_information`].
+    pub fn request_response_information(mut self, request: bool) -> Self {
+        self.request_response_information = request;
         self
     }
 
@@ -413,6 +427,7 @@ mod tests {
         assert!(options.tcp_nodelay);
         assert!(options.tcp_send_buffer_size.is_none());
         assert!(options.tcp_recv_buffer_size.is_none());
+        assert!(!options.request_response_information);
         assert!(options.session_expiry.is_none());
         assert!(options.tls.is_none());
         assert!(options.will_message.is_none());

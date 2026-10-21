@@ -606,6 +606,9 @@ async fn serve(shared: Arc<Shared>, id: u64, stream: TcpStream) {
             session_present: resumed.is_some(),
             max_qos: QoS::AtLeastOnce,
             assigned_client_id: assigned.map(ByteString::from),
+            response_info: connect
+                .request_response_info
+                .then(|| ByteString::from(format!("responses/{client_id}"))),
             ..ConnectAck::default()
         }))));
         if let Some(session) = resumed {

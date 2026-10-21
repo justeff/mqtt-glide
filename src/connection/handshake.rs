@@ -36,6 +36,29 @@ pub struct SessionParams {
     /// Session Present flag from CONNACK (§3.2.2.1.1): `true` when the broker resumed a
     /// stored session. Drives resubscribe for `clean_start = false` connections.
     pub session_present: bool,
+    /// Response Information from CONNACK (§3.2.2.3.15): the broker's suggestion for the
+    /// start of response topics, sent only when asked for with
+    /// [`ConnectOptions::request_response_information`]. The spec leaves its meaning to the
+    /// broker; it is usually a topic prefix this client may subscribe to.
+    ///
+    /// ```no_run
+    /// # async fn demo(client: mqtt_glide::MqttClient) -> Result<(), mqtt_glide::AppError> {
+    /// use mqtt_glide::SessionPhase;
+    ///
+    /// let prefix = match &*client.session_phase().borrow() {
+    ///     SessionPhase::Connected { session, .. } => session.response_information.clone(),
+    ///     _ => None,
+    /// };
+    /// let response_topic = match prefix {
+    ///     Some(prefix) => format!("{prefix}/replies"),
+    ///     None => "replies/my-client".to_owned(),
+    /// };
+    /// let requester = client.requester(response_topic).await?;
+    /// # let _ = requester;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub response_information: Option<ByteString>,
 }
 
 /// Whether the connector negotiates TLS.
@@ -83,6 +106,7 @@ pub(crate) fn build_connect(options: &ConnectOptions, client_id: &str, credentia
         receive_max: Some(options.receive_maximum),
         max_packet_size: Some(options.max_packet_size),
         topic_alias_max: options.topic_alias_maximum,
+        request_response_info: options.request_response_information,
         client_id: ByteString::from(client_id),
         username,
         password,
@@ -187,6 +211,7 @@ pub(crate) fn apply_connack(client_keep_alive: Duration, ack: &ConnectAck) -> Re
         server_topic_alias_maximum: ack.topic_alias_max,
         subscription_identifiers_available: ack.subscription_identifiers_available,
         session_present: ack.session_present,
+        response_information: ack.response_info.clone(),
     })
 }
 
@@ -381,6 +406,14 @@ mod tests {
             "CONNECT must advertise client Maximum Packet Size"
         );
         assert!(packet.will_message.is_none(), "default ConnectOptions has no Will");
+        assert!(!packet.request_response_info, "Response Information only on request");
+    }
+
+    #[test]
+    fn build_connect_requests_response_information_when_asked() {
+        let options = sample_options().request_response_information(true);
+        let packet = build_connect(&options, &resolve_client_id_str(&options), &sample_credentials());
+        assert!(packet.request_response_info);
     }
 
     #[test]
@@ -490,6 +523,14 @@ mod tests {
         assert_eq!(session.max_qos, QoS::AtLeastOnce);
         assert!(session.retain_available);
         assert_eq!(session.server_receive_maximum, nonzero!(512u16));
+        assert_eq!(session.response_information, None);
+
+        let ack = ConnectAck {
+            response_info: Some("replies/c1".into()),
+            ..sample_connack()
+        };
+        let session = apply_connack(Duration::from_secs(60), &ack).expect("success CONNACK");
+        assert_eq!(session.response_information.as_deref(), Some("replies/c1"));
     }
 
     /// Absent Server Keep Alive leaves client keep-alive unchanged.

@@ -7,6 +7,7 @@
 //!   reject them, or lose the PUBACKs) or drop every connection. A client that connects with
 //!   a Session Expiry Interval keeps its session across connections: subscriptions,
 //!   unacknowledged deliveries (resent with DUP) and QoS 1 messages that arrived meanwhile.
+//!   A client that asks for Response Information gets `responses/<client id>`.
 //! - [`FaultProxy`]: a TCP proxy in front of any broker that injects network faults on demand
 //!   (latency, a silent stall, packets split at arbitrary bytes, connection resets, refused
 //!   connects).
