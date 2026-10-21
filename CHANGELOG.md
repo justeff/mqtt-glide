@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `ConnectOptions::tcp_send_buffer_size` / `tcp_recv_buffer_size` set `SO_SNDBUF` / `SO_RCVBUF` before the TCP handshake, for links where the operating system's default limits throughput (a long round trip, say). Unset, nothing changes
 - `ConnectOptions::request_response_information` asks the broker for Response Information (§3.1.2.11.6), a prefix for response topics that the broker allows this client; the answer is `SessionParams::response_information`. `TestBroker` answers with `responses/<client id>`
+- Enhanced authentication (§4.12): an `Authenticator` (`ConnectOptions::authenticator`, `ClientBuilder::authenticator`) runs a challenge / response exchange in AUTH packets for brokers that use SCRAM, Kerberos or a scheme of their own; `AuthExchange::finish` sees the broker's final data, so a method can check the broker too. `MqttClient::reauthenticate` runs a fresh exchange on the open connection while traffic continues (§4.12.1). New errors `AppError::Auth` and `AppError::ReauthenticationTimeout`. `TestBroker::enhanced_auth` scripts the broker side
 
 ## [0.4.0] - 2026-10-19
 

@@ -90,6 +90,7 @@ where
             topic_aliases: crate::connection::topic_alias::InboundTopicAliases::new(0),
             response_router: Arc::default(),
             stats: Default::default(),
+            reauth: None,
             generation: Generation(1),
             receive_maximum: nonzero!(8u16),
             handoff_stalled: Arc::clone(&handoff_stalled),

@@ -410,6 +410,8 @@ pub struct MqttClient {
     refused: watch::Receiver<Vec<crate::RefusedSubscription>>,
     /// Response routing for [`crate::Requester`] (shared with the driver's read path).
     router: Arc<crate::request::ResponseRouter>,
+    /// Re-authentication requests to the read task; `None` without an authenticator.
+    reauth: Option<mpsc::Sender<crate::connection::reauth::ReauthReply>>,
     /// Counters kept by the driver.
     #[cfg(feature = "stats")]
     stats: crate::stats::Stats,
@@ -427,6 +429,7 @@ struct DriverShared {
     phase: watch::Receiver<SessionPhase>,
     refused: watch::Receiver<Vec<crate::RefusedSubscription>>,
     router: Arc<crate::request::ResponseRouter>,
+    reauth: Option<mpsc::Sender<crate::connection::reauth::ReauthReply>>,
     #[cfg(feature = "stats")]
     stats: crate::stats::Stats,
 }
@@ -451,6 +454,7 @@ impl MqttClient {
             phase: shared.phase,
             refused: shared.refused,
             router: shared.router,
+            reauth: shared.reauth,
             #[cfg(feature = "stats")]
             stats: shared.stats,
         }
@@ -508,6 +512,60 @@ impl MqttClient {
     /// A refusal of [`Self::subscribe`] itself is not listed: that answer goes to the caller.
     pub fn refused_subscriptions(&self) -> watch::Receiver<Vec<crate::RefusedSubscription>> {
         self.refused.clone()
+    }
+
+    /// Re-authenticates on the open connection (§4.12.1): runs a fresh exchange of the
+    /// [`Authenticator`](crate::Authenticator), for example with a renewed token, while
+    /// publishes, subscriptions and inbound messages carry on. Resolves when the broker
+    /// accepted (AUTH 0x00 Success, and [`AuthExchange::finish`](crate::AuthExchange::finish)
+    /// agreed). Calls made during an exchange run after it.
+    ///
+    /// # Errors
+    ///
+    /// - [`AppError::InvalidRequest`]: no [`ConnectOptions::authenticator`] is set.
+    /// - [`AppError::NotConnected`]: no connection is up; the next one authenticates afresh.
+    /// - [`AppError::Backpressure`]: several re-authentications are waiting already.
+    /// - [`AppError::Auth`]: the authenticator failed, or the broker refused the client
+    ///   (DISCONNECT 0x87 Not authorized or 0x8C Bad authentication method). The connection was
+    ///   closed, unless [`Authenticator::start`](crate::Authenticator::start) failed (nothing
+    ///   was sent then); the client reconnects per its [`ReconnectPolicy`] and authenticates anew.
+    /// - [`AppError::ReauthenticationTimeout`]: the broker did not answer an AUTH within
+    ///   [`ConnectOptions::ack_timeout`]; the connection was closed.
+    /// - [`AppError::ConnectionLost`]: the connection ended otherwise during the exchange.
+    /// - [`AppError::ShuttingDown`]: [`Self::shutdown`] was called.
+    pub async fn reauthenticate(&self) -> Result<(), AppError> {
+        let Some(requests) = &self.reauth else {
+            return Err(AppError::InvalidRequest(
+                "re-authentication needs an authenticator (ConnectOptions::authenticator)".into(),
+            ));
+        };
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(AppError::ShuttingDown);
+        }
+        // The request belongs to this connection: when it ends, the caller learns at once,
+        // not after the next connection came up and dropped the stale request.
+        let mut phase = self.phase.clone();
+        let generation = match &*phase.borrow_and_update() {
+            SessionPhase::Connected { generation, .. } => *generation,
+            _ => return Err(AppError::NotConnected),
+        };
+        let (reply, answer) = oneshot::channel();
+        requests.try_send(reply).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => {
+                AppError::Backpressure("re-authentications are waiting already".into())
+            }
+            mpsc::error::TrySendError::Closed(_) => AppError::CommandChannelClosed,
+        })?;
+        let ended = phase.wait_for(
+            |phase| !matches!(phase, SessionPhase::Connected { generation: current, .. } if *current == generation),
+        );
+        tokio::select! {
+            // The read task answers before the driver publishes the end of the connection,
+            // so a broker's refusal still wins over the plain loss.
+            biased;
+            answered = answer => answered.unwrap_or(Err(AppError::ConnectionLost)),
+            _ = ended => Err(AppError::ConnectionLost),
+        }
     }
 
     /// Whether a session is currently up (between `Connected` and `Disconnected`).
@@ -1071,6 +1129,16 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
     if let Some(will) = options.will_message.as_ref() {
         crate::connection::validate_will_message(will)?;
     }
+    if let Some(authenticator) = options.authenticator.as_ref() {
+        authenticator.validate()?;
+    }
+    let (reauth_tx, reauth_link) = match options.authenticator.clone() {
+        Some(authenticator) => {
+            let (tx, link) = crate::connection::reauth::reauth_channel(authenticator, options.ack_timeout);
+            (Some(tx), Some(link))
+        }
+        None => (None, None),
+    };
 
     let command_channel_capacity = options.command_channel_capacity.get();
     let (command_tx, command_rx) = mpsc::channel(command_channel_capacity);
@@ -1104,6 +1172,7 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
         lifecycle,
         connected: Arc::clone(&connected),
         response_router: Arc::clone(&router),
+        reauth: reauth_link,
         refused_subscriptions: refused_tx,
         #[cfg(feature = "stats")]
         stats: stats.clone(),
@@ -1139,6 +1208,7 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
                 phase: phase_rx.clone(),
                 refused: refused_rx,
                 router,
+                reauth: reauth_tx,
                 #[cfg(feature = "stats")]
                 stats,
             },

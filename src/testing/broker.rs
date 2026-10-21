@@ -17,9 +17,10 @@ use tokio_util::codec::FramedRead;
 
 use crate::Publish;
 use crate::codec::{
-    ConnectAck, ConnectAckReason, DecodedFrame, Disconnect, DisconnectReasonCode, Packet, PublishAck, PublishAckReason,
-    PublishDelivery, PublishMessage, PublishProperties, QoS, SubscribeAck, SubscribeAckReason, UnsubscribeAck,
-    UnsubscribeAckReason, UserProperties, UserProperty, V5Codec, WillMessage, encode_publish,
+    Auth, AuthReasonCode, ConnectAck, ConnectAckReason, DecodedFrame, Disconnect, DisconnectReasonCode, Packet,
+    PublishAck, PublishAckReason, PublishDelivery, PublishMessage, PublishProperties, QoS, SubscribeAck,
+    SubscribeAckReason, UnsubscribeAck, UnsubscribeAckReason, UserProperties, UserProperty, V5Codec, WillMessage,
+    encode_publish,
 };
 use crate::util::topic_matches;
 
@@ -67,6 +68,37 @@ impl PubAck {
 }
 
 type AckFn = Arc<dyn Fn(&ReceivedPublish) -> PubAck + Send + Sync>;
+
+/// One step of enhanced authentication a [`TestBroker`] is asked to answer; see
+/// [`TestBroker::enhanced_auth`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AuthRequest {
+    /// Client Identifier (the assigned one if it connected without).
+    pub client_id: String,
+    /// The client's Authentication Data: from CONNECT, AUTH 0x19 (Re-authenticate) or its
+    /// AUTH 0x18 answer to a challenge.
+    pub data: Option<Bytes>,
+    /// Part of a re-authentication on an open connection (§4.12.1), not of CONNECT.
+    pub reauthentication: bool,
+}
+
+/// How a [`TestBroker`] answers an [`AuthRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AuthStep {
+    /// AUTH 0x18 (Continue authentication) with this challenge; the client's answer is the
+    /// next request.
+    Continue(Bytes),
+    /// Accept: CONNACK 0x00, or AUTH 0x00 (Success) ending a re-authentication, with this
+    /// Authentication Data.
+    Accept(Option<Bytes>),
+    /// Refuse with 0x87 Not authorized: in the CONNACK, or in a DISCONNECT during a
+    /// re-authentication.
+    Refuse,
+}
+
+type AuthFn = Arc<dyn Fn(&AuthRequest) -> AuthStep + Send + Sync>;
 
 /// A PUBLISH a client sent to the [`TestBroker`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +153,8 @@ struct State {
     sessions: HashMap<String, Session>,
     /// Accept QoS 1 PUBLISHes without answering them (PUBACKs lost on the way).
     withhold_pubacks: bool,
+    /// Enhanced authentication: the method it accepts and how it answers.
+    enhanced_auth: Option<(ByteString, AuthFn)>,
 }
 
 struct Conn {
@@ -499,6 +533,33 @@ impl TestBroker {
             .is_some_and(|session| !session.expired(tokio::time::Instant::now()))
     }
 
+    /// Runs enhanced authentication (§4.12) for clients whose CONNECT names `method`: `answer`
+    /// gets each step's client data and decides how the broker replies, for the CONNECT and
+    /// for re-authentications on an open connection. A CONNECT with another method is refused
+    /// with 0x8C (Bad authentication method), as without this call; one without a method still
+    /// connects. Replaces any earlier answer.
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use mqtt_glide::testing::{AuthStep, TestBroker};
+    ///
+    /// # async fn demo(broker: TestBroker) {
+    /// // One challenge, then the client must have answered it with "signed:nonce".
+    /// broker.enhanced_auth("example-nonce-token", |request| match request.data.as_deref() {
+    ///     None => AuthStep::Continue(Bytes::from_static(b"nonce")),
+    ///     Some(b"signed:nonce") => AuthStep::Accept(None),
+    ///     Some(_) => AuthStep::Refuse,
+    /// });
+    /// # }
+    /// ```
+    pub fn enhanced_auth(
+        &self,
+        method: impl Into<ByteString>,
+        answer: impl Fn(&AuthRequest) -> AuthStep + Send + Sync + 'static,
+    ) {
+        lock(&self.shared).enhanced_auth = Some((method.into(), Arc::new(answer)));
+    }
+
     /// Sends every connected client a DISCONNECT with `reason`, then closes the connections.
     pub fn disconnect_all(&self, reason: DisconnectReasonCode) {
         let state = lock(&self.shared);
@@ -576,6 +637,43 @@ async fn serve(shared: Arc<Shared>, id: u64, stream: TcpStream) {
 
     let assigned = connect.client_id.is_empty().then(|| format!("test-broker-{id}"));
     let client_id = assigned.clone().unwrap_or_else(|| connect.client_id.to_string());
+    // Enhanced authentication before the CONNACK (§4.12).
+    let mut accepted_auth = None;
+    if let Some(method) = connect.auth_method.clone() {
+        let configured = lock(&shared).enhanced_auth.clone();
+        let refusal = match configured.filter(|(accepted, _)| *accepted == method) {
+            None => Some(ConnectAckReason::BadAuthenticationMethod),
+            Some((_, answer)) => {
+                match authenticate_connect(
+                    &answer,
+                    &method,
+                    &client_id,
+                    connect.auth_data.clone(),
+                    &tx,
+                    &mut frames,
+                )
+                .await
+                {
+                    Ok(data) => {
+                        accepted_auth = Some((method, data));
+                        None
+                    }
+                    Err(reason) => Some(reason),
+                }
+            }
+        };
+        if let Some(reason) = refusal {
+            let _ = tx.send(Outgoing::Packet(Packet::ConnectAck(Box::new(ConnectAck {
+                reason_code: reason,
+                ..ConnectAck::default()
+            }))));
+            let _ = tx.send(Outgoing::Close);
+            let _ = writer.await;
+            unregister(&shared, id);
+            return;
+        }
+    }
+    let (auth_method, auth_data) = accepted_auth.map_or((None, None), |(method, data)| (Some(method), data));
     {
         let mut state = lock(&shared);
         let task = state.connections.remove(&id).and_then(|mut conn| conn.task.take());
@@ -609,6 +707,8 @@ async fn serve(shared: Arc<Shared>, id: u64, stream: TcpStream) {
             response_info: connect
                 .request_response_info
                 .then(|| ByteString::from(format!("responses/{client_id}"))),
+            auth_method: auth_method.clone(),
+            auth_data,
             ..ConnectAck::default()
         }))));
         if let Some(session) = resumed {
@@ -634,6 +734,7 @@ async fn serve(shared: Arc<Shared>, id: u64, stream: TcpStream) {
     shared.changed.notify_waiters();
 
     let mut clean_disconnect = false;
+    let mut reauthenticating = false;
     while let Some(Ok((frame, _))) = frames.next().await {
         match frame {
             DecodedFrame::Publish(packet) => {
@@ -759,6 +860,62 @@ async fn serve(shared: Arc<Shared>, id: u64, stream: TcpStream) {
             DecodedFrame::Control(Packet::PingRequest) => {
                 let _ = tx.send(Outgoing::Packet(Packet::PingResponse));
             }
+            DecodedFrame::Control(Packet::Auth(auth)) => {
+                let answer = lock(&shared).enhanced_auth.clone();
+                let expected = if reauthenticating {
+                    AuthReasonCode::ContinueAuth
+                } else {
+                    AuthReasonCode::ReAuth
+                };
+                let valid =
+                    auth.reason_code == expected && auth.auth_method.is_some() && auth.auth_method == auth_method;
+                // Configured meanwhile for another method: this connection's is not accepted any more.
+                if valid
+                    && answer
+                        .as_ref()
+                        .is_none_or(|(method, _)| Some(method) != auth_method.as_ref())
+                {
+                    let _ = tx.send(Outgoing::Packet(Packet::Disconnect(Disconnect::new(
+                        DisconnectReasonCode::BadAuthenticationMethod,
+                    ))));
+                    break;
+                }
+                let step = answer.filter(|_| valid).map(|(_, answer)| {
+                    answer(&AuthRequest {
+                        client_id: client_id.clone(),
+                        data: auth.auth_data,
+                        reauthentication: true,
+                    })
+                });
+                let method = auth.auth_method;
+                match step {
+                    Some(AuthStep::Continue(challenge)) => {
+                        reauthenticating = true;
+                        let _ = tx.send(Outgoing::Packet(auth_packet(
+                            AuthReasonCode::ContinueAuth,
+                            method,
+                            Some(challenge),
+                        )));
+                    }
+                    Some(AuthStep::Accept(data)) => {
+                        reauthenticating = false;
+                        let _ = tx.send(Outgoing::Packet(auth_packet(AuthReasonCode::Success, method, data)));
+                    }
+                    Some(AuthStep::Refuse) => {
+                        let _ = tx.send(Outgoing::Packet(Packet::Disconnect(Disconnect::new(
+                            DisconnectReasonCode::NotAuthorized,
+                        ))));
+                        break;
+                    }
+                    // AUTH without an exchange to belong to ([MQTT-4.12.0-7], [MQTT-4.12.1-1]).
+                    None => {
+                        let _ = tx.send(Outgoing::Packet(Packet::Disconnect(Disconnect::new(
+                            DisconnectReasonCode::ProtocolError,
+                        ))));
+                        break;
+                    }
+                }
+            }
             DecodedFrame::Control(Packet::PublishAck(ack)) => {
                 if let Some(conn) = lock(&shared).connections.get_mut(&id) {
                     conn.unacked.retain(|(packet_id, _)| *packet_id != ack.packet_id);
@@ -787,6 +944,52 @@ async fn serve(shared: Arc<Shared>, id: u64, stream: TcpStream) {
     }
     let _ = tx.send(Outgoing::Close);
     let _ = writer.await;
+}
+
+/// The CONNECT part of enhanced authentication: challenges until `answer` accepts (its
+/// CONNACK data) or refuses (0x87), or the client sends anything but the AUTH answer (0x82,
+/// [MQTT-3.1.2-30]).
+async fn authenticate_connect(
+    answer: &AuthFn,
+    method: &ByteString,
+    client_id: &str,
+    mut data: Option<Bytes>,
+    tx: &mpsc::UnboundedSender<Outgoing>,
+    frames: &mut FramedRead<tokio::net::tcp::OwnedReadHalf, V5Codec>,
+) -> Result<Option<Bytes>, ConnectAckReason> {
+    loop {
+        let request = AuthRequest {
+            client_id: client_id.to_owned(),
+            data,
+            reauthentication: false,
+        };
+        match answer(&request) {
+            AuthStep::Accept(data) => return Ok(data),
+            AuthStep::Refuse => return Err(ConnectAckReason::NotAuthorized),
+            AuthStep::Continue(challenge) => {
+                let challenge = auth_packet(AuthReasonCode::ContinueAuth, Some(method.clone()), Some(challenge));
+                let _ = tx.send(Outgoing::Packet(challenge));
+                match frames.next().await {
+                    Some(Ok((DecodedFrame::Control(Packet::Auth(auth)), _)))
+                        if auth.reason_code == AuthReasonCode::ContinueAuth
+                            && auth.auth_method.as_ref() == Some(method) =>
+                    {
+                        data = auth.auth_data;
+                    }
+                    _ => return Err(ConnectAckReason::ProtocolError),
+                }
+            }
+        }
+    }
+}
+
+fn auth_packet(reason_code: AuthReasonCode, method: Option<ByteString>, data: Option<Bytes>) -> Packet {
+    Packet::Auth(Auth {
+        reason_code,
+        auth_method: method,
+        auth_data: data,
+        ..Auth::default()
+    })
 }
 
 fn unregister(shared: &Shared, id: u64) {

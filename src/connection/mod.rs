@@ -7,6 +7,7 @@ mod lifecycle;
 pub(crate) mod packet_id;
 mod proxy;
 pub(crate) mod read;
+pub(crate) mod reauth;
 mod redirect;
 pub(crate) mod session_policy;
 mod state;
@@ -84,6 +85,8 @@ pub(crate) struct ConnectionChannels<H: InboundSink> {
     pub connected: Arc<std::sync::atomic::AtomicBool>,
     /// Routes request/response replies to waiting [`crate::Requester`] requests.
     pub response_router: Arc<crate::request::ResponseRouter>,
+    /// Re-authentication requests for the read tasks; `None` without an authenticator.
+    pub reauth: Option<reauth::ReauthLink>,
     /// Counters behind [`crate::MqttClient::stats`].
     pub stats: crate::stats::Stats,
     /// Behind [`crate::MqttClient::refused_subscriptions`], kept current by the registry.
@@ -553,6 +556,7 @@ impl<H: InboundSink> Connection<H> {
                 topic_aliases: inbound_topic_aliases,
                 response_router: Arc::clone(&self.channels.response_router),
                 stats: self.channels.stats.clone(),
+                reauth: self.channels.reauth.clone(),
             },
             #[cfg(test)]
             read_stub_exit_rx,
@@ -693,7 +697,7 @@ impl<H: InboundSink> Connection<H> {
             ConnectionOutcome::Auth(_) => match self.reconnect.delay_after(&outcome) {
                 None => {
                     if invalidate_credentials {
-                        self.credentials.invalidate().await;
+                        self.invalidate_auth().await;
                     }
                     self.state = ConnectionState::Stopped;
                     SessionDisposition::Stop(Err(outcome))
@@ -706,7 +710,7 @@ impl<H: InboundSink> Connection<H> {
                     // including a backoff cancelled by shutdown — so a rejected credential
                     // is never kept cached.
                     if invalidate_credentials {
-                        self.credentials.invalidate().await;
+                        self.invalidate_auth().await;
                     }
                     disposition
                 }
@@ -720,6 +724,14 @@ impl<H: InboundSink> Connection<H> {
                     Some(delay) => self.backoff_then_retry(delay).await,
                 }
             }
+        }
+    }
+
+    /// The broker refused the client: drop cached credentials and authenticator material.
+    async fn invalidate_auth(&self) {
+        self.credentials.invalidate().await;
+        if let Some(authenticator) = &self.options.authenticator {
+            authenticator.invalidate().await;
         }
     }
 
@@ -830,6 +842,7 @@ impl<H: InboundSink> Connection<H> {
             Ok(ReadOutcome::BrokerDisconnect(disconnect)) => map_broker_disconnect_outcome(&disconnect),
             Ok(ReadOutcome::Transport(error)) => ConnectionOutcome::Transport(error),
             Ok(ReadOutcome::Protocol(error)) => ConnectionOutcome::Protocol(error),
+            Ok(ReadOutcome::Auth(error)) => ConnectionOutcome::Auth(error),
             Err(join_err) => ConnectionOutcome::Application(AppError::TaskJoin(join_err.to_string())),
         }
     }
@@ -920,6 +933,9 @@ pub(crate) fn map_broker_disconnect_outcome(disconnect: &crate::codec::Disconnec
 
 #[cfg(test)]
 pub(crate) mod test_support;
+
+#[cfg(test)]
+mod auth_tests;
 
 #[cfg(test)]
 mod io_mock_tests;

@@ -276,13 +276,17 @@ pub(crate) fn distinct_v5_codecs_for_framed_halves(inbound_max: u32) -> (crate::
     )
 }
 
-/// Auth path: invalidate credentials on broker rejection only.
+/// Auth path: invalidate credentials (and the authenticator's material) on broker rejection only.
 pub(crate) async fn on_auth_failure(
     credentials: &crate::client::SharedCredentials,
+    authenticator: Option<&crate::auth::SharedAuthenticator>,
     outcome: ConnectionOutcome,
 ) -> ConnectionOutcome {
     if matches!(&outcome, ConnectionOutcome::Auth(AuthError::NotAuthorized)) {
         credentials.invalidate().await;
+        if let Some(authenticator) = authenticator {
+            authenticator.invalidate().await;
+        }
     }
     outcome
 }
@@ -630,7 +634,7 @@ mod tests {
         let shared = SharedCredentials::new(CountingCreds {
             invalidations: Arc::clone(&invalidations),
         });
-        let outcome = on_auth_failure(&shared, ConnectionOutcome::Auth(AuthError::NotAuthorized)).await;
+        let outcome = on_auth_failure(&shared, None, ConnectionOutcome::Auth(AuthError::NotAuthorized)).await;
         assert!(matches!(outcome, ConnectionOutcome::Auth(AuthError::NotAuthorized)));
         assert_eq!(invalidations.load(Ordering::SeqCst), 1);
     }
@@ -664,6 +668,7 @@ mod tests {
         });
         let outcome = on_auth_failure(
             &shared,
+            None,
             ConnectionOutcome::Auth(AuthError::Provider("token endpoint down".into())),
         )
         .await;

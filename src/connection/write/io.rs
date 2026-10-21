@@ -139,6 +139,11 @@ where
                             break;
                         }
                     }
+                    // A re-authentication still running on the read task: its answer goes out,
+                    // or the broker's next challenge would never come and the exchange time out.
+                    Some(ControlMessage::Auth(auth)) => {
+                        send_packet(framed, Packet::Auth(*auth), flush_abort).await?;
+                    }
                     // The read task saw a protocol violation: nothing more will be acknowledged.
                     Some(ControlMessage::ProtocolDisconnect(reason)) => {
                         disconnect_reason = reason;
@@ -489,6 +494,7 @@ where
             }
             flush_writes(framed, flush_abort).await.err()
         }
+        ControlMessage::Auth(auth) => send_packet(framed, Packet::Auth(*auth), flush_abort).await.err(),
         // Coalesce already completed these ACKs; deferred path is a defensive vacuum.
         ControlMessage::SubscribeAck { .. }
         | ControlMessage::UnsubscribeAck { .. }

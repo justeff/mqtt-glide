@@ -185,6 +185,13 @@ impl<H> ClientBuilder<H> {
         self
     }
 
+    /// Authenticates with enhanced authentication (§4.12); see
+    /// [`ConnectOptions::authenticator`]. Credentials from [`Self::credentials`] are sent as well.
+    pub fn authenticator(mut self, authenticator: impl crate::Authenticator + 'static) -> Self {
+        self.config.options = self.config.options.authenticator(authenticator);
+        self
+    }
+
     /// Sets the reconnect policy (replaces the default [`StandardReconnectPolicy::default`]).
     ///
     /// [`NoReconnect`](crate::NoReconnect) makes a dropped connection stay dropped.

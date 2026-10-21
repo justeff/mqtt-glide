@@ -39,14 +39,22 @@ These tests do **not** use Mosquitto. They cover transport failure and DISCONNEC
 cargo test --test connection
 ```
 
-## EMQX
+## EMQX enhanced authentication
 
-**Follow-up (not in this suite):** EMQX coverage for Shared Subs under load / Last is optional and is not implemented here. Add when needed; do not treat absence as silent pass.
+Image: `emqx/emqx:6.1.5` with SCRAM-SHA-256 (built-in database, 4096 iterations) as its only authenticator; the test user is added through the REST API. The SCRAM client lives in the test (`hmac` / `sha2` dev-dependencies). 5.8.6 checks a re-authentication but never answers it with AUTH 0x00.
+
+| Test | Expectation |
+|------|-------------|
+| `scram_primitives_match_the_rfc_7677_example` | The test's SCRAM client computes the proof and server signature of RFC 7677 §3 (no container) |
+| `emqx_scram_connect_reauthentication_and_refusal` | SCRAM in CONNECT / AUTH / CONNACK; `finish` verifies the server signature; `reauthenticate()` runs a second exchange (AUTH 0x19 … AUTH 0x00) while QoS 1 messages keep flowing; a wrong password fails the first connect with `AuthError::NotAuthorized` and invalidates the authenticator once. One container for all of it: parallel EMQX starts race for host ports under rootless Podman |
+
+Shared Subscriptions under load are not covered against EMQX.
 
 ## Helpers
 
 | Helper | Role |
 |--------|------|
 | `start_mosquitto` / `start_mosquitto_on_port` / `start_mosquitto_reject_connect` / `start_mosquitto_dynsec` | Mosquitto containers |
+| `start_emqx_scram` | EMQX with SCRAM-SHA-256 and one user |
 | `dynsec` | `mosquitto_ctrl dynsec ...` as the admin of a Dynamic Security broker |
 | `publish_qos0_via_raw_session` / `publish_qos1_via_raw_session` | Second MQTT 5 session for inbound publishes |

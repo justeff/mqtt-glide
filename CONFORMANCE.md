@@ -9,12 +9,12 @@ only when a test names it.
 
 | | Statements |
 |---|---:|
-| Binding a client (or both peers, the sender, the receiver) | 101 |
-| … ✅ named by at least one test | 101 |
+| Binding a client (or both peers, the sender, the receiver) | 109 |
+| … ✅ named by at least one test | 109 |
 | … 🟡 implemented, cited only in library code | 0 |
 | … ❌ no reference yet | 0 |
 | Binding only the Server | 117 |
-| Part of a feature this client does not implement (QoS 2, enhanced authentication) | 33 |
+| Part of a feature this client does not implement (QoS 2) | 25 |
 
 Scope is assigned in `conformance/statements.tsv`. Server obligations are listed for completeness;
 where the client relies on one (for example the order of SUBACK reason codes) the client side is
@@ -82,7 +82,7 @@ covered by the statement that binds the client.
 | **[MQTT-3.1.2-27]** If Topic Alias Maximum is absent or zero, the Server MUST NOT send any Topic Aliases to the. | — server obligation |  |
 | **[MQTT-3.1.2-28]** A value of 0 indicates that the Server MUST NOT return Response Information. | — server obligation |  |
 | **[MQTT-3.1.2-29]** If the value of Request Problem Information is 0, the Server MAY return a Reason String or User Properties on a CONNACK or DISCONNECT packet, but MUST NOT send a Reason String or User Properties on any packet other than PUBLISH, CONNACK, or DISCONNECT. | — server obligation | `request_problem_information_decides_whether_diagnostics_are_sent` (src/codec/v5/codec.rs) |
-| **[MQTT-3.1.2-30]** If a Client sets an Authentication Method in the CONNECT, the Client MUST NOT send any packets other than AUTH or DISCONNECT packets until it has received a CONNACK packet. | — not supported | Enhanced authentication is not supported |
+| **[MQTT-3.1.2-30]** If a Client sets an Authentication Method in the CONNECT, the Client MUST NOT send any packets other than AUTH or DISCONNECT packets until it has received a CONNACK packet. | ✅ tested | `only_auth_goes_out_before_the_connack` (src/connection/auth_tests.rs) |
 | **[MQTT-3.1.3-1]** The Payload of the CONNECT packet contains one or more length-prefixed fields, whose presence is determined by the flags in the Variable Header. These fields, if present, MUST appear in the order Client Identifier, Will Topic, Will Message, User Name, Password. | ✅ tested | `test_encode_connect_payload_field_order` (src/codec/v5/encode.rs) |
 | **[MQTT-3.1.3-2]** The ClientID MUST be used by Clients and by Servers to identify state that they hold relating to this MQTT Session between the Client and the Server. | ✅ tested | `clean_start_false_reconnects_present_the_same_client_id` (src/client.rs)<br>`generated_client_id_is_the_same_across_reconnects` (src/client.rs) |
 | **[MQTT-3.1.3-3]** The ClientID MUST be present and is the first field in the CONNECT packet Payload. | ✅ tested | `test_encode_connect_packets` (src/codec/v5/encode.rs) |
@@ -288,9 +288,9 @@ covered by the statement that binds the client.
 | Statement | Status | Evidence |
 |---|---|---|
 | **[MQTT-3.15.1-1]** Bits 3,2,1 and 0 of the Fixed Header of the AUTH packet are reserved and MUST all be set to 0. The Client or Server MUST treat any other value as malformed and close the Network Connection. | ✅ tested | `test_decode_rejects_malformed_fixed_headers` (src/codec/v5/decode.rs) |
-| **[MQTT-3.15.2-1]** The sender of the AUTH Packet MUST use one of the Authenticate Reason Codes. | — not supported | Enhanced authentication is not supported<br>src/codec/v5/packet/auth.rs |
-| **[MQTT-3.15.2-2]** The sender MUST NOT send this property if it would increase the size of the AUTH packet beyond the Maximum Packet Size specified by the receiver | — not supported | Enhanced authentication is not supported |
-| **[MQTT-3.15.2-3]** The sender MUST NOT send this property if it would increase the size of the AUTH packet beyond the Maximum Packet Size specified by the receiver. | — not supported | Enhanced authentication is not supported |
+| **[MQTT-3.15.2-1]** The sender of the AUTH Packet MUST use one of the Authenticate Reason Codes. | ✅ tested | `reauthentication_runs_the_exchange` (src/connection/reauth.rs) |
+| **[MQTT-3.15.2-2]** The sender MUST NOT send this property if it would increase the size of the AUTH packet beyond the Maximum Packet Size specified by the receiver | ✅ tested | `reauthentication_runs_the_exchange` (src/connection/reauth.rs) |
+| **[MQTT-3.15.2-3]** The sender MUST NOT send this property if it would increase the size of the AUTH packet beyond the Maximum Packet Size specified by the receiver. | ✅ tested | `reauthentication_runs_the_exchange` (src/connection/reauth.rs) |
 
 ## 4.1
 
@@ -392,13 +392,13 @@ covered by the statement that binds the client.
 |---|---|---|
 | **[MQTT-4.12.0-1]** If the Server does not support the Authentication Method supplied by the Client, it MAY send a CONNACK with a Reason Code of 0x8C (Bad authentication method) or 0x87 (Not Authorized) as described in section 4.13 and MUST close the Network Connection. | — server obligation |  |
 | **[MQTT-4.12.0-2]** If the Server requires additional information to complete the authorization, it can send an AUTH packet to the Client. This packet MUST contain a Reason Code of 0x18 (Continue authentication). | — server obligation |  |
-| **[MQTT-4.12.0-3]** The Client responds to an AUTH packet from the Server by sending a further AUTH packet. This packet MUST contain a Reason Code of 0x18 (Continue authentication). | — not supported | Enhanced authentication is not supported |
+| **[MQTT-4.12.0-3]** The Client responds to an AUTH packet from the Server by sending a further AUTH packet. This packet MUST contain a Reason Code of 0x18 (Continue authentication). | ✅ tested | `only_auth_goes_out_before_the_connack` (src/connection/auth_tests.rs)<br>`reauthentication_runs_the_exchange` (src/connection/reauth.rs) |
 | **[MQTT-4.12.0-4]** The Server can reject the authentication at any point in this process. It MAY send a CONNACK with a Reason Code of 0x80 or above as described in section 4.13, and MUST close the Network Connection. | — server obligation |  |
-| **[MQTT-4.12.0-5]** If the initial CONNECT packet included an Authentication Method property then all AUTH packets, and any successful CONNACK packet MUST include an Authentication Method Property with the same value as in the CONNECT packet. | — not supported | Enhanced authentication is not supported |
-| **[MQTT-4.12.0-6]** If the Client does not include an Authentication Method in the CONNECT, the Server MUST NOT send an AUTH packet, and it MUST NOT send an Authentication Method in the CONNACK packet. | — server obligation |  |
+| **[MQTT-4.12.0-5]** If the initial CONNECT packet included an Authentication Method property then all AUTH packets, and any successful CONNACK packet MUST include an Authentication Method Property with the same value as in the CONNECT packet. | ✅ tested | `broker_breaking_the_connect_exchange_gets_a_protocol_error` (src/connection/auth_tests.rs)<br>`only_auth_goes_out_before_the_connack` (src/connection/auth_tests.rs)<br>`broker_auth_out_of_place_is_a_protocol_error` (src/connection/reauth.rs)<br>+1 more |
+| **[MQTT-4.12.0-6]** If the Client does not include an Authentication Method in the CONNECT, the Server MUST NOT send an AUTH packet, and it MUST NOT send an Authentication Method in the CONNACK packet. | — server obligation | src/connection/read.rs |
 | **[MQTT-4.12.0-7]** If the Client does not include an Authentication Method in the CONNECT, the Client MUST NOT send an AUTH packet to the Server. | ✅ tested | `client_never_sends_auth_without_authentication_method` (src/client.rs) |
-| **[MQTT-4.12.1-1]** If the Client supplied an Authentication Method in the CONNECT packet it can initiate a re-authentication at any time after receiving a CONNACK. It does this by sending an AUTH packet with a Reason Code of 0x19 (Re-authentication). The Client MUST set the Authentication Method to the same value as the Authentication Method originally used to authenticate the Network Connection. | — not supported | Enhanced authentication is not supported |
-| **[MQTT-4.12.1-2]** If the re-authentication fails, the Client or Server SHOULD send DISCONNECT with an appropriate Reason Code and MUST close the Network Connection. | — not supported | Enhanced authentication is not supported |
+| **[MQTT-4.12.1-1]** If the Client supplied an Authentication Method in the CONNECT packet it can initiate a re-authentication at any time after receiving a CONNACK. It does this by sending an AUTH packet with a Reason Code of 0x19 (Re-authentication). The Client MUST set the Authentication Method to the same value as the Authentication Method originally used to authenticate the Network Connection. | ✅ tested | `broker_failing_a_reauthentication_loses_the_connection` (src/connection/auth_tests.rs)<br>`reauthentication_runs_the_exchange` (src/connection/reauth.rs) |
+| **[MQTT-4.12.1-2]** If the re-authentication fails, the Client or Server SHOULD send DISCONNECT with an appropriate Reason Code and MUST close the Network Connection. | ✅ tested | `broker_failing_a_reauthentication_loses_the_connection` (src/connection/auth_tests.rs)<br>`failing_exchange_closes_the_connection` (src/connection/reauth.rs)<br>`hung_or_oversized_authenticator_steps_fail` (src/connection/reauth.rs) |
 
 ## 4.13
 

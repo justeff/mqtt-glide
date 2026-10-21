@@ -139,7 +139,7 @@ def render(rows, tests, code):
         f"| … 🟡 implemented, cited only in library code | {counts['implemented']} |",
         f"| … ❌ no reference yet | {counts['open']} |",
         f"| Binding only the Server | {counts['server']} |",
-        f"| Part of a feature this client does not implement (QoS 2, enhanced authentication) | {counts['unsupported']} |",
+        f"| Part of a feature this client does not implement (QoS 2) | {counts['unsupported']} |",
         "",
         "Scope is assigned in `conformance/statements.tsv`. Server obligations are listed for completeness;",
         "where the client relies on one (for example the order of SUBACK reason codes) the client side is",

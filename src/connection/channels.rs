@@ -8,7 +8,7 @@ use bytestring::ByteString;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::codec::{
-    DisconnectReasonCode, PublishAck, PublishMessage, QoS, SubscribeAck, SubscriptionOptions, UnsubscribeAck,
+    Auth, DisconnectReasonCode, PublishAck, PublishMessage, QoS, SubscribeAck, SubscriptionOptions, UnsubscribeAck,
 };
 use crate::error::AppError;
 
@@ -81,6 +81,9 @@ pub(crate) enum ControlMessage {
         /// Connection generation of the read task that received this PUBACK.
         generation: Generation,
     },
+    /// Client → broker AUTH of a re-authentication (§4.12.1), queued by the read task, which
+    /// runs the exchange.
+    Auth(Box<Auth>),
     /// Client → broker PUBACK for an inbound QoS-1 PUBLISH after successful handoff accept.
     AckInboundPublish {
         /// Packet identifier from the inbound PUBLISH.

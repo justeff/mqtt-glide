@@ -11,6 +11,7 @@ use tokio_util::codec::FramedRead;
 
 use crate::codec::v5::ToReasonCode;
 use crate::codec::{DecodeError, DecodedFrame, DisconnectReasonCode, InboundMessage, Packet, PublishPacket, V5Codec};
+use crate::connection::reauth::{self, Reauth};
 use crate::connection::{ControlMessage, Generation, StopSignal, effective_io_batch, inbound_publish_policy};
 use crate::error::{ProtocolError, TransportError};
 use crate::inbound_sink::{InboundSink, InboundTrySendError};
@@ -33,6 +34,8 @@ pub(crate) enum ReadOutcome {
     BrokerDisconnect(Box<crate::codec::Disconnect>),
     /// Protocol violation or decode failure.
     Protocol(ProtocolError),
+    /// A re-authentication failed on the client's side ([`crate::Authenticator`] error).
+    Auth(crate::error::AuthError),
 }
 
 /// Session tokens and generation for the read task.
@@ -57,6 +60,8 @@ pub(crate) struct ReadSession {
     pub response_router: Arc<crate::request::ResponseRouter>,
     /// Counters behind [`crate::MqttClient::stats`].
     pub stats: crate::stats::Stats,
+    /// Re-authentication requests and the authenticator, when one is configured.
+    pub reauth: Option<super::reauth::ReauthLink>,
 }
 
 /// Drop-guard: signals the write task that the read task has fully exited.
@@ -99,11 +104,42 @@ impl Drop for ReadDoneSignal {
 /// before sending DISCONNECT.
 pub(crate) async fn run<H: InboundSink, R>(
     session: ReadSession,
+    #[cfg(test)] stub_exit_rx: mpsc::Receiver<()>,
+    framed: FramedRead<R, V5Codec>,
+    handoff: H,
+    control_tx: mpsc::Sender<ControlMessage>,
+    read_done: ReadDoneSignal,
+) -> ReadOutcome
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let mut reauth = session.reauth.as_ref().and_then(Reauth::new);
+    let outcome = read_loop(
+        session,
+        #[cfg(test)]
+        stub_exit_rx,
+        framed,
+        handoff,
+        control_tx,
+        read_done,
+        &mut reauth,
+    )
+    .await;
+    if let Some(reauth) = reauth.as_mut() {
+        reauth.conclude(&outcome);
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_loop<H: InboundSink, R>(
+    session: ReadSession,
     #[cfg(test)] mut stub_exit_rx: mpsc::Receiver<()>,
     mut framed: FramedRead<R, V5Codec>,
     handoff: H,
     control_tx: mpsc::Sender<ControlMessage>,
     read_done: ReadDoneSignal,
+    reauth: &mut Option<Reauth>,
 ) -> ReadOutcome
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -136,6 +172,13 @@ where
             // Session cancel or graceful-shutdown notify — stop consuming the read half.
             () = &mut cancel_wait => return ReadOutcome::Cancelled,
             () = &mut stop_wait => return ReadOutcome::Cancelled,
+            event = next_reauth_event(reauth), if reauth.is_some() => {
+                if let Some(state) = reauth.as_mut()
+                    && let Err(failure) = state.handle(event, &control_tx).await
+                {
+                    return reauth_failure(&control_tx, failure).await;
+                }
+            }
             msg = stub_exit => {
                 #[cfg(test)]
                 {
@@ -164,6 +207,10 @@ where
                                     .await;
                             }
                             stats.publish_received(packet.meta.qos, packet.meta.dup);
+                            let reauth_waiting_since = reauth
+                                .as_ref()
+                                .is_some_and(Reauth::busy)
+                                .then(tokio::time::Instant::now);
                             if let Some(outcome) = handle_inbound_publish(
                                 packet,
                                 &stats,
@@ -178,6 +225,18 @@ where
                             .await
                             {
                                 return outcome;
+                            }
+                            // Time spent on a full inbound sink is not the broker's delay.
+                            if let (Some(since), Some(state)) = (reauth_waiting_since, reauth.as_mut()) {
+                                state.extend_deadline(since.elapsed());
+                            }
+                        }
+                        Some(Ok((DecodedFrame::Control(Packet::Auth(auth)), _wire_len))) if reauth.is_some() => {
+                            inbound_activity.store(true, Ordering::Release);
+                            if let Some(state) = reauth.as_mut()
+                                && let Err(failure) = state.on_broker_auth(auth)
+                            {
+                                return reauth_failure(&control_tx, failure).await;
                             }
                         }
                         Some(Ok((DecodedFrame::Control(packet), _wire_len))) => {
@@ -379,7 +438,8 @@ async fn dispatch_control(
             )
             .await,
         ),
-        // Extended AUTH (re-auth) is out of scope — ignore until authenticated sessions land.
+        // Without an Authentication Method in CONNECT the broker must not send AUTH
+        // ([MQTT-4.12.0-6]); tolerated, there is nothing to answer.
         Packet::Auth(_) => None,
         other => {
             let error = ProtocolError::Violation(format!(
@@ -389,6 +449,23 @@ async fn dispatch_control(
             Some(protocol_error_disconnect(control_tx, error, DisconnectReasonCode::ProtocolError).await)
         }
     }
+}
+
+/// The next re-authentication event; never, without an authenticator.
+async fn next_reauth_event(reauth: &mut Option<Reauth>) -> reauth::Event {
+    match reauth {
+        Some(state) => state.next_event().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// A failed re-authentication ends the connection, with a DISCONNECT when the write side is
+/// still there ([MQTT-4.12.1-2]).
+async fn reauth_failure(control_tx: &mpsc::Sender<ControlMessage>, failure: reauth::Failure) -> ReadOutcome {
+    if let Some(reason) = failure.reason {
+        let _ = control_tx.send(ControlMessage::ProtocolDisconnect(reason)).await;
+    }
+    failure.outcome
 }
 
 /// Queues a protocol-error DISCONNECT on the control path, then surfaces the typed error.

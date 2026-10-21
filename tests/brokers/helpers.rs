@@ -344,6 +344,79 @@ pub async fn start_hivemq_with_websocket() -> Option<(ContainerAsync<GenericImag
     Some((container, port, ws_port))
 }
 
+/// EMQX image for the enhanced authentication tests. 5.8.6 checks a re-authentication but never
+/// answers it: the AUTH 0x00 is missing and the broker times out taking over its own session.
+const EMQX_TAG: &str = "6.1.5";
+
+/// API key `glide:glide-secret` for the EMQX REST API, as its bootstrap file wants it.
+const EMQX_API_KEY: &str = "glide:glide-secret:administrator\n";
+
+/// Starts EMQX with SCRAM-SHA-256 enhanced authentication (built-in database, 4096 iterations)
+/// as the only authenticator, adds `user` / `password`, and returns the container and the
+/// mapped MQTT port.
+///
+/// Returns `None` (after a skip message) when Docker is unavailable.
+pub async fn start_emqx_scram(user: &str, password: &str) -> Option<(ContainerAsync<GenericImage>, u16)> {
+    if skip_without_docker() {
+        return None;
+    }
+    let container = GenericImage::new("emqx/emqx", EMQX_TAG)
+        .with_wait_for(WaitFor::message_on_stdout("is running now"))
+        .with_copy_to("/opt/emqx/etc/api_key.bootstrap", EMQX_API_KEY.as_bytes().to_vec())
+        .with_env_var("EMQX_API_KEY__BOOTSTRAP_FILE", "/opt/emqx/etc/api_key.bootstrap")
+        .with_env_var("EMQX_AUTHENTICATION__1__MECHANISM", "scram")
+        .with_env_var("EMQX_AUTHENTICATION__1__BACKEND", "built_in_database")
+        .with_env_var("EMQX_AUTHENTICATION__1__ALGORITHM", "sha256")
+        .with_env_var("EMQX_AUTHENTICATION__1__ITERATION_COUNT", "4096")
+        .start()
+        .await
+        .expect("failed to start EMQX container");
+    let port = container.get_host_port_ipv4(1883).await.expect("mapped emqx port");
+    let api_port = container.get_host_port_ipv4(18083).await.expect("mapped emqx api port");
+    let body = format!(r#"{{"user_id":"{user}","password":"{password}"}}"#);
+    // The dashboard listener may still reset connections right after the broker reports it runs.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = emqx_post(
+            api_port,
+            "/api/v5/authentication/scram%3Abuilt_in_database/users",
+            &body,
+        )
+        .await;
+        match status {
+            Ok(201) => break,
+            Ok(status) => panic!("adding the EMQX SCRAM user answered HTTP {status}"),
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                eprintln!("EMQX API not ready yet: {error}");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(error) => panic!("EMQX API unreachable: {error}"),
+        }
+    }
+    Some((container, port))
+}
+
+/// POSTs JSON to the EMQX REST API with the bootstrap API key; returns the HTTP status.
+async fn emqx_post(api_port: u16, path: &str, body: &str) -> std::io::Result<u16> {
+    use tokio::io::AsyncReadExt;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", api_port)).await?;
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic Z2xpZGU6Z2xpZGUtc2VjcmV0\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    let response = String::from_utf8_lossy(&response);
+    response
+        .split(' ')
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .ok_or_else(|| std::io::Error::other(format!("unexpected HTTP response: {response:?}")))
+}
+
 /// Second MQTT 5 session: CONNECT + QoS 0 PUBLISH + DISCONNECT (no client crate publish API yet).
 ///
 /// Used so broker integration can deliver application messages without.

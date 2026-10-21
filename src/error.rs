@@ -8,16 +8,19 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-/// Authentication failure (CONNACK NotAuthorized, credentials provider error, etc.).
+/// Authentication failure (CONNACK NotAuthorized, credentials provider or authenticator error, etc.).
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum AuthError {
-    /// Broker rejected the supplied username or password.
+    /// Broker rejected the supplied username or password, or the enhanced authentication; or an
+    /// [`Authenticator`](crate::Authenticator) does not trust the broker.
     ///
-    /// Triggers [`CredentialsProvider::invalidate`](crate::CredentialsProvider::invalidate) on connect and active session end.
+    /// Triggers [`CredentialsProvider::invalidate`](crate::CredentialsProvider::invalidate) and
+    /// [`Authenticator::invalidate`](crate::Authenticator::invalidate) on connect and active session end.
     #[error("broker rejected credentials")]
     NotAuthorized,
-    /// Credentials could not be obtained from the provider (transient upstream failure).
+    /// Credentials could not be obtained from the provider, or an
+    /// [`Authenticator`](crate::Authenticator) could not compute its data (transient upstream failure).
     ///
     /// Does **not** invalidate cached credentials — reconnect may retry after auth backoff.
     #[error("credentials provider failed: {0}")]
@@ -150,6 +153,17 @@ pub enum AppError {
     /// is set, so the command was not queued for the next connection.
     #[error("not connected")]
     NotConnected,
+    /// [`MqttClient::reauthenticate`](crate::MqttClient::reauthenticate) failed: the
+    /// [`Authenticator`](crate::Authenticator) failed, or the broker refused the client. Except
+    /// for a failure of [`Authenticator::start`](crate::Authenticator::start), before anything
+    /// was sent, the connection was closed.
+    #[error("re-authentication failed: {0}")]
+    Auth(AuthError),
+    /// [`MqttClient::reauthenticate`](crate::MqttClient::reauthenticate): the broker did not
+    /// answer an AUTH within [`ConnectOptions::ack_timeout`](crate::ConnectOptions::ack_timeout),
+    /// so the connection was closed.
+    #[error("no answer to re-authentication within {0:?}")]
+    ReauthenticationTimeout(Duration),
     /// [`MqttClient::shutdown`](crate::MqttClient::shutdown) was called: no new commands are
     /// accepted while the driver drains and disconnects.
     #[error("client is shutting down")]

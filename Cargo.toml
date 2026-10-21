@@ -62,6 +62,11 @@ path = "tests/tls.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "auth"
+path = "tests/auth.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "stats"
 path = "tests/stats.rs"
 required-features = ["testing", "stats"]
@@ -134,6 +139,9 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 mqtt-glide = { path = ".", default-features = false, features = ["__internals"] }
 # Unit tests and the bench harness hand off through flume; the library only with the `flume` feature.
 flume = "0.12"
+# SCRAM-SHA-256 client for the EMQX enhanced authentication test (tests/brokers/emqx.rs).
+hmac = "0.13"
+sha2 = "0.11"
 # Bench: `getrusage` for subscriber CPU in `mqtt_compare` (see benches/support/cpu.rs).
 libc = "0.2"
 proptest = "1.11"

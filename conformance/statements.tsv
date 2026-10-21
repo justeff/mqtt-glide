@@ -45,7 +45,7 @@ MQTT-3.1.2-26	server		The Server MUST NOT send a Topic Alias in a PUBLISH packet
 MQTT-3.1.2-27	server		If Topic Alias Maximum is absent or zero, the Server MUST NOT send any Topic Aliases to the.
 MQTT-3.1.2-28	server		A value of 0 indicates that the Server MUST NOT return Response Information.
 MQTT-3.1.2-29	server		If the value of Request Problem Information is 0, the Server MAY return a Reason String or User Properties on a CONNACK or DISCONNECT packet, but MUST NOT send a Reason String or User Properties on any packet other than PUBLISH, CONNACK, or DISCONNECT.
-MQTT-3.1.2-30	unsupported	Enhanced authentication is not supported	If a Client sets an Authentication Method in the CONNECT, the Client MUST NOT send any packets other than AUTH or DISCONNECT packets until it has received a CONNACK packet.
+MQTT-3.1.2-30	client		If a Client sets an Authentication Method in the CONNECT, the Client MUST NOT send any packets other than AUTH or DISCONNECT packets until it has received a CONNACK packet.
 MQTT-3.1.3-1	client		The Payload of the CONNECT packet contains one or more length-prefixed fields, whose presence is determined by the flags in the Variable Header. These fields, if present, MUST appear in the order Client Identifier, Will Topic, Will Message, User Name, Password.
 MQTT-3.1.3-2	client		The ClientID MUST be used by Clients and by Servers to identify state that they hold relating to this MQTT Session between the Client and the Server.
 MQTT-3.1.3-3	client		The ClientID MUST be present and is the first field in the CONNECT packet Payload.
@@ -186,9 +186,9 @@ MQTT-3.14.4-1	client		After sending a DISCONNECT packet the sender MUST NOT send
 MQTT-3.14.4-2	client		After sending a DISCONNECT packet the sender MUST close the Network Connection.
 MQTT-3.14.4-3	server		On receipt of DISCONNECT with a Reason Code of 0x00 (Success) the Server MUST discard any Will Message associated with the current Connection without publishing it.
 MQTT-3.15.1-1	client		Bits 3,2,1 and 0 of the Fixed Header of the AUTH packet are reserved and MUST all be set to 0. The Client or Server MUST treat any other value as malformed and close the Network Connection.
-MQTT-3.15.2-1	unsupported	Enhanced authentication is not supported	The sender of the AUTH Packet MUST use one of the Authenticate Reason Codes.
-MQTT-3.15.2-2	unsupported	Enhanced authentication is not supported	The sender MUST NOT send this property if it would increase the size of the AUTH packet beyond the Maximum Packet Size specified by the receiver
-MQTT-3.15.2-3	unsupported	Enhanced authentication is not supported	The sender MUST NOT send this property if it would increase the size of the AUTH packet beyond the Maximum Packet Size specified by the receiver.
+MQTT-3.15.2-1	client		The sender of the AUTH Packet MUST use one of the Authenticate Reason Codes.
+MQTT-3.15.2-2	client		The sender MUST NOT send this property if it would increase the size of the AUTH packet beyond the Maximum Packet Size specified by the receiver
+MQTT-3.15.2-3	client		The sender MUST NOT send this property if it would increase the size of the AUTH packet beyond the Maximum Packet Size specified by the receiver.
 MQTT-4.1.0-1	client		The Client and Server MUST NOT discard the Session State while the Network Connection is open.
 MQTT-4.2.0-1	client		A Client or Server MUST support the use of one or more underlying transport protocols that provide an ordered, lossless, stream of bytes from the Client to Server and Server to Client.
 MQTT-4.1.0-2	server		The Server MUST discard the Session State when the Network Connection is closed and the Session Expiry Interval has passed.
@@ -240,13 +240,13 @@ MQTT-4.9.0-2	client		Each time the Client or Server sends a PUBLISH packet at Qo
 MQTT-4.9.0-3	client		The Client and Server MUST continue to process and respond to all other MQTT Control Packets even if the quota is zero.
 MQTT-4.12.0-1	server		If the Server does not support the Authentication Method supplied by the Client, it MAY send a CONNACK with a Reason Code of 0x8C (Bad authentication method) or 0x87 (Not Authorized) as described in section 4.13 and MUST close the Network Connection.
 MQTT-4.12.0-2	server		If the Server requires additional information to complete the authorization, it can send an AUTH packet to the Client. This packet MUST contain a Reason Code of 0x18 (Continue authentication).
-MQTT-4.12.0-3	unsupported	Enhanced authentication is not supported	The Client responds to an AUTH packet from the Server by sending a further AUTH packet. This packet MUST contain a Reason Code of 0x18 (Continue authentication).
+MQTT-4.12.0-3	client		The Client responds to an AUTH packet from the Server by sending a further AUTH packet. This packet MUST contain a Reason Code of 0x18 (Continue authentication).
 MQTT-4.12.0-4	server		The Server can reject the authentication at any point in this process. It MAY send a CONNACK with a Reason Code of 0x80 or above as described in section 4.13, and MUST close the Network Connection.
-MQTT-4.12.0-5	unsupported	Enhanced authentication is not supported	If the initial CONNECT packet included an Authentication Method property then all AUTH packets, and any successful CONNACK packet MUST include an Authentication Method Property with the same value as in the CONNECT packet.
+MQTT-4.12.0-5	client		If the initial CONNECT packet included an Authentication Method property then all AUTH packets, and any successful CONNACK packet MUST include an Authentication Method Property with the same value as in the CONNECT packet.
 MQTT-4.12.0-6	server		If the Client does not include an Authentication Method in the CONNECT, the Server MUST NOT send an AUTH packet, and it MUST NOT send an Authentication Method in the CONNACK packet.
 MQTT-4.12.0-7	client		If the Client does not include an Authentication Method in the CONNECT, the Client MUST NOT send an AUTH packet to the Server.
-MQTT-4.12.1-1	unsupported	Enhanced authentication is not supported	If the Client supplied an Authentication Method in the CONNECT packet it can initiate a re-authentication at any time after receiving a CONNACK. It does this by sending an AUTH packet with a Reason Code of 0x19 (Re-authentication). The Client MUST set the Authentication Method to the same value as the Authentication Method originally used to authenticate the Network Connection.
-MQTT-4.12.1-2	unsupported	Enhanced authentication is not supported	If the re-authentication fails, the Client or Server SHOULD send DISCONNECT with an appropriate Reason Code and MUST close the Network Connection.
+MQTT-4.12.1-1	client		If the Client supplied an Authentication Method in the CONNECT packet it can initiate a re-authentication at any time after receiving a CONNACK. It does this by sending an AUTH packet with a Reason Code of 0x19 (Re-authentication). The Client MUST set the Authentication Method to the same value as the Authentication Method originally used to authenticate the Network Connection.
+MQTT-4.12.1-2	client		If the re-authentication fails, the Client or Server SHOULD send DISCONNECT with an appropriate Reason Code and MUST close the Network Connection.
 MQTT-4.13.1-1	server		When a Server detects a Malformed Packet or Protocol Error, and a Reason Code is given in the specification, it MUST close the Network Connection.
 MQTT-4.13.2-1	client		The CONNACK and DISCONNECT packets allow a Reason Code of 0x80 or greater to indicate that the Network Connection will be closed. If a Reason Code of 0x80 or greater is specified, then the Network Connection MUST be closed whether or not the CONNACK or DISCONNECT is sent.
 MQTT-6.0.0-1	client		MQTT Control Packets MUST be sent in WebSocket binary data frames. If any other type of data frame is received the recipient MUST close the Network Connection.

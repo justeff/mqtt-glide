@@ -1,4 +1,4 @@
-//! Broker integration tests (Mosquitto via testcontainers).
+//! Broker integration tests (Mosquitto, HiveMQ CE and EMQX via testcontainers).
 //!
 //! Mosquitto integration: CONNECT/CONNACK, disconnect, auth failure, shared subscribe,
 //! QoS1, keep-alive / reconnect / SessionPhase, User Properties, Message Expiry, shutdown.
@@ -7,6 +7,7 @@
 //! When Docker is unavailable, Mosquitto helpers return `None` and each test early-returns
 //! (see `skipping brokers test: docker unavailable`) instead of panicking.
 
+mod emqx;
 mod helpers;
 mod hivemq;
 mod tls;

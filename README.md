@@ -135,7 +135,7 @@ Mocking the client only proves your code called a function. With the `testing` f
 - Clean drain: graceful shutdown without reaching into crate internals, and no "acked but not forwarded" window.
 - Spec-backed: every normative statement of [OASIS MQTT 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html) is listed in [`CONFORMANCE.md`](CONFORMANCE.md) with its scope for a client and the tests that check it. The page is generated from the `[MQTT-x.y.z-n]` references in the tests, and CI fails when it goes stale.
 - Fuzzed: the codec is fuzzed with arbitrary broker input in arbitrary read sizes ([`fuzz/`](fuzz/README.md)).
-- Auth stays outside: a `CredentialsProvider` hook is the whole story. No OAuth or token manager lives in this crate.
+- Auth stays outside: a `CredentialsProvider` hook for username and password, an `Authenticator` for enhanced authentication (SCRAM, Kerberos, a broker's own scheme). No OAuth, token manager or SASL mechanism lives in this crate.
 
 Non-goals are deliberate rather than unfinished; the [feature matrix](#feature-matrix) lists them.
 
@@ -380,6 +380,7 @@ If the broker refuses a restored filter (for example after an ACL change), the c
 | Trait / helper | Role |
 |----------------|------|
 | `CredentialsProvider` | Async `credentials()` before each `CONNECT`; `invalidate()` on CONNECT-level `NotAuthorized` only |
+| `Authenticator` | Enhanced authentication (§4.12): `method()`, async `start()` per `CONNECT` and per re-authentication, an `AuthExchange` answering each broker challenge (`respond`) and checking the broker's final data (`finish`); `invalidate()` like the credentials. See [Enhanced authentication](#enhanced-authentication) |
 | `ReconnectPolicy` | `delay_after(outcome) -> Option<Duration>` (`None` = stop). The outcome of a broker `DISCONNECT` or refused `CONNACK` includes the broker's Reason String (and Server Reference). Ready-made: `StandardReconnectPolicy` + `mark_live()` |
 | `LifecycleHook` | Sync `Connected` / `Disconnected` side effects on the driver task; keep short (no await). `ClientBuilder` already waits for the first `Connected`. For async waits use the [`SessionPhase`](https://docs.rs/mqtt-glide/latest/mqtt_glide/enum.SessionPhase.html) watch (`client.session_phase()`, any client) and `client.is_connected()` for a snapshot |
 | `InboundSink` | Injectable inbound handoff; built-ins: `tokio::mpsc`, `OnInboundSink` (`.on_inbound`), `flume` (feature). Custom sinks **MUST** be cancel-safe |
@@ -412,6 +413,43 @@ let client = ClientBuilder::new("mqtts://broker.internal:8883")?
 
 PEM given as bytes is checked when the `TlsConfig` is built (`TlsConfigError`); files are checked when they are read.
 
+### Enhanced authentication
+
+For brokers that authenticate in a challenge / response exchange (SCRAM, Kerberos, a scheme of their own) instead of, or besides, username and password. The crate runs the exchange; the mechanism is yours, behind `Authenticator` and `AuthExchange`:
+
+```rust,no_run
+# use bytes::Bytes;
+# use mqtt_glide::{AuthError, AuthExchange, Authenticator};
+# struct Scram;
+# struct ScramExchange;
+# impl Authenticator for Scram {
+#     type Exchange = ScramExchange;
+#     fn method(&self) -> &str { "SCRAM-SHA-256" }
+#     async fn start(&self) -> Result<(ScramExchange, Option<Bytes>), AuthError> { Ok((ScramExchange, None)) }
+# }
+# impl AuthExchange for ScramExchange {
+#     async fn respond(&mut self, _: Option<Bytes>) -> Result<Option<Bytes>, AuthError> { Ok(None) }
+# }
+# async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+use mqtt_glide::ClientBuilder;
+
+let client = ClientBuilder::new("mqtts://broker.internal:8883")?
+    .authenticator(Scram)
+    .discard_inbound()
+    .connect()
+    .await?;
+
+// Later, for example before a token runs out: a fresh exchange on the open connection.
+client.reauthenticate().await?;
+# Ok(())
+# }
+```
+
+- **CONNECT:** carries `method()` and the data from `start()`. Each AUTH 0x18 challenge goes to `respond`, whose answer goes back as AUTH 0x18; nothing else is sent before the CONNACK. The CONNACK's data goes to `finish`, where a method like SCRAM checks the broker's signature. The whole exchange counts against `connect_timeout`.
+- **Re-authentication:** `reauthenticate()` sends AUTH 0x19 and runs the same exchange next to the normal traffic: publishes, acknowledgements and inbound messages keep flowing. Answers are due within `ack_timeout`.
+- **Failures:** a broker refusal (CONNACK or DISCONNECT 0x87 / 0x8C) is `AuthError::NotAuthorized` and calls `invalidate()`. The authenticator failing or distrusting the broker sends DISCONNECT 0x80 and closes the connection; the reconnect policy decides what follows, and the next connection authenticates afresh. Only a failing `start()` during a re-authentication leaves the connection alone, since nothing was sent yet.
+- **Testing:** `TestBroker::enhanced_auth(method, |request| AuthStep::…)` scripts the broker side, re-authentication included. The crate's own broker tests run SCRAM-SHA-256 against EMQX, in the CONNECT and in a re-authentication.
+
 ### Examples
 
 Broader flows live under [`examples/`](examples/) and are the better starting point than copying README snippets. Run any of them with `cargo run --example <name>`; they connect to `MQTT_GLIDE_BROKER` (default `mqtt://127.0.0.1:1883`).
@@ -439,6 +477,7 @@ Broader flows live under [`examples/`](examples/) and are the better starting po
 | Inbound QoS 1 `PUBACK` | n/a | Only after successful `InboundSink` push; custom `send` **MUST** be cancel-safe |
 | Readiness | n/a | `ClientBuilder::connect` waits for the first `Connected` (`wait_connected`, default `true`); the low-level `connect` returns a `SessionPhase` watch instead. Use the hook or the watch for side effects, not both |
 | `CredentialsProvider::invalidate` | no-op | `CONNECT`-level `NotAuthorized` only (never `SUBACK` ACL) |
+| `Authenticator::invalidate` | no-op | Same rule as `CredentialsProvider::invalidate` |
 
 `StandardReconnectPolicy::mark_live()`: call once the session is fully ready (typically after subscriptions succeed). The next transport failure then retries immediately (`Duration::ZERO`) once, before falling back to the configured delay; only if the session lasted at least that delay, so a broker that drops every connection right away is not dialled in a loop. Auth failures use the normal delay, then `max_auth_backoff` after a streak (`DEFAULT_AUTH_FAILURE_THRESHOLD`). Credential cache clearing is `CredentialsProvider::invalidate`, not this policy.
 
@@ -490,7 +529,7 @@ assert!(broker.wait_for_subscription("lights", "cmd/+", WAIT).await);
 
 The two helpers:
 
-- `testing::TestBroker`: an in-process MQTT 5 broker on a free local port. It routes between its clients (wildcards, retained messages, Wills, `$share` groups, No Local), records what clients publish (`received`, `wait_for_publishes`), shows who is connected and subscribed (`connected_clients`, `subscriptions`, `wait_for_connects`, `wait_for_subscription`), injects messages (`publish`), and simulates trouble: `drop_client` / `drop_connections` (network cut), `disconnect_all(reason)`, `refuse_connections(reason)`, `reject_publishes(reason)`, `ack_publishes(|publish| PubAck::new(..).reason_string(..))` (a chosen PUBACK per message: 0x10 No Matching Subscribers, a Reason String, User Properties), `refuse_subscription(filter, reason)`, `withhold_pubacks(true)` (PUBACKs lost on the way, so the client resends with DUP). Sessions work like on a real broker: a client with a Session Expiry Interval resumes its subscriptions, gets unacknowledged deliveries again with DUP and the QoS 1 messages that arrived while it was away (`has_session(client_id)`; `ReceivedPublish::dup` shows resends). A client that asks for Response Information gets `responses/<client id>`. It is a test double, not a broker to run: sessions live in memory only, and there is no authentication or QoS 2.
+- `testing::TestBroker`: an in-process MQTT 5 broker on a free local port. It routes between its clients (wildcards, retained messages, Wills, `$share` groups, No Local), records what clients publish (`received`, `wait_for_publishes`), shows who is connected and subscribed (`connected_clients`, `subscriptions`, `wait_for_connects`, `wait_for_subscription`), injects messages (`publish`), and simulates trouble: `drop_client` / `drop_connections` (network cut), `disconnect_all(reason)`, `refuse_connections(reason)`, `reject_publishes(reason)`, `ack_publishes(|publish| PubAck::new(..).reason_string(..))` (a chosen PUBACK per message: 0x10 No Matching Subscribers, a Reason String, User Properties), `refuse_subscription(filter, reason)`, `withhold_pubacks(true)` (PUBACKs lost on the way, so the client resends with DUP). Sessions work like on a real broker: a client with a Session Expiry Interval resumes its subscriptions, gets unacknowledged deliveries again with DUP and the QoS 1 messages that arrived while it was away (`has_session(client_id)`; `ReceivedPublish::dup` shows resends). A client that asks for Response Information gets `responses/<client id>`; `enhanced_auth(method, |request| AuthStep::…)` scripts enhanced authentication, re-authentication included. It is a test double, not a broker to run: sessions live in memory only, username and password are not checked, and there is no QoS 2.
 - `testing::FaultProxy`: a TCP proxy in front of any broker (the `TestBroker` or a real one) that adds latency, stalls silently, splits packets at arbitrary bytes, resets connections or refuses new ones, switched at runtime.
 
 The `TestBroker` checks your service, not mqtt-glide: it shares the crate's codec, so it cannot catch the crate's own misreadings of the spec. That is what the tests against real brokers and [`CONFORMANCE.md`](CONFORMANCE.md) are for.
@@ -548,7 +587,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | Test helpers (`TestBroker`, `FaultProxy`) | ✅ opt-in | `testing` feature; see [Testing your application](#testing-your-application) |
 | HTTP proxy (`CONNECT` tunnel) | ✅ opt-in | `ConnectOptions::http_proxy(HttpProxy::parse("http://user:pass@proxy:3128")?)`; TLS / WebSocket run end to end through the tunnel; Basic auth optional. Not read from `HTTP(S)_PROXY`. SOCKS not supported |
 | Server redirection (§4.11) | ✅ opt-in | `follow_server_redirects(true)`: CONNACK / DISCONNECT 0x9C (Use another server, next connection only) or 0x9D (Server moved, for good) with a Server Reference reconnects there at once; scheme, TLS and WebSocket path stay, at most five redirects in a row. Off: reported in the outcome |
-| Enhanced AUTH (`AUTH` packets, re-authentication) | ❌ | Not implemented; `CredentialsProvider` covers username/password only |
+| Enhanced AUTH (`AUTH` packets, re-authentication) | ✅ opt-in | `Authenticator` / `AuthExchange` run the challenge / response exchange in CONNECT; `client.reauthenticate()` on the open connection. The mechanism (SCRAM, Kerberos, …) is the application's; SCRAM-SHA-256 tested against EMQX |
 | WebSockets | ✅ opt-in | `websocket` feature: `ws://host[:port]/path` / `wss://…` (subprotocol `mqtt`, binary frames, §6). `wss` uses the same rustls setup as `mqtts`. Without the feature such URLs fail to parse |
 | Topic Alias | ✅ opt-in | Inbound: `topic_alias_maximum(n)`, resolved before delivery. Outbound: `outbound_topic_aliases(n)`, capped by the broker's maximum, LRU rebinding. Per connection, reset on reconnect |
 | QoS 2 | ❌ | Rejected at the API (no 4-way handshake / store-and-forward) |

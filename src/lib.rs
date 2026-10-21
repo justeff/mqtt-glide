@@ -38,6 +38,7 @@ compile_error!("features `tls-rustls-aws-lc` and `tls-rustls-ring` are mutually 
 compile_error!("enable exactly one of `tls-rustls-aws-lc` or `tls-rustls-ring`");
 
 mod ack;
+mod auth;
 pub mod builder;
 mod client;
 // The wire layer is internal; `__internals` opens it for the crate's own tests, benches
@@ -77,6 +78,7 @@ pub use ack::{
     Delivery, PublishError, PublishRejection, PublishResponse, RefusedSubscription, SubscribeResponse,
     UnsubscribeResponse,
 };
+pub use auth::{AuthExchange, Authenticator};
 pub use codec::{
     ConnectAckReason, DEFAULT_MAX_PACKET_SIZE, DisconnectReasonCode, InboundMessage, Properties, PublishAckReason,
     PublishMessage, PublishProperties, QoS, RetainHandling, SubscribeAckReason, SubscriptionOptions, UnknownCode,

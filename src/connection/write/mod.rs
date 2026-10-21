@@ -952,6 +952,28 @@ where
                             }
                         }
                     }
+                    Some(ControlMessage::Auth(auth)) => {
+                        if let Err(outcome) = send_packet(&mut framed, Packet::Auth(*auth), flush_abort).await {
+                            return finish_hot_path_write_outcome(
+                                &mut framed,
+                                GracefulDisconnectCtx {
+                                    control_rx: &mut control_rx,
+                                    waiters: &mut waiters,
+                                    publish_waiters: &mut publish_waiters,
+                                    inflight: &mut inflight,
+                                    flush_budget: graceful_disconnect_timeout,
+                                    command_rx,
+                                    publish_limits,
+                                    subscription_registry: &subscription_registry,
+                                    generation,
+                                    read_stop: &read_stop,
+                                },
+                                read_done,
+                                outcome,
+                            )
+                            .await;
+                        }
+                    }
                     #[cfg(test)]
                     Some(ControlMessage::StubExitRead) => {}
                     None => {

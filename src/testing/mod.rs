@@ -7,13 +7,14 @@
 //!   reject them, or lose the PUBACKs) or drop every connection. A client that connects with
 //!   a Session Expiry Interval keeps its session across connections: subscriptions,
 //!   unacknowledged deliveries (resent with DUP) and QoS 1 messages that arrived meanwhile.
-//!   A client that asks for Response Information gets `responses/<client id>`.
+//!   A client that asks for Response Information gets `responses/<client id>`, and
+//!   [`TestBroker::enhanced_auth`] scripts enhanced authentication (also re-authentication).
 //! - [`FaultProxy`]: a TCP proxy in front of any broker that injects network faults on demand
 //!   (latency, a silent stall, packets split at arbitrary bytes, connection resets, refused
 //!   connects).
 //!
 //! The broker is for tests, not production: sessions live in memory only (gone with the
-//! broker), no authentication, no QoS 2, and no Subscription Identifiers on delivered
+//! broker), no checks of username and password, no QoS 2, and no Subscription Identifiers on delivered
 //! messages. Shared subscriptions deliver to their connected members only.
 //!
 //! # Examples
@@ -39,5 +40,5 @@
 mod broker;
 mod fault_proxy;
 
-pub use broker::{PubAck, ReceivedPublish, TestBroker};
+pub use broker::{AuthRequest, AuthStep, PubAck, ReceivedPublish, TestBroker};
 pub use fault_proxy::FaultProxy;

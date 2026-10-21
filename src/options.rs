@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use nonzero_ext::nonzero;
 
+use crate::auth::{Authenticator, SharedAuthenticator};
 use crate::codec::{DEFAULT_MAX_PACKET_SIZE, QoS, WillMessage};
 use crate::tls::TlsConfig;
 use crate::util::{BrokerUrl, ClientId, HttpProxy};
@@ -163,6 +164,9 @@ pub struct ConnectOptions {
     ///
     /// Default `None`: connect directly. Not read from `HTTP(S)_PROXY`; set it explicitly.
     pub http_proxy: Option<HttpProxy>,
+    /// Enhanced authentication (§4.12); see [`Self::authenticator`]. Default `None`: CONNECT
+    /// carries no Authentication Method.
+    pub(crate) authenticator: Option<SharedAuthenticator>,
     /// Counter incremented when the write task feeds an inbound QoS-1 PUBACK; set only by the
     /// benches (`__bench` feature). Does not change enqueue-before-ack semantics.
     pub(crate) bench_inbound_publish_ack_counter: Option<Arc<AtomicUsize>>,
@@ -198,6 +202,7 @@ impl ConnectOptions {
             http_proxy: None,
             topic_alias_maximum: 0,
             outbound_topic_aliases: 0,
+            authenticator: None,
             bench_inbound_publish_ack_counter: None,
         }
     }
@@ -235,6 +240,15 @@ impl ConnectOptions {
     /// Sets [`Self::http_proxy`].
     pub fn http_proxy(mut self, proxy: HttpProxy) -> Self {
         self.http_proxy = Some(proxy);
+        self
+    }
+
+    /// Authenticates with `authenticator` (enhanced authentication, §4.12): every CONNECT
+    /// carries its method and runs its challenge / response exchange, and
+    /// [`MqttClient::reauthenticate`](crate::MqttClient::reauthenticate) can run one on the open
+    /// connection. The method is checked when connecting (non-empty UTF-8 without U+0000).
+    pub fn authenticator(mut self, authenticator: impl Authenticator + 'static) -> Self {
+        self.authenticator = Some(SharedAuthenticator::new(authenticator));
         self
     }
 

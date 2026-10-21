@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytestring::ByteString;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf, split};
 use tokio::net::{TcpSocket, TcpStream};
@@ -18,9 +19,12 @@ use super::handshake::{
 };
 use super::redirect::ServerRedirect;
 use super::subscriptions::refuse_packet;
+use crate::auth::check_auth_data;
 use crate::client::SharedCredentials;
 use crate::codec::v5::ToReasonCode;
-use crate::codec::{ConnectAck, DecodeError, DecodedFrame, DisconnectReasonCode, Packet, V5Codec};
+use crate::codec::{
+    Auth, AuthReasonCode, ConnectAck, DecodeError, DecodedFrame, DisconnectReasonCode, Packet, V5Codec,
+};
 use crate::error::{ConnectionOutcome, ProtocolError, TransportError};
 use crate::options::ConnectOptions;
 use crate::tls::TlsConfig;
@@ -29,7 +33,8 @@ type TlsIo = TlsStream<TcpStream>;
 #[cfg(feature = "websocket")]
 type WsIo<S> = super::websocket::WsByteStream<S>;
 
-/// CONNECT/CONNACK on already-split transport halves.
+/// CONNECT/CONNACK on already-split transport halves, with the enhanced authentication
+/// exchange in between when an [`Authenticator`](crate::Authenticator) is set (§4.12).
 ///
 /// A CONNACK that redirects (§4.11) leaves its target in `redirect`.
 pub(crate) async fn establish_session_on<R, W>(
@@ -47,39 +52,141 @@ where
     let (read_codec, write_codec) = distinct_v5_codecs_for_framed_halves(options.max_packet_size.get());
     let mut framed_read = FramedRead::new(read_half, read_codec);
     let mut framed_write = FramedWrite::new(write_half, write_codec);
+    let authenticator = options.authenticator.as_ref();
+    let auth_failed = |outcome| on_auth_failure(credentials, authenticator, outcome);
 
     let (username, password) = match credentials.credentials().await {
         Ok(pair) => pair,
-        Err(error) => {
-            let outcome = ConnectionOutcome::Auth(error);
-            return Err(on_auth_failure(credentials, outcome).await);
-        }
+        Err(error) => return Err(auth_failed(ConnectionOutcome::Auth(error)).await),
     };
 
     let connect_credentials = ConnectCredentials { username, password };
     let client_id = resolve_client_id_str(options);
-    let connect = build_connect(options, &client_id, &connect_credentials);
+    let mut connect = build_connect(options, &client_id, &connect_credentials);
+    let mut exchange = match authenticator {
+        Some(authenticator) => match within_connect(deadline, options, authenticator.start()).await? {
+            Ok((exchange, data)) => {
+                if let Err(error) = check_auth_data(&data) {
+                    return Err(auth_failed(ConnectionOutcome::Auth(error)).await);
+                }
+                connect.auth_method = Some(authenticator.method().clone());
+                connect.auth_data = data;
+                Some(exchange)
+            }
+            Err(error) => return Err(auth_failed(ConnectionOutcome::Auth(error)).await),
+        },
+        None => None,
+    };
 
     framed_write
         .send(Packet::Connect(Box::new(connect)))
         .await
         .map_err(map_connect_send_error)?;
 
-    let ack = match read_connack(&mut framed_read, deadline, options.connect_timeout).await {
-        Ok(ack) => ack,
-        Err((outcome, None)) => return Err(outcome),
-        Err((outcome, Some(reason))) => return Err(refuse_packet(&mut framed_write, reason, outcome).await),
-    };
-    match apply_connack(options.keep_alive, &ack) {
-        Ok(session) => {
-            apply_session_limits_to_codecs(&mut framed_write, &session);
-            Ok((framed_read, framed_write, session))
+    let ack = loop {
+        let challenge = match read_connack(&mut framed_read, deadline, options.connect_timeout).await {
+            Ok(HandshakePacket::ConnectAck(ack)) => break ack,
+            Ok(HandshakePacket::Auth(auth)) => auth,
+            Err((outcome, None)) => return Err(outcome),
+            Err((outcome, Some(reason))) => return Err(refuse_packet(&mut framed_write, reason, outcome).await),
+        };
+        // Only AUTH or DISCONNECT may go out before CONNACK ([MQTT-3.1.2-30]).
+        let (Some(authenticator), Some(exchange)) = (authenticator, exchange.as_mut()) else {
+            let outcome = protocol_violation("AUTH before CONNACK without an Authentication Method in CONNECT");
+            return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::ProtocolError, outcome).await);
+        };
+        if let Err(error) = check_broker_auth(&challenge, authenticator.method(), AuthReasonCode::ContinueAuth) {
+            let outcome = ConnectionOutcome::Protocol(error);
+            return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::ProtocolError, outcome).await);
         }
+        let answered = within_connect(deadline, options, exchange.respond(challenge.auth_data)).await?;
+        let data = match answered.and_then(|data| check_auth_data(&data).map(|()| data)) {
+            Ok(data) => data,
+            Err(error) => {
+                let outcome = auth_failed(ConnectionOutcome::Auth(error)).await;
+                return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::UnspecifiedError, outcome).await);
+            }
+        };
+        // [MQTT-4.12.0-3] Continue authentication, [MQTT-4.12.0-5] with the CONNECT's method.
+        let answer = Auth {
+            reason_code: AuthReasonCode::ContinueAuth,
+            auth_method: Some(authenticator.method().clone()),
+            auth_data: data,
+            ..Auth::default()
+        };
+        framed_write
+            .send(Packet::Auth(answer))
+            .await
+            .map_err(map_connect_send_error)?;
+    };
+    let session = match apply_connack(options.keep_alive, &ack) {
+        Ok(session) => session,
         Err(outcome) => {
             *redirect = ServerRedirect::from_connack(&ack);
-            Err(on_auth_failure(credentials, outcome).await)
+            return Err(auth_failed(outcome).await);
+        }
+    };
+    if let (Some(authenticator), Some(mut exchange)) = (authenticator, exchange) {
+        if ack
+            .auth_method
+            .as_ref()
+            .is_some_and(|method| method != authenticator.method())
+        {
+            let outcome = protocol_violation("CONNACK Authentication Method differs from CONNECT ([MQTT-4.12.0-5])");
+            return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::ProtocolError, outcome).await);
+        }
+        if let Err(error) = within_connect(deadline, options, exchange.finish(ack.auth_data)).await? {
+            let outcome = auth_failed(ConnectionOutcome::Auth(error)).await;
+            return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::UnspecifiedError, outcome).await);
         }
     }
+    apply_session_limits_to_codecs(&mut framed_write, &session);
+    Ok((framed_read, framed_write, session))
+}
+
+/// An [`Authenticator`](crate::Authenticator) step of the CONNECT exchange, bounded by the
+/// connect budget like the rest of the handshake.
+async fn within_connect<T>(
+    deadline: Instant,
+    options: &ConnectOptions,
+    step: impl Future<Output = T>,
+) -> Result<T, ConnectionOutcome> {
+    timeout_at(tokio::time::Instant::from_std(deadline), step)
+        .await
+        .map_err(|_| {
+            ConnectionOutcome::Transport(TransportError::Connection(format!(
+                "enhanced authentication timed out after {:?}",
+                options.connect_timeout
+            )))
+        })
+}
+
+/// A broker AUTH must carry the expected reason and the CONNECT's method ([MQTT-4.12.0-5]).
+pub(crate) fn check_broker_auth(
+    auth: &Auth,
+    method: &ByteString,
+    expected: AuthReasonCode,
+) -> Result<(), ProtocolError> {
+    if auth.reason_code != expected {
+        return Err(ProtocolError::Violation(format!(
+            "broker AUTH with reason {:?} where {expected:?} belongs",
+            auth.reason_code
+        )));
+    }
+    // Only a Success without properties may leave the method out (§3.15.2.1).
+    match &auth.auth_method {
+        Some(received) if received != method => Err(ProtocolError::Violation(
+            "broker AUTH Authentication Method differs from CONNECT ([MQTT-4.12.0-5])".into(),
+        )),
+        None if expected != AuthReasonCode::Success => Err(ProtocolError::Violation(
+            "broker AUTH without Authentication Method".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn protocol_violation(message: &str) -> ConnectionOutcome {
+    ConnectionOutcome::Protocol(ProtocolError::Violation(message.into()))
 }
 
 /// Applies the broker Maximum Packet Size from CONNACK to the **outbound** encoder only.
@@ -242,9 +349,15 @@ async fn tls_connect(
     }
 }
 
-/// The CONNACK, or why there is none: with the DISCONNECT reason when the broker sent a
-/// packet that is broken or has no place before CONNACK.
-type ConnackRead = Result<ConnectAck, (ConnectionOutcome, Option<DisconnectReasonCode>)>;
+/// What may come before the session: the CONNACK, or an AUTH of the exchange (§4.12).
+enum HandshakePacket {
+    ConnectAck(ConnectAck),
+    Auth(Auth),
+}
+
+/// The next handshake packet, or why there is none: with the DISCONNECT reason when the
+/// broker sent a packet that is broken or has no place before CONNACK.
+type ConnackRead = Result<HandshakePacket, (ConnectionOutcome, Option<DisconnectReasonCode>)>;
 
 async fn read_connack<R>(
     framed_read: &mut FramedRead<R, V5Codec>,
@@ -280,7 +393,8 @@ where
         ))
     };
     match framed_read.next().await {
-        Some(Ok((DecodedFrame::Control(Packet::ConnectAck(ack)), _wire_len))) => Ok(*ack),
+        Some(Ok((DecodedFrame::Control(Packet::ConnectAck(ack)), _wire_len))) => Ok(HandshakePacket::ConnectAck(*ack)),
+        Some(Ok((DecodedFrame::Control(Packet::Auth(auth)), _wire_len))) => Ok(HandshakePacket::Auth(auth)),
         Some(Ok((DecodedFrame::Control(other), _))) => unexpected(format!("{:?}", other.packet_type())),
         Some(Ok((DecodedFrame::Publish(_), _))) => unexpected("PUBLISH".into()),
         Some(Err(DecodeError::Io(message))) => Err((

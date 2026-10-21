@@ -1131,6 +1131,7 @@ fn test_channels() -> (
         lifecycle: Arc::new(NoopLifecycle),
         connected: Arc::default(),
         response_router: Arc::default(),
+        reauth: None,
         stats: Default::default(),
         refused_subscriptions: watch::channel(Vec::new()).0,
         read_stub_exit_tx,
