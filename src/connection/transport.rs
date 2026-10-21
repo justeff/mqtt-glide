@@ -1,11 +1,13 @@
 //! TCP/TLS dial and framed CONNECT/CONNACK handshake.
 
+use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf, split};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::time::timeout_at;
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -106,7 +108,8 @@ pub(crate) async fn open_tcp(options: &ConnectOptions, deadline: Instant) -> Res
         Some(proxy) => (proxy.host(), proxy.port()),
         None => (host, port),
     };
-    let mut stream = match timeout_at(tokio::time::Instant::from_std(deadline), TcpStream::connect(addr)).await {
+    let dial = connect_tcp(addr.0, addr.1, options);
+    let mut stream = match timeout_at(tokio::time::Instant::from_std(deadline), dial).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {
             return Err(ConnectionOutcome::Transport(TransportError::Connection(
@@ -142,6 +145,38 @@ pub(crate) async fn open_tcp(options: &ConnectOptions, deadline: Instant) -> Res
     }
 
     Ok(stream)
+}
+
+/// [`TcpStream::connect`] with the socket options that must be set before the handshake:
+/// tries each resolved address in turn and reports the last error.
+async fn connect_tcp(host: &str, port: u16, options: &ConnectOptions) -> io::Result<TcpStream> {
+    let mut last_error = None;
+    for addr in tokio::net::lookup_host((host, port)).await? {
+        match tcp_socket(addr, options) {
+            Ok(socket) => match socket.connect(addr).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) => last_error = Some(error),
+            },
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "could not resolve to any address")))
+}
+
+/// An unconnected socket for `addr` with the configured send / receive buffer sizes.
+fn tcp_socket(addr: SocketAddr, options: &ConnectOptions) -> io::Result<TcpSocket> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    if let Some(bytes) = options.tcp_send_buffer_size {
+        socket.set_send_buffer_size(bytes.get())?;
+    }
+    if let Some(bytes) = options.tcp_recv_buffer_size {
+        socket.set_recv_buffer_size(bytes.get())?;
+    }
+    Ok(socket)
 }
 
 /// TCP, split into owned halves.
@@ -401,6 +436,45 @@ mod tests {
             }
             other => panic!("expected Transport TCP timeout, got {other:?}"),
         }
+    }
+
+    /// The configured buffer sizes are on the socket before it connects (the kernel may round
+    /// them up: Linux doubles them).
+    #[test]
+    fn tcp_socket_applies_buffer_sizes() {
+        use nonzero_ext::nonzero;
+
+        let url = BrokerUrl::parse("mqtt://127.0.0.1:1883").expect("valid");
+        let default = ConnectOptions::new(url.clone());
+        let tuned = ConnectOptions::new(url)
+            .tcp_send_buffer_size(nonzero!(48_000u32))
+            .tcp_recv_buffer_size(nonzero!(96_000u32));
+        let addr: SocketAddr = "127.0.0.1:1883".parse().expect("addr");
+
+        let socket = tcp_socket(addr, &tuned).expect("socket");
+        assert!(socket.send_buffer_size().expect("SO_SNDBUF") >= 48_000);
+        assert!(socket.recv_buffer_size().expect("SO_RCVBUF") >= 96_000);
+        tcp_socket(addr, &default).expect("socket without buffer sizes");
+    }
+
+    /// A broker reached with buffer sizes set behaves like any other.
+    #[tokio::test]
+    async fn open_tcp_connects_with_buffer_sizes() {
+        use nonzero_ext::nonzero;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let accept = tokio::spawn(async move { listener.accept().await.expect("accept") });
+        let url = BrokerUrl::parse(&format!("mqtt://localhost:{port}")).expect("valid");
+        let options = ConnectOptions::new(url)
+            .tcp_send_buffer_size(nonzero!(32_768u32))
+            .tcp_recv_buffer_size(nonzero!(32_768u32));
+        let stream = open_tcp(&options, Instant::now() + options.connect_timeout)
+            .await
+            .expect("tcp");
+        let (server, _) = accept.await.expect("join accept");
+        assert_eq!(stream.peer_addr().expect("peer"), server.local_addr().expect("local"));
     }
 
     #[tokio::test]

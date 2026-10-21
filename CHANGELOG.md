@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ConnectOptions::tcp_send_buffer_size` / `tcp_recv_buffer_size` set `SO_SNDBUF` / `SO_RCVBUF` before the TCP handshake, for links where the operating system's default limits throughput (a long round trip, say). Unset, nothing changes
+
 ## [0.4.0] - 2026-10-19
 
 ### Changed (breaking)

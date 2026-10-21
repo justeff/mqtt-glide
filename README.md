@@ -542,7 +542,7 @@ Legend: ✅ supported · ⚠️ partial / deferred · ❌ not implemented (open 
 | Subscription identifiers | ✅ | `subscribe_with_id(id, filters)`; inbound `InboundMessage::subscription_ids`; kept across resubscribe; refused when CONNACK says unsupported |
 | Request/response | ✅ | `client.requester(response_topic)` → `request(topic, payload).await` resolves with the response (correlation handled, responses bypass the inbound sink, `ResponseTimeout`); `Publish::reply_to(&request, payload)` on the answering side. CONNECT Request Response Information not requested |
 | Will message (`CONNECT`) | ✅ | `.will(topic, payload)` (+ `.will_qos` / `.will_retain`); QoS 0\|1; power: `WillMessage` |
-| Optional `SO_SNDBUF` / `SO_RCVBUF` | ⚠️ | OS defaults today |
+| Socket buffers (`SO_SNDBUF` / `SO_RCVBUF`) | ✅ opt-in | `ConnectOptions::tcp_send_buffer_size` / `tcp_recv_buffer_size`, set before the TCP handshake; unset, the OS default (with its autotuning) applies |
 | Broker diagnostics (Reason String, User Properties) | ✅ | Passed through on `PUBACK` rejections (`PublishRejection`), `SUBACK` / `UNSUBACK` (`SubscribeResponse` / `UnsubscribeResponse`), and in the outcome of a broker `DISCONNECT` / refused `CONNACK`. The client's own outbound `DISCONNECT` carries no reason string |
 | Client counters (`MqttClient::stats`) | ✅ opt-in | `stats` feature; see [Metrics](#metrics). No dependencies, no metrics system chosen for you |
 | Test helpers (`TestBroker`, `FaultProxy`) | ✅ opt-in | `testing` feature; see [Testing your application](#testing-your-application) |

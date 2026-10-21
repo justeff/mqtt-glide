@@ -76,6 +76,19 @@ pub struct ConnectOptions {
     pub session_expiry: Option<Duration>,
     /// Whether `TCP_NODELAY` is enabled on the underlying socket.
     pub tcp_nodelay: bool,
+    /// Socket send buffer (`SO_SNDBUF`) in bytes, set before connecting. `None` (default)
+    /// keeps the operating system's default.
+    ///
+    /// On Linux a fixed size turns off the kernel's buffer autotuning for the socket, and the
+    /// kernel doubles the value and caps it at `net.core.wmem_max`. Set it only when the
+    /// default measurably limits throughput, for example on a link with a long round trip.
+    pub tcp_send_buffer_size: Option<NonZeroU32>,
+    /// Socket receive buffer (`SO_RCVBUF`) in bytes, set before connecting so the TCP window
+    /// scale is negotiated for it. `None` (default) keeps the operating system's default.
+    ///
+    /// On Linux a fixed size turns off receive buffer autotuning for the socket, and the
+    /// kernel doubles the value and caps it at `net.core.rmem_max`.
+    pub tcp_recv_buffer_size: Option<NonZeroU32>,
     /// TLS settings; set, they turn on TLS even for an `mqtt://` / `ws://` URL. `None` with an
     /// `mqtts://` / `wss://` URL means [`TlsConfig::system_roots`].
     pub tls: Option<TlsConfig>,
@@ -162,6 +175,8 @@ impl ConnectOptions {
             clean_start: true,
             session_expiry: None,
             tcp_nodelay: true,
+            tcp_send_buffer_size: None,
+            tcp_recv_buffer_size: None,
             tls: None,
             ack_timeout: DEFAULT_ACK_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -276,6 +291,18 @@ impl ConnectOptions {
         self
     }
 
+    /// Sets [`Self::tcp_send_buffer_size`] (`SO_SNDBUF`).
+    pub fn tcp_send_buffer_size(mut self, bytes: NonZeroU32) -> Self {
+        self.tcp_send_buffer_size = Some(bytes);
+        self
+    }
+
+    /// Sets [`Self::tcp_recv_buffer_size`] (`SO_RCVBUF`).
+    pub fn tcp_recv_buffer_size(mut self, bytes: NonZeroU32) -> Self {
+        self.tcp_recv_buffer_size = Some(bytes);
+        self
+    }
+
     /// Connects over TLS with these settings: custom CA, client certificate, ALPN, server name.
     ///
     /// Turns on TLS even for an `mqtt://` / `ws://` URL.
@@ -384,6 +411,8 @@ mod tests {
         assert_eq!(options.keep_alive, Duration::from_secs(60));
         assert!(options.clean_start);
         assert!(options.tcp_nodelay);
+        assert!(options.tcp_send_buffer_size.is_none());
+        assert!(options.tcp_recv_buffer_size.is_none());
         assert!(options.session_expiry.is_none());
         assert!(options.tls.is_none());
         assert!(options.will_message.is_none());
@@ -416,8 +445,12 @@ mod tests {
             .ack_timeout(Duration::from_millis(50))
             .connect_timeout(Duration::from_millis(25))
             .graceful_disconnect_timeout(Duration::from_millis(100))
-            .command_channel_capacity(command_channel_capacity);
+            .command_channel_capacity(command_channel_capacity)
+            .tcp_send_buffer_size(nonzero!(65_536u32))
+            .tcp_recv_buffer_size(nonzero!(131_072u32));
         assert_eq!(options.receive_maximum, receive_maximum);
+        assert_eq!(options.tcp_send_buffer_size, Some(nonzero!(65_536u32)));
+        assert_eq!(options.tcp_recv_buffer_size, Some(nonzero!(131_072u32)));
         assert_eq!(options.ack_timeout, Duration::from_millis(50));
         assert_eq!(options.connect_timeout, Duration::from_millis(25));
         assert_eq!(options.graceful_disconnect_timeout, Duration::from_millis(100));
