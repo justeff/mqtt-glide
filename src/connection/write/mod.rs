@@ -41,9 +41,8 @@ use self::commands::{
     CommandDispatch, CommandDispatchCtx, dispatch_client_command, resend_carried, send_parked_publishes,
 };
 use self::io::{
-    ControlCoalesceCtx, FlushAbort, GracefulDisconnectCtx, drain_ready_control_coalesce, feed_inbound_publish_ack,
-    flush_writes, graceful_disconnect, handle_deferred_control, send_broker_violation_disconnect, send_packet,
-    send_pending_protocol_disconnect,
+    ControlCoalesceCtx, FlushAbort, GracefulDisconnectCtx, coalesce_ready_control_and_flush, feed_inbound_publish_ack,
+    flush_writes, graceful_disconnect, send_broker_violation_disconnect, send_packet, send_pending_protocol_disconnect,
 };
 use self::keepalive::keep_alive_ping_timer;
 
@@ -387,8 +386,6 @@ pub(crate) struct WriteSession {
     pub max_qos: QoS,
     /// Broker Retain Available from CONNACK ([MQTT-3.2.2-14]).
     pub retain_available: bool,
-    /// Client Receive Maximum from CONNECT (inbound QoS1 window / adaptive coalesce).
-    pub receive_maximum: NonZeroU16,
     /// Read-task flag: true while blocked on a full handoff (keepalive watchdog exception).
     pub handoff_stalled: Arc<AtomicBool>,
     /// Read-task flag: set on any decoded inbound frame (keepalive liveness).
@@ -452,7 +449,6 @@ where
     let mut restore = restore::RestoreRetry::new(&subscription_registry, session.ack_timeout);
     let mut awaiting_pingresp = false;
     let generation = session.generation;
-    let receive_maximum = session.receive_maximum;
     let publish_limits = BrokerPublishLimits {
         max_qos: session.max_qos,
         retain_available: session.retain_available,
@@ -825,6 +821,46 @@ where
                             ack_generation,
                             ack,
                         );
+                        // With publishes parked behind the broker's Receive Maximum, each PUBACK
+                        // frees a slot for one of them. Take the PUBACKs that are already queued
+                        // first, so the freed slots go out in one write instead of one each.
+                        if publish_waiters.waiting_for_window() > 0
+                            && let Err(outcome) = coalesce_ready_control_and_flush(
+                                &mut ControlCoalesceCtx {
+                                    framed: &mut framed,
+                                    control_rx: &mut control_rx,
+                                    command_rx,
+                                    waiters: &mut waiters,
+                                    publish_waiters: &mut publish_waiters,
+                                    inflight: &mut inflight,
+                                    subscription_registry: &subscription_registry,
+                                    generation,
+                                    inbound_publish_ack_counter: inbound_publish_ack_counter.as_ref(),
+                                    flush_abort,
+                                },
+                                0,
+                            )
+                            .await
+                        {
+                            return finish_hot_path_write_outcome(
+                                &mut framed,
+                                GracefulDisconnectCtx {
+                                    control_rx: &mut control_rx,
+                                    waiters: &mut waiters,
+                                    publish_waiters: &mut publish_waiters,
+                                    inflight: &mut inflight,
+                                    flush_budget: graceful_disconnect_timeout,
+                                    command_rx,
+                                    publish_limits,
+                                    subscription_registry: &subscription_registry,
+                                    generation,
+                                    read_stop: &read_stop,
+                                },
+                                read_done,
+                                outcome,
+                            )
+                            .await;
+                        }
                     }
                     Some(ControlMessage::AckInboundPublish { packet_id }) => {
                         if let Err(outcome) =
@@ -837,7 +873,7 @@ where
                                 outcome,
                             );
                         }
-                        match drain_ready_control_coalesce(
+                        if let Err(outcome) = coalesce_ready_control_and_flush(
                             &mut ControlCoalesceCtx {
                                 framed: &mut framed,
                                 control_rx: &mut control_rx,
@@ -847,7 +883,6 @@ where
                                 inflight: &mut inflight,
                                 subscription_registry: &subscription_registry,
                                 generation,
-                                receive_maximum,
                                 inbound_publish_ack_counter: inbound_publish_ack_counter.as_ref(),
                                 flush_abort,
                             },
@@ -855,101 +890,24 @@ where
                         )
                         .await
                         {
-                            Ok(None) => {
-                                if let Err(outcome) = flush_writes(&mut framed, flush_abort).await {
-                                    return finish_hot_path_write_outcome(
-                                        &mut framed,
-                                        GracefulDisconnectCtx {
-                                            control_rx: &mut control_rx,
-                                            waiters: &mut waiters,
-                                            publish_waiters: &mut publish_waiters,
-                                            inflight: &mut inflight,
-                                            flush_budget: graceful_disconnect_timeout,
-                                            command_rx,
-                                            publish_limits,
-                                            subscription_registry: &subscription_registry,
-                                            generation,
-                                            read_stop: &read_stop,
-                                        },
-                                        read_done,
-                                        outcome,
-                                    )
-                                    .await;
-                                }
-                            }
-                            Ok(Some(deferred)) => {
-                                if let Err(outcome) = flush_writes(&mut framed, flush_abort).await {
-                                    return finish_hot_path_write_outcome(
-                                        &mut framed,
-                                        GracefulDisconnectCtx {
-                                            control_rx: &mut control_rx,
-                                            waiters: &mut waiters,
-                                            publish_waiters: &mut publish_waiters,
-                                            inflight: &mut inflight,
-                                            flush_budget: graceful_disconnect_timeout,
-                                            command_rx,
-                                            publish_limits,
-                                            subscription_registry: &subscription_registry,
-                                            generation,
-                                            read_stop: &read_stop,
-                                        },
-                                        read_done,
-                                        outcome,
-                                    )
-                                    .await;
-                                }
-                                // Deferred non-coalesceable control (PING / DISCONNECT / …).
-                                match handle_deferred_control(
-                                    deferred,
-                                    &mut framed,
-                                    flush_abort,
-                                    inbound_publish_ack_counter.as_ref(),
-                                )
-                                .await
-                                {
-                                    None => {}
-                                    Some(outcome) => {
-                                        return finish_hot_path_write_outcome(
-                                            &mut framed,
-                                            GracefulDisconnectCtx {
-                                                control_rx: &mut control_rx,
-                                                waiters: &mut waiters,
-                                                publish_waiters: &mut publish_waiters,
-                                                inflight: &mut inflight,
-                                                flush_budget: graceful_disconnect_timeout,
-                                                command_rx,
-                                                publish_limits,
-                                                subscription_registry: &subscription_registry,
-                                                generation,
-                                                read_stop: &read_stop,
-                                            },
-                                            read_done,
-                                            outcome,
-                                        )
-                                        .await;
-                                    }
-                                }
-                            }
-                            Err(outcome) => {
-                                return finish_hot_path_write_outcome(
-                                    &mut framed,
-                                    GracefulDisconnectCtx {
-                                        control_rx: &mut control_rx,
-                                        waiters: &mut waiters,
-                                        publish_waiters: &mut publish_waiters,
-                                        inflight: &mut inflight,
-                                        flush_budget: graceful_disconnect_timeout,
-                                        command_rx,
-                                        publish_limits,
-                                        subscription_registry: &subscription_registry,
-                                        generation,
-                                        read_stop: &read_stop,
-                                    },
-                                    read_done,
-                                    outcome,
-                                )
-                                .await;
-                            }
+                            return finish_hot_path_write_outcome(
+                                &mut framed,
+                                GracefulDisconnectCtx {
+                                    control_rx: &mut control_rx,
+                                    waiters: &mut waiters,
+                                    publish_waiters: &mut publish_waiters,
+                                    inflight: &mut inflight,
+                                    flush_budget: graceful_disconnect_timeout,
+                                    command_rx,
+                                    publish_limits,
+                                    subscription_registry: &subscription_registry,
+                                    generation,
+                                    read_stop: &read_stop,
+                                },
+                                read_done,
+                                outcome,
+                            )
+                            .await;
                         }
                     }
                     Some(ControlMessage::Auth(auth)) => {
@@ -1062,7 +1020,6 @@ where
                         publish_waiters: &mut publish_waiters,
                         inflight: &mut inflight,
                         publish_limits,
-                        receive_maximum,
                         flush_abort,
                         subscription_identifiers_available,
                     },

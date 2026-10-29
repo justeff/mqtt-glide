@@ -18,7 +18,7 @@ use crate::codec::{
 use crate::connection::packet_id::InflightPots;
 use crate::connection::subscriptions::SubscriptionRegistry;
 use crate::connection::{
-    ClientCommand, CommandReceiver, ControlMessage, ControlReceiver, Generation, StopSignal, effective_io_batch,
+    ClientCommand, CommandReceiver, ControlMessage, ControlReceiver, Generation, StopSignal, io_batch,
 };
 use crate::error::{AppError, ProtocolError, TransportError};
 
@@ -386,7 +386,6 @@ where
     pub(super) inflight: &'a mut InflightPots,
     pub(super) subscription_registry: &'a Arc<RwLock<SubscriptionRegistry>>,
     pub(super) generation: Generation,
-    pub(super) receive_maximum: NonZeroU16,
     pub(super) inbound_publish_ack_counter: Option<&'a Arc<AtomicUsize>>,
     pub(super) flush_abort: FlushAbort<'a>,
 }
@@ -401,7 +400,7 @@ pub(super) async fn drain_ready_control_coalesce<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let batch = effective_io_batch(ctx.receive_maximum, !ctx.command_rx.is_empty());
+    let batch = io_batch(!ctx.command_rx.is_empty());
     for _ in 0..MAX_READY_DRAIN {
         if fed_publish_acks >= batch {
             break;
@@ -454,6 +453,30 @@ where
         }
     }
     Ok(None)
+}
+
+/// [`drain_ready_control_coalesce`], then one flush for everything it fed, then the
+/// non-coalesceable message it ran into, if any.
+pub(super) async fn coalesce_ready_control_and_flush<W>(
+    ctx: &mut ControlCoalesceCtx<'_, W>,
+    fed_publish_acks: usize,
+) -> Result<(), WriteOutcome>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let deferred = drain_ready_control_coalesce(ctx, fed_publish_acks).await?;
+    flush_writes(ctx.framed, ctx.flush_abort).await?;
+    match deferred {
+        // Deferred non-coalesceable control (PING / DISCONNECT / ...).
+        Some(deferred) => {
+            match handle_deferred_control(deferred, ctx.framed, ctx.flush_abort, ctx.inbound_publish_ack_counter).await
+            {
+                Some(outcome) => Err(outcome),
+                None => Ok(()),
+            }
+        }
+        None => Ok(()),
+    }
 }
 
 /// Handles a control message that could not be coalesced with inbound PUBACKs.

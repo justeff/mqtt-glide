@@ -1,7 +1,5 @@
 //! Application command dispatch: publish / subscribe / unsubscribe.
 
-use std::num::NonZeroU16;
-
 use bytestring::ByteString;
 use futures_util::SinkExt;
 use tokio::io::AsyncWrite;
@@ -13,9 +11,10 @@ use crate::codec::{
     EncodeError, Packet, PublishDelivery, PublishMessage, QoS, Subscribe, SubscriptionOptions, Unsubscribe, V5Codec,
     topic_filter_bytes_invalid,
 };
+use crate::connection::io_batch::MAX_IO_BATCH;
 use crate::connection::packet_id::InflightPots;
 use crate::connection::{
-    ClientCommand, CommandReceiver, PublishReply, SubscribeReply, UnsubscribeReply, effective_io_batch,
+    ClientCommand, CommandReceiver, PublishReply, SubscribeReply, UnsubscribeReply,
     validate_publish_against_broker_limits,
 };
 use crate::error::AppError;
@@ -39,7 +38,6 @@ where
     pub(super) publish_waiters: &'a mut PublishWaiters,
     pub(super) inflight: &'a mut InflightPots,
     pub(super) publish_limits: BrokerPublishLimits,
-    pub(super) receive_maximum: NonZeroU16,
     pub(super) flush_abort: FlushAbort<'a>,
     /// CONNACK Subscription Identifiers Available.
     pub(super) subscription_identifiers_available: bool,
@@ -211,9 +209,10 @@ pub(super) async fn drain_ready_publishes<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    // Competing work for outbound coalesce: subscribe waiters / control backlog are less
-    // relevant here — use false so publish bursts can fill the adaptive window.
-    let batch = effective_io_batch(ctx.receive_maximum, false);
+    // Not sized from Receive Maximum: that is the *inbound* window, which says nothing about how
+    // many outbound publishes may share a write. The drain never awaits except for the soft
+    // flush, so the cap only bounds how long control and keep-alive wait behind a burst.
+    let batch = MAX_IO_BATCH;
     for _ in 0..MAX_READY_DRAIN {
         // Full parked queue: leave further commands in the bounded channel.
         if fed_publishes >= batch || ctx.publish_waiters.parked_full() {

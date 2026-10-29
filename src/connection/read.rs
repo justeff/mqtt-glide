@@ -1,6 +1,5 @@
 //! Read task: decode frames; control inline; PUBLISH → injectable handoff.
 
-use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -12,7 +11,7 @@ use tokio_util::codec::FramedRead;
 use crate::codec::v5::ToReasonCode;
 use crate::codec::{DecodeError, DecodedFrame, DisconnectReasonCode, InboundMessage, Packet, PublishPacket, V5Codec};
 use crate::connection::reauth::{self, Reauth};
-use crate::connection::{ControlMessage, Generation, StopSignal, effective_io_batch, inbound_publish_policy};
+use crate::connection::{ControlMessage, Generation, StopSignal, inbound_publish_policy, io_batch};
 use crate::error::{ProtocolError, TransportError};
 use crate::inbound_sink::{InboundSink, InboundTrySendError};
 
@@ -48,8 +47,6 @@ pub(crate) struct ReadSession {
     pub stop: StopSignal,
     /// Connection generation for stale PUBACK discard.
     pub generation: Generation,
-    /// Client Receive Maximum from CONNECT (adaptive buffered-frame burst).
-    pub receive_maximum: NonZeroU16,
     /// Set while the read task is blocked on a full handoff — keepalive watchdog must not fire.
     pub handoff_stalled: Arc<AtomicBool>,
     /// Set on any successfully decoded inbound frame (clears the ping watchdog).
@@ -149,7 +146,7 @@ where
     let cancel = session.cancel;
     let shutdown_notify = session.stop;
     let generation = session.generation;
-    let read_burst = effective_io_batch(session.receive_maximum, false);
+    let read_burst = io_batch(false);
     let handoff_stalled = session.handoff_stalled;
     let inbound_activity = session.inbound_activity;
     let mut topic_aliases = session.topic_aliases;

@@ -19,7 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Publishes waiting for room in the broker's Receive Maximum go out in one write when several PUBACKs arrive together, instead of one write per PUBACK. Matters against brokers with a small window, such as Mosquitto's default of 20
 - Ack timeouts of waiting publishes are tracked by one deadline task per connection instead of a Tokio timer per publish. Many concurrent publishes no longer contend on the runtime's timer lock. A timeout can fire up to about one millisecond late
+- Outbound publish coalescing is capped at a fixed 64 publishes per write instead of a share of the client's inbound Receive Maximum, so small inbound windows no longer split publish bursts into many small writes
+- Inbound frames read in one burst and inbound PUBACKs sent in one write are likewise capped at a fixed 64 instead of an eighth of the client's Receive Maximum. At the old default of 32 every burst of ready PUBACKs went out four per write
 
 ## [0.4.0] - 2026-10-19
 

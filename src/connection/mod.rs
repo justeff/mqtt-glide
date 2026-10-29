@@ -53,7 +53,7 @@ pub(crate) use channels::{
 pub use handshake::SessionParams;
 pub(crate) use handshake::validate_will_message;
 pub(crate) use handshake::{TlsMode, resolve_tls_mode};
-pub(crate) use io_batch::effective_io_batch;
+pub(crate) use io_batch::io_batch;
 pub use lifecycle::{LifecycleHook, NoopLifecycle, SessionPhase};
 pub(crate) use session_policy::{inbound_publish_policy, validate_publish_against_broker_limits};
 pub(crate) use state::{ConnectionState, Generation};
@@ -567,7 +567,6 @@ impl<H: InboundSink> Connection<H> {
                 cancel: read_cancel.clone(),
                 stop: read_stop.clone(),
                 generation,
-                receive_maximum: self.options.receive_maximum,
                 handoff_stalled: Arc::clone(&handoff_stalled),
                 inbound_activity: Arc::clone(&inbound_activity),
                 topic_aliases: inbound_topic_aliases,
@@ -604,7 +603,6 @@ impl<H: InboundSink> Connection<H> {
             graceful_disconnect_timeout: self.options.graceful_disconnect_timeout,
             max_qos,
             retain_available,
-            receive_maximum: self.options.receive_maximum,
             handoff_stalled,
             inbound_activity,
             bench_inbound_publish_ack_counter: self.options.bench_inbound_publish_ack_counter.clone(),

@@ -14,7 +14,6 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use bytestring::ByteString;
 use futures_util::StreamExt;
-use nonzero_ext::nonzero;
 use rstest::rstest;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -92,7 +91,6 @@ where
             stats: Default::default(),
             reauth: None,
             generation: Generation(1),
-            receive_maximum: nonzero!(8u16),
             handoff_stalled: Arc::clone(&handoff_stalled),
             inbound_activity: Arc::clone(&inbound_activity),
         },
@@ -145,7 +143,6 @@ where
         graceful_disconnect_timeout: Duration::from_millis(200),
         max_qos: QoS::AtLeastOnce,
         retain_available: true,
-        receive_maximum: nonzero!(8u16),
         handoff_stalled: Arc::new(AtomicBool::new(false)),
         inbound_activity: Arc::new(AtomicBool::new(false)),
         bench_inbound_publish_ack_counter: None,

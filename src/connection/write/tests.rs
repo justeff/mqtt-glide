@@ -39,7 +39,6 @@ struct WriteTaskHandle {
 struct WriteSessionOverrides {
     max_qos: QoS,
     retain_available: bool,
-    receive_maximum: NonZeroU16,
     inflight_capacity: NonZeroU16,
 }
 
@@ -48,7 +47,6 @@ impl Default for WriteSessionOverrides {
         Self {
             max_qos: QoS::AtLeastOnce,
             retain_available: true,
-            receive_maximum: nonzero!(1024u16),
             inflight_capacity: nonzero!(4u16),
         }
     }
@@ -88,7 +86,6 @@ where
         graceful_disconnect_timeout: Duration::from_secs(2),
         max_qos: overrides.max_qos,
         retain_available: overrides.retain_available,
-        receive_maximum: overrides.receive_maximum,
         handoff_stalled: Arc::new(AtomicBool::new(false)),
         inbound_activity: Arc::new(AtomicBool::new(false)),
         bench_inbound_publish_ack_counter: None,
@@ -157,7 +154,6 @@ async fn timed_out_subscribe_keeps_waiter_until_suback() {
     let harness = spawn_write_task(
         framed,
         WriteSessionOverrides {
-            receive_maximum: nonzero!(8u16),
             inflight_capacity: nonzero!(8u16),
             ..Default::default()
         },
@@ -675,7 +671,6 @@ async fn cancelled_qos1_publish_keeps_packet_id_until_puback() {
     let harness = spawn_write_task(
         framed,
         WriteSessionOverrides {
-            receive_maximum: nonzero!(1u16),
             inflight_capacity: nonzero!(1u16),
             ..Default::default()
         },
@@ -786,7 +781,6 @@ async fn closed_publish_reply_before_encode_skips_packet_id_alloc() {
     let harness = spawn_write_task(
         framed,
         WriteSessionOverrides {
-            receive_maximum: nonzero!(1u16),
             inflight_capacity: nonzero!(1u16),
             ..Default::default()
         },
@@ -1081,6 +1075,136 @@ async fn full_parked_queue_leaves_commands_in_the_channel() {
         replies.iter_mut().all(|reply| reply.try_recv().is_err()),
         "nothing is answered while the window stays full"
     );
+
+    drop(harness.command_tx);
+    drop(harness.control_tx);
+    harness.cancel.cancel();
+    let _ = timeout(Duration::from_secs(2), harness.join).await;
+    let _ = timeout(Duration::from_secs(2), peer).await;
+}
+
+/// Counts the `poll_write` calls that reach the transport.
+struct CountingWriter<W> {
+    inner: W,
+    writes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for CountingWriter<W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// PUBACKs that are already queued are all taken before the publishes parked behind the
+/// broker's Receive Maximum go out, so the freed slots share one write instead of one each.
+#[tokio::test]
+async fn queued_pubacks_send_the_parked_publishes_in_one_write() {
+    use crate::codec::{DecodedFrame, PublishAck};
+
+    const WINDOW: u16 = 4;
+    let (task_end, peer_end) = tokio::io::duplex(64 * 1024);
+    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let framed = FramedWrite::new(
+        CountingWriter {
+            inner: task_end,
+            writes: Arc::clone(&writes),
+        },
+        V5Codec::with_max_packet_size(0),
+    );
+    let (wired_tx, mut wired_rx) = mpsc::unbounded_channel::<NonZeroU16>();
+    let peer = tokio::spawn(async move {
+        let mut framed = FramedRead::new(peer_end, V5Codec::with_max_packet_size(0));
+        while let Some(Ok((frame, _))) = framed.next().await {
+            if let DecodedFrame::Publish(p) = frame {
+                let _ = wired_tx.send(p.meta.packet_id.expect("QoS1 packet id"));
+            }
+        }
+    });
+    let harness = spawn_write_task(
+        framed,
+        WriteSessionOverrides {
+            inflight_capacity: NonZeroU16::new(WINDOW).expect("nz"),
+            ..Default::default()
+        },
+    );
+
+    // A full window and as many publishes parked behind it.
+    let mut replies = Vec::new();
+    for _ in 0..2 * WINDOW {
+        let (tx, ticket) = publish_reply(true);
+        replies.push(ticket.rx);
+        let command = ClientCommand::Publish {
+            message: PublishMessage {
+                topic: ByteString::from_static("t/window"),
+                payload: Bytes::from_static(b"x"),
+                properties: Default::default(),
+            },
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            reply: tx,
+        };
+        harness.command_tx.send(command).await.expect("publish command");
+    }
+    let mut in_flight = Vec::new();
+    for _ in 0..WINDOW {
+        let id = timeout(Duration::from_secs(2), wired_rx.recv())
+            .await
+            .expect("wire timeout")
+            .expect("wired packet id");
+        in_flight.push(id);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(wired_rx.try_recv().is_err(), "the rest waits for the window");
+
+    // All PUBACKs are queued before the write task looks at the first one.
+    let before = writes.load(Ordering::Relaxed);
+    for packet_id in in_flight {
+        harness
+            .control_tx
+            .try_send(ControlMessage::PublishAck {
+                ack: PublishAck {
+                    packet_id,
+                    reason_code: PublishAckReason::Success,
+                    properties: Vec::new(),
+                    reason_string: None,
+                },
+                generation: Generation(1),
+            })
+            .expect("puback");
+    }
+    for _ in 0..WINDOW {
+        timeout(Duration::from_secs(2), wired_rx.recv())
+            .await
+            .expect("parked publish must reach the wire")
+            .expect("wired packet id");
+    }
+    assert_eq!(
+        writes.load(Ordering::Relaxed) - before,
+        1,
+        "one write for the freed window"
+    );
+    for reply in &mut replies[..usize::from(WINDOW)] {
+        assert!(matches!(reply.try_recv(), Ok(Ok(_))), "acknowledged publish completes");
+    }
 
     drop(harness.command_tx);
     drop(harness.control_tx);
