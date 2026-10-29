@@ -1,5 +1,6 @@
 //! Connection coordinator: `run()`, state machine, channels, task supervision.
 
+mod ack_deadlines;
 mod channels;
 mod handshake;
 mod io_batch;
@@ -41,6 +42,7 @@ use crate::options::ConnectOptions;
 
 #[cfg(test)]
 pub(crate) use crate::options::COMMAND_CHANNEL_CAPACITY;
+pub(crate) use ack_deadlines::AckDeadlines;
 #[cfg(test)]
 use channels::CONTROL_CHANNEL_CAPACITY;
 pub(crate) use channels::control_channel_capacity;
@@ -146,6 +148,15 @@ impl<H: InboundSink> ConnectionChannels<H> {
     }
 }
 
+/// Aborts a task when dropped.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// I/O driver: connect, read/write tasks, reconnect until shutdown.
 pub struct Connection<H: InboundSink = tokio::sync::mpsc::Sender<crate::codec::InboundMessage>> {
     options: ConnectOptions,
@@ -155,6 +166,8 @@ pub struct Connection<H: InboundSink = tokio::sync::mpsc::Sender<crate::codec::I
     cancel: CancellationToken,
     /// Priority graceful-shutdown notify shared with [`crate::MqttClient`].
     shutdown_notify: CancellationToken,
+    /// Acknowledgement timeouts of the client's publishes, swept while [`Self::run`] runs.
+    ack_deadlines: AckDeadlines,
     generation: Generation,
     state: ConnectionState,
     /// Publish vs subscribe/unsubscribe Packet-ID pots.
@@ -193,6 +206,7 @@ impl<H: InboundSink> Connection<H> {
         channels: ConnectionChannels<H>,
         cancel: CancellationToken,
         shutdown_notify: CancellationToken,
+        ack_deadlines: AckDeadlines,
     ) -> Self {
         let inflight = packet_id::InflightPots::new(options.receive_maximum);
         let resumable = !options.clean_start && handshake::session_expiry_secs(options.session_expiry) > 0;
@@ -207,6 +221,7 @@ impl<H: InboundSink> Connection<H> {
             channels,
             cancel,
             shutdown_notify,
+            ack_deadlines,
             generation: Generation(0),
             state: ConnectionState::Stopped,
             inflight,
@@ -308,6 +323,8 @@ impl<H: InboundSink> Connection<H> {
     /// The outcome that made the driver stop on its own: the broker refused the credentials,
     /// or the [`ReconnectPolicy`] gave up after a transport or protocol failure.
     pub async fn run(mut self) -> Result<(), ConnectionOutcome> {
+        // Stops with the driver, however it ends (returned or dropped).
+        let _sweeper = AbortOnDrop(tokio::spawn(self.ack_deadlines.sweep()));
         loop {
             if self.cancel.is_cancelled() {
                 self.state = ConnectionState::Stopped;

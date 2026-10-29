@@ -16,8 +16,8 @@ use zeroize::Zeroizing;
 
 use crate::codec::{QoS, RetainHandling, SubscriptionOptions};
 use crate::connection::{
-    Abandoned, ClientCommand, CommandSender, Connection, ConnectionChannels, LifecycleHook, PublishTicket,
-    SessionPhase, control_channel_capacity, publish_reply,
+    Abandoned, AckDeadlines, ClientCommand, CommandSender, Connection, ConnectionChannels, LifecycleHook,
+    PublishTicket, SessionPhase, control_channel_capacity, publish_reply,
 };
 use crate::error::{AppError, AuthError, ConnectError, ConnectionOutcome};
 use crate::inbound_sink::InboundSink;
@@ -306,6 +306,7 @@ impl SharedCredentials {
 pub struct PublishCompletion {
     ticket: PublishTicket,
     ack_timeout: Option<Duration>,
+    ack_deadlines: AckDeadlines,
 }
 
 impl PublishCompletion {
@@ -332,31 +333,54 @@ impl PublishCompletion {
         self,
         ack_timeout: Option<Duration>,
     ) -> Result<crate::ack::PublishResponse, crate::ack::PublishError> {
-        use crate::ack::{Delivery, PublishError};
+        let PublishCompletion {
+            ticket, ack_deadlines, ..
+        } = self;
+        wait_ticket(ticket, ack_timeout, &ack_deadlines).await
+    }
+}
 
-        let PublishCompletion { mut ticket, .. } = self;
-        let received = match ack_timeout {
-            Some(deadline) => match timeout(deadline, &mut ticket.rx).await {
-                Ok(received) => received,
-                Err(_elapsed) => {
+/// Waits for a publish's answer, at most `ack_timeout`.
+async fn wait_ticket(
+    mut ticket: PublishTicket,
+    ack_timeout: Option<Duration>,
+    ack_deadlines: &AckDeadlines,
+) -> Result<crate::ack::PublishResponse, crate::ack::PublishError> {
+    use crate::ack::{Delivery, PublishError};
+
+    // The answer is often there already (the oldest publish of a window): look before starting
+    // the timeout. A pending poll has registered this task's waker, so the awaits below do not
+    // lose the wakeup.
+    let first = std::future::poll_fn(|cx| std::task::Poll::Ready(Pin::new(&mut ticket.rx).poll(cx))).await;
+    let received = match (first, ack_timeout) {
+        (std::task::Poll::Ready(received), _) => received,
+        (std::task::Poll::Pending, Some(limit)) => {
+            // The driver's deadline sweeper while it runs, a runtime timer otherwise.
+            let answer = match ack_deadlines.start(limit) {
+                Some(deadline) => deadline.race(&mut ticket.rx).await.ok(),
+                None => timeout(limit, &mut ticket.rx).await.ok(),
+            };
+            match answer {
+                Some(received) => received,
+                None => {
                     let delivery = match ticket.abandon() {
                         Abandoned::NotWritten => Delivery::NotSent,
                         Abandoned::MaybeWritten => Delivery::Unknown,
                         Abandoned::Completed(result) => return completed(result, &ticket),
                     };
                     return Err(PublishError {
-                        error: AppError::PublishTimeout(deadline),
+                        error: AppError::PublishTimeout(limit),
                         delivery,
                     });
                 }
-            },
-            None => (&mut ticket.rx).await,
-        };
-        match received {
-            Ok(result) => completed(result, &ticket),
-            // The driver dropped the publish without an answer (its task ended).
-            Err(_closed) => completed(Err(AppError::CommandChannelClosed), &ticket),
+            }
         }
+        (std::task::Poll::Pending, None) => (&mut ticket.rx).await,
+    };
+    match received {
+        Ok(result) => completed(result, &ticket),
+        // The driver dropped the publish without an answer (its task ended).
+        Err(_closed) => completed(Err(AppError::CommandChannelClosed), &ticket),
     }
 }
 
@@ -412,6 +436,8 @@ pub struct MqttClient {
     router: Arc<crate::request::ResponseRouter>,
     /// Re-authentication requests to the read task; `None` without an authenticator.
     reauth: Option<mpsc::Sender<crate::connection::reauth::ReauthReply>>,
+    /// Acknowledgement timeouts of publishes, swept by the driver.
+    ack_deadlines: AckDeadlines,
     /// Counters kept by the driver.
     #[cfg(feature = "stats")]
     stats: crate::stats::Stats,
@@ -430,6 +456,7 @@ struct DriverShared {
     refused: watch::Receiver<Vec<crate::RefusedSubscription>>,
     router: Arc<crate::request::ResponseRouter>,
     reauth: Option<mpsc::Sender<crate::connection::reauth::ReauthReply>>,
+    ack_deadlines: AckDeadlines,
     #[cfg(feature = "stats")]
     stats: crate::stats::Stats,
 }
@@ -455,6 +482,7 @@ impl MqttClient {
             refused: shared.refused,
             router: shared.router,
             reauth: shared.reauth,
+            ack_deadlines: shared.ack_deadlines,
             #[cfg(feature = "stats")]
             stats: shared.stats,
         }
@@ -740,15 +768,13 @@ impl MqttClient {
         use crate::ack::PublishError;
 
         // Flat on purpose: one future layer and a sync `try_send` on the hot path.
-        let (command, completion) = self
-            .publish_command(publish, ack_timeout)
-            .map_err(PublishError::not_sent)?;
+        let (command, ticket) = Self::publish_command(publish).map_err(PublishError::not_sent)?;
         if let Some(command) = self.try_send_or_return(command).map_err(PublishError::not_sent)? {
             Box::pin(self.wait_for_room(command))
                 .await
                 .map_err(PublishError::not_sent)?;
         }
-        completion.wait().await
+        wait_ticket(ticket, ack_timeout, &self.ack_deadlines).await
     }
 
     /// Enqueues a PUBLISH without waiting at all and returns its completion handle; the
@@ -772,9 +798,9 @@ impl MqttClient {
         ack_timeout: Option<Duration>,
     ) -> Result<PublishCompletion, crate::ack::PublishError> {
         let enqueue = || {
-            let (command, completion) = self.publish_command(publish, ack_timeout)?;
+            let (command, ticket) = Self::publish_command(publish)?;
             self.try_send_command(command)?;
-            Ok(completion)
+            Ok(self.completion(ticket, ack_timeout))
         };
         enqueue().map_err(crate::ack::PublishError::not_sent)
     }
@@ -799,22 +825,16 @@ impl MqttClient {
     ) -> Result<PublishCompletion, crate::ack::PublishError> {
         use crate::ack::PublishError;
 
-        let (command, completion) = self
-            .publish_command(publish, ack_timeout)
-            .map_err(PublishError::not_sent)?;
+        let (command, ticket) = Self::publish_command(publish).map_err(PublishError::not_sent)?;
         if let Some(command) = self.try_send_or_return(command).map_err(PublishError::not_sent)? {
             Box::pin(self.wait_for_room(command))
                 .await
                 .map_err(PublishError::not_sent)?;
         }
-        Ok(completion)
+        Ok(self.completion(ticket, ack_timeout))
     }
 
-    fn publish_command(
-        &self,
-        publish: Publish,
-        ack_timeout: Option<Duration>,
-    ) -> Result<(ClientCommand, PublishCompletion), AppError> {
+    fn publish_command(publish: Publish) -> Result<(ClientCommand, PublishTicket), AppError> {
         if publish.qos == QoS::ExactlyOnce {
             return Err(AppError::InvalidRequest("QoS 2 publish is not supported".into()));
         }
@@ -825,7 +845,16 @@ impl MqttClient {
             retain: publish.retain,
             reply,
         };
-        Ok((command, PublishCompletion { ticket, ack_timeout }))
+        Ok((command, ticket))
+    }
+
+    /// The handle the caller waits on; [`Self::send_with`] waits on the ticket itself.
+    fn completion(&self, ticket: PublishTicket, ack_timeout: Option<Duration>) -> PublishCompletion {
+        PublishCompletion {
+            ticket,
+            ack_timeout,
+            ack_deadlines: self.ack_deadlines.clone(),
+        }
     }
 
     /// Starts a sliding-window pipeline over [`Self::start_publish`] (no task per message).
@@ -1155,6 +1184,7 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
     let connected = Arc::new(AtomicBool::new(false));
     let router = Arc::new(crate::request::ResponseRouter::default());
     let stats = crate::stats::Stats::default();
+    let ack_deadlines = AckDeadlines::default();
     let client_options = ClientOptions {
         ack_timeout: options.ack_timeout,
         fail_fast_when_disconnected: options.fail_fast_when_disconnected,
@@ -1195,6 +1225,7 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
         channels,
         cancel.clone(),
         shutdown_notify.clone(),
+        ack_deadlines.clone(),
     );
 
     Ok((
@@ -1209,6 +1240,7 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
                 refused: refused_rx,
                 router,
                 reauth: reauth_tx,
+                ack_deadlines,
                 #[cfg(feature = "stats")]
                 stats,
             },

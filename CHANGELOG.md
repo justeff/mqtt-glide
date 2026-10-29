@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ConnectOptions::request_response_information` asks the broker for Response Information (§3.1.2.11.6), a prefix for response topics that the broker allows this client; the answer is `SessionParams::response_information`. `TestBroker` answers with `responses/<client id>`
 - Enhanced authentication (§4.12): an `Authenticator` (`ConnectOptions::authenticator`, `ClientBuilder::authenticator`) runs a challenge / response exchange in AUTH packets for brokers that use SCRAM, Kerberos or a scheme of their own; `AuthExchange::finish` sees the broker's final data, so a method can check the broker too. `MqttClient::reauthenticate` runs a fresh exchange on the open connection while traffic continues (§4.12.1). New errors `AppError::Auth` and `AppError::ReauthenticationTimeout`. `TestBroker::enhanced_auth` scripts the broker side
 
+### Changed
+
+- Ack timeouts of waiting publishes are tracked by one deadline task per connection instead of a Tokio timer per publish. Many concurrent publishes no longer contend on the runtime's timer lock. A timeout can fire up to about one millisecond late
+
 ## [0.4.0] - 2026-10-19
 
 ### Changed (breaking)
