@@ -7,13 +7,14 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use mqtt5::{ConnectOptions, MqttClient, PublishOptions, PublishResult, QoS, SubscribeOptions};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::compare::fixtures::{HANDOFF_CAPACITY, INGRESS_TOPIC, KEEP_ALIVE, OUTBOUND_TOPIC, RECEIVE_MAXIMUM};
+use crate::compare::fixtures::{HANDOFF_CAPACITY, INGRESS_TOPIC, KEEP_ALIVE, OUTBOUND_TOPIC, client_receive_maximum};
 use crate::compare::harness::{
     AckPolicy, BenchClient, BenchQos, ClientCaps, ClientId, IngressSession, OutboundSession, SessionCfg,
 };
-use crate::support::handoff::BenchHandoff;
+use crate::support::handoff::{BenchHandoff, payload_stamp};
 
 /// LabOverWire mqtt5 bench client.
 pub struct Mqtt5Client;
@@ -46,7 +47,7 @@ impl BenchClient for Mqtt5Client {
 }
 
 struct PeerIngress {
-    handoff_rx: flume::Receiver<BenchHandoff>,
+    handoff_rx: mpsc::Receiver<BenchHandoff>,
     handed_off: Arc<AtomicUsize>,
     topic: String,
     client: MqttClient,
@@ -85,7 +86,7 @@ fn peer_connect_options(client_id: &str) -> ConnectOptions {
     ConnectOptions::new(client_id)
         .with_clean_start(true)
         .with_keep_alive(KEEP_ALIVE)
-        .with_receive_maximum(RECEIVE_MAXIMUM.get())
+        .with_receive_maximum(client_receive_maximum().get())
         .with_automatic_reconnect(false)
 }
 
@@ -102,7 +103,7 @@ fn wire_qos(qos: BenchQos) -> QoS {
 
 async fn setup_ingress(cfg: &SessionCfg) -> PeerIngress {
     let topic = format!("{INGRESS_TOPIC}/{}", cfg.client_id);
-    let (handoff_tx, handoff_rx) = flume::bounded(HANDOFF_CAPACITY);
+    let (handoff_tx, handoff_rx) = mpsc::channel(HANDOFF_CAPACITY);
     let handed_off = Arc::new(AtomicUsize::new(0));
     let client = MqttClient::with_options(peer_connect_options(&cfg.client_id));
     client.connect(&broker_url(cfg.port)).await.expect("peer mqtt5 connect");
@@ -115,7 +116,16 @@ async fn setup_ingress(cfg: &SessionCfg) -> PeerIngress {
     client
         .subscribe_with_options(topic.clone(), sub_opts, move |message| {
             let handoff = BenchHandoff::from_peer_mqtt5(&message);
-            if handoff_tx.send(handoff).is_err() {
+            // The callback is synchronous: block this worker on a full handoff like a
+            // blocking channel send would, without stalling the rest of the runtime.
+            let sent = match handoff_tx.try_send(handoff) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(handoff)) => {
+                    tokio::task::block_in_place(|| handoff_tx.blocking_send(handoff)).is_ok()
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            };
+            if !sent {
                 return;
             }
             handed_off_counter.fetch_add(1, Ordering::Relaxed);
@@ -163,13 +173,14 @@ impl IngressSession for PeerIngress {
         self.handed_off.store(0, Ordering::Relaxed);
     }
 
-    fn drain(&self) {
+    fn drain(&mut self) {
         while self.handoff_rx.try_recv().is_ok() {}
     }
 
-    async fn recv_touch(&self) {
-        let msg = self.handoff_rx.recv_async().await.expect("peer mqtt5 handoff");
+    async fn recv_touch(&mut self) -> u64 {
+        let msg = self.handoff_rx.recv().await.expect("peer mqtt5 handoff");
         msg.touch();
+        payload_stamp(&msg.payload)
     }
 
     async fn wait_barrier(&self, target: usize) {

@@ -97,13 +97,13 @@ MQTT_COMPARE_BROKER_CPUS=2-3 MQTT_COMPARE_PUBLISHER_CPUS=2-3 MQTT_COMPARE_RUNS=5
 |---------|------|
 | `mosquitto` | Tuned (`max_inflight_messages 0`, `max_queued_messages 0`, `set_tcp_nodelay`, no persistence / `$SYS` / logs). The published baseline |
 | `mosquitto-stock` | Stock `max_inflight_messages 20` / `max_queued_messages 1000`, i.e. CONNACK Receive Maximum 20. Added because the tuned broker hid problems with a small broker window: mqtt-glide previously failed in this setup for windows wider than 20 (fixed on main) |
-| `mock` | Out-of-process mock MQTT 5 (multi-thread, Arc fanout, `TCP_NODELAY`, inbound PUBLISH counter, `receive_max` 1024). A client-side ceiling, not a broker claim |
+| `mock` | Out-of-process mock MQTT 5 (multi-thread, Arc fanout, `TCP_NODELAY`, inbound PUBLISH counter, `receive_max` 1024, delivery at the lower of publish and subscription QoS, batched delivery writes). A client-side ceiling, not a broker claim |
 
 ## Fairness rules
 
 ### Ingress is always the handoff use case
 
-All ingress cells measure decode → bounded app queue (flume) → drain, never "handle inline in the decode path". Peers are adapted to that shape. QoS 1 `after_enqueue` / `before` only moves PUBACK relative to the handoff.
+All ingress cells measure decode → bounded app queue (`tokio::sync::mpsc`; tables before the switch used flume) → drain, never "handle inline in the decode path". Peers are adapted to that shape. QoS 1 `after_enqueue` / `before` only moves PUBACK relative to the handoff.
 
 ### Outbound: wire counter (mock) vs Mosquitto
 
@@ -457,11 +457,13 @@ Units: p50 / p99 µs.
 
 Units: msg/s · CPU ns/msg.
 
+These cells predate a fix to the bench: the mock delivered every message at QoS 1 regardless of publish QoS and wrote one delivery per syscall, and the QoS 0 publisher wrote one message per syscall. That capped ingress below the client limit; QoS 0 ingress now reaches about 3M msg/s on an Apple M-series laptop for glide and rumqttc alike. Re-run before quoting.
+
 #### QoS 0
 
 | Payload | glide | rumqttc | mqtt5 |
 |---:|---:|---:|---:|
-| 256 B | 366 516 · 2 450 | **422 390** · **2 212** | 302 788 · 3 138 |
+| 256 B | 366 516 · 2 450 | **422 390** · **2 212** | 302 788 · 3 138 |
 
 #### QoS 1 · `after_enqueue`
 

@@ -9,13 +9,14 @@ mod compare;
 mod support;
 
 use compare::fixtures::{
-    GLIDE_VERSION, LOAD_WINDOW, PEER_MQTT5_VERSION, PEER_RUMQTTC_VERSION, bench_runs, child_cpus, load_messages,
-    parse_clients, parse_concurrency, parse_rates, rate_secs,
+    GLIDE_VERSION, LOAD_WINDOW, PEER_MQTT5_VERSION, PEER_RUMQTTC_VERSION, bench_runs, child_cpus,
+    client_receive_maximum, ingress_window, load_messages, mock_receive_maximum, parse_clients, parse_concurrency,
+    parse_ingress_rates, parse_rates, rate_secs,
 };
 use compare::report::{ResultWriter, RunMeta, output_dir};
 use compare::run::MatrixCtx;
 use compare::{build_matrix, execute_matrix};
-use support::broker::bench_broker_backend;
+use support::broker::{BenchBrokerBackend, bench_broker_backend};
 use tokio::runtime::Runtime;
 
 fn host_label() -> String {
@@ -64,6 +65,11 @@ fn main() {
         runs: bench_runs(),
         load_messages: load_messages(),
         load_window: LOAD_WINDOW,
+        ingress_window: ingress_window(),
+        client_receive_max: client_receive_maximum().get(),
+        mock_receive_max: (bench_broker_backend() == BenchBrokerBackend::Mock).then(|| mock_receive_maximum().get()),
+        worker_threads: std::env::var("TOKIO_WORKER_THREADS").ok(),
+        ingress_rates: parse_ingress_rates(),
         concurrency: parse_concurrency(),
         rates: parse_rates(),
         rate_secs: rate_secs(),
@@ -88,16 +94,25 @@ fn main() {
     );
     eprintln!("  cells: {}", cells.len());
     eprintln!("  runs (median-of): {}", bench_runs());
+    eprintln!(
+        "  client RM {}, ingress window {}",
+        client_receive_maximum(),
+        ingress_window()
+    );
 
-    rt.block_on(execute_matrix(
-        MatrixCtx {
-            port: broker.port(),
-            backend: bench_broker_backend(),
-            mock_stats: broker.mock_stats(),
-        },
-        &clients,
-        &cells,
-        &writer,
-    ));
-    eprintln!("done — results in {}", writer.dir().display());
+    let ctx = MatrixCtx {
+        port: broker.port(),
+        backend: bench_broker_backend(),
+        mock_stats: broker.mock_stats(),
+    };
+    let dir = writer.dir().to_path_buf();
+    // On a worker, like an application's own tasks: `block_on` would run the harness (the
+    // ingress consumer, the outbound drivers) on this non-worker thread, and every message it
+    // waits for would cost the client a futex wake-up that no real consumer task causes.
+    rt.block_on(async move {
+        tokio::spawn(async move { execute_matrix(ctx, &clients, &cells, &writer).await })
+            .await
+            .expect("matrix task");
+    });
+    eprintln!("done — results in {}", dir.display());
 }

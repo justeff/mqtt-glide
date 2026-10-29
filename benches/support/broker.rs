@@ -3,7 +3,7 @@
 use std::process::{Child, Stdio};
 
 use super::mock_broker;
-use crate::compare::fixtures::{RECEIVE_MAXIMUM, pinned_command};
+use crate::compare::fixtures::{mock_receive_maximum, pinned_command};
 
 /// Selectable broker backend for benches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +14,9 @@ pub enum BenchBrokerBackend {
     MosquittoStock,
     /// Out-of-process minimal MQTT 5 broker (no Podman/Docker).
     Mock,
+    /// A broker that is already running on `127.0.0.1:$MQTT_COMPARE_BROKER_PORT`, e.g. a pinned
+    /// Mosquitto container in the same Podman pod. Described by `MQTT_COMPARE_BROKER_LABEL`.
+    External,
 }
 
 impl BenchBrokerBackend {
@@ -27,8 +30,9 @@ impl BenchBrokerBackend {
                 "eclipse-mosquitto:2.1.2-alpine (anonymous, nodelay, STOCK max_inflight_messages 20 / max_queued_messages 1000; testcontainers)"
             }
             Self::Mock => {
-                "out-of-process mock MQTT 5 (receive_max 1024, multi-thread, Arc fanout, nodelay, publish counter; MQTT_COMPARE_BROKER=mock)"
+                "out-of-process mock MQTT 5 (honours client Receive Maximum, multi-thread, Arc fanout, nodelay, publish counter; MQTT_COMPARE_BROKER=mock)"
             }
+            Self::External => "external broker (MQTT_COMPARE_BROKER=external)",
         }
     }
 }
@@ -43,8 +47,9 @@ pub fn bench_broker_backend() -> BenchBrokerBackend {
         "mosquitto" => BenchBrokerBackend::Mosquitto,
         "mosquitto-stock" | "mosquitto_stock" => BenchBrokerBackend::MosquittoStock,
         "mock" => BenchBrokerBackend::Mock,
+        "external" => BenchBrokerBackend::External,
         other => panic!(
-            "invalid MQTT_COMPARE_BROKER={other:?}: expected \"mosquitto\" (default), \"mosquitto-stock\" or \"mock\""
+            "invalid MQTT_COMPARE_BROKER={other:?}: expected \"mosquitto\" (default), \"mosquitto-stock\", \"mock\" or \"external\""
         ),
     }
 }
@@ -82,6 +87,8 @@ enum BrokerGuard {
     Mosquitto(String),
     /// Mock broker child process — killed and reaped on drop.
     Mock(Child),
+    /// Not ours to stop.
+    External,
 }
 
 /// Kills and reaps the child if dropped before ownership moves into [`BenchBroker`].
@@ -126,18 +133,36 @@ pub async fn start_bench_broker() -> BenchBroker {
                 guard: BrokerGuard::Mosquitto(id),
             }
         }
-        BenchBrokerBackend::Mock => {
-            let receive_max = RECEIVE_MAXIMUM.get();
-            // Guard covers panic/timeout between spawn and BenchBroker construction.
-            let mut pending = KillChildOnDrop::new(spawn_mock_broker_child(receive_max));
-            let ready = mock_broker::read_mock_broker_ready(pending.child_mut());
+        BenchBrokerBackend::Mock => start_mock_broker(),
+        BenchBrokerBackend::External => {
+            let port = std::env::var("MQTT_COMPARE_BROKER_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .expect("MQTT_COMPARE_BROKER=external needs MQTT_COMPARE_BROKER_PORT");
+            let label = std::env::var("MQTT_COMPARE_BROKER_LABEL")
+                .map(|label| &*Box::leak(label.into_boxed_str()))
+                .unwrap_or(BenchBrokerBackend::External.report_label());
             BenchBroker {
-                port: ready.mqtt_port,
-                mock_stats: Some(mock_broker::MockStatsPort::new(ready.stats_port)),
-                label: BenchBrokerBackend::Mock.report_label(),
-                guard: BrokerGuard::Mock(pending.into_child()),
+                port,
+                mock_stats: None,
+                label,
+                guard: BrokerGuard::External,
             }
         }
+    }
+}
+
+/// Starts one mock broker child regardless of `MQTT_COMPARE_BROKER`.
+pub fn start_mock_broker() -> BenchBroker {
+    let receive_max = mock_receive_maximum().get();
+    // Guard covers panic/timeout between spawn and BenchBroker construction.
+    let mut pending = KillChildOnDrop::new(spawn_mock_broker_child(receive_max));
+    let ready = mock_broker::read_mock_broker_ready(pending.child_mut());
+    BenchBroker {
+        port: ready.mqtt_port,
+        mock_stats: Some(mock_broker::MockStatsPort::new(ready.stats_port)),
+        label: BenchBrokerBackend::Mock.report_label(),
+        guard: BrokerGuard::Mock(pending.into_child()),
     }
 }
 
@@ -160,6 +185,7 @@ impl Drop for BenchBroker {
                 let _ = child.kill();
                 let _ = child.wait();
             }
+            BrokerGuard::External => {}
             BrokerGuard::Mosquitto(id) => {
                 let _ = std::process::Command::new("docker")
                     .args(["rm", "-f", id.as_str()])

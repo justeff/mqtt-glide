@@ -24,3 +24,16 @@ fn timeval_to_duration(tv: libc::timeval) -> Duration {
     let micros = u64::try_from(tv.tv_usec).unwrap_or(0);
     Duration::from_secs(secs) + Duration::from_micros(micros)
 }
+
+/// `CLOCK_MONOTONIC` in nanoseconds: one clock for every process on the host, so a stamp written
+/// by the publisher child can be compared with the time the bench process reads it.
+pub fn monotonic_ns() -> u64 {
+    // SAFETY: `clock_gettime` fully initializes `ts` on success (rc == 0).
+    let ts = unsafe {
+        let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        let rc = libc::clock_gettime(libc::CLOCK_MONOTONIC, ts.as_mut_ptr());
+        assert_eq!(rc, 0, "clock_gettime(CLOCK_MONOTONIC) failed");
+        ts.assume_init()
+    };
+    u64::try_from(ts.tv_sec).unwrap_or(0) * 1_000_000_000 + u64::try_from(ts.tv_nsec).unwrap_or(0)
+}

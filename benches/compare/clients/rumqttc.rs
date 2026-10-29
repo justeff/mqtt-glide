@@ -1,4 +1,4 @@
-//! rumqttc-v5-next adapter (`manual_acks` after flume and auto-ack).
+//! rumqttc-v5-next adapter (`manual_acks` after the handoff and auto-ack).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -9,15 +9,16 @@ use async_trait::async_trait;
 use rumqttc::{
     AsyncClient, ConnectReturnCode, Event, MqttOptions, NetworkOptions, Packet, PublishNotice, QoS as RumqttQoS,
 };
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::compare::fixtures::{
-    HANDOFF_CAPACITY, INGRESS_TOPIC, KEEP_ALIVE, OUTBOUND_TOPIC, RECEIVE_MAXIMUM, REQUEST_CAPACITY,
+    HANDOFF_CAPACITY, INGRESS_TOPIC, KEEP_ALIVE, OUTBOUND_TOPIC, REQUEST_CAPACITY, client_receive_maximum,
 };
 use crate::compare::harness::{
     AckPolicy, BenchClient, BenchQos, ClientCaps, ClientId, IngressSession, OutboundSession, SessionCfg,
 };
-use crate::support::handoff::BenchHandoff;
+use crate::support::handoff::{BenchHandoff, payload_stamp};
 
 /// rumqttc-v5-next bench client.
 pub struct RumqttcClient;
@@ -47,7 +48,7 @@ impl BenchClient for RumqttcClient {
 }
 
 struct RumqttcIngress {
-    handoff_rx: flume::Receiver<BenchHandoff>,
+    handoff_rx: mpsc::Receiver<BenchHandoff>,
     handed_off: Arc<AtomicUsize>,
     acked: Arc<AtomicUsize>,
     after_enqueue: bool,
@@ -66,7 +67,9 @@ struct RumqttcOutbound {
 fn base_opts(client_id: &str, port: u16) -> MqttOptions {
     let mut opts = MqttOptions::new(client_id, ("127.0.0.1", port));
     opts.set_keep_alive(KEEP_ALIVE.as_secs() as u16);
-    opts.set_receive_maximum(Some(RECEIVE_MAXIMUM.get()));
+    opts.set_receive_maximum(Some(client_receive_maximum().get()));
+    // rumqttc rejects inbound packets over 10 KiB by default; the payload sweep goes to 64 KiB.
+    opts.set_max_packet_size(Some(1 << 20));
     opts.set_network_options({
         let mut network = NetworkOptions::new();
         network.set_tcp_nodelay(true);
@@ -106,7 +109,7 @@ async fn wait_suback(eventloop: &mut rumqttc::EventLoop) {
 
 async fn setup_ingress(cfg: &SessionCfg) -> RumqttcIngress {
     let topic = format!("{INGRESS_TOPIC}/{}", cfg.client_id);
-    let (handoff_tx, handoff_rx) = flume::bounded(HANDOFF_CAPACITY);
+    let (handoff_tx, handoff_rx) = mpsc::channel(HANDOFF_CAPACITY);
     let acked = Arc::new(AtomicUsize::new(0));
     let handed_off = Arc::new(AtomicUsize::new(0));
     let after_enqueue = matches!(cfg.ack, Some(AckPolicy::AfterEnqueue)) && cfg.qos == BenchQos::AtLeastOnce;
@@ -130,7 +133,7 @@ async fn setup_ingress(cfg: &SessionCfg) -> RumqttcIngress {
             match eventloop.poll().await {
                 Ok(Event::Incoming(Packet::Publish(publish))) => {
                     let handoff = BenchHandoff::from_rumqttc(&publish);
-                    if handoff_tx.send_async(handoff).await.is_err() {
+                    if handoff_tx.send(handoff).await.is_err() {
                         break;
                     }
                     handed_off_counter.fetch_add(1, Ordering::Relaxed);
@@ -195,13 +198,14 @@ impl IngressSession for RumqttcIngress {
         self.handed_off.store(0, Ordering::Relaxed);
     }
 
-    fn drain(&self) {
+    fn drain(&mut self) {
         while self.handoff_rx.try_recv().is_ok() {}
     }
 
-    async fn recv_touch(&self) {
-        let msg = self.handoff_rx.recv_async().await.expect("rumqttc handoff");
+    async fn recv_touch(&mut self) -> u64 {
+        let msg = self.handoff_rx.recv().await.expect("rumqttc handoff");
         msg.touch();
+        payload_stamp(&msg.payload)
     }
 
     async fn wait_barrier(&self, target: usize) {

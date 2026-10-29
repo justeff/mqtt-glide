@@ -1,6 +1,6 @@
 //! Shared handoff payload helpers for fair peer ↔ mqtt-glide comparison.
 //!
-//! Peer crates build a [`BenchHandoff`] before flume (owned topic/payload/user-props).
+//! Peer crates build a [`BenchHandoff`] before the handoff channel (owned topic/payload/user-props).
 //! mqtt-glide pushes production [`InboundMessage`] — consumers must only *touch* that value,
 //! not re-convert it into [`BenchHandoff`] (that would add extra post-handoff work only on glide).
 
@@ -49,6 +49,14 @@ impl BenchHandoff {
         std::hint::black_box(self.payload.len());
         std::hint::black_box(self.user_properties.len());
     }
+}
+
+/// First 8 payload bytes as the publisher's `monotonic_ns` send stamp (`ingress_rate`), else 0.
+pub fn payload_stamp(payload: &[u8]) -> u64 {
+    payload
+        .get(..8)
+        .and_then(|head| head.try_into().ok())
+        .map_or(0, u64::from_le_bytes)
 }
 
 /// Touches mqtt-glide [`InboundMessage`] fields without re-encoding (fair vs [`BenchHandoff::touch`]).

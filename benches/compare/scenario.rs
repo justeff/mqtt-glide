@@ -1,7 +1,8 @@
 //! Scenario matrix cells.
 
 use super::fixtures::{
-    parse_ack_policies, parse_concurrency, parse_directions, parse_payloads, parse_qos_list, parse_rates,
+    parse_ack_policies, parse_concurrency, parse_directions, parse_ingress_rates, parse_payloads, parse_qos_list,
+    parse_rates,
 };
 use super::harness::{AckPolicy, BenchQos};
 
@@ -15,16 +16,13 @@ pub enum Direction {
     /// Shared client, `level` long-lived caller tasks each awaiting every publish
     /// (a service handling requests). Reports throughput, CPU and per-publish latency.
     OutboundConcurrent,
-    /// One task spawned per message, awaiting its publish (fire-and-forget relays).
-    /// Throughput and CPU only.
-    OutboundSpawn,
     /// Open loop: `level` msg/s released on a fixed schedule; the generator never waits on
     /// the client, so falling behind shows up as latency and a lower achieved rate.
     OutboundRate,
-    /// Ingress serial latency (p50/p99).
-    IngressSerial,
-    /// Outbound serial latency (p50/p99).
-    OutboundSerialLatency,
+    /// Open-loop ingress: the publisher child releases `level` msg/s on a fixed schedule;
+    /// latency runs from the publisher's write to the subscriber taking the message off its
+    /// app queue.
+    IngressRate,
 }
 
 impl Direction {
@@ -34,27 +32,21 @@ impl Direction {
             Self::IngressLoad => "ingress_load",
             Self::OutboundPipelined => "outbound_pipelined",
             Self::OutboundConcurrent => "outbound_concurrent",
-            Self::OutboundSpawn => "outbound_spawn",
             Self::OutboundRate => "outbound_rate",
-            Self::IngressSerial => "ingress_serial",
-            Self::OutboundSerialLatency => "outbound_serial_latency",
+            Self::IngressRate => "ingress_rate",
         }
     }
 
     /// Whether this direction uses ingress ack policy (QoS 1 only).
     pub const fn uses_ingress_ack(self) -> bool {
-        matches!(self, Self::IngressLoad | Self::IngressSerial)
+        matches!(self, Self::IngressLoad | Self::IngressRate)
     }
 
     /// Whether this is a client → broker scenario.
     pub const fn is_outbound(self) -> bool {
         matches!(
             self,
-            Self::OutboundPipelined
-                | Self::OutboundConcurrent
-                | Self::OutboundSpawn
-                | Self::OutboundRate
-                | Self::OutboundSerialLatency
+            Self::OutboundPipelined | Self::OutboundConcurrent | Self::OutboundRate
         )
     }
 
@@ -63,6 +55,7 @@ impl Direction {
         match self {
             Self::OutboundConcurrent => parse_concurrency().into_iter().map(Some).collect(),
             Self::OutboundRate => parse_rates().into_iter().map(Some).collect(),
+            Self::IngressRate => parse_ingress_rates().into_iter().map(Some).collect(),
             _ => vec![None],
         }
     }
@@ -79,7 +72,8 @@ pub struct ScenarioCell {
     pub payload: usize,
     /// Ingress ack policy (only meaningful for ingress + QoS 1).
     pub ack: Option<AckPolicy>,
-    /// Caller tasks ([`Direction::OutboundConcurrent`]) or offered msg/s ([`Direction::OutboundRate`]).
+    /// Caller tasks ([`Direction::OutboundConcurrent`]) or offered msg/s ([`Direction::OutboundRate`],
+    /// [`Direction::IngressRate`]).
     pub level: Option<u32>,
 }
 

@@ -2,10 +2,10 @@
 
 use std::process::{Child, Stdio};
 
-use super::fixtures::{LOAD_WINDOW, pinned_command};
+use super::fixtures::{ingress_window, pinned_command};
 use super::harness::BenchQos;
 
-/// Spawns the `MQTT_COMPARE_ROLE=publisher` child of this bench binary.
+/// Spawns the `MQTT_COMPARE_ROLE=publisher` child of this bench binary (open loop at `rate` msg/s if set).
 pub fn spawn_publisher_child(
     port: u16,
     messages: usize,
@@ -13,13 +13,18 @@ pub fn spawn_publisher_child(
     topic: &str,
     payload_size: usize,
     qos: BenchQos,
+    rate: Option<u32>,
 ) -> Child {
     let exe = std::env::current_exe().expect("current_exe for publisher child");
-    pinned_command(&exe, "MQTT_COMPARE_PUBLISHER_CPUS")
+    let mut command = pinned_command(&exe, "MQTT_COMPARE_PUBLISHER_CPUS");
+    if let Some(rate) = rate {
+        command.env("MQTT_COMPARE_PUB_RATE", rate.to_string());
+    }
+    command
         .env("MQTT_COMPARE_ROLE", "publisher")
         .env("MQTT_COMPARE_PORT", port.to_string())
         .env("MQTT_COMPARE_MSGS", messages.to_string())
-        .env("MQTT_COMPARE_WINDOW", LOAD_WINDOW.to_string())
+        .env("MQTT_COMPARE_WINDOW", ingress_window().to_string())
         .env("MQTT_COMPARE_TOPIC", topic)
         .env("MQTT_COMPARE_PAYLOAD_SIZE", payload_size.to_string())
         .env("MQTT_COMPARE_CLIENT_ID", client_id)

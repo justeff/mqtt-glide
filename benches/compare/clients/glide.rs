@@ -14,15 +14,16 @@ use mqtt_glide::{
     InboundMessage, MqttClient, NoopLifecycle, Publish, PublishMessage, QoS, ReconnectPolicy, SessionParams,
     SessionPhase, connect,
 };
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::compare::fixtures::{
-    HANDOFF_CAPACITY, INGRESS_TOPIC, KEEP_ALIVE, OUTBOUND_TOPIC, RECEIVE_MAXIMUM, REQUEST_CAPACITY,
+    HANDOFF_CAPACITY, INGRESS_TOPIC, KEEP_ALIVE, OUTBOUND_TOPIC, REQUEST_CAPACITY, client_receive_maximum,
 };
 use crate::compare::harness::{
     AckPolicy, BenchClient, BenchQos, ClientCaps, ClientId, IngressSession, OutboundSession, SessionCfg,
 };
-use crate::support::handoff::touch_publish;
+use crate::support::handoff::{payload_stamp, touch_publish};
 
 struct BenchCredentials;
 
@@ -71,7 +72,7 @@ impl BenchClient for GlideClient {
 }
 
 struct GlideIngress {
-    handoff_rx: flume::Receiver<InboundMessage>,
+    handoff_rx: mpsc::Receiver<InboundMessage>,
     handed_off: Arc<AtomicUsize>,
     acked: Arc<AtomicUsize>,
     qos: BenchQos,
@@ -95,12 +96,12 @@ async fn setup_ingress(cfg: &SessionCfg) -> GlideIngress {
     let mut options = ConnectOptions::new(url)
         .client_id(GlideClientId::from_prefix(&cfg.client_id))
         .keep_alive(KEEP_ALIVE)
-        .receive_maximum(RECEIVE_MAXIMUM)
+        .receive_maximum(client_receive_maximum())
         .command_channel_capacity(NonZeroUsize::new(REQUEST_CAPACITY).expect("non-zero"));
     if cfg.qos == BenchQos::AtLeastOnce {
         options = options.bench_inbound_publish_ack_counter(Arc::clone(&acked));
     }
-    let (handoff_tx, handoff_rx) = flume::bounded(HANDOFF_CAPACITY);
+    let (handoff_tx, handoff_rx) = mpsc::channel(HANDOFF_CAPACITY);
     let (client, connection, mut phase) =
         connect(options, BenchCredentials, NoReconnect, handoff_tx, NoopLifecycle).expect("glide connect");
     let run = tokio::spawn(connection.run());
@@ -125,9 +126,9 @@ async fn setup_outbound(cfg: &SessionCfg) -> GlideOutbound {
     let options = ConnectOptions::new(url)
         .client_id(GlideClientId::from_prefix(&cfg.client_id))
         .keep_alive(KEEP_ALIVE)
-        .receive_maximum(RECEIVE_MAXIMUM)
+        .receive_maximum(client_receive_maximum())
         .command_channel_capacity(NonZeroUsize::new(REQUEST_CAPACITY).expect("non-zero"));
-    let (handoff_tx, _handoff_rx) = flume::bounded(HANDOFF_CAPACITY);
+    let (handoff_tx, _handoff_rx) = mpsc::channel::<InboundMessage>(HANDOFF_CAPACITY);
     let (client, connection, mut phase) =
         connect(options, BenchCredentials, NoReconnect, handoff_tx, NoopLifecycle).expect("glide connect");
     let run = tokio::spawn(connection.run());
@@ -181,14 +182,15 @@ impl IngressSession for GlideIngress {
         self.handed_off.store(0, Ordering::Relaxed);
     }
 
-    fn drain(&self) {
+    fn drain(&mut self) {
         while self.handoff_rx.try_recv().is_ok() {}
     }
 
-    async fn recv_touch(&self) {
-        let msg = self.handoff_rx.recv_async().await.expect("glide handoff");
+    async fn recv_touch(&mut self) -> u64 {
+        let msg = self.handoff_rx.recv().await.expect("glide handoff");
         touch_publish(&msg);
         self.handed_off.fetch_add(1, Ordering::Relaxed);
+        payload_stamp(&msg.payload)
     }
 
     async fn wait_barrier(&self, target: usize) {

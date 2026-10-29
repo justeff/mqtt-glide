@@ -46,7 +46,7 @@ impl BenchQos {
 /// Ingress QoS 1 acknowledgement policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AckPolicy {
-    /// PUBACK only after app handoff accept (enqueue-before-ack / manual ack after flume).
+    /// PUBACK only after app handoff accept (enqueue-before-ack / manual ack after the handoff).
     AfterEnqueue,
     /// PUBACK before (or without waiting for) app handoff (auto-ack).
     Before,
@@ -137,10 +137,11 @@ pub trait IngressSession: Send + Sync {
     fn reset_barrier(&self);
 
     /// Drain any leftover handoffs without counting.
-    fn drain(&self);
+    fn drain(&mut self);
 
-    /// Block until one message is handed off and touched.
-    async fn recv_touch(&self);
+    /// Block until one message is handed off and touched; returns its
+    /// [`crate::support::handoff::payload_stamp`].
+    async fn recv_touch(&mut self) -> u64;
 
     /// Wait until barrier reaches `target` (PUBACKs or handoffs, depending on ack policy).
     async fn wait_barrier(&self, target: usize);

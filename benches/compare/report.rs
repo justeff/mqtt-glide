@@ -22,8 +22,18 @@ pub struct RunMeta<'a> {
     pub runs: usize,
     /// Load burst size.
     pub load_messages: usize,
-    /// Pipelined in-flight window / ingress publisher window.
+    /// `outbound_pipelined` in-flight window.
     pub load_window: usize,
+    /// Ingress publisher window (`MQTT_COMPARE_INGRESS_WINDOW`).
+    pub ingress_window: usize,
+    /// Receive Maximum every client announces (`MQTT_COMPARE_CLIENT_RM`).
+    pub client_receive_max: u16,
+    /// Receive Maximum the mock broker announces (`MQTT_COMPARE_MOCK_RM`), mock only.
+    pub mock_receive_max: Option<u16>,
+    /// `TOKIO_WORKER_THREADS`, if set (else Tokio's default: one per CPU the process may use).
+    pub worker_threads: Option<String>,
+    /// `ingress_rate` offered msg/s levels.
+    pub ingress_rates: Vec<u32>,
     /// `outbound_concurrent` caller-task levels.
     pub concurrency: Vec<u32>,
     /// `outbound_rate` offered msg/s levels.
@@ -117,11 +127,34 @@ pub struct ResultRow {
     pub p999_us: Option<f64>,
     /// Number of runs aggregated.
     pub runs: usize,
+    /// msg/s of every run, in run order (spread of the median above).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub msg_s_runs: Vec<f64>,
+    /// CPU ns/msg of every run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cpu_ns_per_msg_runs: Vec<f64>,
+    /// p50 µs of every run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub p50_us_runs: Vec<f64>,
+    /// p99 µs of every run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub p99_us_runs: Vec<f64>,
 }
 
 impl ResultRow {
-    /// Measured cell.
-    pub fn measured(key: CellKey, metrics: Metrics, runs: usize) -> Self {
+    /// Measured cell: per-metric median across `samples`, plus every run's value.
+    pub fn measured(key: CellKey, samples: &[Metrics]) -> Self {
+        let each = |metric: fn(&Metrics) -> Option<f64>| -> Vec<f64> { samples.iter().filter_map(metric).collect() };
+        Self {
+            msg_s_runs: each(|m| m.msg_s),
+            cpu_ns_per_msg_runs: each(|m| m.cpu_ns_per_msg),
+            p50_us_runs: each(|m| m.p50_us),
+            p99_us_runs: each(|m| m.p99_us),
+            ..Self::with_metrics(key, median_metrics(samples), samples.len())
+        }
+    }
+
+    fn with_metrics(key: CellKey, metrics: Metrics, runs: usize) -> Self {
         Self {
             client: key.client.as_str(),
             scenario: key.scenario,
@@ -137,6 +170,10 @@ impl ResultRow {
             p99_us: metrics.p99_us,
             p999_us: metrics.p999_us,
             runs,
+            msg_s_runs: Vec::new(),
+            cpu_ns_per_msg_runs: Vec::new(),
+            p50_us_runs: Vec::new(),
+            p99_us_runs: Vec::new(),
         }
     }
 
@@ -145,8 +182,27 @@ impl ResultRow {
         Self {
             status: "n/a",
             reason: Some(reason),
-            ..Self::measured(key, Metrics::default(), runs)
+            ..Self::with_metrics(key, Metrics::default(), runs)
         }
+    }
+}
+
+/// Median of each metric across runs (metrics absent in a run are skipped).
+pub fn median_metrics(samples: &[Metrics]) -> Metrics {
+    fn median(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+        let mut values: Vec<f64> = values.flatten().collect();
+        if values.is_empty() {
+            return None;
+        }
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Some(values[values.len() / 2])
+    }
+    Metrics {
+        msg_s: median(samples.iter().map(|s| s.msg_s)),
+        cpu_ns_per_msg: median(samples.iter().map(|s| s.cpu_ns_per_msg)),
+        p50_us: median(samples.iter().map(|s| s.p50_us)),
+        p99_us: median(samples.iter().map(|s| s.p99_us)),
+        p999_us: median(samples.iter().map(|s| s.p999_us)),
     }
 }
 

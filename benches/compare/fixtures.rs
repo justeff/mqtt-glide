@@ -18,17 +18,35 @@ pub const KEEP_ALIVE: Duration = Duration::from_secs(60);
 /// Client Receive Maximum (large window; not library defaults).
 pub const RECEIVE_MAXIMUM: NonZeroU16 = nonzero!(1024u16);
 
+/// Receive Maximum every client under test announces: `MQTT_COMPARE_CLIENT_RM` (default
+/// [`RECEIVE_MAXIMUM`]). It caps the QoS 1 deliveries the broker has in flight toward the client.
+///
+/// The default is a large window on purpose; the libraries' own defaults differ (mqtt-glide 32,
+/// rumqttc and mqtt5 65 535). Set it to see what an out-of-the-box application gets.
+pub fn client_receive_maximum() -> NonZeroU16 {
+    std::env::var("MQTT_COMPARE_CLIENT_RM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .and_then(NonZeroU16::new)
+        .unwrap_or(RECEIVE_MAXIMUM)
+}
+
+/// Receive Maximum the mock broker announces: `MQTT_COMPARE_MOCK_RM` (default [`RECEIVE_MAXIMUM`]).
+///
+/// Mosquitto's stock value is 20; the mock's default of 1024 never limits the client's window.
+pub fn mock_receive_maximum() -> NonZeroU16 {
+    std::env::var("MQTT_COMPARE_MOCK_RM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .and_then(NonZeroU16::new)
+        .unwrap_or(RECEIVE_MAXIMUM)
+}
+
 /// Injectable handoff capacity.
 pub const HANDOFF_CAPACITY: usize = 10_000;
 
 /// rumqttc / mqtt-glide command-queue depth for heavy publish (1024).
 pub const REQUEST_CAPACITY: usize = 1024;
-
-/// Warmup iterations before latency collection.
-pub const WARMUP_SAMPLES: usize = 50;
-
-/// Samples for serial latency p50/p99.
-pub const SUMMARY_SAMPLES: usize = 200;
 
 /// Default messages per sustained-load burst (`MQTT_COMPARE_LOAD_MSGS`).
 ///
@@ -36,8 +54,22 @@ pub const SUMMARY_SAMPLES: usize = 200;
 /// jitter and warmup do not dominate the measurement.
 pub const DEFAULT_LOAD_MESSAGES: usize = 50_000;
 
-/// Max in-flight for ingress publisher and outbound pipelined load.
+/// Max in-flight for outbound pipelined load.
 pub const LOAD_WINDOW: usize = 64;
+
+/// Default ingress publisher window (`MQTT_COMPARE_INGRESS_WINDOW`): QoS 1 publishes in flight
+/// toward the broker, and QoS 0 publishes per write. As large as the mock's and the clients'
+/// default Receive Maximum, so the publisher does not cap ingress before the client does.
+pub const DEFAULT_INGRESS_WINDOW: usize = 1024;
+
+/// `MQTT_COMPARE_INGRESS_WINDOW` (default [`DEFAULT_INGRESS_WINDOW`], min 1).
+pub fn ingress_window() -> usize {
+    std::env::var("MQTT_COMPARE_INGRESS_WINDOW")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|n: &usize| *n >= 1)
+        .unwrap_or(DEFAULT_INGRESS_WINDOW)
+}
 
 /// Default caller-task counts for `outbound_concurrent` (`MQTT_COMPARE_CONCURRENCY`).
 pub const DEFAULT_CONCURRENCY: &str = "8,64,512";
@@ -45,7 +77,10 @@ pub const DEFAULT_CONCURRENCY: &str = "8,64,512";
 /// Default offered rates (msg/s) for `outbound_rate` (`MQTT_COMPARE_RATES`).
 pub const DEFAULT_RATES: &str = "10000,50000";
 
-/// Default duration of one `outbound_rate` run (`MQTT_COMPARE_RATE_SECS`).
+/// Default offered rates (msg/s) for `ingress_rate` (`MQTT_COMPARE_INGRESS_RATES`).
+pub const DEFAULT_INGRESS_RATES: &str = "10000,50000,200000";
+
+/// Default duration of one `outbound_rate` / `ingress_rate` run (`MQTT_COMPARE_RATE_SECS`).
 pub const DEFAULT_RATE_SECS: f64 = 2.0;
 
 /// Default median-of runs (`MQTT_COMPARE_RUNS`).
@@ -100,6 +135,11 @@ pub fn rate_secs() -> f64 {
 /// `MQTT_COMPARE_CONCURRENCY` — comma list of caller-task counts (default [`DEFAULT_CONCURRENCY`]).
 pub fn parse_concurrency() -> Vec<u32> {
     parse_positive_list("MQTT_COMPARE_CONCURRENCY", DEFAULT_CONCURRENCY)
+}
+
+/// `MQTT_COMPARE_INGRESS_RATES` — comma list of offered msg/s (default [`DEFAULT_INGRESS_RATES`]).
+pub fn parse_ingress_rates() -> Vec<u32> {
+    parse_positive_list("MQTT_COMPARE_INGRESS_RATES", DEFAULT_INGRESS_RATES)
 }
 
 /// `MQTT_COMPARE_RATES` — comma list of offered msg/s (default [`DEFAULT_RATES`]).
@@ -235,10 +275,8 @@ pub fn parse_ack_policies() -> Vec<AckPolicy> {
 
 /// `MQTT_COMPARE_SCENARIOS` — comma list of directions (default all load+latency).
 pub fn parse_directions() -> Vec<Direction> {
-    let raw = std::env::var("MQTT_COMPARE_SCENARIOS").unwrap_or_else(|_| {
-        "ingress_load,outbound_concurrent,outbound_spawn,outbound_rate,outbound_pipelined,ingress_serial,outbound_serial_latency"
-            .into()
-    });
+    let raw = std::env::var("MQTT_COMPARE_SCENARIOS")
+        .unwrap_or_else(|_| "ingress_load,ingress_rate,outbound_concurrent,outbound_rate,outbound_pipelined".into());
     let mut out = Vec::new();
     for part in raw.split(',') {
         let part = part.trim().to_ascii_lowercase();
@@ -249,10 +287,8 @@ pub fn parse_directions() -> Vec<Direction> {
             "ingress_load" => Direction::IngressLoad,
             "outbound_pipelined" => Direction::OutboundPipelined,
             "outbound_concurrent" => Direction::OutboundConcurrent,
-            "outbound_spawn" => Direction::OutboundSpawn,
             "outbound_rate" => Direction::OutboundRate,
-            "ingress_serial" => Direction::IngressSerial,
-            "outbound_serial_latency" => Direction::OutboundSerialLatency,
+            "ingress_rate" => Direction::IngressRate,
             other => panic!("invalid MQTT_COMPARE_SCENARIOS entry {other:?}"),
         });
     }

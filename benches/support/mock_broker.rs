@@ -4,8 +4,11 @@
 //! `getrusage(RUSAGE_SELF)` excludes broker encode/decode/fanout.
 //!
 //! Protocol needs: CONNACK (`receive_max`), SUBACK, QoS1 PUBACK, fanout of
-//! every inbound PUBLISH to all subscribed connections (no topic-filter matching —
-//! ingress uses one exact topic per session; outbound has no subscribers).
+//! every inbound PUBLISH to all subscribed connections at the lower of the publish and
+//! subscription QoS (no topic-filter matching —
+//! ingress uses one exact topic per session; outbound has no subscribers). QoS 1 deliveries
+//! respect the subscriber's CONNECT Receive Maximum; the rest wait in order until PUBACKs free
+//! the window.
 //!
 //! A second TCP **stats** port exposes `RESET` / `GET` / `WAIT <n>` for the inbound
 //! PUBLISH counter used as the outbound wire-load stopwatch (`RECEIVED` / `TIMEOUT`).
@@ -15,15 +18,17 @@
 //! - `TCP_NODELAY`
 //! - subscriber list under a short `std` mutex; fanout sends `Arc` payloads outside the lock
 
+use std::collections::VecDeque;
 use std::io::{BufRead, Write as _};
 use std::num::NonZeroU16;
 use std::process::Child;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use bytes::BytesMut;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use mqtt_glide::codec::{
     ConnectAck, DecodedFrame, Packet, PublishAck, PublishDelivery, PublishPacket, SubscribeAck, V5Codec, encode_publish,
 };
@@ -58,13 +63,15 @@ pub struct MockBrokerReady {
 }
 
 /// Fanout target: any connection that completed SUBSCRIBE.
+#[derive(Clone)]
 struct Subscriber {
     conn_id: u16,
-    sender: mpsc::UnboundedSender<Arc<PublishMessage>>,
+    sender: mpsc::UnboundedSender<(Arc<PublishMessage>, QoS)>,
 }
 
 struct BrokerState {
-    subscribers: Mutex<Vec<Subscriber>>,
+    /// Read lock-free on every PUBLISH; replaced on (un)subscribe.
+    subscribers: ArcSwap<Vec<Subscriber>>,
     next_conn_id: AtomicU16,
     /// Inbound PUBLISH frames decoded (QoS 0 and 1), for wire-load stopwatches.
     publishes_received: AtomicU64,
@@ -75,15 +82,17 @@ struct BrokerState {
 impl BrokerState {
     fn new() -> Self {
         Self {
-            subscribers: Mutex::new(Vec::new()),
+            subscribers: ArcSwap::from_pointee(Vec::new()),
             next_conn_id: AtomicU16::new(1),
             publishes_received: AtomicU64::new(0),
             publish_notify: Notify::new(),
         }
     }
 
-    fn note_publish_received(&self) {
-        self.publishes_received.fetch_add(1, Ordering::Relaxed);
+    /// Counts `count` decoded PUBLISHes at once: `notify_waiters` takes a lock, so it runs once
+    /// per batch of frames, not per message.
+    fn note_publishes_received(&self, count: u64) {
+        self.publishes_received.fetch_add(count, Ordering::Relaxed);
         self.publish_notify.notify_waiters();
     }
 
@@ -101,34 +110,32 @@ impl BrokerState {
         self.next_conn_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn register_subscriber(&self, conn_id: u16, sender: mpsc::UnboundedSender<Arc<PublishMessage>>) {
-        self.subscribers
-            .lock()
-            .expect("mock broker subscriber lock")
-            .push(Subscriber { conn_id, sender });
+    fn register_subscriber(&self, conn_id: u16, sender: mpsc::UnboundedSender<(Arc<PublishMessage>, QoS)>) {
+        let subscriber = Subscriber { conn_id, sender };
+        self.subscribers.rcu(|subs| {
+            let mut subs = Vec::clone(subs);
+            subs.push(subscriber.clone());
+            subs
+        });
     }
 
     fn unregister_conn(&self, conn_id: u16) {
-        self.subscribers
-            .lock()
-            .expect("mock broker subscriber lock")
-            .retain(|sub| sub.conn_id != conn_id);
+        self.subscribers.rcu(|subs| {
+            let mut subs = Vec::clone(subs);
+            subs.retain(|sub| sub.conn_id != conn_id);
+            subs
+        });
     }
 
-    /// Forward to every subscribed connection (no topic matching).
-    ///
-    /// Snapshot senders under a short lock, then send an [`Arc`] shared payload.
-    fn fanout(&self, message: PublishMessage) {
-        let senders: Vec<mpsc::UnboundedSender<Arc<PublishMessage>>> = {
-            let subs = self.subscribers.lock().expect("mock broker subscriber lock");
-            if subs.is_empty() {
-                return;
-            }
-            subs.iter().map(|sub| sub.sender.clone()).collect()
-        };
+    /// Forward to every subscribed connection (no topic matching), sharing one [`Arc`] payload.
+    fn fanout(&self, message: PublishMessage, qos: QoS) {
+        let subs = self.subscribers.load();
+        if subs.is_empty() {
+            return;
+        }
         let shared = Arc::new(message);
-        for sender in senders {
-            let _ = sender.send(Arc::clone(&shared));
+        for sub in subs.iter() {
+            let _ = sub.sender.send((Arc::clone(&shared), qos));
         }
     }
 }
@@ -440,10 +447,11 @@ async fn serve_connection(
         .await
         .ok_or("client closed before CONNECT")?
         .map_err(|_| "decode CONNECT")?;
-    match first {
-        (DecodedFrame::Control(Packet::Connect(_)), _) => {}
+    // Absent Receive Maximum means 65 535 (§3.1.2.11.3).
+    let client_receive_max = match first {
+        (DecodedFrame::Control(Packet::Connect(connect)), _) => connect.receive_max.map_or(u16::MAX, NonZeroU16::get),
         _ => return Err("expected CONNECT"),
-    }
+    };
 
     let connack = ConnectAck {
         reason_code: ConnectAckReason::Success,
@@ -455,54 +463,84 @@ async fn serve_connection(
         .await
         .map_err(|_| "send CONNACK")?;
 
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Arc<PublishMessage>>();
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<(Arc<PublishMessage>, QoS)>();
     let mut subscribed = false;
-    let mut next_packet_id = 1u16;
+    let mut delivery = Delivery {
+        granted: QoS::AtMostOnce,
+        next_packet_id: 1,
+        in_flight: 0,
+        // Like a broker with its own per-client cap on deliveries in flight (EMQX `max_inflight`).
+        receive_max: client_receive_max.min(delivery_inflight_cap()),
+        parked: VecDeque::new(),
+    };
     loop {
         tokio::select! {
             inbound = framed_read.next() => {
-                match inbound {
-                    None => break,
-                    Some(Err(_)) => return Err("decode client frame"),
-                    Some(Ok((DecodedFrame::Publish(publish), _))) => {
-                        handle_inbound_publish(&mut framed_write, &state, publish).await?;
-                    }
-                    Some(Ok((DecodedFrame::Control(packet), _))) => {
-                        match packet {
-                            Packet::Subscribe(subscribe) => {
-                                let mut status = Vec::with_capacity(subscribe.topic_filters.len());
-                                for (_filter, options) in &subscribe.topic_filters {
-                                    status.push(granted_qos(options.qos));
-                                }
-                                if !subscribed {
-                                    state.register_subscriber(conn_id, outbound_tx.clone());
-                                    subscribed = true;
-                                }
-                                let suback = SubscribeAck {
-                                    packet_id: subscribe.packet_id,
-                                    properties: Vec::new(),
-                                    reason_string: None,
-                                    status,
-                                };
-                                framed_write.send(Packet::SubscribeAck(suback)).await.map_err(|_| "send SUBACK")?;
-                            }
-                            Packet::PublishAck(_) => {
-                                // Subscriber QoS1 ack — tolerate without tracking.
-                            }
-                            Packet::PingRequest => {
-                                framed_write.send(Packet::PingResponse).await.map_err(|_| "send PINGRESP")?;
-                            }
-                            Packet::Disconnect(_) => break,
-                            _ => {}
+                // Handle every frame already buffered, then write once, as a broker reading a
+                // full socket buffer does: one write per batch of PUBACKs to a publisher, and
+                // one delivery flush per batch of PUBACKs from a subscriber.
+                let mut next = Some(inbound);
+                let mut batch = FrameBatch::default();
+                let mut handled = 0;
+                while let Some(inbound) = next.take() {
+                    let frame = match inbound {
+                        None => {
+                            batch.finish(&mut framed_write, &state, &mut delivery).await?;
+                            state.unregister_conn(conn_id);
+                            return Ok(());
                         }
+                        Some(Err(_)) => return Err("decode client frame"),
+                        Some(Ok((frame, _))) => frame,
+                    };
+                    match frame {
+                        DecodedFrame::Publish(publish) => batch.publish(&mut framed_write, &state, publish).await?,
+                        DecodedFrame::Control(Packet::PublishAck(_)) => {
+                            delivery.in_flight = delivery.in_flight.saturating_sub(1);
+                            batch.acked = true;
+                        }
+                        DecodedFrame::Control(Packet::Subscribe(subscribe)) => {
+                            let mut status = Vec::with_capacity(subscribe.topic_filters.len());
+                            for (_filter, options) in &subscribe.topic_filters {
+                                status.push(granted_qos(options.qos));
+                                delivery.granted = delivery.granted.max(delivery_qos(options.qos));
+                            }
+                            if !subscribed {
+                                state.register_subscriber(conn_id, outbound_tx.clone());
+                                subscribed = true;
+                            }
+                            let suback = SubscribeAck {
+                                packet_id: subscribe.packet_id,
+                                properties: Vec::new(),
+                                reason_string: None,
+                                status,
+                            };
+                            framed_write.send(Packet::SubscribeAck(suback)).await.map_err(|_| "send SUBACK")?;
+                        }
+                        DecodedFrame::Control(Packet::PingRequest) => {
+                            framed_write.send(Packet::PingResponse).await.map_err(|_| "send PINGRESP")?;
+                        }
+                        DecodedFrame::Control(Packet::Disconnect(_)) => {
+                            batch.finish(&mut framed_write, &state, &mut delivery).await?;
+                            state.unregister_conn(conn_id);
+                            return Ok(());
+                        }
+                        DecodedFrame::Control(_) => {}
+                    }
+                    handled += 1;
+                    if handled < FRAME_BATCH {
+                        next = framed_read.next().now_or_never();
                     }
                 }
+                batch.finish(&mut framed_write, &state, &mut delivery).await?;
             }
-            outbound = outbound_rx.recv() => {
-                let Some(message) = outbound else { break };
-                let id = NonZeroU16::new(next_packet_id).ok_or("packet id zero")?;
-                next_packet_id = if next_packet_id == u16::MAX { 1 } else { next_packet_id + 1 };
-                send_publish(&mut framed_write, message.as_ref(), QoS::AtLeastOnce, Some(id)).await?;
+            // Parked deliveries wait for PUBACKs; take no more until they are out.
+            outbound = outbound_rx.recv(), if delivery.parked.is_empty() => {
+                let Some(first) = outbound else { break };
+                delivery.parked.push_back(first);
+                while let Ok(next) = outbound_rx.try_recv() {
+                    delivery.parked.push_back(next);
+                }
+                delivery.flush(&mut framed_write).await?;
             }
         }
     }
@@ -511,36 +549,139 @@ async fn serve_connection(
     Ok(())
 }
 
-async fn handle_inbound_publish(
-    framed_write: &mut FramedWr,
-    state: &BrokerState,
-    publish: PublishPacket,
-) -> Result<(), &'static str> {
-    state.note_publish_received();
-    // PUBACK first so publisher RTT is not blocked on fanout work.
-    if publish.meta.qos == QoS::AtLeastOnce {
-        let packet_id = publish.meta.packet_id.ok_or("QoS1 publish without packet id")?;
-        let puback = PublishAck {
-            packet_id,
-            reason_code: PublishAckReason::Success,
-            properties: Vec::new(),
-            reason_string: None,
-        };
-        framed_write
-            .send(Packet::PublishAck(puback))
-            .await
-            .map_err(|_| "send PUBACK to publisher")?;
-    }
+/// Most frames handled from the read buffer before writing.
+const FRAME_BATCH: usize = 64;
 
-    state.fanout(publish.into_message());
-    Ok(())
+/// What one batch of inbound frames leaves to write.
+#[derive(Default)]
+struct FrameBatch {
+    /// PUBLISHes decoded (counted toward the stats port once per batch).
+    received: u64,
+    /// PUBACKs to publishers fed into the write buffer, not yet flushed.
+    pubacks_fed: bool,
+    /// The subscriber PUBACKed deliveries, so parked ones may fit its window now.
+    acked: bool,
 }
 
-async fn send_publish(
-    framed_write: &mut FramedWr,
+impl FrameBatch {
+    /// PUBACKs a QoS 1 publish (fed, flushed with the batch) and fans it out.
+    async fn publish(
+        &mut self,
+        framed_write: &mut FramedWr,
+        state: &BrokerState,
+        publish: PublishPacket,
+    ) -> Result<(), &'static str> {
+        self.received += 1;
+        let qos = delivery_qos(publish.meta.qos);
+        if publish.meta.qos == QoS::AtLeastOnce {
+            let packet_id = publish.meta.packet_id.ok_or("QoS1 publish without packet id")?;
+            let puback = PublishAck {
+                packet_id,
+                reason_code: PublishAckReason::Success,
+                properties: Vec::new(),
+                reason_string: None,
+            };
+            framed_write
+                .feed(Packet::PublishAck(puback))
+                .await
+                .map_err(|_| "send PUBACK to publisher")?;
+            self.pubacks_fed = true;
+        }
+        state.fanout(publish.into_message(), qos);
+        Ok(())
+    }
+
+    /// Counts, flushes the PUBACKs and sends deliveries that fit the subscriber's window now.
+    async fn finish(
+        &mut self,
+        framed_write: &mut FramedWr,
+        state: &BrokerState,
+        delivery: &mut Delivery,
+    ) -> Result<(), &'static str> {
+        if self.received > 0 {
+            state.note_publishes_received(self.received);
+        }
+        // Before deliveries: those bypass the framed write buffer.
+        if self.pubacks_fed {
+            framed_write.flush().await.map_err(|_| "flush PUBACKs to publisher")?;
+        }
+        if self.acked {
+            delivery.flush(framed_write).await?;
+        }
+        *self = Self::default();
+        Ok(())
+    }
+}
+
+/// `MQTT_COMPARE_MOCK_DELIVERY_INFLIGHT`: QoS 1 deliveries the mock keeps unacknowledged per
+/// subscriber at most, whatever the subscriber's Receive Maximum (default: no cap of its own).
+fn delivery_inflight_cap() -> u16 {
+    std::env::var("MQTT_COMPARE_MOCK_DELIVERY_INFLIGHT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|n: &u16| *n >= 1)
+        .unwrap_or(u16::MAX)
+}
+
+/// Most PUBLISHes a subscriber connection sends in one write.
+const OUTBOUND_BATCH: usize = 64;
+
+/// Per-connection delivery state toward a subscriber.
+struct Delivery {
+    /// Highest QoS granted to the subscription.
+    granted: QoS,
+    next_packet_id: u16,
+    /// QoS 1 deliveries not yet PUBACKed.
+    in_flight: u16,
+    /// The subscriber's CONNECT Receive Maximum.
+    receive_max: u16,
+    /// Queued deliveries, in order.
+    parked: VecDeque<(Arc<PublishMessage>, QoS)>,
+}
+
+impl Delivery {
+    /// Sends parked deliveries in batches of [`OUTBOUND_BATCH`] until the queue is empty or the
+    /// next QoS 1 delivery would exceed the subscriber's Receive Maximum.
+    async fn flush(&mut self, framed_write: &mut FramedWr) -> Result<(), &'static str> {
+        loop {
+            let mut buf = BytesMut::new();
+            let mut batched = 0;
+            while batched < OUTBOUND_BATCH {
+                // Delivered at the lower of the publish and subscription QoS (§3.8.4).
+                let Some(qos) = self.parked.front().map(|(_, qos)| (*qos).min(self.granted)) else {
+                    break;
+                };
+                let packet_id = if qos == QoS::AtMostOnce {
+                    None
+                } else if self.in_flight >= self.receive_max {
+                    break;
+                } else {
+                    let id = NonZeroU16::new(self.next_packet_id).ok_or("packet id zero")?;
+                    self.next_packet_id = self.next_packet_id.checked_add(1).unwrap_or(1);
+                    self.in_flight += 1;
+                    Some(id)
+                };
+                let (message, _) = self.parked.pop_front().expect("front checked");
+                encode_delivery(message.as_ref(), qos, packet_id, &mut buf)?;
+                batched += 1;
+            }
+            if batched == 0 {
+                return Ok(());
+            }
+            framed_write
+                .get_mut()
+                .write_all(&buf)
+                .await
+                .map_err(|_| "write PUBLISH")?;
+        }
+    }
+}
+
+fn encode_delivery(
     message: &PublishMessage,
     qos: QoS,
     packet_id: Option<NonZeroU16>,
+    buf: &mut BytesMut,
 ) -> Result<(), &'static str> {
     let delivery = PublishDelivery {
         dup: false,
@@ -548,15 +689,12 @@ async fn send_publish(
         qos,
         packet_id,
     };
-    let mut buf = BytesMut::new();
-    encode_publish(message, delivery, DEFAULT_MAX_PACKET_SIZE, &mut buf).map_err(|_| "encode PUBLISH")?;
-    // Direct socket write (codec buffer unused for this path); nodelay already set.
-    framed_write
-        .get_mut()
-        .write_all(&buf)
-        .await
-        .map_err(|_| "write PUBLISH")?;
-    Ok(())
+    encode_publish(message, delivery, DEFAULT_MAX_PACKET_SIZE, buf).map_err(|_| "encode PUBLISH")
+}
+
+/// QoS the mock delivers at: it never runs PUBREL/PUBCOMP, so QoS 2 becomes QoS 1.
+fn delivery_qos(qos: QoS) -> QoS {
+    qos.min(QoS::AtLeastOnce)
 }
 
 fn granted_qos(qos: QoS) -> SubscribeAckReason {

@@ -82,6 +82,19 @@ path = "benches/mqtt_compare.rs"
 harness = false
 required-features = ["__bench"]
 
+[[bench]]
+name = "ingress_fanin"
+path = "benches/ingress_fanin.rs"
+harness = false
+# flume and async-channel: the library's own sinks are the candidates.
+required-features = ["__bench", "stats", "flume", "async-channel"]
+
+[[bench]]
+name = "alloc_profile"
+path = "benches/alloc_profile.rs"
+harness = false
+required-features = ["__bench"]
+
 [features]
 default = ["tls-rustls-aws-lc"]
 # Exactly one rustls crypto provider. Do not enable both (compile_error) and do not use
@@ -107,7 +120,7 @@ async-channel = ["dep:async-channel"]
 # benches and fuzz target. Not part of the public API; no stability guarantees.
 __internals = []
 # Internal: hooks for the `mqtt_compare` bench only. Not part of the public API.
-__bench = ["flume", "__internals"]
+__bench = ["__internals"]
 
 [dependencies]
 arc-swap = "1.9"
@@ -141,7 +154,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 # The crate itself with its internals public, so integration tests and benches can drive the
 # wire codec. No TLS feature here: the package's own feature selection supplies the provider.
 mqtt-glide = { path = ".", default-features = false, features = ["__internals"] }
-# Unit tests and the bench harness hand off through flume; the library only with the `flume` feature.
+# Unit tests hand off through flume; the library only with the `flume` feature.
 flume = "0.12"
 # SCRAM-SHA-256 client for the EMQX enhanced authentication test (tests/brokers/emqx.rs).
 hmac = "0.13"
