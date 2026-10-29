@@ -314,7 +314,7 @@ mod tests {
         ConnectOptions::new(url)
             .client_id(ClientId::from_prefix("connect"))
             .keep_alive(Duration::from_secs(45))
-            .receive_maximum(nonzero!(256u16))
+            .receive_maximum(nonzero!(512u16))
             .clean_start(true)
             .session_expiry(Some(Duration::from_secs(120)))
     }
@@ -378,7 +378,7 @@ mod tests {
         let client_id = resolve_client_id_str(&options);
         let packet = build_connect(&options, &client_id, &sample_credentials());
 
-        assert_eq!(packet.receive_max, Some(nonzero!(256u16)));
+        assert_eq!(packet.receive_max, Some(nonzero!(512u16)));
         assert_ne!(
             packet.receive_max_or_default(),
             RECEIVE_MAX_DEFAULT,

@@ -241,7 +241,7 @@ A caller that stops waiting earlier (its `ack_timeout` ran out during a long rec
 
 ### Capacities sized for a few connections, not a pipeline
 
-`command_channel_capacity` and `receive_maximum` are both `32`. See [Flow control](#flow-control).
+`command_channel_capacity` is `32` and `receive_maximum` is `256`. See [Flow control](#flow-control).
 
 | Setting | Default | Change it when |
 |---------|--------:|----------------|
@@ -251,7 +251,7 @@ A caller that stops waiting earlier (its `ack_timeout` ran out during a long rec
 | `topic_alias_maximum` / `outbound_topic_aliases` | `0` / `0` | long topics published or received often: aliases replace the topic bytes after the first message per connection |
 | `fail_fast_when_disconnected` | `false` (queue) | a publish that cannot go out now is worthless, or you buffer yourself: commands then fail with `AppError::NotConnected` during reconnects; check `client.is_connected()` for a snapshot |
 | `command_channel_capacity` | `32` | you keep more than ~32 publishes in flight |
-| `receive_maximum` | `32` | inbound QoS 1 rate is high and workers are fast |
+| `receive_maximum` | `256` | the broker is far away or messages arrive in large bursts (raise to 1024 or more); one slow member of a shared subscription should not hold many messages (lower it) |
 | `keep_alive` | 60 s | your broker or NAT expects otherwise |
 | `connect_timeout` / `ack_timeout` | 5 s / 5 s | links are slow or the broker is far |
 | `graceful_disconnect_timeout` | 2 s | shutdown must flush a large backlog |
@@ -294,7 +294,7 @@ Three limits, easy to confuse, only two of them yours to set.
 
 ### Receive Maximum
 
-`ConnectOptions::receive_maximum`, default `32`: how many inbound QoS 1 messages the broker may leave unacknowledged with this client. This is the knob that bounds memory when your sink is slow.
+`ConnectOptions::receive_maximum`, default `256`: how many inbound QoS 1 messages the broker may leave unacknowledged with this client. mqtt-glide sends the `PUBACK` once the message is in your sink, so inbound QoS 1 throughput is at most this window per round trip to the broker: 256 at 1 ms is 256 000 msg/s, at 20 ms 12 800 msg/s. Raise it for distant brokers or large bursts. Lower it for shared subscriptions with slow members: each member can hold up to this many unacknowledged messages that no other member of the group can take. The window does not bound the client's memory; the sink does.
 
 What a slow sink can hold is bounded by its own capacity, the read task's one message in hand, and `max_packet_size` per message. A decoded message usually costs about its wire size, payload and strings share the read buffer. User Properties are the exception: each costs about 70 bytes of heap however short it is, so a broker sending a 1 MiB PUBLISH packed with empty User Properties (5 bytes each on the wire) makes it about 14 MiB once decoded. If you do not trust the broker's publishers, size `max_packet_size` and the sink with that factor in mind.
 
@@ -304,7 +304,7 @@ Not yours: the broker's Receive Maximum from `CONNACK` decides how many of your 
 
 How many publishes you have in flight is an application decision, not a library option. That is what [`publish_window`](https://docs.rs/mqtt-glide/latest/mqtt_glide/struct.PublishWindow.html) gives you.
 
-Do not confuse `DEFAULT_RECEIVE_MAXIMUM` (`32`, on `ConnectOptions`) with the protocol default of `65535`, which applies when the wire property is absent. Internal write coalesce / soft-flush sizes are fixed; there is no env-var tuning in the library (`MQTT_COMPARE_*` is bench-only).
+Do not confuse `DEFAULT_RECEIVE_MAXIMUM` (`256`, on `ConnectOptions`) with the protocol default of `65535`, which applies when the wire property is absent. Internal write coalesce / soft-flush sizes are fixed; there is no env-var tuning in the library (`MQTT_COMPARE_*` is bench-only).
 
 | Goal | What to set |
 |------|-------------|

@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ack timeouts of waiting publishes are tracked by one deadline task per connection instead of a Tokio timer per publish. Many concurrent publishes no longer contend on the runtime's timer lock. A timeout can fire up to about one millisecond late
 - Outbound publish coalescing is capped at a fixed 64 publishes per write instead of a share of the client's inbound Receive Maximum, so small inbound windows no longer split publish bursts into many small writes
 - Inbound frames read in one burst and inbound PUBACKs sent in one write are likewise capped at a fixed 64 instead of an eighth of the client's Receive Maximum. At the old default of 32 every burst of ready PUBACKs went out four per write
+- `DEFAULT_RECEIVE_MAXIMUM` is 256 instead of 32. Inbound QoS 1 throughput is at most this window per round trip to the broker, so 32 capped it at 32 000 msg/s at 1 ms and 1 600 msg/s at 20 ms; at high rates the small window also cost several times the CPU per message. Set `receive_maximum(32)` to keep the old value, e.g. for shared subscriptions with slow members
 
 ## [0.4.0] - 2026-10-19
 

@@ -26,9 +26,12 @@ pub const COMMAND_CHANNEL_CAPACITY: usize = 32;
 
 /// Default inbound QoS-1 pipelining window ([`ConnectOptions::receive_maximum`]).
 ///
-/// Bounded enough to limit memory under handoff stall / a misbehaving broker;
-/// raise explicitly for high-throughput pipelines.
-pub const DEFAULT_RECEIVE_MAXIMUM: NonZeroU16 = nonzero!(32u16);
+/// Inbound QoS 1 throughput is at most this window per round trip to the broker (256 at 1 ms
+/// is 256 000 msg/s, at 20 ms 12 800 msg/s). It does not bound client memory; the
+/// [`crate::InboundSink`] capacity and [`ConnectOptions::max_packet_size`] do. Kept below the
+/// protocol's 65 535 so one slow member of a shared subscription cannot take a large share of
+/// the group's messages.
+pub const DEFAULT_RECEIVE_MAXIMUM: NonZeroU16 = nonzero!(256u16);
 
 /// Default MQTT keep-alive interval when not overridden.
 const DEFAULT_KEEP_ALIVE: Duration = Duration::from_secs(60);
@@ -175,7 +178,7 @@ pub struct ConnectOptions {
 impl ConnectOptions {
     /// Creates options for `broker_url` with documented defaults.
     ///
-    /// Defaults: keep-alive 60 s, [`DEFAULT_RECEIVE_MAXIMUM`] (32), `clean_start`
+    /// Defaults: keep-alive 60 s, [`DEFAULT_RECEIVE_MAXIMUM`] (256), `clean_start`
     /// true, `tcp_nodelay` true, no explicit TLS config (see [`BrokerUrl`] scheme).
     pub fn new(broker_url: BrokerUrl) -> Self {
         Self {
@@ -278,7 +281,7 @@ impl ConnectOptions {
 
     /// Sets the client **Receive Maximum** (inbound QoS-1 pipelining window).
     ///
-    /// Default: [`DEFAULT_RECEIVE_MAXIMUM`] (32).
+    /// Default: [`DEFAULT_RECEIVE_MAXIMUM`] (256).
     pub fn receive_maximum(mut self, receive_maximum: NonZeroU16) -> Self {
         self.receive_maximum = receive_maximum;
         self
@@ -447,7 +450,7 @@ mod tests {
         assert!(options.will_message.is_none());
 
         assert_eq!(options.receive_maximum, DEFAULT_RECEIVE_MAXIMUM);
-        assert_eq!(DEFAULT_RECEIVE_MAXIMUM.get(), 32);
+        assert_eq!(DEFAULT_RECEIVE_MAXIMUM.get(), 256);
 
         assert_eq!(options.ack_timeout, DEFAULT_ACK_TIMEOUT);
         assert_eq!(DEFAULT_ACK_TIMEOUT, Duration::from_secs(5));
@@ -467,7 +470,7 @@ mod tests {
     #[test]
     fn builder_overrides_limits_and_timeouts() {
         let url = BrokerUrl::parse("mqtt://broker.example").expect("valid url");
-        let receive_maximum = NonZeroU16::new(256).expect("non-zero");
+        let receive_maximum = NonZeroU16::new(512).expect("non-zero");
         let command_channel_capacity = NonZeroUsize::new(128).expect("non-zero");
         let options = ConnectOptions::new(url)
             .receive_maximum(receive_maximum)
