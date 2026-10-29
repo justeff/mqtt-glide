@@ -11,7 +11,7 @@ use bytes::{Buf, Bytes};
 use bytestring::ByteString;
 
 use crate::codec::error::DecodeError;
-use crate::codec::publish::{PublishMessage, PublishPacket, PublishPacketMeta, PublishProperties};
+use crate::codec::publish::{Properties, PublishMessage, PublishPacket, PublishPacketMeta, PublishProperties};
 use crate::codec::types::QoS;
 use crate::codec::utils::{self, Decode, Property};
 use crate::codec::v5::{UserProperties, UserProperty, property_type as pt};
@@ -54,14 +54,10 @@ impl PublishPacket {
             return Err(DecodeError::ProtocolViolation("empty topic without topic alias"));
         }
         let payload = src;
-        let mut props = properties.unwrap_or_default();
-        let subscription_ids = std::mem::take(&mut props.subscription_ids);
-
-        Ok(PublishPacket {
-            message: PublishMessage {
-                topic,
-                payload,
-                properties: PublishProperties {
+        let (properties, subscription_ids) = match properties {
+            None => (Properties::default(), Vec::new()),
+            Some(props) => (
+                PublishProperties {
                     correlation_data: props.correlation_data,
                     message_expiry_interval: props.message_expiry_interval,
                     content_type: props.content_type,
@@ -70,6 +66,15 @@ impl PublishPacket {
                     response_topic: props.response_topic,
                 }
                 .into(),
+                props.subscription_ids,
+            ),
+        };
+
+        Ok(PublishPacket {
+            message: PublishMessage {
+                topic,
+                payload,
+                properties,
             },
             meta: PublishPacketMeta {
                 dup,
