@@ -105,7 +105,7 @@ If the channel is full, the read task waits and the broker stops sending. That i
 
 1. The read task decodes the frame off the socket.
 2. It pushes the message into your `InboundSink`, waiting if the sink is full.
-3. Only once the sink has accepted it does the write task send `PUBACK`.
+3. Only once the sink has accepted it is `PUBACK` sent.
 4. Your workers take it off the other end and do the work.
 
 Step 3 after step 2 is the whole point, and the rest of this document calls it **enqueue-before-ack**. A client that acks at step 1 tells the broker "delivered" while the message still only exists inside the client. If the process dies there, the broker has already moved on. Here the broker keeps ownership until your queue has the message. The guarantee ends there: once the handoff succeeded, the message belongs to your application, and what happens to it afterwards is your responsibility.
@@ -190,8 +190,8 @@ The biggest changes: a new publish API (`client.publish(topic, payload).qos(..)`
 `connect()` gives you a handle and starts one driver over a single socket:
 
 1. `MqttClient`: a cheap cloneable handle. It sends commands and does no socket I/O.
-2. Write task: encodes `PUBLISH` / `SUBSCRIBE` / acks / `PINGREQ`, and puts inbound `PUBACK`s ahead of your publishes.
-3. Read task: decodes frames, answers control packets itself, and passes application `PUBLISH` to your sink.
+2. Write task: encodes `PUBLISH` / `SUBSCRIBE` / `PINGREQ` and everything else the client sends.
+3. Read task: decodes frames, answers control packets itself, and passes application `PUBLISH` to your sink. It writes the `PUBACK`s of accepted messages itself, through the writer it shares with the write task, when the write task is not writing; otherwise the write task sends them ahead of your publishes.
 
 The driver around these tasks (`Connection::run`) owns reconnects and credential refresh; neither is your code's job.
 

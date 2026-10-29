@@ -89,6 +89,9 @@ pub(crate) enum ControlMessage {
         /// Packet identifier from the inbound PUBLISH.
         packet_id: std::num::NonZeroU16,
     },
+    /// The read task left PUBACKs in the shared write buffer because the socket was full;
+    /// the write task flushes them.
+    FlushWrites,
     /// Test-only hook: no-op control variant (read exit uses the stub-exit mpsc).
     #[cfg(test)]
     #[doc(hidden)]

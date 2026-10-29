@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use bytestring::ByteString;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use rstest::rstest;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -69,6 +69,17 @@ where
     spawn_read_task_with_handoff_cap(framed, 8)
 }
 
+/// A shared writer the write task holds for good: the read task hands every PUBACK to the
+/// control channel, where these tests look for it.
+fn busy_writer() -> crate::connection::write::SharedWriter<tokio::io::Sink> {
+    let writer = Arc::new(tokio::sync::Mutex::new(FramedWrite::new(
+        tokio::io::sink(),
+        V5Codec::with_max_packet_size(0),
+    )));
+    std::mem::forget(Arc::clone(&writer).try_lock_owned().expect("fresh writer"));
+    writer
+}
+
 fn spawn_read_task_with_handoff_cap<R>(framed: FramedRead<R, V5Codec>, handoff_cap: usize) -> ReadTaskHandle
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -93,11 +104,13 @@ where
             generation: Generation(1),
             handoff_stalled: Arc::clone(&handoff_stalled),
             inbound_activity: Arc::clone(&inbound_activity),
+            inbound_publish_ack_counter: None,
         },
         stub_rx,
         framed,
         handoff_tx,
         control_tx,
+        busy_writer(),
         ReadDoneSignal::new(read_done_tx),
     ));
 
@@ -159,7 +172,7 @@ where
             control_rx,
             &mut command_rx,
             stub_rx,
-            framed,
+            Arc::new(tokio::sync::Mutex::new(framed)),
             session,
             InflightPots::new(NonZeroU16::new(4).expect("nz")),
             read_done_rx,
@@ -733,4 +746,83 @@ async fn read_task_cut_off_by_shutdown_does_not_puback_unaccepted_publish() {
         1,
         "the cut-off publish never entered the sink"
     );
+}
+
+/// With the shared writer free, the read task writes the PUBACK itself: it reaches the wire
+/// and the write task (the control channel) never hears of it. The clock is paused and never
+/// advanced, so the PUBACK must not wait for a timer: a broker that keeps fewer deliveries in
+/// flight than the Receive Maximum allows waits for it, and holding PUBACKs back for more
+/// messages or for time cut such a broker to a few thousand msg/s.
+#[tokio::test(start_paused = true)]
+async fn read_task_writes_puback_itself_when_the_writer_is_free() {
+    let delivery = PublishDelivery {
+        dup: false,
+        retain: false,
+        qos: QoS::AtLeastOnce,
+        packet_id: NonZeroU16::new(7),
+    };
+    let message = PublishMessage {
+        topic: ByteString::from_static("io/mock"),
+        payload: Bytes::from_static(b"p"),
+        properties: Default::default(),
+    };
+    let mut wire = BytesMut::new();
+    encode_publish(&message, delivery, u32::MAX, &mut wire).expect("encode qos1 publish");
+
+    let (read_end, mut broker_writes) = tokio::io::duplex(512);
+    let (write_end, broker_reads) = tokio::io::duplex(512);
+    let writer = Arc::new(tokio::sync::Mutex::new(FramedWrite::new(
+        write_end,
+        V5Codec::with_max_packet_size(0),
+    )));
+    let (control_tx, mut control_rx) = mpsc::channel(8);
+    let (_stub_tx, stub_rx) = mpsc::channel(1);
+    let (handoff_tx, handoff_rx) = flume::bounded(4);
+    let (read_done_tx, _read_done_rx) = oneshot::channel();
+    let stop = StopSignal::new();
+    let join = tokio::spawn(crate::connection::read::run(
+        ReadSession {
+            cancel: StopSignal::new(),
+            stop: stop.clone(),
+            topic_aliases: crate::connection::topic_alias::InboundTopicAliases::new(0),
+            response_router: Arc::default(),
+            stats: Default::default(),
+            generation: Generation(1),
+            handoff_stalled: Arc::new(AtomicBool::new(false)),
+            inbound_activity: Arc::new(AtomicBool::new(false)),
+            reauth: None,
+            inbound_publish_ack_counter: None,
+        },
+        stub_rx,
+        FramedRead::new(read_end, V5Codec::with_max_packet_size(0)),
+        handoff_tx,
+        control_tx,
+        writer,
+        ReadDoneSignal::new(read_done_tx),
+    ));
+
+    broker_writes.write_all(&wire).await.expect("publish");
+    let mut broker = FramedRead::new(broker_reads, V5Codec::with_max_packet_size(0));
+    // Busy-polling keeps the paused clock from advancing on its own.
+    let mut frame = None;
+    for _ in 0..10_000 {
+        if let Some(next) = broker.next().now_or_never() {
+            frame = next;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    match frame.expect("PUBACK without the clock advancing").expect("decodes") {
+        (DecodedFrame::Control(Packet::PublishAck(ack)), _) => assert_eq!(ack.packet_id.get(), 7),
+        other => panic!("expected PUBACK, got {other:?}"),
+    }
+    assert_eq!(handoff_rx.len(), 1, "accepted before the PUBACK");
+    assert!(control_rx.try_recv().is_err(), "the write task was not involved");
+
+    stop.cancel();
+    let outcome = timeout(Duration::from_secs(2), join)
+        .await
+        .expect("join timeout")
+        .expect("join");
+    assert_eq!(outcome, ReadOutcome::Cancelled);
 }

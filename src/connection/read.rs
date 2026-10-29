@@ -1,16 +1,18 @@
 //! Read task: decode frames; control inline; PUBLISH → injectable handoff.
 
+use std::num::NonZeroU16;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use futures_util::{FutureExt, StreamExt};
-use tokio::io::AsyncRead;
+use futures_util::{FutureExt, SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio_util::codec::FramedRead;
 
 use crate::codec::v5::ToReasonCode;
 use crate::codec::{DecodeError, DecodedFrame, DisconnectReasonCode, InboundMessage, Packet, PublishPacket, V5Codec};
 use crate::connection::reauth::{self, Reauth};
+use crate::connection::write::{SharedWriter, feed_inbound_publish_ack};
 use crate::connection::{ControlMessage, Generation, StopSignal, inbound_publish_policy, io_batch};
 use crate::error::{ProtocolError, TransportError};
 use crate::inbound_sink::{InboundSink, InboundTrySendError};
@@ -59,6 +61,8 @@ pub(crate) struct ReadSession {
     pub stats: crate::stats::Stats,
     /// Re-authentication requests and the authenticator, when one is configured.
     pub reauth: Option<super::reauth::ReauthLink>,
+    /// Bench-only count of PUBACKs written (see `ConnectOptions`); shared with the write task.
+    pub inbound_publish_ack_counter: Option<Arc<AtomicUsize>>,
 }
 
 /// Drop-guard: signals the write task that the read task has fully exited.
@@ -99,50 +103,61 @@ impl Drop for ReadDoneSignal {
 ///
 /// `read_done` is dropped when this task returns so the write task can finish PUBACK drain
 /// before sending DISCONNECT.
-pub(crate) async fn run<H: InboundSink, R>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run<H: InboundSink, R, W>(
     session: ReadSession,
     #[cfg(test)] stub_exit_rx: mpsc::Receiver<()>,
     framed: FramedRead<R, V5Codec>,
     handoff: H,
     control_tx: mpsc::Sender<ControlMessage>,
+    writer: SharedWriter<W>,
     read_done: ReadDoneSignal,
 ) -> ReadOutcome
 where
     R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
+    // Hold until every exit path so write observes a completed read-join.
+    let _read_done = read_done;
+    let mut acks = AcksOut {
+        ids: Vec::new(),
+        writer,
+        counter: session.inbound_publish_ack_counter.clone(),
+    };
     let mut reauth = session.reauth.as_ref().and_then(Reauth::new);
-    let outcome = read_loop(
+    let outcome = read_frames(
         session,
         #[cfg(test)]
         stub_exit_rx,
         framed,
         handoff,
-        control_tx,
-        read_done,
+        &control_tx,
+        &mut acks,
         &mut reauth,
     )
     .await;
+    // Before `read_done`: a graceful drain must see every PUBACK of an accepted message.
+    acks.send_now(&control_tx);
     if let Some(reauth) = reauth.as_mut() {
         reauth.conclude(&outcome);
     }
     outcome
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn read_loop<H: InboundSink, R>(
+/// The read loop of [`run`]; returns with PUBACKs possibly still held in `acks`.
+async fn read_frames<H: InboundSink, R, W>(
     session: ReadSession,
     #[cfg(test)] mut stub_exit_rx: mpsc::Receiver<()>,
     mut framed: FramedRead<R, V5Codec>,
     handoff: H,
-    control_tx: mpsc::Sender<ControlMessage>,
-    read_done: ReadDoneSignal,
+    control_tx: &mpsc::Sender<ControlMessage>,
+    acks: &mut AcksOut<W>,
     reauth: &mut Option<Reauth>,
 ) -> ReadOutcome
 where
     R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
-    // Hold until every exit path so write observes a completed read-join.
-    let _read_done = read_done;
     let cancel = session.cancel;
     let shutdown_notify = session.stop;
     let generation = session.generation;
@@ -171,9 +186,9 @@ where
             () = &mut stop_wait => return ReadOutcome::Cancelled,
             event = next_reauth_event(reauth), if reauth.is_some() => {
                 if let Some(state) = reauth.as_mut()
-                    && let Err(failure) = state.handle(event, &control_tx).await
+                    && let Err(failure) = state.handle(event, control_tx).await
                 {
-                    return reauth_failure(&control_tx, failure).await;
+                    return reauth_failure(control_tx, failure).await;
                 }
             }
             msg = stub_exit => {
@@ -195,12 +210,12 @@ where
                 for burst_idx in 0..read_burst {
                     match pending {
                         None => return ReadOutcome::PeerClosed,
-                        Some(Err(error)) => return decode_error_disconnect(&control_tx, error).await,
+                        Some(Err(error)) => return decode_error_disconnect(control_tx, error).await,
                         Some(Ok((DecodedFrame::Publish(mut packet), _wire_len))) => {
                             inbound_activity.store(true, Ordering::Release);
                             if let Err(error) = topic_aliases.resolve(&mut packet) {
                                 // §3.3.2.3.4: an unknown or out-of-range alias is answered with 0x94.
-                                return protocol_error_disconnect(&control_tx, error, DisconnectReasonCode::TopicAliasInvalid)
+                                return protocol_error_disconnect(control_tx, error, DisconnectReasonCode::TopicAliasInvalid)
                                     .await;
                             }
                             stats.publish_received(packet.meta.qos, packet.meta.dup);
@@ -213,7 +228,8 @@ where
                                 &stats,
                                 &response_router,
                                 &handoff,
-                                &control_tx,
+                                control_tx,
+                                acks,
                                 &cancel,
                                 &shutdown_notify,
                                 &handoff_stalled,
@@ -233,12 +249,12 @@ where
                             if let Some(state) = reauth.as_mut()
                                 && let Err(failure) = state.on_broker_auth(auth)
                             {
-                                return reauth_failure(&control_tx, failure).await;
+                                return reauth_failure(control_tx, failure).await;
                             }
                         }
                         Some(Ok((DecodedFrame::Control(packet), _wire_len))) => {
                             inbound_activity.store(true, Ordering::Release);
-                            if let Some(outcome) = dispatch_control(packet, generation, &control_tx).await {
+                            if let Some(outcome) = dispatch_control(packet, generation, control_tx).await {
                                 return outcome;
                             }
                         }
@@ -256,19 +272,128 @@ where
                         None => break,
                     }
                 }
+                // Only now: nothing more is buffered, so a broker that waits for these PUBACKs
+                // before it sends more (its window is full) gets them without delay.
+                if acks.send(control_tx).await.is_err() {
+                    return ReadOutcome::PeerClosed;
+                }
             }
         }
     }
 }
 
+/// PUBACKs of accepted messages, written at the end of each read burst.
+///
+/// Never held past the burst (until more data arrives, or for a timer): a broker that keeps
+/// fewer deliveries in flight than the client's Receive Maximum allows (EMQX's `max_inflight`
+/// defaults to 32) would stop and wait for them, and both sides would wait.
+///
+/// Handing each one to the write task woke it once per message; with the consumer woken for
+/// the same message, two runnable tasks made Tokio wake a second worker thread. When messages
+/// arrive one at a time (a broker writing each delivery on its own) that was the largest cost
+/// of inbound QoS 1. When the shared writer is free, the read task now writes the burst's
+/// PUBACKs itself; when the write task holds it, they go to the write task as before (it is
+/// awake then, so the hand-over costs no extra wake-up).
+pub(crate) struct AcksOut<W> {
+    ids: Vec<NonZeroU16>,
+    writer: SharedWriter<W>,
+    counter: Option<Arc<AtomicUsize>>,
+}
+
+impl<W: AsyncWrite + Unpin + Send + 'static> AcksOut<W> {
+    fn hold(&mut self, packet_id: NonZeroU16) {
+        self.ids.push(packet_id);
+    }
+
+    /// Writes the held PUBACKs, or hands them to the write task if it holds the writer.
+    async fn send(&mut self, control_tx: &mpsc::Sender<ControlMessage>) -> Result<(), ()> {
+        match self.write_now() {
+            Written::All => Ok(()),
+            Written::Buffered => control_tx.send(ControlMessage::FlushWrites).await.map_err(|_| ()),
+            Written::WriterBusy => {
+                for packet_id in self.ids.drain(..) {
+                    control_tx
+                        .send(ControlMessage::AckInboundPublish { packet_id })
+                        .await
+                        .map_err(|_| ())?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// On exit: like [`Self::send`] without waiting. A PUBACK that fits nowhere is not sent,
+    /// so the broker redelivers that message (QoS 1 allows the duplicate).
+    fn send_now(&mut self, control_tx: &mpsc::Sender<ControlMessage>) {
+        match self.write_now() {
+            Written::All => {}
+            Written::Buffered => {
+                let _ = control_tx.try_send(ControlMessage::FlushWrites);
+            }
+            Written::WriterBusy => {
+                for packet_id in self.ids.drain(..) {
+                    if control_tx
+                        .try_send(ControlMessage::AckInboundPublish { packet_id })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Encodes the held PUBACKs into the shared writer and flushes once, without waiting.
+    fn write_now(&mut self) -> Written {
+        if self.ids.is_empty() {
+            return Written::All;
+        }
+        let Ok(mut writer) = self.writer.try_lock() else {
+            return Written::WriterBusy;
+        };
+        let mut fed = 0;
+        for &packet_id in &self.ids {
+            if feed_inbound_publish_ack(&mut writer, packet_id, self.counter.as_ref()).is_err() {
+                break;
+            }
+            fed += 1;
+        }
+        self.ids.drain(..fed);
+        if !self.ids.is_empty() {
+            // The encoder refused a PUBACK (a broker Maximum Packet Size below 4 bytes). The
+            // write task, which owns the session's outcome, meets the same error and ends the
+            // connection.
+            return Written::WriterBusy;
+        }
+        match writer.flush().now_or_never() {
+            Some(Ok(())) => Written::All,
+            // A failed flush leaves the unsent bytes in the buffer: the write task's flush
+            // reports the error and ends the connection.
+            Some(Err(_)) | None => Written::Buffered,
+        }
+    }
+}
+
+/// What [`AcksOut::write_now`] managed.
+enum Written {
+    /// Written (or nothing was held).
+    All,
+    /// Encoded, but the socket is full or the flush failed: the write task has to flush.
+    Buffered,
+    /// The write task holds the writer, or the encoder refused a PUBACK: the held ones go to
+    /// the write task.
+    WriterBusy,
+}
+
 /// `packet` must already have its Topic Alias resolved.
 #[allow(clippy::too_many_arguments)]
-async fn handle_inbound_publish<H: InboundSink>(
+async fn handle_inbound_publish<H: InboundSink, W: AsyncWrite + Unpin + Send + 'static>(
     packet: PublishPacket,
     stats: &crate::stats::Stats,
     response_router: &crate::request::ResponseRouter,
     handoff: &H,
     control_tx: &mpsc::Sender<ControlMessage>,
+    acks: &mut AcksOut<W>,
     cancel: &StopSignal,
     shutdown_notify: &StopSignal,
     handoff_stalled: &AtomicBool,
@@ -286,6 +411,8 @@ async fn handle_inbound_publish<H: InboundSink>(
         match accept_publish_preferring_completed_push(
             handoff,
             message,
+            control_tx,
+            acks,
             stats,
             cancel,
             shutdown_notify,
@@ -299,14 +426,9 @@ async fn handle_inbound_publish<H: InboundSink>(
             PublishAccept::Closed => return Some(ReadOutcome::InboundSinkClosed),
         }
     }
-    // PUBACK only after successful handoff accept (enqueue-before-ack).
-    if let Some(packet_id) = puback_id
-        && control_tx
-            .send(ControlMessage::AckInboundPublish { packet_id })
-            .await
-            .is_err()
-    {
-        return Some(ReadOutcome::PeerClosed);
+    // PUBACK only after successful handoff accept (enqueue-before-ack); written with the burst.
+    if let Some(packet_id) = puback_id {
+        acks.hold(packet_id);
     }
     None
 }
@@ -347,9 +469,12 @@ impl Drop for HandoffStallGuard<'_> {
 /// After a stalled push finally accepts, sets `inbound_activity` once as catch-up grace:
 /// broker replies may already sit in the TCP/codec buffer while `handoff_stalled` drops —
 /// without grace the next ping tick could spuriously time out before read catches up.
-async fn accept_publish_preferring_completed_push<H: InboundSink>(
+#[allow(clippy::too_many_arguments)]
+async fn accept_publish_preferring_completed_push<H: InboundSink, W: AsyncWrite + Unpin + Send + 'static>(
     handoff: &H,
     message: InboundMessage,
+    control_tx: &mpsc::Sender<ControlMessage>,
+    acks: &mut AcksOut<W>,
     stats: &crate::stats::Stats,
     cancel: &StopSignal,
     shutdown_notify: &StopSignal,
@@ -360,6 +485,10 @@ async fn accept_publish_preferring_completed_push<H: InboundSink>(
         Ok(()) => PublishAccept::Accepted,
         Err(InboundTrySendError::Closed(_)) => PublishAccept::Closed,
         Err(InboundTrySendError::Full(message)) => {
+            // The wait can be long: let the broker have the PUBACKs it is owed meanwhile.
+            if acks.send(control_tx).await.is_err() {
+                return PublishAccept::Closed;
+            }
             handoff_stalled.store(true, Ordering::Release);
             let _stall_guard = HandoffStallGuard { flag: handoff_stalled };
             let _stall_timer = stats.handoff_stall();
@@ -500,7 +629,9 @@ mod tests {
     use bytestring::ByteString;
     use std::sync::atomic::AtomicBool;
 
-    use super::{PublishAccept, StopSignal, accept_publish_preferring_completed_push};
+    use tokio::sync::mpsc;
+
+    use super::{AcksOut, PublishAccept, StopSignal, accept_publish_preferring_completed_push};
     use crate::codec::{InboundMessage, QoS};
 
     fn sample_publish(payload: &'static [u8]) -> InboundMessage {
@@ -512,6 +643,18 @@ mod tests {
             retain: false,
             dup: false,
             subscription_ids: Vec::new(),
+        }
+    }
+
+    /// Nothing held, so the writer is never touched.
+    fn no_acks() -> AcksOut<tokio::io::Sink> {
+        AcksOut {
+            ids: Vec::new(),
+            writer: std::sync::Arc::new(tokio::sync::Mutex::new(tokio_util::codec::FramedWrite::new(
+                tokio::io::sink(),
+                crate::codec::V5Codec::with_max_packet_size(0),
+            ))),
+            counter: None,
         }
     }
 
@@ -529,6 +672,8 @@ mod tests {
         let outcome = accept_publish_preferring_completed_push(
             &tx,
             sample_publish(b"in"),
+            &mpsc::channel(8).0,
+            &mut no_acks(),
             &crate::stats::Stats::default(),
             &cancel,
             &shutdown_notify,
@@ -563,6 +708,8 @@ mod tests {
                 accept_publish_preferring_completed_push(
                     &tx,
                     sample_publish(b"stall"),
+                    &mpsc::channel(8).0,
+                    &mut no_acks(),
                     &crate::stats::Stats::default(),
                     &cancel,
                     &shutdown_notify,
@@ -608,6 +755,8 @@ mod tests {
                 accept_publish_preferring_completed_push(
                     &tx,
                     sample_publish(b"stall"),
+                    &mpsc::channel(8).0,
+                    &mut no_acks(),
                     &crate::stats::Stats::default(),
                     &cancel,
                     &shutdown_notify,
@@ -629,5 +778,77 @@ mod tests {
         assert_eq!(outcome, PublishAccept::Accepted);
         assert!(!stalled.load(std::sync::atomic::Ordering::Acquire));
         assert!(activity.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// A socket that refuses every write.
+    struct BrokenSocket;
+
+    impl tokio::io::AsyncWrite for BrokenSocket {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn acks_on<W: tokio::io::AsyncWrite>(socket: W, max_packet_size: u32) -> AcksOut<W> {
+        let mut codec = crate::codec::V5Codec::with_max_packet_size(0);
+        codec.set_max_outbound_size(max_packet_size);
+        AcksOut {
+            ids: vec![
+                std::num::NonZeroU16::new(1).unwrap(),
+                std::num::NonZeroU16::new(2).unwrap(),
+            ],
+            writer: std::sync::Arc::new(tokio::sync::Mutex::new(tokio_util::codec::FramedWrite::new(
+                socket, codec,
+            ))),
+            counter: None,
+        }
+    }
+
+    /// A failed flush is not a written PUBACK: the write task flushes again and meets the error.
+    #[tokio::test]
+    async fn failed_flush_goes_to_the_write_task() {
+        let mut acks = acks_on(BrokenSocket, 0);
+        let (control_tx, mut control_rx) = mpsc::channel(8);
+        acks.send(&control_tx).await.expect("control channel open");
+        assert!(matches!(control_rx.try_recv(), Ok(super::ControlMessage::FlushWrites)));
+        assert_eq!(
+            acks.writer.lock().await.write_buffer().len(),
+            8,
+            "both PUBACKs still buffered"
+        );
+    }
+
+    /// A PUBACK the encoder refuses goes to the write task, which ends the connection with that
+    /// error instead of the broker never hearing of the message.
+    #[tokio::test]
+    async fn refused_puback_goes_to_the_write_task() {
+        let mut acks = acks_on(tokio::io::sink(), 3);
+        let (control_tx, mut control_rx) = mpsc::channel(8);
+        acks.send(&control_tx).await.expect("control channel open");
+        for expected in [1, 2] {
+            match control_rx.try_recv() {
+                Ok(super::ControlMessage::AckInboundPublish { packet_id }) => assert_eq!(packet_id.get(), expected),
+                other => panic!("expected AckInboundPublish, got {other:?}"),
+            }
+        }
+        assert!(acks.ids.is_empty());
     }
 }

@@ -41,10 +41,25 @@ use self::commands::{
     CommandDispatch, CommandDispatchCtx, dispatch_client_command, resend_carried, send_parked_publishes,
 };
 use self::io::{
-    ControlCoalesceCtx, FlushAbort, GracefulDisconnectCtx, coalesce_ready_control_and_flush, feed_inbound_publish_ack,
-    flush_writes, graceful_disconnect, send_broker_violation_disconnect, send_packet, send_pending_protocol_disconnect,
+    ControlCoalesceCtx, FlushAbort, GracefulDisconnectCtx, coalesce_ready_control_and_flush, flush_writes,
+    graceful_disconnect, send_broker_violation_disconnect, send_packet, send_pending_protocol_disconnect,
 };
 use self::keepalive::keep_alive_ping_timer;
+
+pub(crate) use self::io::feed_inbound_publish_ack;
+
+/// The session's framed writer. The write task holds it while it writes; the read task takes it
+/// when free to write PUBACKs itself instead of waking the write task for them.
+pub(crate) type SharedWriter<W> = Arc<tokio::sync::Mutex<FramedWrite<W, V5Codec>>>;
+
+/// Takes the writer, without waiting when it is free. `Mutex::lock` counts against the task's
+/// cooperative budget even when uncontended, which made a busy write task yield more often.
+async fn lock_writer<W>(shared: &SharedWriter<W>) -> tokio::sync::MutexGuard<'_, FramedWrite<W, V5Codec>> {
+    match shared.try_lock() {
+        Ok(writer) => writer,
+        Err(_) => shared.lock().await,
+    }
+}
 
 #[allow(unused_imports)] // re-exported for crate callers / write::tests via super::*
 pub(crate) use self::acks::{ack_generation_applies, complete_publish_ack};
@@ -423,7 +438,7 @@ pub(crate) async fn run<W>(
     mut control_rx: ControlReceiver,
     command_rx: &mut CommandReceiver,
     #[cfg(test)] mut stub_exit_rx: mpsc::Receiver<()>,
-    mut framed: FramedWrite<W, V5Codec>,
+    shared: SharedWriter<W>,
     session: WriteSession,
     mut inflight: InflightPots,
     read_done: oneshot::Receiver<()>,
@@ -462,6 +477,9 @@ where
         stall_limit: (!keep_alive.is_zero()).then(|| keep_alive * 3 / 2),
     };
 
+    // Each step below takes the writer only while it writes, so that the read task can write
+    // PUBACKs itself while this task waits (see `read::AcksOut`).
+    let mut framed = lock_writer(&shared).await;
     // What the previous connection still owed: unacknowledged QoS-1 PUBLISHes first (resumed
     // session; original ids, DUP set, [MQTT-4.4.0-1]), then publishes it never sent.
     if let Err(outcome) = resend_carried(
@@ -493,6 +511,8 @@ where
         .await;
     }
 
+    drop(framed);
+
     // Created once, not per iteration: each fresh `cancelled()` future registers with (and on
     // drop deregisters from) the token under its mutex.
     let shutdown_wait = shutdown_notify.cancelled();
@@ -502,6 +522,7 @@ where
     loop {
         // A PUBACK handled in the previous iteration may have freed window slots.
         if publish_waiters.waiting_for_window() > 0 && inflight.has_publish_capacity() {
+            let mut framed = lock_writer(&shared).await;
             let sent = match send_parked_publishes(&mut framed, &mut inflight, &mut publish_waiters) {
                 Ok(()) => flush_writes(&mut framed, flush_abort).await,
                 Err(outcome) => Err(outcome),
@@ -544,6 +565,7 @@ where
             // App shutdown / session cancel before ping so the watchdog cannot turn a graceful
             // teardown into `PINGRESP timed out` while read has already stopped marking activity.
             () = &mut shutdown_wait => {
+                let mut framed = lock_writer(&shared).await;
                 return graceful_disconnect(
                     &mut framed,
                     GracefulDisconnectCtx {
@@ -563,6 +585,7 @@ where
                 .await;
             }
             () = &mut cancel_wait => {
+                let mut framed = lock_writer(&shared).await;
                 // Peer close / supervisor cancel: outstanding QoS1 waiters must not hang
                 // on connection loss.
                 send_pending_protocol_disconnect(&mut framed, &mut control_rx).await;
@@ -579,6 +602,7 @@ where
                     None => std::future::pending().await,
                 }
             } => {
+                let mut framed = lock_writer(&shared).await;
                 let _ = ping_tick;
                 // Belt-and-suspenders if notify fired in the same wake as this tick.
                 if shutdown_notify.is_cancelled() || cancel.is_cancelled() {
@@ -627,6 +651,7 @@ where
                 awaiting_pingresp = true;
             }
             control = control_rx.recv() => {
+                let mut framed = lock_writer(&shared).await;
                 match control {
                     #[cfg(test)]
                     Some(ControlMessage::StubExitWrite) => return WriteOutcome::StubExit,
@@ -862,16 +887,21 @@ where
                             .await;
                         }
                     }
-                    Some(ControlMessage::AckInboundPublish { packet_id }) => {
-                        if let Err(outcome) =
-                            feed_inbound_publish_ack(&mut framed, packet_id, inbound_publish_ack_counter.as_ref())
-                        {
-                            return finish_write_outcome(
-                                &mut waiters,
-                                &mut publish_waiters,
-                                &mut inflight,
-                                outcome,
-                            );
+                    Some(message @ (ControlMessage::AckInboundPublish { .. } | ControlMessage::FlushWrites)) => {
+                        // FlushWrites: PUBACKs the read task fed into the buffer wait for a flush.
+                        let mut fed = 0;
+                        if let ControlMessage::AckInboundPublish { packet_id } = message {
+                            if let Err(outcome) =
+                                feed_inbound_publish_ack(&mut framed, packet_id, inbound_publish_ack_counter.as_ref())
+                            {
+                                return finish_write_outcome(
+                                    &mut waiters,
+                                    &mut publish_waiters,
+                                    &mut inflight,
+                                    outcome,
+                                );
+                            }
+                            fed = 1;
                         }
                         if let Err(outcome) = coalesce_ready_control_and_flush(
                             &mut ControlCoalesceCtx {
@@ -886,7 +916,7 @@ where
                                 inbound_publish_ack_counter: inbound_publish_ack_counter.as_ref(),
                                 flush_abort,
                             },
-                            1, // already fed the triggering PUBACK
+                            fed, // the triggering PUBACK, if any, is already fed
                         )
                         .await
                         {
@@ -950,6 +980,7 @@ where
                     None => std::future::pending().await,
                 }
             } => {
+                let mut framed = lock_writer(&shared).await;
                 if shutdown_notify.is_cancelled() || cancel.is_cancelled() {
                     continue;
                 }
@@ -1003,6 +1034,7 @@ where
             }
             // Full parked queue: leave commands in the bounded channel (backpressure).
             command = command_rx.recv(), if !publish_waiters.parked_full() => {
+                let mut framed = lock_writer(&shared).await;
                 let Some(cmd) = command else {
                     return finish_write_outcome(
                         &mut waiters,

@@ -562,6 +562,7 @@ impl<H: InboundSink> Connection<H> {
         let handoff_stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let inbound_activity = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        let framed_write: write::SharedWriter<_> = Arc::new(tokio::sync::Mutex::new(framed_write));
         let read_handle = tokio::spawn(read::run(
             read::ReadSession {
                 cancel: read_cancel.clone(),
@@ -573,12 +574,14 @@ impl<H: InboundSink> Connection<H> {
                 response_router: Arc::clone(&self.channels.response_router),
                 stats: self.channels.stats.clone(),
                 reauth: self.channels.reauth.clone(),
+                inbound_publish_ack_counter: self.options.bench_inbound_publish_ack_counter.clone(),
             },
             #[cfg(test)]
             read_stub_exit_rx,
             framed_read,
             handoff,
             control_tx,
+            Arc::clone(&framed_write),
             read::ReadDoneSignal::new(read_done_tx),
         ));
 

@@ -357,7 +357,7 @@ pub(super) async fn send_pending_protocol_disconnect<W>(
 ///
 /// Uses [`encode_publish_ack`] into the write buffer — same pattern as [`feed_publish`] /
 /// [`encode_publish`] (no `Packet` / `FramedWrite::feed`).
-pub(super) fn feed_inbound_publish_ack<W>(
+pub(crate) fn feed_inbound_publish_ack<W>(
     framed: &mut FramedWrite<W, V5Codec>,
     packet_id: NonZeroU16,
     counter: Option<&Arc<AtomicUsize>>,
@@ -417,6 +417,8 @@ where
             }) => {
                 complete_publish_ack(ctx.publish_waiters, ctx.inflight, ctx.generation, ack_generation, ack);
             }
+            // The flush after this drain covers it.
+            Ok(ControlMessage::FlushWrites) => {}
             Ok(ControlMessage::SubscribeAck {
                 ack,
                 generation: ack_generation,
@@ -518,6 +520,7 @@ where
             flush_writes(framed, flush_abort).await.err()
         }
         ControlMessage::Auth(auth) => send_packet(framed, Packet::Auth(*auth), flush_abort).await.err(),
+        ControlMessage::FlushWrites => flush_writes(framed, flush_abort).await.err(),
         // Coalesce already completed these ACKs; deferred path is a defensive vacuum.
         ControlMessage::SubscribeAck { .. }
         | ControlMessage::UnsubscribeAck { .. }

@@ -102,7 +102,7 @@ where
             control_rx,
             &mut command_rx,
             stub_rx,
-            framed,
+            Arc::new(tokio::sync::Mutex::new(framed)),
             session,
             InflightPots::new(overrides.inflight_capacity),
             read_done_rx,
