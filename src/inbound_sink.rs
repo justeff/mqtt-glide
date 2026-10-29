@@ -2,15 +2,15 @@
 //!
 //! The read task delivers each inbound [`InboundMessage`] through a [`InboundSink`]
 //! **before** QoS 1 PUBACK. Built-ins: [`tokio::sync::mpsc::Sender`], [`OnInboundSink`]
-//! (inline handler via [`crate::ClientBuilder::on_inbound`]) and, with the `flume`
-//! feature, `flume::Sender`.
+//! (inline handler via [`crate::ClientBuilder::on_inbound`]) and, with the `flume` or
+//! `async-channel` feature, `flume::Sender` or `async_channel::Sender`.
 //!
 //! # Cancel safety
 //!
 //! On shutdown/session cancel the read task may drop a pending [`InboundSink::send`]
 //! future. That **MUST** mean the message was **not** accepted into the sink (so the
-//! client correctly skips PUBACK). Tokio `mpsc::Sender::send`, flume `send_async`, and
-//! [`OnInboundSink`] satisfy this. Custom sinks **MUST** uphold the same contract: do
+//! client correctly skips PUBACK). Tokio `mpsc::Sender::send`, flume `send_async`,
+//! async-channel `send`, and [`OnInboundSink`] satisfy this. Custom sinks **MUST** uphold the same contract: do
 //! not deliver to the consumer before the `send` future completes with `Ok(())`.
 
 use std::future::Future;
@@ -46,14 +46,15 @@ pub enum InboundTrySendError {
 ///
 /// The read task delivers each inbound message through the sink **before** the QoS 1
 /// PUBACK. Built-ins: [`tokio::sync::mpsc::Sender`], [`OnInboundSink`] (inline handler via
-/// [`crate::ClientBuilder::on_inbound`]) and, with the `flume` feature, `flume::Sender`.
+/// [`crate::ClientBuilder::on_inbound`]) and, with the `flume` or `async-channel` feature,
+/// `flume::Sender` or `async_channel::Sender`.
 ///
 /// # Cancel safety
 ///
 /// On shutdown/session cancel the read task may drop a pending [`Self::send`] future. That
 /// **MUST** mean the message was **not** accepted into the sink (so the client correctly
-/// skips PUBACK). Tokio `mpsc::Sender::send`, flume `send_async`, and [`OnInboundSink`]
-/// satisfy this. Custom sinks **MUST** uphold the same contract: do not deliver to the
+/// skips PUBACK). Tokio `mpsc::Sender::send`, flume `send_async`, async-channel `send`, and
+/// [`OnInboundSink`] satisfy this. Custom sinks **MUST** uphold the same contract: do not deliver to the
 /// consumer before the `send` future completes with `Ok(())`.
 pub trait InboundSink: Clone + Send + Sync + 'static {
     /// Whether further sends will fail because the consumer side is gone.
@@ -93,6 +94,33 @@ impl InboundSink for flume::Sender<InboundMessage> {
     }
 }
 
+// Unit tests cover async-channel (a dev-dependency) with or without the feature.
+#[cfg(any(feature = "async-channel", test))]
+impl InboundSink for async_channel::Sender<InboundMessage> {
+    #[inline]
+    fn is_closed(&self) -> bool {
+        async_channel::Sender::is_closed(self)
+    }
+
+    #[inline]
+    fn try_send(&self, message: InboundMessage) -> Result<(), InboundTrySendError> {
+        match async_channel::Sender::try_send(self, message) {
+            Ok(()) => Ok(()),
+            Err(async_channel::TrySendError::Full(message)) => Err(InboundTrySendError::Full(message)),
+            Err(async_channel::TrySendError::Closed(message)) => Err(InboundTrySendError::Closed(message)),
+        }
+    }
+
+    fn send(&self, message: InboundMessage) -> impl Future<Output = Result<(), InboundSinkClosed>> + Send {
+        let sender = self.clone();
+        async move {
+            async_channel::Sender::send(&sender, message)
+                .await
+                .map_err(|_| InboundSinkClosed)
+        }
+    }
+}
+
 impl InboundSink for tokio::sync::mpsc::Sender<InboundMessage> {
     #[inline]
     fn is_closed(&self) -> bool {
@@ -120,7 +148,7 @@ impl InboundSink for tokio::sync::mpsc::Sender<InboundMessage> {
 
 /// Inline inbound handoff: runs `handler` on the connection **read task** (no app queue).
 ///
-/// Prefer a channel [`InboundSink`] (`tokio::mpsc`, or `flume` with the feature) for non-trivial work —
+/// Prefer a channel [`InboundSink`] (`tokio::mpsc`, or `flume` / `async-channel` with the feature) for non-trivial work —
 /// this path stalls decode and keepalive while `handler` runs. QoS 1 `PUBACK` is sent
 /// only after `handler` returns. Built for [`crate::ClientBuilder::on_inbound`]; also
 /// usable with [`crate::connect`].
@@ -232,6 +260,36 @@ mod tests {
         assert_eq!(&*rx.recv_async().await.expect("drain").payload, b"fill");
         push.await.expect("join").expect("send");
         assert_eq!(&*rx.recv_async().await.expect("next").payload, b"next");
+    }
+
+    #[test]
+    fn async_channel_try_send_full_and_closed() {
+        let (tx, rx) = async_channel::bounded::<InboundMessage>(1);
+        tx.try_send(sample(b"a")).expect("fill");
+        match InboundSink::try_send(&tx, sample(b"b")) {
+            Err(InboundTrySendError::Full(_)) => {}
+            other => panic!("expected Full, got {other:?}"),
+        }
+        drop(rx);
+        match InboundSink::try_send(&tx, sample(b"c")) {
+            Err(InboundTrySendError::Closed(_)) => {}
+            other => panic!("expected Closed, got {other:?}"),
+        }
+        assert!(InboundSink::is_closed(&tx));
+    }
+
+    #[tokio::test]
+    async fn async_channel_send_awaits_capacity() {
+        let (tx, rx) = async_channel::bounded::<InboundMessage>(1);
+        InboundSink::try_send(&tx, sample(b"fill")).expect("fill");
+        let push = tokio::spawn({
+            let tx = tx.clone();
+            async move { InboundSink::send(&tx, sample(b"next")).await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(&*rx.recv().await.expect("drain").payload, b"fill");
+        push.await.expect("join").expect("send");
+        assert_eq!(&*rx.recv().await.expect("next").payload, b"next");
     }
 
     #[test]

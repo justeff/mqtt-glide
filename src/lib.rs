@@ -27,6 +27,8 @@
 //!   applications; meant for `[dev-dependencies]`.
 //! - `stats`: `MqttClient::stats` returns counters of what the connection did.
 //! - `flume`: `InboundSink` for `flume::Sender<InboundMessage>`; ties your build to flume 0.12.
+//! - `async-channel`: `InboundSink` for `async_channel::Sender<InboundMessage>`; ties your build
+//!   to async-channel 2.
 //!
 //! Crate overview: see the [repository README](https://github.com/justeff/mqtt-glide).
 //! Spec coverage: `CONFORMANCE.md` in the repository.

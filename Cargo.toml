@@ -34,7 +34,7 @@ exclude = [
 unsafe_code = "deny"
 
 [package.metadata.docs.rs]
-features = ["websocket", "testing", "stats", "flume"]
+features = ["websocket", "testing", "stats", "flume", "async-channel"]
 
 [[test]]
 name = "faults"
@@ -100,6 +100,9 @@ stats = []
 # `InboundSink` for `flume::Sender<InboundMessage>`. Ties the API to flume 0.12: a flume
 # upgrade here is a breaking change for code that enables this feature.
 flume = ["dep:flume"]
+# `InboundSink` for `async_channel::Sender<InboundMessage>`. Ties the API to async-channel 2:
+# an async-channel major upgrade here is a breaking change for code that enables this feature.
+async-channel = ["dep:async-channel"]
 # Internal: makes the wire codec and connection modules public for the crate's own tests,
 # benches and fuzz target. Not part of the public API; no stability guarantees.
 __internals = []
@@ -108,6 +111,7 @@ __bench = ["flume", "__internals"]
 
 [dependencies]
 arc-swap = "1.9"
+async-channel = { version = "2", optional = true }
 bitflags = "2.13"
 bytes = "1.12"
 bytestring = "1.5"
@@ -142,6 +146,8 @@ flume = "0.12"
 # SCRAM-SHA-256 client for the EMQX enhanced authentication test (tests/brokers/emqx.rs).
 hmac = "0.13"
 sha2 = "0.11"
+# Unit tests cover the async-channel sink; the library only with the `async-channel` feature.
+async-channel = "2"
 # Bench: `getrusage` for subscriber CPU in `mqtt_compare` (see benches/support/cpu.rs).
 libc = "0.2"
 proptest = "1.11"

@@ -4,7 +4,8 @@
 //!
 //! Incoming PUBLISH delivery **MUST** be configured before [`ClientBuilder::connect`]:
 //! call [`.inbound_sink`](ClientBuilder::inbound_sink) with any [`InboundSink`] (for
-//! example `tokio::sync::mpsc::Sender`, or `flume::Sender` with the `flume` feature),
+//! example `tokio::sync::mpsc::Sender`, or `flume::Sender` / `async_channel::Sender` with the
+//! `flume` / `async-channel` feature),
 //! [`.on_inbound`](ClientBuilder::on_inbound) for an inline handler on the read task,
 //! or [`.discard_inbound`](ClientBuilder::discard_inbound) to drain/drop messages in a
 //! background task. These paths are mutually exclusive (compile-time). The unset state

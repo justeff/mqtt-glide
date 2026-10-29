@@ -34,12 +34,14 @@ Then connect with `ws://broker:8080/mqtt` or `wss://broker/mqtt`.
 
 Minimum supported Rust version: **1.88**. It is raised only in a minor release (before 1.0: a `0.x` bump), never in a patch release, and every raise is listed in the changelog.
 
-Inbound messages go into any `InboundSink`; `tokio::sync::mpsc::Sender` works out of the box. To hand them to a `flume::Sender` instead, enable the `flume` feature. It ties your build to flume 0.12, so a flume upgrade in mqtt-glide is a breaking change for you:
+Inbound messages go into any `InboundSink`; `tokio::sync::mpsc::Sender` works out of the box. For several consumer tasks draining one queue, enable `async-channel` or `flume` and hand the client that crate's `Sender`. Each feature ties your build to that crate's version, so an upgrade in mqtt-glide is a breaking change for you:
 
 ```toml
-mqtt-glide = { version = "0.4", features = ["flume"] }
-flume = "0.12"
+mqtt-glide = { version = "0.4", features = ["async-channel"] }
+async-channel = "2"
 ```
+
+Which one: `tokio::sync::mpsc` for one consumer. With several consumers, and especially several clients (brokers) feeding one queue, async-channel was never clearly slower than flume and up to 40% faster in the [fan-in bench](BENCHMARKS.md#which-inbound-sink); flume (0.12) works the same way. Cheap per-message work is fastest in `.on_inbound`, with no queue at all.
 
 ## Quickstart
 
@@ -110,7 +112,7 @@ Step 3 after step 2 is the whole point, and the rest of this document calls it *
 
 ### One handoff instead of two queues
 
-Decoded messages go directly into your `InboundSink`: a `tokio::sync::mpsc` sender (or `flume` with the feature), an inline handler, or your own implementation. There is no library-owned inbound queue in front of it to size, drain, or reason about.
+Decoded messages go directly into your `InboundSink`: a `tokio::sync::mpsc` sender (or `flume` / `async-channel` with the feature), an inline handler, or your own implementation. There is no library-owned inbound queue in front of it to size, drain, or reason about.
 
 ### A slow consumer costs throughput, not the session
 
@@ -120,7 +122,7 @@ Read and write run as separate tasks on a split socket. While the read task wait
 |---------|----------|
 | App API | Cloneable `MqttClient` (no polling) |
 | I/O | Separate read and write tasks on a split socket |
-| Inbound | Injectable `InboundSink` (e.g. `tokio::mpsc`, `flume` with the feature) |
+| Inbound | Injectable `InboundSink` (e.g. `tokio::mpsc`, `flume` or `async-channel` with the feature) |
 | QoS 1 ingress | enqueue-before-ack: `PUBACK` only after the sink accepts |
 | Keep-alive under load | Write keeps sending `PINGREQ` while read waits on a full sink; liveness treats that stall as self-induced |
 | Shutdown | Graceful drain, then `DISCONNECT` |
@@ -383,7 +385,7 @@ If the broker refuses a restored filter (for example after an ACL change), the c
 | `Authenticator` | Enhanced authentication (§4.12): `method()`, async `start()` per `CONNECT` and per re-authentication, an `AuthExchange` answering each broker challenge (`respond`) and checking the broker's final data (`finish`); `invalidate()` like the credentials. See [Enhanced authentication](#enhanced-authentication) |
 | `ReconnectPolicy` | `delay_after(outcome) -> Option<Duration>` (`None` = stop). The outcome of a broker `DISCONNECT` or refused `CONNACK` includes the broker's Reason String (and Server Reference). Ready-made: `StandardReconnectPolicy` + `mark_live()` |
 | `LifecycleHook` | Sync `Connected` / `Disconnected` side effects on the driver task; keep short (no await). `ClientBuilder` already waits for the first `Connected`. For async waits use the [`SessionPhase`](https://docs.rs/mqtt-glide/latest/mqtt_glide/enum.SessionPhase.html) watch (`client.session_phase()`, any client) and `client.is_connected()` for a snapshot |
-| `InboundSink` | Injectable inbound handoff; built-ins: `tokio::mpsc`, `OnInboundSink` (`.on_inbound`), `flume` (feature). Custom sinks **MUST** be cancel-safe |
+| `InboundSink` | Injectable inbound handoff; built-ins: `tokio::mpsc`, `OnInboundSink` (`.on_inbound`), `flume` and `async-channel` (features). Custom sinks **MUST** be cancel-safe |
 
 ### TLS
 
@@ -481,7 +483,7 @@ Broader flows live under [`examples/`](examples/) and are the better starting po
 
 `StandardReconnectPolicy::mark_live()`: call once the session is fully ready (typically after subscriptions succeed). The next transport failure then retries immediately (`Duration::ZERO`) once, before falling back to the configured delay; only if the session lasted at least that delay, so a broker that drops every connection right away is not dialled in a loop. Auth failures use the normal delay, then `max_auth_backoff` after a streak (`DEFAULT_AUTH_FAILURE_THRESHOLD`). Credential cache clearing is `CredentialsProvider::invalidate`, not this policy.
 
-Custom `InboundSink` cancel safety: built-ins (`tokio::mpsc`, `OnInboundSink`, `flume`) are fine. If you implement `InboundSink`, dropping `send()` before `Ok(())` **MUST** mean the message was not accepted by your consumer. On shutdown the driver may drop a pending send and will withhold `PUBACK` in that case. `.on_inbound` runs on the connection read task; keep the handler short or use a channel sink.
+Custom `InboundSink` cancel safety: built-ins (`tokio::mpsc`, `OnInboundSink`, `flume`, `async-channel`) are fine. If you implement `InboundSink`, dropping `send()` before `Ok(())` **MUST** mean the message was not accepted by your consumer. On shutdown the driver may drop a pending send and will withhold `PUBACK` in that case. `.on_inbound` runs on the connection read task; keep the handler short or use a channel sink.
 
 Spec **SHOULD**s this client adopts: `CONNACK` within `connect_timeout`; `PINGRESP` watchdog (~1× Keep Alive) with handoff-stall exemption.
 
