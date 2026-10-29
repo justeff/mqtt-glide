@@ -1752,7 +1752,8 @@ mod tests {
         client.shutdown().await.expect("shutdown");
         let _ = run.await;
 
-        let frames = observed.lock().await.clone();
+        // The broker records on its own task: the driver can be done before it read the marker.
+        let frames = recorded_at_least(&observed, 1).await;
         assert_eq!(frames, [(QoS::AtMostOnce, None, Bytes::from_static(b"marker"))]);
     }
 
