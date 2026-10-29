@@ -41,7 +41,7 @@ mqtt-glide = { version = "0.4", features = ["async-channel"] }
 async-channel = "2"
 ```
 
-Which one: `tokio::sync::mpsc` for one consumer. With several consumers, and especially several clients (brokers) feeding one queue, async-channel was never clearly slower than flume and up to 40% faster in the [fan-in bench](BENCHMARKS.md#which-inbound-sink); flume (0.12) works the same way. Cheap per-message work is fastest in `.on_inbound`, with no queue at all.
+Which one: `tokio::sync::mpsc` for one consumer. With several clients (brokers) feeding one queue that several consumers drain, async-channel was faster than flume in most cells of the [fan-in bench](BENCHMARKS.md#which-inbound-sink), by up to 69%; flume was a few percent ahead in some cells with real per-message work. One `tokio::sync::mpsc` per worker, chosen by a hash of the topic, was faster still and keeps per-topic order. Cheap per-message work is fastest in `.on_inbound`, with no queue at all.
 
 ## Quickstart
 
@@ -545,7 +545,7 @@ With the `stats` feature, `client.stats()` returns what the connection has done 
 - **Inbound:** publishes per QoS, duplicates, how often and how long the inbound sink was full.
 - **Bytes** in each direction.
 
-The crate does not choose a metrics system for you. Read the snapshot on each scrape (a few dozen atomic loads) and hand the numbers to Prometheus, OpenTelemetry or a log line. Without the feature the counting is compiled out. With it on, each counted event is a plain atomic store on the task that owns the counter; in an interleaved on/off comparison, throughput did not change and CPU per message stayed within about 2% in all but one of six cells, at the size of the run-to-run spread ([Cost of the `stats` feature](BENCHMARKS.md#cost-of-the-stats-feature)).
+The crate does not choose a metrics system for you. Read the snapshot on each scrape (a few dozen atomic loads) and hand the numbers to Prometheus, OpenTelemetry or a log line. Without the feature the counting is compiled out. With it on, each counted event is a relaxed load and store on a counter that only the task owning it writes: no lock, no read-modify-write, and no cache line shared with other connections. An interleaved on/off comparison found no difference beyond the run-to-run spread.
 
 ```toml
 mqtt-glide = { version = "0.4", features = ["stats"] }
@@ -601,15 +601,24 @@ Broker-dependent: Message Expiry *drop after interval* (property round-trip is t
 
 All results and the reading guide: [`BENCHMARKS.md`](BENCHMARKS.md). How to run them yourself: [`benches/README.md`](benches/README.md).
 
-Headline at 256 B, QoS 1, tuned Mosquitto `2.1.2-alpine`, median of 5 runs, 50 000-message bursts, on an Intel Core Ultra 7 258V with the client pinned to 2 P-cores (msg/s · CPU ns/msg; **bold** = best in row):
+Tuned Mosquitto `2.1.2-alpine`, 256 B, QoS 1. Linux in a Podman VM on Apple M5 Max, client on 4 pinned vCPUs, broker and publisher on their own. Median of 5 runs, clients taking turns (msg/s · CPU ns/msg; **bold** = best in row):
 
-| Scenario | glide (main) | rumqttc-v5-next 0.33.3 | mqtt5 0.48.0 |
+| Scenario | glide | rumqttc-v5-next 0.33.3 | mqtt5 0.48.0 |
 |----------|------:|--------:|------:|
-| 64 callers sharing one client | **293 160** · **3 600** | 206 252 · 4 782 | 171 652 · 7 590 |
-| 512 callers sharing one client | **316 591** · **3 430** | 220 438 · 4 540 | 215 616 · 6 810 |
-| Pipelined, window 64 | **298 327** · **3 691** | 216 274 · 4 527 | 180 156 · 8 513 |
+| 8 callers sharing one client | 145 013 · 7 587 | **147 261** · **7 115** | 83 870 · 13 816 |
+| 64 callers sharing one client | **234 701** · **6 201** | 201 105 · 6 508 | 85 024 · 13 738 |
+| 512 callers sharing one client | **252 546** · **5 918** | 193 985 · 6 609 | 83 387 · 13 847 |
+| 50 000 msg/s offered, p50 / p99 | **494 / 1 274 µs** · **12 311** | 968 / 1 989 µs · 14 315 | 894 / 2 544 µs · 22 596 |
+| Receiving, PUBACK after the app queue | 102 577 · **3 545** | **103 092** · 4 438 | n/a |
 
-These are absolute numbers on one host and broker setup, not paired comparisons. Against a stock-limit Mosquitto (Receive Maximum 20) glide and mqtt5 lose throughput at high concurrency, and peers lead some cells (for example idle QoS 0 outbound latency and QoS 0 ingress load on the mock broker, and mqtt5's idle QoS 1 latency on tuned Mosquitto). rumqttc is pinned to 0.33.3 because 0.34.0 scans its whole outgoing table on every flush; against a broker without a Receive Maximum that table has 65 535 slots and throughput falls to a few thousand msg/s. Per-publish p50/p99/p99.9 latency, a task-per-message burst, fixed-rate load, ingress, and the pinning and fairness details are in [`BENCHMARKS.md`](BENCHMARKS.md). The wire codec alone, without broker or client, is measured by `cargo bench --bench codec_throughput` ([`benches/README.md`](benches/README.md)).
+- glide publishes fastest and cheapest from a few dozen callers up, and at a fixed load it has about half the latency of the peers. Against a broker that is never the bottleneck, its publishing is 3 to 15× theirs.
+- Receiving, glide spends the least CPU per message, also against rumqttc acknowledging on decode; all clients get what Mosquitto delivers (about 100k msg/s at QoS 1).
+- With a handful of callers glide and rumqttc are even; at 16 KiB with 8 callers rumqttc is ahead.
+- rumqttc is pinned to 0.33.3 because 0.34.0 scans its whole outgoing table on every flush; against a broker without a Receive Maximum that table has 65 535 slots and throughput falls to a few thousand msg/s.
+
+[`BENCHMARKS.md`](BENCHMARKS.md) also has the mock-broker ceiling, stock Mosquitto, a broker with its own in-flight cap, payload sizes up to 16 KiB, which inbound sink to use with several brokers, the fairness rules, and why each client is ahead where it is.
+
+The wire codec alone, without broker or client, is measured by `cargo bench --bench codec_throughput` ([`benches/README.md`](benches/README.md)).
 
 Throughput knobs live under [Flow control](#flow-control); the `MQTT_COMPARE_*` variables configure the bench harness and have no effect on the library.
 
