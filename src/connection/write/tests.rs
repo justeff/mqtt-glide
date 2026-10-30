@@ -5,7 +5,7 @@ use crate::codec::{
 use crate::connection::ClientCommand;
 use crate::connection::publish_reply;
 use crate::connection::{ControlMessage, Generation};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use bytestring::ByteString;
 use futures_util::StreamExt;
 use nonzero_ext::nonzero;
@@ -1406,4 +1406,23 @@ async fn large_publishes_of_one_burst_share_a_write() {
     harness.cancel.cancel();
     let _ = timeout(Duration::from_secs(2), harness.join).await;
     let _ = timeout(Duration::from_secs(2), peer).await;
+}
+
+/// An empty buffer that a burst grew is given back at the keep-alive tick; a small one, or one
+/// still holding bytes, is left alone.
+#[test]
+fn idle_write_buffer_shrinks_only_when_large_and_empty() {
+    use super::{WRITE_BUFFER_START_BYTES, release_idle_write_buffer};
+
+    let mut grown = BytesMut::with_capacity(1024 * 1024);
+    assert!(release_idle_write_buffer(&mut grown));
+    assert!(grown.capacity() >= WRITE_BUFFER_START_BYTES && grown.capacity() < 64 * 1024);
+
+    let mut small = BytesMut::with_capacity(WRITE_BUFFER_START_BYTES);
+    assert!(!release_idle_write_buffer(&mut small));
+
+    let mut busy = BytesMut::with_capacity(1024 * 1024);
+    busy.extend_from_slice(b"unflushed");
+    assert!(!release_idle_write_buffer(&mut busy));
+    assert_eq!(&busy[..], b"unflushed");
 }

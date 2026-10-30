@@ -91,6 +91,27 @@ use tokio::sync::mpsc;
 /// are not held waiting for this threshold.
 pub(super) const WRITE_BUFFER_SOFT_FLUSH_BYTES: usize = 16 * 1024;
 
+/// Write buffer capacity an idle buffer returns to: what `FramedWrite::new` starts with. A start
+/// of 16 KiB (one soft flush) measured 5% slower at 512 callers with 16 KiB payloads.
+pub(crate) const WRITE_BUFFER_START_BYTES: usize = 8 * 1024;
+
+/// An empty write buffer larger than this goes back to [`WRITE_BUFFER_START_BYTES`] at the next
+/// keep-alive tick.
+const WRITE_BUFFER_RETAIN_BYTES: usize = 64 * 1024;
+
+/// Gives back the memory a burst of large publishes left in the empty write buffer.
+///
+/// The buffer keeps its largest capacity after a write (up to [`WRITE_BUFFER_HARD_FLUSH_BYTES`]
+/// plus one publish). Called on the keep-alive tick, never on the publish path: a connection
+/// that keeps sending large bursts shrinks and regrows once per keep-alive interval.
+fn release_idle_write_buffer(buffer: &mut bytes::BytesMut) -> bool {
+    if buffer.is_empty() && buffer.capacity() > WRITE_BUFFER_RETAIN_BYTES {
+        *buffer = bytes::BytesMut::with_capacity(WRITE_BUFFER_START_BYTES);
+        return true;
+    }
+    false
+}
+
 /// Fewest publishes a burst puts in the write buffer before a mid-burst flush. With payloads of
 /// [`WRITE_BUFFER_SOFT_FLUSH_BYTES`] or more, the byte threshold alone flushed after every
 /// publish; small publishes reach the byte threshold first and flush as before.
@@ -658,6 +679,7 @@ where
                 }
                 publish_waiters.stats.ping_sent();
                 awaiting_pingresp = true;
+                release_idle_write_buffer(framed.write_buffer_mut());
             }
             control = control_rx.recv() => {
                 let mut framed = lock_writer(&shared).await;
