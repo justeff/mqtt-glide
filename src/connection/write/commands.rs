@@ -21,10 +21,11 @@ use crate::error::AppError;
 use crate::util::{is_shared_subscription_filter, validate_share_name};
 
 use super::acks::app_error_from_write_outcome;
-use super::io::{FlushAbort, feed_publish, flush_if_buffer_large, flush_writes, map_encode_error};
+use super::io::{FlushAbort, feed_publish, flush_writes, map_encode_error};
 use super::{
-    BrokerPublishLimits, CarriedPublish, MAX_READY_DRAIN, PendingOutboundPublish, PendingSubscribe, PendingUnsubscribe,
-    PublishWaiters, SubUnsubWaiters, WriteOutcome,
+    BrokerPublishLimits, CarriedPublish, MAX_READY_DRAIN, PUBLISHES_PER_SOFT_FLUSH, PendingOutboundPublish,
+    PendingSubscribe, PendingUnsubscribe, PublishWaiters, SubUnsubWaiters, WRITE_BUFFER_HARD_FLUSH_BYTES,
+    WRITE_BUFFER_SOFT_FLUSH_BYTES, WriteOutcome,
 };
 
 /// Mutable state needed to dispatch one [`ClientCommand`].
@@ -213,6 +214,7 @@ where
     // many outbound publishes may share a write. The drain never awaits except for the soft
     // flush, so the cap only bounds how long control and keep-alive wait behind a burst.
     let batch = MAX_IO_BATCH;
+    let mut since_flush = 0;
     for _ in 0..MAX_READY_DRAIN {
         // Full parked queue: leave further commands in the bounded channel.
         if fed_publishes >= batch || ctx.publish_waiters.parked_full() {
@@ -239,7 +241,16 @@ where
                 )
                 .await?;
                 fed_publishes += 1;
-                flush_if_buffer_large(ctx.framed, ctx.flush_abort).await?;
+                since_flush += 1;
+                // Mid-burst flush: by bytes for small publishes (as for every other frame), but
+                // never after fewer than PUBLISHES_PER_SOFT_FLUSH, so large payloads share writes.
+                let buffered = ctx.framed.write_buffer().len();
+                if (since_flush >= PUBLISHES_PER_SOFT_FLUSH && buffered >= WRITE_BUFFER_SOFT_FLUSH_BYTES)
+                    || buffered >= WRITE_BUFFER_HARD_FLUSH_BYTES
+                {
+                    flush_writes(ctx.framed, ctx.flush_abort).await?;
+                    since_flush = 0;
+                }
             }
             #[cfg(test)]
             Ok(ClientCommand::Noop) => {}

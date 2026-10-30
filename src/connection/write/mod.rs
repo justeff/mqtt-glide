@@ -91,6 +91,15 @@ use tokio::sync::mpsc;
 /// are not held waiting for this threshold.
 pub(super) const WRITE_BUFFER_SOFT_FLUSH_BYTES: usize = 16 * 1024;
 
+/// Fewest publishes a burst puts in the write buffer before a mid-burst flush. With payloads of
+/// [`WRITE_BUFFER_SOFT_FLUSH_BYTES`] or more, the byte threshold alone flushed after every
+/// publish; small publishes reach the byte threshold first and flush as before.
+pub(super) const PUBLISHES_PER_SOFT_FLUSH: usize = 16;
+
+/// Flush mid-burst at this size whatever the publish count (bounds the buffer for large
+/// payloads).
+pub(super) const WRITE_BUFFER_HARD_FLUSH_BYTES: usize = 1024 * 1024;
+
 pub(super) use crate::connection::io_batch::MAX_READY_DRAIN;
 
 /// Upper bound on QoS-1 PUBLISHes held while the broker's Receive Maximum window is full.

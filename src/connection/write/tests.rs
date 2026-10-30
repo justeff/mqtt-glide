@@ -1344,3 +1344,66 @@ async fn coalesced_inbound_acks_keep_a_queued_protocol_disconnect() {
         .expect("write join");
     assert_eq!(outcome, WriteOutcome::Cancelled);
 }
+
+/// Large publishes queued together share a write: the 16 KiB soft-flush threshold alone used to
+/// flush after every 16 KiB publish, one write each.
+#[tokio::test]
+async fn large_publishes_of_one_burst_share_a_write() {
+    use crate::codec::DecodedFrame;
+
+    // The harness's command channel holds 8.
+    const PUBLISHES: usize = 8;
+    let (task_end, peer_end) = tokio::io::duplex(4 * 1024 * 1024);
+    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let framed = FramedWrite::new(
+        CountingWriter {
+            inner: task_end,
+            writes: Arc::clone(&writes),
+        },
+        V5Codec::with_max_packet_size(0),
+    );
+    let (wired_tx, mut wired_rx) = mpsc::unbounded_channel::<()>();
+    let peer = tokio::spawn(async move {
+        let mut framed = FramedRead::new(peer_end, V5Codec::with_max_packet_size(0));
+        while let Some(Ok((frame, _))) = framed.next().await {
+            if let DecodedFrame::Publish(_) = frame {
+                let _ = wired_tx.send(());
+            }
+        }
+    });
+    let harness = spawn_write_task(framed, WriteSessionOverrides::default());
+
+    // Queued before the write task first runs (current-thread runtime), so one burst takes all.
+    let payload = Bytes::from(vec![7u8; 16 * 1024]);
+    let mut replies = Vec::new();
+    for _ in 0..PUBLISHES {
+        let (tx, ticket) = publish_reply(false);
+        replies.push(ticket.rx);
+        harness
+            .command_tx
+            .try_send(ClientCommand::Publish {
+                message: PublishMessage {
+                    topic: ByteString::from_static("t/large"),
+                    payload: payload.clone(),
+                    properties: Default::default(),
+                },
+                qos: QoS::AtMostOnce,
+                retain: false,
+                reply: tx,
+            })
+            .expect("publish command");
+    }
+    for _ in 0..PUBLISHES {
+        timeout(Duration::from_secs(2), wired_rx.recv())
+            .await
+            .expect("publish must reach the wire")
+            .expect("peer open");
+    }
+    let writes = writes.load(Ordering::Relaxed);
+    assert!(writes <= 2, "{PUBLISHES} large publishes took {writes} writes");
+
+    drop(replies);
+    harness.cancel.cancel();
+    let _ = timeout(Duration::from_secs(2), harness.join).await;
+    let _ = timeout(Duration::from_secs(2), peer).await;
+}
