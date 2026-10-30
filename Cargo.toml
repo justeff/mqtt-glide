@@ -164,7 +164,7 @@ async-channel = "2"
 # Bench: `getrusage` for subscriber CPU in `mqtt_compare` (see benches/support/cpu.rs).
 libc = "0.2"
 proptest = "1.11"
-rstest = "0.26"
+rstest = "0.28"
 # Absolute multi-client matrix for `mqtt_compare` only (not runtime deps of the library).
 # No crypto provider on rumqttc — the library feature under test supplies the single rustls provider.
 # `mqtt5` (LabOverWire) is client-only here (no broker / WS / QUIC).
