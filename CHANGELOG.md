@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An idle connection gives back the write buffer memory a burst of large publishes left behind: at the keep-alive tick, an empty buffer above 64 KiB returns to 8 KiB. The buffer keeps its largest size after a write, up to about 1 MiB with bursts of large publishes. Shrinking once a second, 60 times the default rate, cost nothing measurable
 - `DEFAULT_RECEIVE_MAXIMUM` is 256 instead of 32. Inbound QoS 1 throughput is at most this window per round trip to the broker, so 32 capped it at 32 000 msg/s at 1 ms and 1 600 msg/s at 20 ms; at high rates the small window also cost several times the CPU per message. Set `receive_maximum(32)` to keep the old value, e.g. for shared subscriptions with slow members
 
+### Fixed
+
+- Enabling both `tls-rustls-aws-lc` and `tls-rustls-ring` no longer fails to compile; ring is used. Cargo merges the features every crate in a build asks for, so a dependency that left mqtt-glide's default on broke the build of an application that chose ring
+
 ## [0.4.0] - 2026-10-19
 
 ### Changed (breaking)

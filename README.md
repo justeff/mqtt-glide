@@ -18,7 +18,7 @@ mqtt-glide = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 ```
 
-TLS goes through rustls. Enable **exactly one** crypto provider: `tls-rustls-aws-lc` (default) or `tls-rustls-ring`. Prefer pinning the choice in dependents. The client builds its `ClientConfig` with `builder_with_provider` and does not rely on a process-global rustls default, so enabling both features (or `--all-features`) is rejected.
+TLS goes through rustls with one of two crypto providers: `tls-rustls-aws-lc` (default) or `tls-rustls-ring`. With both enabled (another crate in your build left the default on, or `--all-features`), ring is used, since it is only ever enabled on purpose. The client builds its `ClientConfig` with `builder_with_provider` and does not rely on a process-global rustls default. To build without aws-lc-rs:
 
 ```toml
 mqtt-glide = { version = "0.4", default-features = false, features = ["tls-rustls-ring"] }

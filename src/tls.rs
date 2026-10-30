@@ -289,15 +289,16 @@ impl fmt::Debug for TlsConfig {
     }
 }
 
-/// Crypto provider selected by the active `tls-rustls-*` Cargo feature.
+/// Crypto provider selected by the `tls-rustls-*` Cargo features: ring when enabled (it is
+/// only ever enabled on purpose, aws-lc-rs is the default), otherwise aws-lc-rs.
 pub(crate) fn selected_crypto_provider() -> rustls::crypto::CryptoProvider {
-    #[cfg(feature = "tls-rustls-aws-lc")]
-    {
-        rustls::crypto::aws_lc_rs::default_provider()
-    }
     #[cfg(feature = "tls-rustls-ring")]
     {
         rustls::crypto::ring::default_provider()
+    }
+    #[cfg(not(feature = "tls-rustls-ring"))]
+    {
+        rustls::crypto::aws_lc_rs::default_provider()
     }
 }
 

@@ -153,8 +153,7 @@ jobs:
       - name: check ring TLS
         run: cargo check --lib --no-default-features --features tls-rustls-ring
 
-  # Default features only: `tls-rustls-aws-lc` and `tls-rustls-ring` are mutually exclusive,
-  # so the action's all-features heuristic cannot document the crate.
+  # Default features only: `--all-features` would pull in the unstable `__internals` API.
   # Release type is inferred from the version bump (0.1 → 0.2 = Cargo's 0.x "major").
   semver-checks:
     name: cargo-semver-checks

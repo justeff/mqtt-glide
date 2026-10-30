@@ -9,16 +9,16 @@
 //!
 //! # TLS crypto provider
 //!
-//! TLS uses rustls. Enable **exactly one** Cargo feature:
+//! TLS uses rustls. Enable at least one Cargo feature:
 //!
 //! - `tls-rustls-aws-lc` (default) — rustls + aws-lc-rs
 //! - `tls-rustls-ring` — rustls + ring
 //!
-//! The client builds its `ClientConfig` with the selected provider explicitly
-//! (`builder_with_provider`), so MQTT TLS does not depend on a process-global
-//! rustls default. Do not enable both features and do not use `--all-features`.
-//! Downstream crates should pin explicitly, e.g.
-//! `mqtt-glide = { ..., default-features = false, features = ["tls-rustls-aws-lc"] }`.
+//! With both enabled (another crate in the build left the default on, or `--all-features`),
+//! ring is used: it is only ever enabled on purpose. The client builds its `ClientConfig` with
+//! that provider explicitly (`builder_with_provider`), so MQTT TLS does not depend on a
+//! process-global rustls default. To build without aws-lc-rs, use
+//! `mqtt-glide = { ..., default-features = false, features = ["tls-rustls-ring"] }`.
 //!
 //! # Other features
 //!
@@ -33,11 +33,8 @@
 //! Crate overview: see the [repository README](https://github.com/justeff/mqtt-glide).
 //! Spec coverage: `CONFORMANCE.md` in the repository.
 
-#[cfg(all(feature = "tls-rustls-aws-lc", feature = "tls-rustls-ring"))]
-compile_error!("features `tls-rustls-aws-lc` and `tls-rustls-ring` are mutually exclusive");
-
 #[cfg(not(any(feature = "tls-rustls-aws-lc", feature = "tls-rustls-ring")))]
-compile_error!("enable exactly one of `tls-rustls-aws-lc` or `tls-rustls-ring`");
+compile_error!("enable `tls-rustls-aws-lc` or `tls-rustls-ring`");
 
 mod ack;
 mod auth;

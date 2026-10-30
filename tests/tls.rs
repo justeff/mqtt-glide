@@ -32,10 +32,10 @@ fn certificate(name: &str) -> CertificateDer<'static> {
 }
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
-    #[cfg(feature = "tls-rustls-aws-lc")]
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
     #[cfg(feature = "tls-rustls-ring")]
     let provider = rustls::crypto::ring::default_provider();
+    #[cfg(not(feature = "tls-rustls-ring"))]
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
     Arc::new(provider)
 }
 

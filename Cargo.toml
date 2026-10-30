@@ -97,8 +97,8 @@ required-features = ["__bench"]
 
 [features]
 default = ["tls-rustls-aws-lc"]
-# Exactly one rustls crypto provider. Do not enable both (compile_error) and do not use
-# `--all-features`. Consumers embed via `default-features = false, features = [...]`.
+# rustls crypto provider; at least one. With both, ring is used (it is only ever enabled on
+# purpose). Without aws-lc-rs: `default-features = false, features = ["tls-rustls-ring"]`.
 tls-rustls-aws-lc = ["rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
 tls-rustls-ring = ["rustls/ring", "tokio-rustls/ring"]
 # MQTT over WebSocket (`ws://` / `wss://` broker URLs). `wss` reuses the client's own rustls
