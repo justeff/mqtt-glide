@@ -143,7 +143,7 @@ impl From<&[u8]> for Password {
 ///
 /// Implementations must be [`Send`] + [`Sync`] so the driver can share them across tasks.
 /// For fixed passwords see [`StaticCredentials`]; apps with rotating tokens implement this
-/// trait themselves (this crate does not embed OAuth).
+/// trait themselves (the crate has no token handling of its own).
 ///
 /// Uses RPITIT (`impl Future + Send`) instead of the `async_trait` crate so futures
 /// are `Send` and can be erased for storage in [`Connection`].

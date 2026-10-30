@@ -8,26 +8,26 @@ An MQTT 5 client for Tokio. You connect once, get a cloneable handle, and publis
 
 Inbound messages go to a sink you provide: a channel, or a closure that runs inline. For QoS 1, mqtt-glide sends `PUBACK` only after that sink has accepted the message, so a message the broker considers delivered is already in your queue, not in flight somewhere inside the client.
 
-MQTT 5 only, QoS 0 and 1, over TCP, TLS or (opt-in) WebSocket. No MQTT 3.1.1, no QoS 2, `no_std`, or business logic; see the [feature matrix](#feature-matrix) before you adopt it.
+MQTT 5 only, QoS 0 and 1, over TCP, TLS or (opt-in) WebSocket. No MQTT 3.1.1, no QoS 2 and no `no_std`; see the [feature matrix](#feature-matrix) before you adopt it.
 
 ## Install
 
 ```toml
 [dependencies]
-mqtt-glide = "0.4"
+mqtt-glide = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 ```
 
 TLS goes through rustls with one of two crypto providers: `tls-rustls-aws-lc` (default) or `tls-rustls-ring`. With both enabled (another crate in your build left the default on, or `--all-features`), ring is used, since it is only ever enabled on purpose. The client builds its `ClientConfig` with `builder_with_provider` and does not rely on a process-global rustls default. To build without aws-lc-rs:
 
 ```toml
-mqtt-glide = { version = "0.4", default-features = false, features = ["tls-rustls-ring"] }
+mqtt-glide = { version = "0.5", default-features = false, features = ["tls-rustls-ring"] }
 ```
 
 MQTT over WebSocket (for networks that only let HTTP(S) out, or brokers behind an HTTP ingress) is behind the optional `websocket` feature; it adds `tokio-tungstenite` for the handshake and framing only:
 
 ```toml
-mqtt-glide = { version = "0.4", features = ["websocket"] }
+mqtt-glide = { version = "0.5", features = ["websocket"] }
 ```
 
 Then connect with `ws://broker:8080/mqtt` or `wss://broker/mqtt`.
@@ -37,7 +37,7 @@ Minimum supported Rust version: **1.88**. It is raised only in a minor release (
 Inbound messages go into any `InboundSink`; `tokio::sync::mpsc::Sender` works out of the box. For several consumer tasks draining one queue, enable `async-channel` or `flume` and hand the client that crate's `Sender`. Each feature ties your build to that crate's version, so an upgrade in mqtt-glide is a breaking change for you:
 
 ```toml
-mqtt-glide = { version = "0.4", features = ["async-channel"] }
+mqtt-glide = { version = "0.5", features = ["async-channel"] }
 async-channel = "2"
 ```
 
@@ -169,7 +169,11 @@ When a full application queue blocks the same loop that sends `PINGREQ`, a slow 
 
 ### What it costs
 
-No MQTT 3.1.1 and no QoS 2: both are out of scope, not pending. If you need either, rumqttc remains the better fit. Unacknowledged QoS 1 publishes are kept in memory only: they are resent after a reconnect into a resumed session (see [No session](#no-session)), but not after a process restart. Cross-process session resume needs a stable client ID (`.client_id("…")?` or `ClientId::try_new`) plus `clean_start(false)` and a non-zero `session_expiry`. rumqttc is also the far more widely deployed crate; this one is 0.4.x, and the API can still move.
+No MQTT 3.1.1 and no QoS 2: both are out of scope, not pending. If you need either, rumqttc remains the better fit. Unacknowledged QoS 1 publishes are kept in memory only: they are resent after a reconnect into a resumed session (see [No session](#no-session)), but not after a process restart. Cross-process session resume needs a stable client ID (`.client_id("…")?` or `ClientId::try_new`) plus `clean_start(false)` and a non-zero `session_expiry`. rumqttc is also the far more widely deployed crate; this one is 0.5.x, and the API can still move.
+
+## Upgrading from 0.4
+
+Three changes can affect existing code. One default changed: `receive_maximum` is `256` instead of `32`, so a broker may keep up to 256 inbound QoS 1 messages unacknowledged with this client (see [Receive Maximum](#receive-maximum)). `.options(|o| o.receive_maximum(NonZeroU16::new(32).unwrap()))` keeps the old window, for example for shared subscriptions with slow members. `ConnectOptions` and `ClientBuilder` are no longer `UnwindSafe`, because they can hold an `Authenticator`; code that moves them into `std::panic::catch_unwind` wraps them in `AssertUnwindSafe`. `Subscription` can no longer be built as a struct literal; use `Subscription::new(filter, qos)` or `(filter, qos)`. The rest of 0.5 is [enhanced authentication](#enhanced-authentication) with re-authentication, Response Information, socket buffer sizes, faster inbound QoS 1 and large publishes, and the `async-channel` feature; the [CHANGELOG](CHANGELOG.md#050---2026-11-02) has the details.
 
 ## Upgrading from 0.3
 
@@ -180,10 +184,6 @@ No MQTT 3.1.1 and no QoS 2: both are out of scope, not pending. If you need eith
 - **Reconnect:** the builder reconnects by default (`StandardReconnectPolicy::default()`); `.reconnect(NoReconnect)` keeps the old behaviour.
 
 The [CHANGELOG](CHANGELOG.md#040---2026-10-19) has the details.
-
-## Upgrading from 0.2
-
-The biggest changes: a new publish API (`client.publish(topic, payload).qos(..)`, and an owned `Publish` for `send`), inbound messages delivered as `InboundMessage` (with `retain`, `dup` and `qos`), the non-blocking enqueue renamed to `try_start_publish` while `start_publish` now waits for room, and `#[non_exhaustive]` on most public enums and response types, so a `match` on them needs a wildcard arm. A filter the broker refuses to restore after a reconnect no longer makes the client reconnect; watch `refused_subscriptions()` instead. The [CHANGELOG](CHANGELOG.md#030---2026-10-17) has a migration table from the old calls to the new ones.
 
 ## Architecture
 
@@ -499,7 +499,7 @@ The `testing` feature (meant for `[dev-dependencies]`, no extra dependencies) le
 
 ```toml
 [dev-dependencies]
-mqtt-glide = { version = "0.4", features = ["testing"] }
+mqtt-glide = { version = "0.5", features = ["testing"] }
 ```
 
 A test for a service that switches lights on command and reports their state:
@@ -550,7 +550,7 @@ With the `stats` feature, `client.stats()` returns what the connection has done 
 The crate does not choose a metrics system for you. Read the snapshot on each scrape (a few dozen atomic loads) and hand the numbers to Prometheus, OpenTelemetry or a log line. Without the feature the counting is compiled out. With it on, each counted event is a relaxed load and store on a counter that only the task owning it writes: no lock, no read-modify-write, and no cache line shared with other connections. An interleaved on/off comparison found no difference beyond the run-to-run spread.
 
 ```toml
-mqtt-glide = { version = "0.4", features = ["stats"] }
+mqtt-glide = { version = "0.5", features = ["stats"] }
 ```
 
 ```rust,no_run

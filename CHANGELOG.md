@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-02
+
 ### Changed (breaking)
 
+- `DEFAULT_RECEIVE_MAXIMUM` is 256 instead of 32. Inbound QoS 1 throughput is at most this window per round trip to the broker, so 32 capped it at 32 000 msg/s at 1 ms and 1 600 msg/s at 20 ms; at high rates the small window also cost several times the CPU per message. Set `receive_maximum(32)` to keep the old value, e.g. for shared subscriptions with slow members
 - `ConnectOptions` (and so `ClientBuilder`) is no longer `UnwindSafe` / `RefUnwindSafe`: it can hold an `Authenticator` now, which these auto traits do not cover. Code that moves it into `std::panic::catch_unwind` wraps it in `AssertUnwindSafe`
+- `Subscription` is `#[non_exhaustive]`, so later per-filter settings are not breaking changes. Build it with `Subscription::new(filter, qos)` (plus `.no_local(..)`, `.retain_as_published(..)`, `.retain_handling(..)`) or from `(filter, qos)` instead of a struct literal; the fields stay public
 
 ### Added
 
@@ -27,10 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Inbound PUBACKs are written by the read task itself, all of one read burst together, when the write task is not writing. Handing each one to the write task woke a second worker thread per message. Inbound QoS 1 costs about half the CPU per message against Mosquitto and reaches about 35% more msg/s under load; PUBACKs leave no later than before. Against a broker that is itself the limit and delivers one message at a time, fewer PUBACKs share a write than before, which cost about 4% of Mosquitto's peak delivery rate
 - Large publishes queued together share a write. A burst is flushed mid-way only once it holds 16 KiB and 16 publishes (or 1 MiB); the byte threshold alone flushed after every publish of 16 KiB or more. Publishing 16 KiB at QoS 1 reaches about twice the msg/s against a broker that keeps up; small publishes are written as before
 - An idle connection gives back the write buffer memory a burst of large publishes left behind: at the keep-alive tick, an empty buffer above 64 KiB returns to 8 KiB. The buffer keeps its largest size after a write, up to about 1 MiB with bursts of large publishes. Shrinking once a second, 60 times the default rate, cost nothing measurable
-- `DEFAULT_RECEIVE_MAXIMUM` is 256 instead of 32. Inbound QoS 1 throughput is at most this window per round trip to the broker, so 32 capped it at 32 000 msg/s at 1 ms and 1 600 msg/s at 20 ms; at high rates the small window also cost several times the CPU per message. Set `receive_maximum(32)` to keep the old value, e.g. for shared subscriptions with slow members
 
 ### Fixed
 
+- A QoS 0 PUBLISH with the DUP flag set is delivered with the flag cleared instead of ending the connection as a malformed packet. [MQTT-3.3.1-2] forbids the flag to the sender, but some brokers set it on messages they forward at QoS 0, which disconnected the client on every such message
 - Enabling both `tls-rustls-aws-lc` and `tls-rustls-ring` no longer fails to compile; ring is used. Cargo merges the features every crate in a build asks for, so a dependency that left mqtt-glide's default on broke the build of an application that chose ring
 
 ## [0.4.0] - 2026-10-19

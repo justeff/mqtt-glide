@@ -112,14 +112,12 @@ We follow [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Body
 
-Use a body when the **why** is not obvious from the diff.
-Two to four sentences is the upper limit. No bullet lists that only mirror the file list.
+Use a body when the **why** is not obvious from the diff: one compact paragraph after the blank line, with no line breaks inside it. Two to four sentences is the upper limit. No bullet lists that only mirror the file list.
 
 ```
 fix(keepalive): skip ping watchdog during handoff stall
 
-A full InboundSink must not look like a dead peer; the write task
-already keeps PINGREQ alive while read waits on backpressure.
+A full InboundSink must not look like a dead peer; the write task already keeps PINGREQ alive while read waits on backpressure.
 ```
 
 ### Examples
