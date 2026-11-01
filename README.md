@@ -239,6 +239,8 @@ What happens to your publishes when the connection drops and the client reconnec
 | Never sent (parked behind Receive Maximum, or still queued) | sent on the next connection | sent on the next connection |
 | QoS 1 sent, `PUBACK` missing | fails with `AppError::ConnectionLost` | resent in order with its original packet id and `DUP` set ([MQTT-4.4.0-1]) and what is left of its Message Expiry Interval (at least 1 s); fails with `ConnectionLost` if CONNACK reports no session |
 
+That holds for QoS 0 too: a value published during an outage arrives after it, and the subscribers take it for current. When a stale value is worse than none, as with live sensor readings, set `fail_fast_when_disconnected(true)` and publishes fail with `AppError::NotConnected` until the connection is back.
+
 A caller that stops waiting earlier (its `ack_timeout` ran out during a long reconnect backoff) gets `PublishTimeout`, and `PublishError::delivery` says which case it hit. For QoS 1, `Delivery::NotSent`: the publish had not been written, and it never will be, so publishing it again cannot duplicate it. `Delivery::Unknown`: it had been written; an unacknowledged one in a resumed session is still resent, so publishing it again yourself can deliver it twice. QoS 0 keeps no write state (it would cost QoS 0 throughput), so its timeout says `Unknown`; one not yet written is still never written afterwards. To wait for the PUBACK however long a reconnect takes, use `.ack_timeout(None)` on the publish, or `PublishCompletion::wait_for(None)`.
 
 ### Capacities sized for a few connections, not a pipeline
