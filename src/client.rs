@@ -31,7 +31,11 @@ pub use crate::publish::{Publish, PublishBuilder};
 pub use crate::publish_window::PublishWindow;
 
 /// One topic filter + options for [`MqttClient::subscribe`].
+///
+/// Build it with [`Subscription::new`] or from `(filter, QoS)`; the fields stay readable and
+/// writable, and further per-filter settings can be added without a breaking change.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Subscription {
     /// Topic filter (may be a shared filter such as `$share/group/topic`).
     pub filter: ByteString,
