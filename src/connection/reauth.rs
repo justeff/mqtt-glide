@@ -6,12 +6,13 @@
 //! packets on the control path to the write task. Publishes and acknowledgements keep flowing
 //! meanwhile.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{OwnedMutexGuard, mpsc, oneshot};
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, Sleep, sleep_until};
 
 use super::ControlMessage;
 use super::transport::check_broker_auth;
@@ -62,25 +63,21 @@ enum State {
     Starting {
         reply: ReauthReply,
         step: Step<Result<Started, AuthError>>,
-        deadline: Instant,
     },
-    /// An AUTH went out; the broker's answer is due by `deadline`.
+    /// An AUTH went out; the broker's answer is due before the timer fires.
     Waiting {
         reply: ReauthReply,
         exchange: Box<dyn ExchangeErased>,
-        deadline: Instant,
     },
     /// [`AuthExchange::respond`](crate::AuthExchange::respond) runs.
     Responding {
         reply: ReauthReply,
         step: Step<Responded>,
-        deadline: Instant,
     },
     /// [`AuthExchange::finish`](crate::AuthExchange::finish) runs.
     Finishing {
         reply: ReauthReply,
         step: Step<Result<(), AuthError>>,
-        deadline: Instant,
     },
 }
 
@@ -107,6 +104,12 @@ pub(crate) struct Reauth {
     requests: OwnedMutexGuard<mpsc::Receiver<ReauthReply>>,
     ack_timeout: Duration,
     state: State,
+    /// Deadline of the running step. One timer per connection, re-armed per step: the read
+    /// loop polls the exchange on every pass and must not register a fresh timer each time.
+    timer: Pin<Box<Sleep>>,
+    /// Time the read task spent away from the exchange since the timer was armed, added to the
+    /// deadline only when the timer fires, so a busy inbound path does not reset it per message.
+    held_up: Duration,
 }
 
 impl Reauth {
@@ -122,6 +125,8 @@ impl Reauth {
             requests,
             ack_timeout: link.ack_timeout,
             state: State::Idle,
+            timer: Box::pin(sleep_until(Instant::now())),
+            held_up: Duration::ZERO,
         })
     }
 
@@ -140,41 +145,44 @@ impl Reauth {
     /// sink): neither the broker's answer that arrived meanwhile nor an authenticator step that
     /// was not polled is late.
     pub(crate) fn extend_deadline(&mut self, by: Duration) {
-        match &mut self.state {
-            State::Idle => {}
-            State::Starting { deadline, .. }
-            | State::Waiting { deadline, .. }
-            | State::Responding { deadline, .. }
-            | State::Finishing { deadline, .. } => *deadline += by,
+        if self.busy() {
+            self.held_up += by;
         }
     }
 
     /// The next event. Cancel-safe: the steps are polled in place, so a `select!` that drops
     /// this future loses nothing.
     pub(crate) async fn next_event(&mut self) -> Event {
-        match &mut self.state {
-            State::Idle => match self.requests.recv().await {
+        let Self {
+            state,
+            requests,
+            timer,
+            held_up,
+            ..
+        } = self;
+        match state {
+            State::Idle => match requests.recv().await {
                 Some(reply) => Event::Request(reply),
                 // Every client handle is gone; nobody can ask any more.
                 None => std::future::pending().await,
             },
             // Every step is bounded like the broker's answer: a hung token endpoint must not
             // hold the caller (or, mid-exchange, the broker) forever.
-            State::Starting { step, deadline, .. } => match timeout_at(*deadline, step).await {
-                Ok(started) => Event::Started(started),
-                Err(_) => Event::TimedOut,
+            State::Starting { step, .. } => match bounded(step, timer, held_up).await {
+                Some(started) => Event::Started(started),
+                None => Event::TimedOut,
             },
-            State::Waiting { deadline, .. } => {
-                tokio::time::sleep_until(*deadline).await;
+            State::Waiting { .. } => {
+                expired(timer, held_up).await;
                 Event::TimedOut
             }
-            State::Responding { step, deadline, .. } => match timeout_at(*deadline, step).await {
-                Ok((exchange, result)) => Event::Responded(exchange, result),
-                Err(_) => Event::TimedOut,
+            State::Responding { step, .. } => match bounded(step, timer, held_up).await {
+                Some((exchange, result)) => Event::Responded(exchange, result),
+                None => Event::TimedOut,
             },
-            State::Finishing { step, deadline, .. } => match timeout_at(*deadline, step).await {
-                Ok(finished) => Event::Finished(finished),
-                Err(_) => Event::TimedOut,
+            State::Finishing { step, .. } => match bounded(step, timer, held_up).await {
+                Some(finished) => Event::Finished(finished),
+                None => Event::TimedOut,
             },
         }
     }
@@ -190,8 +198,8 @@ impl Reauth {
                 if !reply.is_closed() {
                     let authenticator = self.authenticator.clone();
                     let step = Box::pin(async move { authenticator.start().await });
-                    let deadline = self.deadline();
-                    self.state = State::Starting { reply, step, deadline };
+                    self.arm();
+                    self.state = State::Starting { reply, step };
                 }
                 Ok(())
             }
@@ -273,16 +281,16 @@ impl Reauth {
                     return Err(protocol_failure(error));
                 }
                 let data = auth.auth_data;
-                let deadline = self.deadline();
+                self.arm();
                 self.state = if expected == AuthReasonCode::Success {
                     let step = Box::pin(async move { exchange.finish(data).await });
-                    State::Finishing { reply, step, deadline }
+                    State::Finishing { reply, step }
                 } else {
                     let step = Box::pin(async move {
                         let result = exchange.respond(data).await;
                         (exchange, result)
                     });
-                    State::Responding { reply, step, deadline }
+                    State::Responding { reply, step }
                 };
                 Ok(())
             }
@@ -354,18 +362,38 @@ impl Reauth {
                 outcome: ReadOutcome::PeerClosed,
             });
         }
-        let deadline = self.deadline();
-        self.state = State::Waiting {
-            reply,
-            exchange,
-            deadline,
-        };
+        self.arm();
+        self.state = State::Waiting { reply, exchange };
         Ok(())
     }
 
-    /// When a step started now is late.
-    fn deadline(&self) -> Instant {
-        Instant::now() + self.ack_timeout
+    /// Starts the deadline of a step that begins now.
+    fn arm(&mut self) {
+        self.held_up = Duration::ZERO;
+        self.timer.as_mut().reset(Instant::now() + self.ack_timeout);
+    }
+}
+
+/// The step's output, or `None` once its deadline passed.
+async fn bounded<T>(step: &mut Step<T>, timer: &mut Pin<Box<Sleep>>, held_up: &mut Duration) -> Option<T> {
+    tokio::select! {
+        // Like `timeout_at`: a step that is ready wins over a deadline passing at the same time.
+        biased;
+        output = step => Some(output),
+        () = expired(timer, held_up) => None,
+    }
+}
+
+/// Completes once the deadline, moved by the time the read task was held up, has passed.
+/// Cancel-safe: a move is applied to the timer before waiting on it again.
+async fn expired(timer: &mut Pin<Box<Sleep>>, held_up: &mut Duration) {
+    loop {
+        timer.as_mut().await;
+        if held_up.is_zero() {
+            return;
+        }
+        let deadline = timer.deadline() + std::mem::take(held_up);
+        timer.as_mut().reset(deadline);
     }
 }
 
@@ -544,11 +572,8 @@ mod tests {
         assert_eq!(response.auth_data.as_deref(), Some(&b"answer:nonce"[..]));
         assert!(response.reason_string.is_none() && response.user_properties.is_empty());
 
-        // A Success without properties may leave the method out (§3.15.2.1).
-        let success = Auth {
-            auth_data: Some(Bytes::from_static(b"server-ok")),
-            ..Auth::default()
-        };
+        // With Authentication Data the Success carries the method too (§3.15.2.1).
+        let success = broker_auth(AuthReasonCode::Success, "scripted", b"server-ok");
         rig.reauth.on_broker_auth(success).expect("success");
         rig.step().await.expect("finished");
         assert_eq!(answer.await.expect("answered"), Ok(()));
@@ -608,13 +633,18 @@ mod tests {
     }
 
     /// A broker AUTH that does not fit the exchange is a Protocol Error: another method
-    /// ([MQTT-4.12.0-5]), a Re-authenticate from the server, or a second AUTH before the
-    /// client answered the first.
+    /// ([MQTT-4.12.0-5]), a Re-authenticate from the server, a Success with data but without
+    /// the method, or a second AUTH before the client answered the first.
     #[tokio::test]
     async fn broker_auth_out_of_place_is_a_protocol_error() {
+        let success_without_method = Auth {
+            auth_data: Some(Bytes::from_static(b"server-ok")),
+            ..Auth::default()
+        };
         for auth in [
             broker_auth(AuthReasonCode::ContinueAuth, "other", b"nonce"),
             broker_auth(AuthReasonCode::ReAuth, "scripted", b"nonce"),
+            success_without_method,
         ] {
             let mut rig = rig_default();
             let answer = rig.started().await;

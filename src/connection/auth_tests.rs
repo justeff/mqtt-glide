@@ -168,18 +168,20 @@ async fn only_auth_goes_out_before_the_connack() {
 }
 
 /// A broker AUTH that does not fit is answered with DISCONNECT 0x82: another method than the
-/// CONNECT's, or a CONNACK naming another method ([MQTT-4.12.0-5]), or any AUTH when the CONNECT
+/// CONNECT's, or a CONNACK naming another method or none ([MQTT-4.12.0-5]), or any AUTH when the CONNECT
 /// had no method.
 #[tokio::test]
 async fn broker_breaking_the_connect_exchange_gets_a_protocol_error() {
     enum Break {
         AuthMethod,
         ConnackMethod,
+        ConnackWithoutMethod,
         AuthWithoutMethodInConnect,
     }
     for broken in [
         Break::AuthMethod,
         Break::ConnackMethod,
+        Break::ConnackWithoutMethod,
         Break::AuthWithoutMethodInConnect,
     ] {
         let authenticator = (!matches!(broken, Break::AuthWithoutMethodInConnect)).then(Scripted::default);
@@ -193,6 +195,7 @@ async fn broker_breaking_the_connect_exchange_gets_a_protocol_error() {
                         auth(AuthReasonCode::ContinueAuth, "other", b"nonce")
                     }
                     Break::ConnackMethod => connack_with_method("other"),
+                    Break::ConnackWithoutMethod => Packet::ConnectAck(Box::default()),
                 };
                 let _ = write.send(packet).await;
                 disconnect_reason(&mut read).await

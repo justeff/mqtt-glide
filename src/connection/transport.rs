@@ -127,12 +127,10 @@ where
         }
     };
     if let (Some(authenticator), Some(mut exchange)) = (authenticator, exchange) {
-        if ack
-            .auth_method
-            .as_ref()
-            .is_some_and(|method| method != authenticator.method())
-        {
-            let outcome = protocol_violation("CONNACK Authentication Method differs from CONNECT ([MQTT-4.12.0-5])");
+        // A broker that left the method out may never have run the exchange; `finish` would
+        // then accept a client that was not authenticated with this method at all.
+        if ack.auth_method.as_ref() != Some(authenticator.method()) {
+            let outcome = protocol_violation("CONNACK without the CONNECT's Authentication Method ([MQTT-4.12.0-5])");
             return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::ProtocolError, outcome).await);
         }
         if let Err(error) = within_connect(deadline, options, exchange.finish(ack.auth_data)).await? {
@@ -173,12 +171,17 @@ pub(crate) fn check_broker_auth(
             auth.reason_code
         )));
     }
-    // Only a Success without properties may leave the method out (§3.15.2.1).
+    // Only a Success without any properties may leave the method out (§3.15.2.1); Data, a
+    // Reason String or User Properties need the method next to them.
+    let bare_success = auth.reason_code == AuthReasonCode::Success
+        && auth.auth_data.is_none()
+        && auth.reason_string.is_none()
+        && auth.user_properties.is_empty();
     match &auth.auth_method {
         Some(received) if received != method => Err(ProtocolError::Violation(
             "broker AUTH Authentication Method differs from CONNECT ([MQTT-4.12.0-5])".into(),
         )),
-        None if expected != AuthReasonCode::Success => Err(ProtocolError::Violation(
+        None if !bare_success => Err(ProtocolError::Violation(
             "broker AUTH without Authentication Method".into(),
         )),
         _ => Ok(()),
@@ -418,6 +421,43 @@ mod tests {
     use crate::codec::V5Codec;
     use crate::util::BrokerUrl;
     use tokio_util::codec::{FramedRead, FramedWrite};
+
+    /// A broker AUTH leaves the method out only as a Success without any properties.
+    #[test]
+    fn broker_auth_without_method_only_as_bare_success() {
+        use bytes::Bytes;
+
+        let method = ByteString::from("scripted");
+        let bare = Auth::default();
+        check_broker_auth(&bare, &method, AuthReasonCode::Success).expect("bare Success");
+
+        let with_method = Auth {
+            auth_method: Some(method.clone()),
+            auth_data: Some(Bytes::from_static(b"server-ok")),
+            ..Auth::default()
+        };
+        check_broker_auth(&with_method, &method, AuthReasonCode::Success).expect("Success with method");
+
+        let data_only = Auth {
+            auth_data: Some(Bytes::from_static(b"server-ok")),
+            ..Auth::default()
+        };
+        let reason_only = Auth {
+            reason_string: Some("ok".into()),
+            ..Auth::default()
+        };
+        let continue_without_method = Auth {
+            reason_code: AuthReasonCode::ContinueAuth,
+            ..Auth::default()
+        };
+        for (auth, expected) in [
+            (data_only, AuthReasonCode::Success),
+            (reason_only, AuthReasonCode::Success),
+            (continue_without_method, AuthReasonCode::ContinueAuth),
+        ] {
+            assert!(check_broker_auth(&auth, &method, expected).is_err(), "{auth:?}");
+        }
+    }
 
     /// The first byte the client puts on a fresh connection is the CONNECT Fixed Header
     /// ([MQTT-3.1.0-1]).

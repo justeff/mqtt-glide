@@ -449,7 +449,7 @@ client.reauthenticate().await?;
 
 - **CONNECT:** carries `method()` and the data from `start()`. Each AUTH 0x18 challenge goes to `respond`, whose answer goes back as AUTH 0x18; nothing else is sent before the CONNACK. The CONNACK's data goes to `finish`, where a method like SCRAM checks the broker's signature. The whole exchange counts against `connect_timeout`.
 - **Re-authentication:** `reauthenticate()` sends AUTH 0x19 and runs the same exchange next to the normal traffic: publishes, acknowledgements and inbound messages keep flowing. Answers are due within `ack_timeout`.
-- **Failures:** a broker refusal (CONNACK or DISCONNECT 0x87 / 0x8C) is `AuthError::NotAuthorized` and calls `invalidate()`. The authenticator failing or distrusting the broker sends DISCONNECT 0x80 and closes the connection; the reconnect policy decides what follows, and the next connection authenticates afresh. Only a failing `start()` during a re-authentication leaves the connection alone, since nothing was sent yet.
+- **Failures:** a broker refusal (CONNACK 0x86 / 0x87 or DISCONNECT 0x87 / 0x8C) is `AuthError::NotAuthorized` and calls `invalidate()`. The authenticator failing or distrusting the broker sends DISCONNECT 0x80 and closes the connection; the reconnect policy decides what follows, and the next connection authenticates afresh. Only a failing `start()` during a re-authentication leaves the connection alone, since nothing was sent yet.
 - **Testing:** `TestBroker::enhanced_auth(method, |request| AuthStep::…)` scripts the broker side, re-authentication included. The crate's own broker tests run SCRAM-SHA-256 against EMQX, in the CONNECT and in a re-authentication.
 
 ### Examples
