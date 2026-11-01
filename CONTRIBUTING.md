@@ -16,6 +16,12 @@ RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --features websocket,testing,stat
 
 `__bench` is an internal feature for the comparison bench; it is not part of the public API.
 
+The two fast ones, `cargo fmt --check` and the conformance check below, also run before every commit once the repository's hook is enabled (once per clone; `git commit --no-verify` skips it):
+
+```shell
+git config core.hooksPath .githooks
+```
+
 CI repeats clippy and the tests for the second TLS provider and for WebSocket. Locally, for example:
 
 ```shell

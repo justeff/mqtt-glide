@@ -1,0 +1,13 @@
+#!/bin/sh
+# Fast checks CI would fail on. Enable once per clone: git config core.hooksPath .githooks
+# Skip a single commit with: git commit --no-verify
+status=0
+if ! cargo fmt --check >/dev/null 2>&1; then
+    echo "pre-commit: code is not formatted; run 'cargo fmt' and stage the changes." >&2
+    status=1
+fi
+if ! python3 conformance/render.py --check; then
+    echo "pre-commit: run 'python3 conformance/render.py' and stage CONFORMANCE.md." >&2
+    status=1
+fi
+exit $status

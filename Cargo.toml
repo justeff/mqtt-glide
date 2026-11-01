@@ -15,6 +15,7 @@ categories = ["network-programming", "asynchronous"]
 # Keep the crates.io tarball lean; benches/tests stay in git for CI.
 exclude = [
     "/.github/",
+    "/.githooks/",
     "/.gitignore",
     "/benches/",
     "/conformance/",
