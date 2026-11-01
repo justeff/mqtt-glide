@@ -30,6 +30,12 @@
 //! - `async-channel`: `InboundSink` for `async_channel::Sender<InboundMessage>`; ties your build
 //!   to async-channel 2.
 //!
+//! # Stability
+//!
+//! Everything documented here follows Semantic Versioning. Features whose names start with
+//! `__` (`__internals`, `__bench`) are not: they exist for the crate's own tests, benches and
+//! fuzz target, and what they expose can change or disappear in any release.
+//!
 //! Crate overview: see the [repository README](https://github.com/justeff/mqtt-glide).
 //! Spec coverage: `CONFORMANCE.md` in the repository.
 

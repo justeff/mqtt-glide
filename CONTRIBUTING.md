@@ -14,7 +14,7 @@ cargo test --lib --features testing,stats
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --features websocket,testing,stats
 ```
 
-`__bench` is an internal feature for the comparison bench; it is not part of the public API.
+`__bench` (the comparison bench) and `__internals` (the wire codec and connection modules for the crate's own tests, benches and fuzz target) are internal features: not part of the public API and not covered by Semantic Versioning.
 
 The two fast ones, `cargo fmt --check` and the conformance check below, also run before every commit once the repository's hook is enabled (once per clone; `git commit --no-verify` skips it):
 
