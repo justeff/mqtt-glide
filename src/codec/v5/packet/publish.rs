@@ -1,7 +1,7 @@
 //! MQTT PUBLISH (§3.3) — variable header, properties, and payload decode.
 //!
 //! # Errors
-//! Rejects QoS 0 with DUP ([MQTT-3.3.1-2]), invalid Topic Names ([MQTT-3.3.2-2]),
+//! Rejects invalid Topic Names ([MQTT-3.3.2-2]),
 //! empty Topic Name without Topic Alias (§3.3.2.1), and trailing/malformed
 //! property blocks (§2.2.2.2, §2.1.4).
 
@@ -32,11 +32,15 @@ pub(crate) struct PublishWireProperties {
 impl PublishPacket {
     /// Decode a PUBLISH packet body (variable header + properties + payload).
     pub(crate) fn decode(mut src: Bytes, packet_flags: u8) -> Result<Self, DecodeError> {
-        let dup = (packet_flags & 0b1000) == 0b1000;
         let qos = QoS::try_from((packet_flags & 0b0110) >> 1)?; // [MQTT-3.3.1-4]
+        let mut dup = (packet_flags & 0b1000) == 0b1000;
         if qos == QoS::AtMostOnce && dup {
-            // [MQTT-3.3.1-2]
-            return Err(DecodeError::MalformedPacket("PUBLISH QoS 0 with DUP"));
+            // [MQTT-3.3.1-2] binds the sender, and the spec names no receiver action. DUP means
+            // nothing at QoS 0, so it is cleared rather than failing the packet: a broker that
+            // sets it does so for every message it forwards that way, so a disconnect would
+            // loop forever.
+            tracing::debug!("ignoring DUP on inbound QoS 0 PUBLISH");
+            dup = false;
         }
 
         let topic = utils::decode_topic_name_allow_empty(&mut src)?;
@@ -201,14 +205,14 @@ mod tests {
         assert_eq!(publish.message.payload.as_ref(), b"data");
     }
 
-    /// A PUBLISH with QoS 0 and DUP 1 is malformed ([MQTT-3.3.1-2]).
+    /// A QoS 0 PUBLISH with DUP 1 breaks [MQTT-3.3.1-2] on the sender's side; the receiver
+    /// delivers it with DUP cleared instead of dropping the connection.
     #[test]
-    fn publish_decode_qos0_dup_rejected() {
-        let result = PublishPacket::decode(topic_and_prop0_payload(b"data"), QOS0_DUP_FLAGS);
-        assert_eq!(
-            result.map_err(|e| e.to_string()),
-            Err(DecodeError::MalformedPacket("PUBLISH QoS 0 with DUP").to_string())
-        );
+    fn publish_decode_qos0_dup_cleared() {
+        let publish = PublishPacket::decode(topic_and_prop0_payload(b"data"), QOS0_DUP_FLAGS).unwrap();
+        assert_eq!(publish.meta.qos, QoS::AtMostOnce);
+        assert!(!publish.meta.dup);
+        assert_eq!(publish.message.payload.as_ref(), b"data");
     }
 
     /// §3.3.2.3.4: Topic Alias 0 is not permitted; the receiver answers with DISCONNECT 0x94.

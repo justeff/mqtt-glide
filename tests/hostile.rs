@@ -508,7 +508,6 @@ async fn run_attack(attack: Vec<u8>, sentinel: bool) -> (Seen, Result<(), Connec
 #[case::suback_without_reason_codes(pkt(0x90, &[0, 1, 0]), 0x81)]
 #[case::publish_qos1_packet_id_zero(publish("a/b", 1, 0, &[], b"x"), 0x81)]
 #[case::publish_qos3(pkt(0x36, &[&utf8("a/b")[..], &[0, 1, 0]].concat()), 0x81)]
-#[case::publish_dup_on_qos0(pkt(0x38, &[&utf8("a/b")[..], &[0]].concat()), 0x81)]
 #[case::publish_wildcard_topic(publish("a/+/b", 0, 0, &[], b"x"), 0x81)]
 #[case::publish_topic_invalid_utf8(pkt(0x30, &[0, 2, 0xC3, 0x28, 0]), 0x81)]
 #[case::publish_qos2_unsupported(publish("a/b", 2, 7, &[], b"x"), 0x82)]
@@ -546,6 +545,8 @@ async fn attack_is_answered_with_disconnect_reason(#[case] attack: Vec<u8>, #[ca
 #[case::suback_for_unknown_id(suback(7, &[0]), 0)]
 #[case::unsuback_for_unknown_id(unsuback(8, &[0]), 0)]
 #[case::puback_with_large_id(puback(60_000), 0)]
+// [MQTT-3.3.1-2] binds the sender, and DUP carries no meaning at QoS 0.
+#[case::publish_dup_on_qos0(pkt(0x38, &[&utf8("a/b")[..], &[0], &b"x"[..]].concat()), 1)]
 #[case::subscription_identifier_zero(publish("a", 0, 0, &[prop::varint(0x0B, 0)], b"x"), 1)]
 #[case::invalid_utf8_with_payload_format_indicator(publish("a", 0, 0, &[prop::u8(0x01, 1)], &[0xC3, 0x28, 0xFF]), 1)]
 #[tokio::test]

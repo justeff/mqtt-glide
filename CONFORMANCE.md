@@ -136,7 +136,7 @@ covered by the statement that binds the client.
 | Statement | Status | Evidence |
 |---|---|---|
 | **[MQTT-3.3.1-1]** The DUP flag MUST be set to 1 by the Client or Server when it attempts to re-deliver a PUBLISH packet. | ✅ tested | `unacked_qos1_is_resent_with_dup_on_session_resume` (src/client.rs) |
-| **[MQTT-3.3.1-2]** The DUP flag MUST be set to 0 for all QoS 0 messages. | ✅ tested | `test_encode_publish_qos0_dup_rejected` (src/codec/v5/encode.rs)<br>`publish_decode_qos0_dup_rejected` (src/codec/v5/packet/publish.rs) |
+| **[MQTT-3.3.1-2]** The DUP flag MUST be set to 0 for all QoS 0 messages. | ✅ tested | `test_encode_publish_qos0_dup_rejected` (src/codec/v5/encode.rs)<br>`publish_decode_qos0_dup_cleared` (src/codec/v5/packet/publish.rs)<br>`tolerated_input_keeps_the_session` (tests/hostile.rs) |
 | **[MQTT-3.3.1-3]** The DUP flag in the outgoing PUBLISH packet is set independently to the incoming PUBLISH packet, its value MUST be determined solely by whether the outgoing PUBLISH packet is a retransmission. | — server obligation |  |
 | **[MQTT-3.3.1-4]** A PUBLISH Packet MUST NOT have both QoS bits set to 1. | ✅ tested | `publish_decode_rejects_both_qos_bits_set` (src/codec/v5/packet/publish.rs)<br>`read_task_malformed_or_truncated_inbound` (src/connection/io_mock_tests.rs) |
 | **[MQTT-3.3.1-5]** If the RETAIN flag is set to 1 in a PUBLISH packet sent by a Client to a Server, the Server MUST replace any existing retained message for this topic and store the Application Message. | — server obligation |  |
