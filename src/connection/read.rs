@@ -565,8 +565,15 @@ async fn dispatch_control(
             .await,
         ),
         // Without an Authentication Method in CONNECT the broker must not send AUTH
-        // ([MQTT-4.12.0-6]); tolerated, there is nothing to answer.
-        Packet::Auth(_) => None,
+        // ([MQTT-4.12.0-6], §3.15): a Protocol Error, as before the CONNACK.
+        Packet::Auth(_) => Some(
+            protocol_error_disconnect(
+                control_tx,
+                ProtocolError::Violation("AUTH without an Authentication Method in CONNECT".into()),
+                DisconnectReasonCode::ProtocolError,
+            )
+            .await,
+        ),
         other => {
             let error = ProtocolError::Violation(format!(
                 "unexpected control packet on connected session: {:?}",

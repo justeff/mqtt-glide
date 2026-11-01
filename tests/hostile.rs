@@ -519,6 +519,8 @@ async fn run_attack(attack: Vec<u8>, sentinel: bool) -> (Seen, Result<(), Connec
 #[case::publish_topic_alias_above_maximum(publish("a", 0, 0, &[prop::u16(0x23, 4)], b"x"), 0x94)]
 #[case::publish_over_maximum_packet_size(publish("big", 0, 0, &[], &[b'x'; 2000]), 0x95)]
 #[case::pubrec_unsupported(pkt(0x50, &[0, 1]), 0x82)]
+// [MQTT-4.12.0-6]: no Authentication Method in CONNECT, so the broker must not send AUTH.
+#[case::unsolicited_auth(pkt(0xF0, &[0x00, 0x00]), 0x82)]
 #[case::subscribe_from_server(pkt(0x82, &[0, 1, 0, 0, 1, b'a', 0]), 0x82)]
 #[case::connect_from_server(pkt(0x10, &[0, 4, b'M', b'Q', b'T', b'T', 5, 2, 0, 10, 0, 0, 0]), 0x82)]
 #[case::second_connack(connack(&[]), 0x82)]
@@ -545,7 +547,6 @@ async fn attack_is_answered_with_disconnect_reason(#[case] attack: Vec<u8>, #[ca
 #[case::unsuback_for_unknown_id(unsuback(8, &[0]), 0)]
 #[case::puback_with_large_id(puback(60_000), 0)]
 #[case::subscription_identifier_zero(publish("a", 0, 0, &[prop::varint(0x0B, 0)], b"x"), 1)]
-#[case::unsolicited_auth(pkt(0xF0, &[0x00, 0x00]), 0)]
 #[case::invalid_utf8_with_payload_format_indicator(publish("a", 0, 0, &[prop::u8(0x01, 1)], &[0xC3, 0x28, 0xFF]), 1)]
 #[tokio::test]
 async fn tolerated_input_keeps_the_session(#[case] attack: Vec<u8>, #[case] delivered_expected: usize) {

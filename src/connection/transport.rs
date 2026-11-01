@@ -137,6 +137,10 @@ where
             let outcome = auth_failed(ConnectionOutcome::Auth(error)).await;
             return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::UnspecifiedError, outcome).await);
         }
+    } else if ack.auth_method.is_some() {
+        // [MQTT-4.12.0-6] Without a method in CONNECT the broker must not name one.
+        let outcome = protocol_violation("CONNACK Authentication Method without one in CONNECT ([MQTT-4.12.0-6])");
+        return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::ProtocolError, outcome).await);
     }
     apply_session_limits_to_codecs(&mut framed_write, &session);
     Ok((framed_read, framed_write, session))

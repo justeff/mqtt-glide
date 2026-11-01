@@ -3943,8 +3943,9 @@ mod tests {
     }
 
     /// Without an Authentication Method the client never sends AUTH ([MQTT-4.12.0-7]): not for
-    /// connect, subscribe, QoS 0 and QoS 1 publishes, an AUTH the broker sends anyway (ignored),
-    /// or graceful shutdown. Every packet the broker receives is recorded by type.
+    /// connect, subscribe, QoS 0 and QoS 1 publishes, or graceful shutdown. Every packet the
+    /// broker receives is recorded by type. (An AUTH the broker sends anyway is answered with
+    /// DISCONNECT 0x82, see `connection::auth_tests`.)
     #[tokio::test]
     async fn client_never_sends_auth_without_authentication_method() {
         const AUTH_TYPE: u8 = 15;
@@ -3983,15 +3984,10 @@ mod tests {
                     DecodedFrame::Control(packet) => (packet.packet_type() >> 4, None),
                 };
                 received_broker.lock().await.push(kind);
-                if let Some(reply) = reply {
-                    let is_suback = matches!(reply, Packet::SubscribeAck(_));
-                    if framed_write.send(reply).await.is_err() {
-                        return;
-                    }
-                    if is_suback {
-                        // An AUTH the client did not ask for: ignored, not answered.
-                        let _ = framed_write.send(Packet::Auth(crate::codec::Auth::default())).await;
-                    }
+                if let Some(reply) = reply
+                    && framed_write.send(reply).await.is_err()
+                {
+                    return;
                 }
             }
             let _ = done_tx.send(());
@@ -4005,7 +4001,6 @@ mod tests {
             .await
             .expect("subscribe");
         client.publish("t/auth", "q0").await.expect("QoS 0 publish");
-        // Acknowledged after the broker's AUTH on the wire, so the client has read (and ignored) it.
         client
             .publish("t/auth", "q1")
             .qos(QoS::AtLeastOnce)

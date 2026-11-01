@@ -168,8 +168,9 @@ async fn only_auth_goes_out_before_the_connack() {
 }
 
 /// A broker AUTH that does not fit is answered with DISCONNECT 0x82: another method than the
-/// CONNECT's, or a CONNACK naming another method or none ([MQTT-4.12.0-5]), or any AUTH when the CONNECT
-/// had no method.
+/// CONNECT's, or a CONNACK naming another method or none ([MQTT-4.12.0-5]); without a method in
+/// the CONNECT, an AUTH before or after the CONNACK or a CONNACK naming a method
+/// ([MQTT-4.12.0-6]); with one, an AUTH after the CONNACK that answers no AUTH of the client.
 #[tokio::test]
 async fn broker_breaking_the_connect_exchange_gets_a_protocol_error() {
     enum Break {
@@ -177,27 +178,50 @@ async fn broker_breaking_the_connect_exchange_gets_a_protocol_error() {
         ConnackMethod,
         ConnackWithoutMethod,
         AuthWithoutMethodInConnect,
+        ConnackMethodWithoutMethodInConnect,
+        AuthAfterConnackWithoutMethodInConnect,
+        UnsolicitedAuthAfterConnack,
     }
     for broken in [
         Break::AuthMethod,
         Break::ConnackMethod,
         Break::ConnackWithoutMethod,
         Break::AuthWithoutMethodInConnect,
+        Break::ConnackMethodWithoutMethodInConnect,
+        Break::AuthAfterConnackWithoutMethodInConnect,
+        Break::UnsolicitedAuthAfterConnack,
     ] {
-        let authenticator = (!matches!(broken, Break::AuthWithoutMethodInConnect)).then(Scripted::default);
+        let authenticator = (!matches!(
+            broken,
+            Break::AuthWithoutMethodInConnect
+                | Break::ConnackMethodWithoutMethodInConnect
+                | Break::AuthAfterConnackWithoutMethodInConnect
+        ))
+        .then(Scripted::default);
         let (_client, driver, report) = run(
             authenticator,
             |options| options,
             move |mut read, mut write| async move {
                 let _ = next(&mut read).await;
-                let packet = match broken {
+                let packets = match broken {
                     Break::AuthMethod | Break::AuthWithoutMethodInConnect => {
-                        auth(AuthReasonCode::ContinueAuth, "other", b"nonce")
+                        vec![auth(AuthReasonCode::ContinueAuth, "other", b"nonce")]
                     }
-                    Break::ConnackMethod => connack_with_method("other"),
-                    Break::ConnackWithoutMethod => Packet::ConnectAck(Box::default()),
+                    Break::ConnackMethod => vec![connack_with_method("other")],
+                    Break::ConnackWithoutMethod => vec![Packet::ConnectAck(Box::default())],
+                    Break::ConnackMethodWithoutMethodInConnect => vec![connack_with_method(METHOD)],
+                    Break::AuthAfterConnackWithoutMethodInConnect => vec![
+                        Packet::ConnectAck(Box::default()),
+                        auth(AuthReasonCode::ContinueAuth, METHOD, b"nonce"),
+                    ],
+                    Break::UnsolicitedAuthAfterConnack => vec![
+                        connack_with_method(METHOD),
+                        auth(AuthReasonCode::ContinueAuth, METHOD, b"nonce"),
+                    ],
                 };
-                let _ = write.send(packet).await;
+                for packet in packets {
+                    let _ = write.send(packet).await;
+                }
                 disconnect_reason(&mut read).await
             },
         )

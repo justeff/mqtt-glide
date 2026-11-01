@@ -302,11 +302,14 @@ impl Reauth {
                     "broker AUTH while the client's answer was still due".into(),
                 )))
             }
-            // No AUTH of ours is open: tolerated like any unsolicited AUTH.
+            // No AUTH of ours is open: only the client starts a re-authentication (§4.12.1), so
+            // an AUTH here belongs to no exchange.
             state => {
-                tracing::debug!(reason = ?auth.reason_code, "ignoring AUTH outside a re-authentication");
                 self.state = state;
-                Ok(())
+                Err(protocol_failure(ProtocolError::Violation(format!(
+                    "broker AUTH {:?} outside a re-authentication",
+                    auth.reason_code
+                ))))
             }
         }
     }
@@ -668,14 +671,28 @@ mod tests {
         assert_eq!(answer.await, Ok(Err(AppError::ConnectionLost)));
     }
 
-    /// An AUTH while no exchange is open is ignored, like without an authenticator.
+    /// An AUTH while no AUTH of the client is open is a Protocol Error: only the client starts a
+    /// re-authentication (§4.12.1). A request whose `start` still runs learns that the
+    /// connection was lost.
     #[tokio::test]
-    async fn unsolicited_auth_is_ignored() {
+    async fn unsolicited_auth_is_a_protocol_error() {
         let mut rig = rig_default();
-        rig.reauth
+        let failure = rig
+            .reauth
             .on_broker_auth(broker_auth(AuthReasonCode::ContinueAuth, "scripted", b"x"))
-            .expect("ignored");
-        assert!(!rig.reauth.waiting());
+            .expect_err("no exchange open");
+        assert_eq!(failure.reason, Some(DisconnectReasonCode::ProtocolError));
+
+        let mut rig = rig_default();
+        let answer = rig.request();
+        rig.step().await.expect("request");
+        let failure = rig
+            .reauth
+            .on_broker_auth(broker_auth(AuthReasonCode::ReAuth, "scripted", b"x"))
+            .expect_err("nothing sent yet");
+        assert_eq!(failure.reason, Some(DisconnectReasonCode::ProtocolError));
+        rig.reauth.conclude(&failure.outcome);
+        assert_eq!(answer.await, Ok(Err(AppError::ConnectionLost)));
     }
 
     /// No answer within the ack timeout closes the connection; time the read task spent on a
