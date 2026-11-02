@@ -356,3 +356,37 @@ async fn reauthenticate_does_not_wait_for_the_next_connection() {
         client.shutdown().await.expect("shutdown");
     }
 }
+
+/// `Duration::MAX` as "no timeout" works for re-authentication and the connect budget too: the
+/// step deadline used to overflow `Instant` and panic the read task, which stopped the client
+/// for good.
+#[tokio::test]
+async fn reauthentication_with_unbounded_timeouts() {
+    let broker = TestBroker::start().await.expect("broker");
+    script(
+        &broker,
+        b"server-ok",
+        AuthStep::Accept(Some(Bytes::from_static(b"server-ok"))),
+    );
+    let authenticator = Arc::new(NonceToken::default());
+    let (tx, mut rx) = mpsc::channel(16);
+    let client = ClientBuilder::new(broker.url())
+        .expect("url")
+        .authenticator(Arc::clone(&authenticator))
+        .options(|options| options.ack_timeout(Duration::MAX).connect_timeout(Duration::MAX))
+        .inbound_sink(tx)
+        .connect()
+        .await
+        .expect("connect");
+    client
+        .subscribe([("auth/echo", QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe");
+
+    tokio::time::timeout(WAIT, client.reauthenticate())
+        .await
+        .expect("in time")
+        .expect("re-authenticated");
+    round_trip(&client, &mut rx, "after").await;
+    assert_eq!(broker.connect_count(), 1);
+}

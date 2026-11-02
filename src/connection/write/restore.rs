@@ -114,7 +114,7 @@ impl RestoreRetry {
                 topic_filters: filters,
             });
             send_packet(framed, packet, flush_abort).await?;
-            self.deadline = Some(now + self.ack_timeout);
+            self.deadline = Some(crate::util::extend_deadline(now, self.ack_timeout));
         }
         Ok(())
     }
@@ -226,5 +226,14 @@ mod tests {
             1,
             "asked again once the backoff passed"
         );
+    }
+
+    /// `Duration::MAX` as `ack_timeout` (no timeout) does not panic when a refused
+    /// subscription is asked for again.
+    #[tokio::test]
+    async fn unbounded_ack_timeout_does_not_panic_on_retry() {
+        let mut harness = Harness::new();
+        let mut retry = RestoreRetry::new(&harness.registry, Duration::MAX);
+        harness.wake(&mut retry).await.expect("first retry");
     }
 }

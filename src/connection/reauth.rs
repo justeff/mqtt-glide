@@ -373,7 +373,7 @@ impl Reauth {
     /// Starts the deadline of a step that begins now.
     fn arm(&mut self) {
         self.held_up = Duration::ZERO;
-        self.timer.as_mut().reset(Instant::now() + self.ack_timeout);
+        self.timer.as_mut().reset(crate::util::deadline_after(self.ack_timeout));
     }
 }
 
@@ -395,7 +395,7 @@ async fn expired(timer: &mut Pin<Box<Sleep>>, held_up: &mut Duration) {
         if held_up.is_zero() {
             return;
         }
-        let deadline = timer.deadline() + std::mem::take(held_up);
+        let deadline = crate::util::extend_deadline(timer.deadline(), std::mem::take(held_up));
         timer.as_mut().reset(deadline);
     }
 }

@@ -348,7 +348,7 @@ impl<H: InboundSink> Connection<H> {
     /// One TCP connect + supervised read/write session.
     async fn run_one_session(&mut self) -> SessionDisposition {
         self.state = ConnectionState::Connecting;
-        let deadline = Instant::now() + self.options.connect_timeout;
+        let deadline = crate::util::std_deadline_after(self.options.connect_timeout);
 
         // Dial under `select!` with borrowed `options` (no per-attempt `ConnectOptions` clone,
         // except towards a one-off redirect target); the borrow ends before `&mut self` resumes

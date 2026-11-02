@@ -692,7 +692,7 @@ impl MqttClient {
 
     #[cold]
     async fn wait_for_room(&self, command: ClientCommand) -> Result<(), AppError> {
-        let deadline = tokio::time::Instant::now() + self.ack_timeout;
+        let deadline = crate::util::deadline_after(self.ack_timeout);
         loop {
             let sender = self.command_tx.load_full();
             // No select on the shutdown token: registering on it takes its mutex for every

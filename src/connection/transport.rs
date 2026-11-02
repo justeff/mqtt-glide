@@ -518,7 +518,7 @@ mod tests {
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{}", addr.port())).expect("valid");
         let options = ConnectOptions::new(url);
         let credentials = SharedCredentials::new(TestCreds);
-        let deadline = Instant::now() + options.connect_timeout;
+        let deadline = crate::util::std_deadline_after(options.connect_timeout);
         let tcp_stream = open_tcp(&options, deadline).await.expect("tcp");
         let (read_half, write_half) = tcp_stream.into_split();
         establish_session_on(read_half, write_half, &options, &credentials, deadline, &mut None)
@@ -560,7 +560,7 @@ mod tests {
         let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{}", addr.port())).expect("valid");
         let options = ConnectOptions::new(url).connect_timeout(Duration::from_millis(50));
         let credentials = SharedCredentials::new(TestCreds);
-        let deadline = Instant::now() + options.connect_timeout;
+        let deadline = crate::util::std_deadline_after(options.connect_timeout);
         let tcp_stream = open_tcp(&options, deadline).await.expect("tcp");
         let (read_half, write_half) = tcp_stream.into_split();
         let err = match establish_session_on(read_half, write_half, &options, &credentials, deadline, &mut None).await {
@@ -628,7 +628,7 @@ mod tests {
         let options = ConnectOptions::new(url)
             .tcp_send_buffer_size(nonzero!(32_768u32))
             .tcp_recv_buffer_size(nonzero!(32_768u32));
-        let stream = open_tcp(&options, Instant::now() + options.connect_timeout)
+        let stream = open_tcp(&options, crate::util::std_deadline_after(options.connect_timeout))
             .await
             .expect("tcp");
         let (server, _) = accept.await.expect("join accept");
