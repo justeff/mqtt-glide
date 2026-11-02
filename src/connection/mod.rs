@@ -662,7 +662,12 @@ impl<H: InboundSink> Connection<H> {
         {
             self.count_session_end(&outcome, from_active_session);
             self.state = ConnectionState::Draining;
-            self.notify_disconnected(outcome);
+            // A redirecting CONNACK ended no session: the connect goes on, towards the other
+            // server. Reporting it as a disconnect made `ClientBuilder::connect` give up on the
+            // first connection instead of following.
+            if from_active_session {
+                self.notify_disconnected(outcome);
+            }
             return self.backoff_then_retry(Duration::ZERO).await;
         }
         self.finish_session(outcome, from_active_session).await

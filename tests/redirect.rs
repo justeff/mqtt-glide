@@ -11,8 +11,8 @@ use common::{NoReconnect, PeerSession, join_peer, spawn_peer_broker, static_cred
 use futures_util::SinkExt;
 use mqtt_glide::codec::{ConnectAck, ConnectAckReason, Disconnect, Packet};
 use mqtt_glide::{
-    BrokerUrl, ClientId, ConnectOptions, ConnectionOutcome, DisconnectReasonCode, InboundMessage, NoopLifecycle,
-    ReconnectPolicy, SessionPhase, TransportError, connect,
+    BrokerUrl, ClientBuilder, ClientId, ConnectOptions, ConnectionOutcome, DisconnectReasonCode, InboundMessage,
+    NoopLifecycle, ReconnectPolicy, SessionPhase, TransportError, connect,
 };
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -102,6 +102,44 @@ async fn connack_redirect_is_followed_at_once() {
 
     client.shutdown().await.expect("shutdown");
     let _ = timeout(Duration::from_secs(5), run).await.expect("run join");
+    join_peer(origin).await;
+    target.abort();
+}
+
+/// `ClientBuilder::connect` waits for the redirect target: the redirecting CONNACK of the
+/// first connection is no failed connect when it is followed.
+#[tokio::test]
+async fn builder_connect_follows_a_connack_redirect() {
+    let (target_port, target) = spawn_peer_broker(|broker| async move {
+        let mut session = broker.accept_session().await;
+        session.expect_connect().await;
+        session.send_connack_success().await;
+        session.hold().await;
+    })
+    .await;
+    let (port, origin) = spawn_peer_broker(move |broker| async move {
+        let mut session = broker.accept_session().await;
+        refuse_with_redirect(
+            &mut session,
+            ConnectAckReason::UseAnotherServer,
+            format!("127.0.0.1:{target_port}"),
+        )
+        .await;
+    })
+    .await;
+
+    let client = timeout(
+        Duration::from_secs(5),
+        ClientBuilder::from_options(options(port, true))
+            .discard_inbound()
+            .connect(),
+    )
+    .await
+    .expect("in time")
+    .expect("the redirect is followed");
+    assert!(client.is_connected());
+
+    client.shutdown().await.expect("shutdown");
     join_peer(origin).await;
     target.abort();
 }
