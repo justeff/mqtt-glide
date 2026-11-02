@@ -325,6 +325,9 @@ pub(crate) struct InflightPublish {
     pub(super) expiry: Option<ExpiryClock>,
     /// Position in send order (see [`PublishWaiters`]).
     pub(super) seq: u64,
+    /// Connections in a row that ended with a broker DISCONNECT while this was the oldest
+    /// unacknowledged publish ([`CarriedPublish::refusals`]).
+    pub(super) refusals: u8,
 }
 
 /// The Message Expiry Interval a publish was first sent with, and when. A resend carries what
@@ -365,7 +368,18 @@ pub(crate) struct CarriedPublish {
     pub(crate) expiry: Option<ExpiryClock>,
     /// Original send order ([MQTT-4.6.0-1]).
     pub(crate) seq: u64,
+    /// Connections in a row that the broker ended with a DISCONNECT refusing a publish while
+    /// this was the oldest unacknowledged one: the broker acknowledges in order, so that is
+    /// the publish it stopped at. Counted by the driver; at
+    /// [`BROKER_REFUSALS_BEFORE_GIVING_UP`] the publish fails instead of being resent again.
+    pub(crate) refusals: u8,
 }
+
+/// Sends of one publish that the broker answers with a DISCONNECT before the client gives it
+/// up. [MQTT-4.4.0-1] asks for the resend without a limit, but a broker that disconnects on
+/// this publish (an ACL refusal, a payload it cannot take) does so on every resend, and the
+/// client reconnected for ever with everything else queued behind it.
+pub(crate) const BROKER_REFUSALS_BEFORE_GIVING_UP: u8 = 3;
 
 /// Hand-over slot between connections, owned by the [`Connection`](crate::Connection).
 ///
@@ -384,6 +398,9 @@ pub(crate) struct Carry {
     /// Publishes parked behind the broker's Receive Maximum, never put on the wire; sent like
     /// new ones, before the commands still waiting in the command channel.
     pub(crate) unsent: VecDeque<PendingOutboundPublish>,
+    /// Packet Identifier of the oldest publish in `unacked` that was on the wire of the
+    /// connection that just ended (`None`: none was).
+    pub(crate) oldest_on_wire: Option<NonZeroU16>,
 }
 
 impl Carry {
@@ -396,6 +413,7 @@ impl Carry {
 
     /// Takes everything out, failing nothing (caller decides).
     pub(crate) fn take_all(&mut self) -> (Vec<CarriedPublish>, VecDeque<PendingOutboundPublish>) {
+        self.oldest_on_wire = None;
         (std::mem::take(&mut self.unacked), std::mem::take(&mut self.unsent))
     }
 }
@@ -428,7 +446,7 @@ impl PublishWaiters {
         } else {
             None
         };
-        self.register(packet_id, publish, false, expiry);
+        self.register(packet_id, publish, false, expiry, 0);
     }
 
     /// Registers a QoS-1 publish resent with DUP after a reconnect.
@@ -437,8 +455,9 @@ impl PublishWaiters {
         packet_id: NonZeroU16,
         publish: PendingOutboundPublish,
         expiry: Option<ExpiryClock>,
+        refusals: u8,
     ) {
-        self.register(packet_id, publish, true, expiry);
+        self.register(packet_id, publish, true, expiry, refusals);
     }
 
     fn register(
@@ -447,6 +466,7 @@ impl PublishWaiters {
         publish: PendingOutboundPublish,
         resent: bool,
         expiry: Option<ExpiryClock>,
+        refusals: u8,
     ) {
         let resend = self.keep_messages.then_some((publish.message, publish.retain));
         let seq = self.next_seq;
@@ -459,6 +479,7 @@ impl PublishWaiters {
                 resend,
                 expiry,
                 seq,
+                refusals,
             },
         );
     }
@@ -487,6 +508,7 @@ impl PublishWaiters {
                 resend: None,
                 expiry: None,
                 seq,
+                refusals: 0,
             },
         );
     }

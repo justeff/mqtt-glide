@@ -256,6 +256,45 @@ impl<H: InboundSink> Connection<H> {
         }
     }
 
+    /// A session ended. If the broker ended it with a DISCONNECT whose reason can refuse a publish,
+    /// charges the oldest publish that was on the wire, which is where the broker stopped
+    /// acknowledging, and gives it up after [`write::BROKER_REFUSALS_BEFORE_GIVING_UP`] such
+    /// connections in a row.
+    ///
+    /// A connection that ends any other way clears the counts: they are for refusals in a row.
+    fn count_broker_refusal(&self, reason: Option<DisconnectReasonCode>) {
+        let mut carry = self
+            .session_carry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(reason) = reason.filter(|&reason| refuses_publish(reason)) else {
+            carry.oldest_on_wire = None;
+            for entry in &mut carry.unacked {
+                entry.refusals = 0;
+            }
+            return;
+        };
+        let Some(oldest) = carry.oldest_on_wire.take() else {
+            return;
+        };
+        let Some(index) = carry.unacked.iter().position(|entry| entry.packet_id == oldest) else {
+            return;
+        };
+        let entry = &mut carry.unacked[index];
+        entry.refusals += 1;
+        if entry.refusals < write::BROKER_REFUSALS_BEFORE_GIVING_UP {
+            return;
+        }
+        let entry = carry.unacked.remove(index);
+        drop(carry);
+        tracing::warn!(
+            ?reason,
+            topic = %entry.message.topic,
+            "giving up a QoS 1 publish: the broker disconnected each time it was sent"
+        );
+        entry.reply.send(Err(AppError::PublishRefusedByDisconnect(reason)));
+    }
+
     /// Fails carried *unacknowledged* publishes: the broker has no session to resend into.
     fn fail_carried_unacked(&self) {
         let unacked = std::mem::take(
@@ -634,7 +673,7 @@ impl<H: InboundSink> Connection<H> {
             (outcome, command_rx)
         });
 
-        let (outcome, redirect) = Self::supervise_tasks(
+        let (outcome, redirect, broker_reason) = Self::supervise_tasks(
             read_handle,
             write_handle,
             read_cancel,
@@ -643,6 +682,7 @@ impl<H: InboundSink> Connection<H> {
         )
         .await;
         self.channels.stats.outbound_window(0, 0);
+        self.count_broker_refusal(broker_reason);
         self.finish_session_or_redirect(outcome, true, redirect).await
     }
 
@@ -810,7 +850,11 @@ impl<H: InboundSink> Connection<H> {
         read_cancel: StopSignal,
         write_cancel: StopSignal,
         command_rx: &mut Option<CommandReceiver>,
-    ) -> (ConnectionOutcome, Option<redirect::ServerRedirect>) {
+    ) -> (
+        ConnectionOutcome,
+        Option<redirect::ServerRedirect>,
+        Option<DisconnectReasonCode>,
+    ) {
         tokio::pin!(read_handle);
         let write_handle = async {
             write_handle.await.map(|(outcome, receiver)| {
@@ -831,8 +875,11 @@ impl<H: InboundSink> Connection<H> {
         };
 
         let redirect_of = |result: &Result<ReadOutcome, tokio::task::JoinError>| match result {
-            Ok(ReadOutcome::BrokerDisconnect(disconnect)) => redirect::ServerRedirect::from_disconnect(disconnect),
-            _ => None,
+            Ok(ReadOutcome::BrokerDisconnect(disconnect)) => (
+                redirect::ServerRedirect::from_disconnect(disconnect),
+                Some(disconnect.reason_code),
+            ),
+            _ => (None, None),
         };
         match first {
             FirstResult::Read(read_result) => {
@@ -840,15 +887,16 @@ impl<H: InboundSink> Connection<H> {
                 let write_result = write_handle.as_mut().await;
                 // Prefer write's graceful DISCONNECT over read cut-off Cancelled.
                 if matches!(&write_result, Ok(WriteOutcome::Shutdown)) {
-                    return (Self::map_write_outcome(write_result), None);
+                    return (Self::map_write_outcome(write_result), None, None);
                 }
-                let redirect = redirect_of(&read_result);
-                (Self::map_read_outcome(read_result), redirect)
+                let (redirect, broker_reason) = redirect_of(&read_result);
+                (Self::map_read_outcome(read_result), redirect, broker_reason)
             }
             FirstResult::Write(write_result) => {
                 read_cancel.cancel();
                 let read_result = read_handle.as_mut().await;
-                (Self::map_write_outcome(write_result), redirect_of(&read_result))
+                let (redirect, broker_reason) = redirect_of(&read_result);
+                (Self::map_write_outcome(write_result), redirect, broker_reason)
             }
         }
     }
@@ -923,6 +971,29 @@ pub(crate) fn broker_detail(reason_string: Option<&str>, server_reference: Optio
 }
 
 /// Maps a broker DISCONNECT to a typed connection outcome.
+/// DISCONNECT Reason Codes a broker can send because of a PUBLISH it would not take; not
+/// those about the connection as a whole (shutting down, session taken over, keep-alive,
+/// redirects, administrative action).
+fn refuses_publish(reason: DisconnectReasonCode) -> bool {
+    matches!(
+        reason,
+        DisconnectReasonCode::UnspecifiedError
+            | DisconnectReasonCode::MalformedPacket
+            | DisconnectReasonCode::ProtocolError
+            | DisconnectReasonCode::ImplementationSpecificError
+            | DisconnectReasonCode::NotAuthorized
+            | DisconnectReasonCode::TopicNameInvalid
+            | DisconnectReasonCode::ReceiveMaximumExceeded
+            | DisconnectReasonCode::TopicAliasInvalid
+            | DisconnectReasonCode::PacketTooLarge
+            | DisconnectReasonCode::MessageRateTooHigh
+            | DisconnectReasonCode::QuotaExceeded
+            | DisconnectReasonCode::PayloadFormatInvalid
+            | DisconnectReasonCode::RetainNotSupported
+            | DisconnectReasonCode::QosNotSupported
+    )
+}
+
 pub(crate) fn map_broker_disconnect_outcome(disconnect: &crate::codec::Disconnect) -> ConnectionOutcome {
     let reason = disconnect.reason_code;
     match reason {

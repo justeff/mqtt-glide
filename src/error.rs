@@ -168,6 +168,13 @@ pub enum AppError {
     /// accepted while the driver drains and disconnects.
     #[error("client is shutting down")]
     ShuttingDown,
+    /// A QoS 1 publish of a resumed session was given up: the last three connections it was
+    /// sent on ended with a broker DISCONNECT with this Reason Code before its `PUBACK`, while
+    /// it was the oldest unacknowledged publish (the broker acknowledges in order, so the one
+    /// it stopped at). Resending it would only repeat that; the publishes behind it go on.
+    /// The broker may still have it ([`Delivery::Unknown`](crate::Delivery::Unknown)).
+    #[error("publish given up: the broker disconnected with {0:?} each time it was sent")]
+    PublishRefusedByDisconnect(crate::codec::DisconnectReasonCode),
 }
 
 /// Graceful or requested shutdown.

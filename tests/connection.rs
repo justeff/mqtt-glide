@@ -447,3 +447,104 @@ async fn lost_session_resubscribes_on_reconnect() {
         .expect("join");
     peer.abort();
 }
+
+/// A QoS 1 publish the broker answers with a DISCONNECT each time (an ACL refusal) is given up
+/// after three sends instead of being resent on every reconnect for ever, and the publishes
+/// behind it go on. The broker acknowledges in order, so the oldest unacknowledged publish is
+/// the one it stopped at.
+#[tokio::test]
+async fn publish_the_broker_disconnects_on_is_given_up() {
+    use mqtt_glide::codec::{PublishAck, PublishAckReason};
+
+    let connects = Arc::new(AtomicUsize::new(0));
+    let refused_sends = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let broker = tokio::spawn({
+        let connects = Arc::clone(&connects);
+        let refused_sends = Arc::clone(&refused_sends);
+        async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let index = connects.fetch_add(1, Ordering::SeqCst);
+                let refused_sends = Arc::clone(&refused_sends);
+                tokio::spawn(async move {
+                    let (read, write) = common::framed_halves(stream);
+                    let mut session = common::PeerSession { read, write };
+                    session.expect_connect().await;
+                    session
+                        .send_connack(ConnectAck {
+                            session_present: index > 0,
+                            ..ConnectAck::default()
+                        })
+                        .await;
+                    while let Some(Ok((frame, _))) = session.read.next().await {
+                        let DecodedFrame::Publish(packet) = frame else {
+                            continue;
+                        };
+                        if &*packet.message.topic == "forbidden" {
+                            refused_sends.fetch_add(1, Ordering::SeqCst);
+                            session.send_disconnect(DisconnectReasonCode::NotAuthorized).await;
+                            return;
+                        }
+                        let packet_id = packet.meta.packet_id.expect("QoS 1");
+                        let ack = Packet::PublishAck(PublishAck {
+                            packet_id,
+                            reason_code: PublishAckReason::Success,
+                            properties: Default::default(),
+                            reason_string: None,
+                        });
+                        let _ = session.write.send(ack).await;
+                    }
+                });
+            }
+        }
+    });
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url)
+        .client_id(ClientId::try_new("refused-publish").expect("client id"))
+        .clean_start(false)
+        .session_expiry(Some(Duration::from_secs(3600)));
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
+    let (client, connection, mut phase) = connect(
+        options,
+        static_credentials(),
+        StandardReconnectPolicy::new(Duration::from_millis(20), Duration::from_millis(20)),
+        tx,
+        NoopLifecycle,
+    )
+    .expect("wiring");
+    let run = tokio::spawn(connection.run());
+    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
+        matches!(phase, SessionPhase::Connected { .. })
+    })
+    .await;
+
+    let refused = timeout(
+        Duration::from_secs(5),
+        client.publish("forbidden", "x").qos(QoS::AtLeastOnce).ack_timeout(None),
+    )
+    .await
+    .expect("given up in time")
+    .expect_err("refused");
+    assert_eq!(
+        refused.error,
+        mqtt_glide::AppError::PublishRefusedByDisconnect(DisconnectReasonCode::NotAuthorized)
+    );
+    assert_eq!(refused_sends.load(Ordering::SeqCst), 3);
+
+    timeout(
+        Duration::from_secs(5),
+        client.publish("allowed", "y").qos(QoS::AtLeastOnce),
+    )
+    .await
+    .expect("in time")
+    .expect("the next publish goes through");
+    assert_eq!(refused_sends.load(Ordering::SeqCst), 3, "not sent again");
+    assert_eq!(connects.load(Ordering::SeqCst), 4);
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+    broker.abort();
+}

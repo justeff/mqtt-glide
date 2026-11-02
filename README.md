@@ -237,7 +237,7 @@ What happens to your publishes when the connection drops and the client reconnec
 | Publish state at the drop | Clean Start (`true`) | Resumed session (`clean_start(false)`, `session_expiry` > 0) |
 |---|---|---|
 | Never sent (parked behind Receive Maximum, or still queued) | sent on the next connection | sent on the next connection |
-| QoS 1 sent, `PUBACK` missing | fails with `AppError::ConnectionLost` | resent in order with its original packet id and `DUP` set ([MQTT-4.4.0-1]) and what is left of its Message Expiry Interval (at least 1 s); fails with `ConnectionLost` if CONNACK reports no session |
+| QoS 1 sent, `PUBACK` missing | fails with `AppError::ConnectionLost` | resent in order with its original packet id and `DUP` set ([MQTT-4.4.0-1]) and what is left of its Message Expiry Interval (at least 1 s); fails with `ConnectionLost` if CONNACK reports no session, and with `PublishRefusedByDisconnect` once the broker has ended three connections in a row with a DISCONNECT that refuses a publish (`NotAuthorized`, `QuotaExceeded`, `PacketTooLarge`, ...) while it was the oldest unacknowledged one |
 
 That holds for QoS 0 too: a value published during an outage arrives after it, and the subscribers take it for current. When a stale value is worse than none, as with live sensor readings, set `fail_fast_when_disconnected(true)` and publishes fail with `AppError::NotConnected` until the connection is back.
 

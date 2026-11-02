@@ -488,6 +488,7 @@ where
             reply: entry.reply,
         },
         entry.expiry,
+        entry.refusals,
     );
     Ok(())
 }

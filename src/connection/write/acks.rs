@@ -215,6 +215,10 @@ pub(super) fn fail_waiters_for_outcome(
             .filter(|(_, entry)| entry.resend.is_some())
             .map(|(id, _)| *id)
             .collect();
+        slot.oldest_on_wire = ids
+            .iter()
+            .min_by_key(|id| publish_waiters.by_id.get(id).map(|entry| entry.seq))
+            .copied();
         for id in ids {
             let Some(entry) = publish_waiters.by_id.remove(&id) else {
                 continue;
@@ -228,6 +232,7 @@ pub(super) fn fail_waiters_for_outcome(
                 reply: entry.reply,
                 expiry: entry.expiry,
                 seq: entry.seq,
+                refusals: entry.refusals,
             });
         }
         slot.unacked.extend(publish_waiters.resend_parked.drain(..));
