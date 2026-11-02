@@ -58,6 +58,7 @@ struct ReadTaskHandle {
     handoff_stalled: Arc<AtomicBool>,
     handoff_rx: flume::Receiver<InboundMessage>,
     control_rx: mpsc::Receiver<ControlMessage>,
+    writer: crate::connection::write::SharedWriter<tokio::io::Sink>,
     join: JoinHandle<ReadOutcome>,
     _stub_tx: mpsc::Sender<()>,
 }
@@ -69,14 +70,14 @@ where
     spawn_read_task_with_handoff_cap(framed, 8)
 }
 
-/// A shared writer the write task holds for good: the read task hands every PUBACK to the
-/// control channel, where these tests look for it.
+/// A shared writer the write task holds for good: the read task queues every PUBACK in its
+/// pending queue, where these tests look for it.
 fn busy_writer() -> crate::connection::write::SharedWriter<tokio::io::Sink> {
-    let writer = Arc::new(tokio::sync::Mutex::new(FramedWrite::new(
+    let writer = crate::connection::write::SharedWriter::new(FramedWrite::new(
         tokio::io::sink(),
         V5Codec::with_max_packet_size(0),
-    )));
-    std::mem::forget(Arc::clone(&writer).try_lock_owned().expect("fresh writer"));
+    ));
+    std::mem::forget(writer.try_lock().expect("fresh writer"));
     writer
 }
 
@@ -92,6 +93,7 @@ where
     let (read_done_tx, _read_done_rx) = oneshot::channel();
     let inbound_activity = Arc::new(AtomicBool::new(false));
     let handoff_stalled = Arc::new(AtomicBool::new(false));
+    let writer = busy_writer();
 
     let join = tokio::spawn(crate::connection::read::run(
         ReadSession {
@@ -105,12 +107,14 @@ where
             handoff_stalled: Arc::clone(&handoff_stalled),
             inbound_activity: Arc::clone(&inbound_activity),
             inbound_publish_ack_counter: None,
+            receive_maximum: std::num::NonZeroU16::MAX,
+            shutdown_notify: tokio_util::sync::CancellationToken::new(),
         },
         stub_rx,
         framed,
         handoff_tx,
         control_tx,
-        busy_writer(),
+        writer.clone(),
         ReadDoneSignal::new(read_done_tx),
     ));
 
@@ -121,6 +125,7 @@ where
         handoff_stalled,
         handoff_rx,
         control_rx,
+        writer,
         join,
         _stub_tx: stub_tx,
     }
@@ -172,7 +177,7 @@ where
             control_rx,
             &mut command_rx,
             stub_rx,
-            Arc::new(tokio::sync::Mutex::new(framed)),
+            crate::connection::write::SharedWriter::new(framed),
             session,
             InflightPots::new(NonZeroU16::new(4).expect("nz")),
             read_done_rx,
@@ -733,13 +738,19 @@ async fn read_task_cut_off_by_shutdown_does_not_puback_unaccepted_publish() {
         .expect("join");
     assert_eq!(outcome, ReadOutcome::Cancelled);
 
-    let mut acked = Vec::new();
     while let Ok(message) = harness.control_rx.try_recv() {
-        match message {
-            ControlMessage::AckInboundPublish { packet_id } => acked.push(packet_id.get()),
-            other => panic!("unexpected control message {other:?}"),
-        }
+        assert!(
+            matches!(message, ControlMessage::AcksPending),
+            "unexpected control message {message:?}"
+        );
     }
+    let acked: Vec<u16> = harness
+        .writer
+        .pending_acks()
+        .snapshot()
+        .iter()
+        .map(|id| id.get())
+        .collect();
     assert_eq!(acked, [1], "only the accepted publish may be acknowledged");
     assert_eq!(
         harness.handoff_rx.len(),
@@ -771,10 +782,8 @@ async fn read_task_writes_puback_itself_when_the_writer_is_free() {
 
     let (read_end, mut broker_writes) = tokio::io::duplex(512);
     let (write_end, broker_reads) = tokio::io::duplex(512);
-    let writer = Arc::new(tokio::sync::Mutex::new(FramedWrite::new(
-        write_end,
-        V5Codec::with_max_packet_size(0),
-    )));
+    let writer =
+        crate::connection::write::SharedWriter::new(FramedWrite::new(write_end, V5Codec::with_max_packet_size(0)));
     let (control_tx, mut control_rx) = mpsc::channel(8);
     let (_stub_tx, stub_rx) = mpsc::channel(1);
     let (handoff_tx, handoff_rx) = flume::bounded(4);
@@ -792,6 +801,8 @@ async fn read_task_writes_puback_itself_when_the_writer_is_free() {
             inbound_activity: Arc::new(AtomicBool::new(false)),
             reauth: None,
             inbound_publish_ack_counter: None,
+            receive_maximum: std::num::NonZeroU16::MAX,
+            shutdown_notify: tokio_util::sync::CancellationToken::new(),
         },
         stub_rx,
         FramedRead::new(read_end, V5Codec::with_max_packet_size(0)),

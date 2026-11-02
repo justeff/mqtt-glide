@@ -63,6 +63,10 @@ pub(crate) struct ReadSession {
     pub reauth: Option<super::reauth::ReauthLink>,
     /// Bench-only count of PUBACKs written (see `ConnectOptions`); shared with the write task.
     pub inbound_publish_ack_counter: Option<Arc<AtomicUsize>>,
+    /// The Receive Maximum the client announced in CONNECT.
+    pub receive_maximum: NonZeroU16,
+    /// The client's graceful shutdown (`MqttClient::shutdown`): its drain holds the writer.
+    pub shutdown_notify: tokio_util::sync::CancellationToken,
 }
 
 /// Drop-guard: signals the write task that the read task has fully exited.
@@ -98,7 +102,7 @@ impl Drop for ReadDoneSignal {
 /// short burst (`now_or_never`) before awaiting the next socket read — fewer task wakeups under
 /// pipelined load.
 ///
-/// On graceful shutdown, [`ReadSession::shutdown_notify`] cuts off further `framed.next()`;
+/// On graceful shutdown, [`ReadSession::stop`] cuts off further `framed.next()`;
 /// packets not yet accepted into the handoff are discarded and never PUBACKed.
 ///
 /// `read_done` is dropped when this task returns so the write task can finish PUBACK drain
@@ -123,6 +127,9 @@ where
         ids: Vec::new(),
         writer,
         counter: session.inbound_publish_ack_counter.clone(),
+        queue_limit: super::control_channel_capacity(session.receive_maximum),
+        cancel: session.cancel.clone(),
+        shutdown_notify: session.shutdown_notify.clone(),
     };
     let mut reauth = session.reauth.as_ref().and_then(Reauth::new);
     let outcome = read_frames(
@@ -159,7 +166,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let cancel = session.cancel;
-    let shutdown_notify = session.stop;
+    let stop = session.stop;
     let generation = session.generation;
     let read_burst = io_batch(false);
     let handoff_stalled = session.handoff_stalled;
@@ -170,7 +177,7 @@ where
     // Created once, not per iteration (see the write task): fresh `cancelled()` futures
     // register with the token under its mutex.
     let cancel_wait = cancel.cancelled();
-    let stop_wait = shutdown_notify.cancelled();
+    let stop_wait = stop.cancelled();
     tokio::pin!(cancel_wait, stop_wait);
 
     loop {
@@ -231,7 +238,7 @@ where
                                 control_tx,
                                 acks,
                                 &cancel,
-                                &shutdown_notify,
+                                &stop,
                                 &handoff_stalled,
                                 &inbound_activity,
                             )
@@ -260,7 +267,7 @@ where
                         }
                     }
 
-                    if cancel.is_cancelled() || shutdown_notify.is_cancelled() {
+                    if cancel.is_cancelled() || stop.is_cancelled() {
                         return ReadOutcome::Cancelled;
                     }
                     if burst_idx + 1 == read_burst {
@@ -292,12 +299,20 @@ where
 /// the same message, two runnable tasks made Tokio wake a second worker thread. When messages
 /// arrive one at a time (a broker writing each delivery on its own) that was the largest cost
 /// of inbound QoS 1. When the shared writer is free, the read task now writes the burst's
-/// PUBACKs itself; when the write task holds it, they go to the write task as before (it is
-/// awake then, so the hand-over costs no extra wake-up).
+/// PUBACKs itself; when the write task holds it, they wait in the writer's
+/// [`PendingAcks`](crate::connection::write::PendingAcks) queue, and the write task gets one
+/// [`ControlMessage::AcksPending`] when the queue was empty (it is awake then, so the hand-over
+/// costs no extra wake-up). Whoever holds the writer feeds the queue before newer PUBACKs, so
+/// they leave in order ([MQTT-4.6.0-2]).
 pub(crate) struct AcksOut<W> {
     ids: Vec<NonZeroU16>,
     writer: SharedWriter<W>,
     counter: Option<Arc<AtomicUsize>>,
+    /// PUBACKs past which this task waits for the writer instead of queueing more: the
+    /// client's Receive Maximum, at least the 128 the control channel held before.
+    queue_limit: usize,
+    cancel: StopSignal,
+    shutdown_notify: tokio_util::sync::CancellationToken,
 }
 
 impl<W: AsyncWrite + Unpin + Send + 'static> AcksOut<W> {
@@ -305,45 +320,55 @@ impl<W: AsyncWrite + Unpin + Send + 'static> AcksOut<W> {
         self.ids.push(packet_id);
     }
 
-    /// Writes the held PUBACKs, or hands them to the write task if it holds the writer.
+    /// Whether more PUBACKs wait than [`Self::queue_limit`], which only a broker sending more
+    /// than the client's Receive Maximum ([MQTT-3.3.4-9]) brings about. PUBACKs handed to the
+    /// writer count as sent: the broker can only know of fewer.
+    fn over_limit(&self) -> bool {
+        self.ids.len() + self.writer.pending_acks().len() > self.queue_limit
+    }
+
+    /// Writes the held PUBACKs, or queues them for the write task if it holds the writer.
     async fn send(&mut self, control_tx: &mpsc::Sender<ControlMessage>) -> Result<(), ()> {
-        match self.write_now() {
+        let written = match self.write_now() {
+            // The client does not end the session over a broker past its Receive Maximum, but
+            // the queue must not grow with it: wait for the writer, as the bounded control
+            // channel once made this task wait.
+            Written::WriterBusy if self.over_limit() => self.write_waiting().await,
+            written => written,
+        };
+        match written {
             Written::All => Ok(()),
             Written::Buffered => control_tx.send(ControlMessage::FlushWrites).await.map_err(|_| ()),
             Written::WriterBusy => {
-                for packet_id in self.ids.drain(..) {
-                    control_tx
-                        .send(ControlMessage::AckInboundPublish { packet_id })
-                        .await
-                        .map_err(|_| ())?;
+                if self.writer.pending_acks().push(&mut self.ids) {
+                    control_tx.send(ControlMessage::AcksPending).await.map_err(|_| ())?;
                 }
                 Ok(())
+            }
+            Written::Refused => {
+                self.writer.pending_acks().push(&mut self.ids);
+                control_tx.send(ControlMessage::AcksPending).await.map_err(|_| ())
             }
         }
     }
 
-    /// On exit: like [`Self::send`] without waiting. A PUBACK that fits nowhere is not sent,
-    /// so the broker redelivers that message (QoS 1 allows the duplicate).
+    /// On exit: like [`Self::send`] without waiting. The write task's drain feeds the queue
+    /// once this task has ended, even without [`ControlMessage::AcksPending`].
     fn send_now(&mut self, control_tx: &mpsc::Sender<ControlMessage>) {
         match self.write_now() {
             Written::All => {}
             Written::Buffered => {
                 let _ = control_tx.try_send(ControlMessage::FlushWrites);
             }
-            Written::WriterBusy => {
-                for packet_id in self.ids.drain(..) {
-                    if control_tx
-                        .try_send(ControlMessage::AckInboundPublish { packet_id })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
+            Written::WriterBusy | Written::Refused => {
+                self.writer.pending_acks().push(&mut self.ids);
+                let _ = control_tx.try_send(ControlMessage::AcksPending);
             }
         }
     }
 
-    /// Encodes the held PUBACKs into the shared writer and flushes once, without waiting.
+    /// Encodes the queued and then the held PUBACKs into the shared writer and flushes once,
+    /// without waiting.
     fn write_now(&mut self) -> Written {
         if self.ids.is_empty() {
             return Written::All;
@@ -351,26 +376,63 @@ impl<W: AsyncWrite + Unpin + Send + 'static> AcksOut<W> {
         let Ok(mut writer) = self.writer.try_lock() else {
             return Written::WriterBusy;
         };
-        let mut fed = 0;
-        for &packet_id in &self.ids {
-            if feed_inbound_publish_ack(&mut writer, packet_id, self.counter.as_ref()).is_err() {
-                break;
-            }
-            fed += 1;
+        write_held(
+            &mut self.ids,
+            &mut writer,
+            self.writer.pending_acks(),
+            self.counter.as_ref(),
+        )
+    }
+
+    /// Like [`Self::write_now`], waiting for the write task to let go of the writer. Not
+    /// during a shutdown: the graceful drain holds the writer until this task has handed on
+    /// the broker's PUBACKs, so the held ones are queued for the drain instead.
+    async fn write_waiting(&mut self) -> Written {
+        let mut writer = tokio::select! {
+            biased;
+            () = self.shutdown_notify.cancelled() => return Written::WriterBusy,
+            () = self.cancel.cancelled() => return Written::WriterBusy,
+            writer = self.writer.lock() => writer,
+        };
+        write_held(
+            &mut self.ids,
+            &mut writer,
+            self.writer.pending_acks(),
+            self.counter.as_ref(),
+        )
+    }
+}
+
+/// Encodes the queued and then the held PUBACKs into the writer and flushes once, without
+/// waiting.
+fn write_held<W: AsyncWrite + Unpin + Send + 'static>(
+    ids: &mut Vec<NonZeroU16>,
+    writer: &mut tokio_util::codec::FramedWrite<W, V5Codec>,
+    pending: &crate::connection::write::PendingAcks,
+    counter: Option<&Arc<AtomicUsize>>,
+) -> Written {
+    // Older PUBACKs queued while the write task held the writer go first.
+    if pending.feed(writer, counter).is_err() {
+        return Written::Refused;
+    }
+    let mut fed = 0;
+    for &packet_id in ids.iter() {
+        if feed_inbound_publish_ack(writer, packet_id, counter).is_err() {
+            break;
         }
-        self.ids.drain(..fed);
-        if !self.ids.is_empty() {
-            // The encoder refused a PUBACK (a broker Maximum Packet Size below 4 bytes). The
-            // write task, which owns the session's outcome, meets the same error and ends the
-            // connection.
-            return Written::WriterBusy;
-        }
-        match writer.flush().now_or_never() {
-            Some(Ok(())) => Written::All,
-            // A failed flush leaves the unsent bytes in the buffer: the write task's flush
-            // reports the error and ends the connection.
-            Some(Err(_)) | None => Written::Buffered,
-        }
+        fed += 1;
+    }
+    ids.drain(..fed);
+    if !ids.is_empty() {
+        // The encoder refused a PUBACK (a broker Maximum Packet Size below 4 bytes). The write
+        // task, which owns the session's outcome, meets the same error and ends the connection.
+        return Written::Refused;
+    }
+    match writer.flush().now_or_never() {
+        Some(Ok(())) => Written::All,
+        // A failed flush leaves the unsent bytes in the buffer: the write task's flush reports
+        // the error and ends the connection.
+        Some(Err(_)) | None => Written::Buffered,
     }
 }
 
@@ -380,9 +442,11 @@ enum Written {
     All,
     /// Encoded, but the socket is full or the flush failed: the write task has to flush.
     Buffered,
-    /// The write task holds the writer, or the encoder refused a PUBACK: the held ones go to
-    /// the write task.
+    /// The write task holds the writer: the held ones are queued for it.
     WriterBusy,
+    /// The encoder refused a PUBACK: the rest are queued, and the write task, which meets the
+    /// same error, is told even when the queue was not empty.
+    Refused,
 }
 
 /// `packet` must already have its Topic Alias resolved.
@@ -657,11 +721,14 @@ mod tests {
     fn no_acks() -> AcksOut<tokio::io::Sink> {
         AcksOut {
             ids: Vec::new(),
-            writer: std::sync::Arc::new(tokio::sync::Mutex::new(tokio_util::codec::FramedWrite::new(
+            writer: crate::connection::write::SharedWriter::new(tokio_util::codec::FramedWrite::new(
                 tokio::io::sink(),
                 crate::codec::V5Codec::with_max_packet_size(0),
-            ))),
+            )),
             counter: None,
+            queue_limit: usize::MAX,
+            cancel: StopSignal::new(),
+            shutdown_notify: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -822,11 +889,42 @@ mod tests {
                 std::num::NonZeroU16::new(1).unwrap(),
                 std::num::NonZeroU16::new(2).unwrap(),
             ],
-            writer: std::sync::Arc::new(tokio::sync::Mutex::new(tokio_util::codec::FramedWrite::new(
-                socket, codec,
-            ))),
+            writer: crate::connection::write::SharedWriter::new(tokio_util::codec::FramedWrite::new(socket, codec)),
             counter: None,
+            queue_limit: usize::MAX,
+            cancel: StopSignal::new(),
+            shutdown_notify: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// Past the client's Receive Maximum (a broker breaking [MQTT-3.3.4-9]) the read task waits
+    /// for the writer instead of queueing more PUBACKs for the write task; within it, it queues.
+    #[tokio::test]
+    async fn pubacks_past_the_receive_maximum_wait_for_the_writer() {
+        let mut acks = acks_on(tokio::io::sink(), 0);
+        acks.queue_limit = 3;
+        let writer = acks.writer.clone();
+        let (control_tx, _control_rx) = mpsc::channel(8);
+        let held = writer.lock().await;
+        acks.send(&control_tx).await.expect("queued while the writer is taken");
+        assert_eq!(writer.pending_acks().len(), 2, "within the window: queued");
+
+        for id in 3..=4 {
+            acks.hold(std::num::NonZeroU16::new(id).unwrap());
+        }
+        let mut send = std::pin::pin!(acks.send(&control_tx));
+        assert!(
+            futures_util::poll!(send.as_mut()).is_pending(),
+            "past the window: waits for the writer"
+        );
+        drop(held);
+        send.await.expect("written");
+        assert_eq!(writer.pending_acks().len(), 0);
+        assert_eq!(
+            writer.lock().await.write_buffer().len(),
+            0,
+            "all four PUBACKs written and flushed"
+        );
     }
 
     /// A failed flush is not a written PUBACK: the write task flushes again and meets the error.
@@ -850,12 +948,15 @@ mod tests {
         let mut acks = acks_on(tokio::io::sink(), 3);
         let (control_tx, mut control_rx) = mpsc::channel(8);
         acks.send(&control_tx).await.expect("control channel open");
-        for expected in [1, 2] {
-            match control_rx.try_recv() {
-                Ok(super::ControlMessage::AckInboundPublish { packet_id }) => assert_eq!(packet_id.get(), expected),
-                other => panic!("expected AckInboundPublish, got {other:?}"),
-            }
-        }
+        assert!(matches!(control_rx.try_recv(), Ok(super::ControlMessage::AcksPending)));
+        let queued: Vec<u16> = acks
+            .writer
+            .pending_acks()
+            .snapshot()
+            .iter()
+            .map(|id| id.get())
+            .collect();
+        assert_eq!(queued, [1, 2]);
         assert!(acks.ids.is_empty());
     }
 }

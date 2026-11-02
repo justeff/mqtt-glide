@@ -50,7 +50,108 @@ pub(crate) use self::io::feed_inbound_publish_ack;
 
 /// The session's framed writer. The write task holds it while it writes; the read task takes it
 /// when free to write PUBACKs itself instead of waking the write task for them.
-pub(crate) type SharedWriter<W> = Arc<tokio::sync::Mutex<FramedWrite<W, V5Codec>>>;
+///
+/// PUBACKs the read task could not write because the writer was taken wait in
+/// [`PendingAcks`] next to it, and whoever holds the writer next feeds them before any newer
+/// PUBACK, so inbound PUBACKs leave in the order the PUBLISHes came in ([MQTT-4.6.0-2]).
+pub(crate) struct SharedWriter<W>(Arc<SharedWriterInner<W>>);
+
+struct SharedWriterInner<W> {
+    framed: tokio::sync::Mutex<FramedWrite<W, V5Codec>>,
+    pending_acks: PendingAcks,
+}
+
+impl<W> Clone for SharedWriter<W> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<W> SharedWriter<W> {
+    pub(crate) fn new(framed: FramedWrite<W, V5Codec>) -> Self {
+        Self(Arc::new(SharedWriterInner {
+            framed: tokio::sync::Mutex::new(framed),
+            pending_acks: PendingAcks::default(),
+        }))
+    }
+
+    pub(crate) fn try_lock(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, FramedWrite<W, V5Codec>>, tokio::sync::TryLockError> {
+        self.0.framed.try_lock()
+    }
+
+    pub(crate) async fn lock(&self) -> tokio::sync::MutexGuard<'_, FramedWrite<W, V5Codec>> {
+        self.0.framed.lock().await
+    }
+
+    pub(crate) fn pending_acks(&self) -> &PendingAcks {
+        &self.0.pending_acks
+    }
+}
+
+/// Inbound PUBACKs, oldest first, that the read task queued while the writer was taken.
+///
+/// The read task appends and sends [`ControlMessage::AcksPending`] when the queue was empty;
+/// every holder of the writer that feeds PUBACKs feeds these first.
+#[derive(Default)]
+pub(crate) struct PendingAcks {
+    ids: std::sync::Mutex<Vec<std::num::NonZeroU16>>,
+    /// `ids.len()`, readable without the lock: the read task checks it per QoS 1 publish.
+    queued: std::sync::atomic::AtomicUsize,
+}
+
+impl PendingAcks {
+    /// Queues `ids` (emptied) behind the PUBACKs already waiting. `true` when the queue was
+    /// empty: the write task has no [`ControlMessage::AcksPending`] for them yet.
+    pub(crate) fn push(&self, ids: &mut Vec<std::num::NonZeroU16>) -> bool {
+        let mut queue = self.ids.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let was_empty = queue.is_empty();
+        self.queued.fetch_add(ids.len(), std::sync::atomic::Ordering::AcqRel);
+        queue.append(ids);
+        was_empty
+    }
+
+    /// PUBACKs queued and not yet fed to the writer.
+    pub(crate) fn len(&self) -> usize {
+        self.queued.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Feeds every queued PUBACK into `framed`, without flushing; returns how many. The caller
+    /// holds the writer. On an encoder error the refused PUBACK and the ones after it stay
+    /// queued.
+    pub(crate) fn feed<W>(
+        &self,
+        framed: &mut FramedWrite<W, V5Codec>,
+        counter: Option<&Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> Result<usize, WriteOutcome>
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut queue = self.ids.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (fed, &packet_id) in queue.iter().enumerate() {
+            if let Err(outcome) = feed_inbound_publish_ack(framed, packet_id, counter) {
+                queue.drain(..fed);
+                self.queued.fetch_sub(fed, std::sync::atomic::Ordering::AcqRel);
+                return Err(outcome);
+            }
+        }
+        let fed = queue.len();
+        if fed > 0 {
+            queue.clear();
+            self.queued.fetch_sub(fed, std::sync::atomic::Ordering::AcqRel);
+        }
+        Ok(fed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> Vec<std::num::NonZeroU16> {
+        self.ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
 
 /// Takes the writer, without waiting when it is free. `Mutex::lock` counts against the task's
 /// cooperative budget even when uncontended, which made a busy write task yield more often.
@@ -490,6 +591,7 @@ where
     let inbound_activity = session.inbound_activity;
     let inbound_publish_ack_counter = session.bench_inbound_publish_ack_counter;
     let read_stop = session.read_stop;
+    let pending_acks = shared.pending_acks();
     let subscription_identifiers_available = session.subscription_identifiers_available;
     let mut restore = restore::RestoreRetry::new(&subscription_registry, session.ack_timeout);
     let mut awaiting_pingresp = false;
@@ -534,6 +636,7 @@ where
                 subscription_registry: &subscription_registry,
                 generation,
                 read_stop: &read_stop,
+                pending_acks,
             },
             read_done,
             outcome,
@@ -571,6 +674,7 @@ where
                         subscription_registry: &subscription_registry,
                         generation,
                         read_stop: &read_stop,
+                        pending_acks,
                     },
                     read_done,
                     outcome,
@@ -609,6 +713,7 @@ where
                         subscription_registry: &subscription_registry,
                         generation,
                         read_stop: &read_stop,
+                        pending_acks,
                     },
                     read_done,
                 )
@@ -671,6 +776,7 @@ where
                             subscription_registry: &subscription_registry,
                             generation,
                             read_stop: &read_stop,
+                            pending_acks,
                         },
                         read_done,
                         outcome,
@@ -720,6 +826,7 @@ where
                                     subscription_registry: &subscription_registry,
                                     generation,
                                     read_stop: &read_stop,
+                                    pending_acks,
                                 },
                                 read_done,
                                 outcome,
@@ -751,6 +858,7 @@ where
                                     subscription_registry: &subscription_registry,
                                     generation,
                                     read_stop: &read_stop,
+                                    pending_acks,
                                 },
                                 read_done,
                                 outcome,
@@ -786,6 +894,7 @@ where
                                     subscription_registry: &subscription_registry,
                                     generation,
                                     read_stop: &read_stop,
+                                    pending_acks,
                                 },
                                 read_done,
                                 outcome,
@@ -830,6 +939,7 @@ where
                                     subscription_registry: &subscription_registry,
                                     generation,
                                     read_stop: &read_stop,
+                                    pending_acks,
                                 },
                                 read_done,
                                 outcome,
@@ -862,6 +972,7 @@ where
                                     subscription_registry: &subscription_registry,
                                     generation,
                                     read_stop: &read_stop,
+                                    pending_acks,
                                 },
                                 read_done,
                                 outcome,
@@ -892,6 +1003,7 @@ where
                                     subscription_registry: &subscription_registry,
                                     generation,
                                     inbound_publish_ack_counter: inbound_publish_ack_counter.as_ref(),
+                            pending_acks,
                                     flush_abort,
                                 },
                                 0,
@@ -911,6 +1023,7 @@ where
                                     subscription_registry: &subscription_registry,
                                     generation,
                                     read_stop: &read_stop,
+                                    pending_acks,
                                 },
                                 read_done,
                                 outcome,
@@ -918,21 +1031,21 @@ where
                             .await;
                         }
                     }
-                    Some(message @ (ControlMessage::AckInboundPublish { .. } | ControlMessage::FlushWrites)) => {
+                    Some(message @ (ControlMessage::AcksPending | ControlMessage::FlushWrites)) => {
                         // FlushWrites: PUBACKs the read task fed into the buffer wait for a flush.
                         let mut fed = 0;
-                        if let ControlMessage::AckInboundPublish { packet_id } = message {
-                            if let Err(outcome) =
-                                feed_inbound_publish_ack(&mut framed, packet_id, inbound_publish_ack_counter.as_ref())
-                            {
-                                return finish_write_outcome(
-                                    &mut waiters,
-                                    &mut publish_waiters,
-                                    &mut inflight,
-                                    outcome,
-                                );
+                        if matches!(message, ControlMessage::AcksPending) {
+                            match pending_acks.feed(&mut framed, inbound_publish_ack_counter.as_ref()) {
+                                Ok(count) => fed = count,
+                                Err(outcome) => {
+                                    return finish_write_outcome(
+                                        &mut waiters,
+                                        &mut publish_waiters,
+                                        &mut inflight,
+                                        outcome,
+                                    );
+                                }
                             }
-                            fed = 1;
                         }
                         if let Err(outcome) = coalesce_ready_control_and_flush(
                             &mut ControlCoalesceCtx {
@@ -945,9 +1058,10 @@ where
                                 subscription_registry: &subscription_registry,
                                 generation,
                                 inbound_publish_ack_counter: inbound_publish_ack_counter.as_ref(),
+                            pending_acks,
                                 flush_abort,
                             },
-                            fed, // the triggering PUBACK, if any, is already fed
+                            fed, // the queued PUBACKs just fed, counted toward the coalesce budget
                         )
                         .await
                         {
@@ -964,6 +1078,7 @@ where
                                     subscription_registry: &subscription_registry,
                                     generation,
                                     read_stop: &read_stop,
+                                    pending_acks,
                                 },
                                 read_done,
                                 outcome,
@@ -986,6 +1101,7 @@ where
                                     subscription_registry: &subscription_registry,
                                     generation,
                                     read_stop: &read_stop,
+                                    pending_acks,
                                 },
                                 read_done,
                                 outcome,
@@ -1039,6 +1155,7 @@ where
                             subscription_registry: &subscription_registry,
                             generation,
                             read_stop: &read_stop,
+                            pending_acks,
                         },
                         read_done,
                         outcome,
@@ -1106,6 +1223,7 @@ where
                                 subscription_registry: &subscription_registry,
                                 generation,
                                 read_stop: &read_stop,
+                                pending_acks,
                             },
                             read_done,
                         )
@@ -1125,6 +1243,7 @@ where
                                 subscription_registry: &subscription_registry,
                                 generation,
                                 read_stop: &read_stop,
+                                pending_acks,
                             },
                             read_done,
                             outcome,

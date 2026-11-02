@@ -31,6 +31,22 @@ struct WriteTaskHandle {
     join: JoinHandle<WriteOutcome>,
     /// Kept alive so `stub_exit_rx.recv()` does not resolve early (biased select in unit tests).
     _stub_tx: mpsc::Sender<()>,
+    /// Queues inbound PUBACKs in the shared writer as the read task does when the writer is
+    /// taken; `true` when the queue was empty.
+    queue_acks: QueueAcks,
+}
+
+type QueueAcks = Box<dyn Fn(&[u16]) -> bool + Send + Sync>;
+
+impl WriteTaskHandle {
+    /// What the read task does with PUBACKs while the write task holds the writer.
+    fn queue_inbound_acks(&self, packet_ids: &[u16]) {
+        if (self.queue_acks)(packet_ids) {
+            self.control_tx
+                .try_send(ControlMessage::AcksPending)
+                .expect("AcksPending");
+        }
+    }
 }
 
 /// [`WriteSession`] fields that vary across write-task unit tests; everything else uses a
@@ -77,6 +93,12 @@ where
     let _ = read_done_tx.send(());
     let subscription_registry = Arc::new(RwLock::new(SubscriptionRegistry::default()));
 
+    let writer = SharedWriter::new(framed);
+    let queue_writer = writer.clone();
+    let queue_acks = Box::new(move |ids: &[u16]| {
+        let mut ids = ids.iter().map(|&id| NonZeroU16::new(id).expect("nz")).collect();
+        queue_writer.pending_acks().push(&mut ids)
+    });
     let session = WriteSession {
         generation: Generation(1),
         keep_alive: Duration::from_secs(3600),
@@ -102,7 +124,7 @@ where
             control_rx,
             &mut command_rx,
             stub_rx,
-            Arc::new(tokio::sync::Mutex::new(framed)),
+            writer,
             session,
             InflightPots::new(overrides.inflight_capacity),
             read_done_rx,
@@ -117,6 +139,7 @@ where
         subscription_registry,
         join,
         _stub_tx: stub_tx,
+        queue_acks,
     }
 }
 
@@ -535,12 +558,7 @@ async fn protocol_disconnect_is_terminal_no_frames_after() {
         .send(ControlMessage::PingReq)
         .await
         .expect("late ping");
-    let packet_id = NonZeroU16::new(7).expect("nz");
-    harness
-        .control_tx
-        .send(ControlMessage::AckInboundPublish { packet_id })
-        .await
-        .expect("late puback");
+    harness.queue_inbound_acks(&[7]);
     drop(harness.control_tx);
 
     // Peer must see DISCONNECT then EOF without waiting for supervisor cancel.
@@ -882,12 +900,7 @@ async fn shutdown_flushes_pending_inbound_publish_acks_before_disconnect() {
         .await
         .expect("write must enter Shutdown arm");
 
-    let packet_id = NonZeroU16::new(42).expect("nz");
-    harness
-        .control_tx
-        .send(ControlMessage::AckInboundPublish { packet_id })
-        .await
-        .expect("queue late inbound PUBACK while Shutdown is paused");
+    harness.queue_inbound_acks(&[42]);
     gate.release.notify_waiters();
 
     let outcome = timeout(Duration::from_secs(2), harness.join)
@@ -1276,6 +1289,7 @@ async fn graceful_disconnect_sends_publishes_parked_behind_a_freed_window() {
             subscription_registry: &registry,
             generation: Generation(1),
             read_stop: &read_stop,
+            pending_acks: &PendingAcks::default(),
         },
         read_done,
     )
@@ -1312,14 +1326,7 @@ async fn coalesced_inbound_acks_keep_a_queued_protocol_disconnect() {
 
     let harness = spawn_write_task(framed, WriteSessionOverrides::default());
     // Queued before the write task first runs, so it finds them all in one wakeup.
-    for packet_id in [1u16, 2, 3] {
-        harness
-            .control_tx
-            .try_send(ControlMessage::AckInboundPublish {
-                packet_id: NonZeroU16::new(packet_id).expect("nz"),
-            })
-            .expect("inbound ack");
-    }
+    harness.queue_inbound_acks(&[1, 2, 3]);
     harness
         .control_tx
         .try_send(ControlMessage::ProtocolDisconnect(

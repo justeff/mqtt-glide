@@ -1913,3 +1913,108 @@ async fn handoff_survives_shutdown() {
     );
     assert_eq!(order[puback_pos.expect("puback")].1, 9);
 }
+
+/// Inbound PUBACKs leave in the order of the PUBLISHes while the client publishes too
+/// ([MQTT-4.6.0-2]). The read task writes PUBACKs itself when the writer is free and queues
+/// them for the write task when it is not; a later burst written directly overtook queued
+/// PUBACKs within a few hundred messages before they shared one queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbound_pubacks_keep_publish_order_while_publishing() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const TOTAL: usize = 20_000;
+    const WINDOW: usize = 64;
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel::<(usize, Option<(u16, u16)>)>();
+    let port = spawn_broker_once(move |mut framed_read, mut framed_write| async move {
+        if !accept_connect_send_connack(&mut framed_read, &mut framed_write).await {
+            return;
+        }
+        let window = Arc::new(tokio::sync::Semaphore::new(WINDOW));
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel::<u16>();
+        let writer_window = Arc::clone(&window);
+        let writer = tokio::spawn(async move {
+            for id in (1..=u16::MAX).cycle().take(TOTAL) {
+                writer_window.acquire().await.expect("open").forget();
+                order_tx.send(id).expect("reader alive");
+                send_inbound_qos1_publish(
+                    &mut framed_write,
+                    "in/order",
+                    b"x",
+                    NonZeroU16::new(id).expect("nz"),
+                    crate::codec::PublishProperties::default(),
+                )
+                .await;
+            }
+            std::future::pending::<()>().await;
+        });
+        let mut seen = 0;
+        let mut mismatch = None;
+        while seen < TOTAL {
+            match framed_read.next().await {
+                Some(Ok((DecodedFrame::Control(Packet::PublishAck(ack)), _))) => {
+                    let expected = order_rx.recv().await.expect("sent before acknowledged");
+                    if ack.packet_id.get() != expected {
+                        mismatch = Some((expected, ack.packet_id.get()));
+                        break;
+                    }
+                    seen += 1;
+                    window.add_permits(1);
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => break,
+            }
+        }
+        let _ = result_tx.send((seen, mismatch));
+        writer.abort();
+    })
+    .await;
+
+    let (handoff_tx, handoff_rx) = flume::bounded::<InboundMessage>(1024);
+    let drain = tokio::spawn(async move { while handoff_rx.recv_async().await.is_ok() {} });
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let (client, connection, mut phase) = connect(
+        ConnectOptions::new(url),
+        static_test_credentials(),
+        NoReconnect,
+        handoff_tx,
+        NoopLifecycle,
+    )
+    .expect("connect");
+    let run = tokio::spawn(connection.run());
+    await_connected(&mut phase).await;
+
+    // QoS 0 publishers keep the write task holding the writer most of the time.
+    let stop = Arc::new(AtomicBool::new(false));
+    let publishers: Vec<_> = (0..4)
+        .map(|_| {
+            let client = client.clone();
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let payload = bytes::Bytes::from(vec![7u8; 64]);
+                while !stop.load(Ordering::Relaxed) {
+                    if client.publish("out/load", payload.clone()).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let (seen, mismatch) = timeout(Duration::from_secs(60), result_rx)
+        .await
+        .expect("broker verdict in time")
+        .expect("broker task alive");
+    stop.store(true, Ordering::Relaxed);
+    for publisher in publishers {
+        let _ = publisher.await;
+    }
+    client.shutdown().await.ok();
+    let _ = run.await;
+    drain.abort();
+    assert_eq!(
+        mismatch, None,
+        "PUBACK out of order after {seen} in-order ones: (expected, got)"
+    );
+    assert_eq!(seen, TOTAL);
+}

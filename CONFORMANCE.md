@@ -176,7 +176,7 @@ covered by the statement that binds the client.
 | **[MQTT-3.3.4-6]** A PUBLISH packet sent from a Client to a Server MUST NOT contain a Subscription Identifier. | ✅ tested | `encode_publish_never_writes_subscription_identifier` (src/codec/v5/encode.rs) |
 | **[MQTT-3.3.4-7]** The Client MUST NOT send more than Receive Maximum QoS 1 and QoS 2 PUBLISH packets for which it has not received PUBACK, PUBCOMP, or PUBREC with a Reason Code of 128 or greater from the Server. | ✅ tested | `qos1_publish_waits_for_window_when_inflight_exhausted` (src/client.rs) |
 | **[MQTT-3.3.4-8]** The Client MUST NOT delay the sending of any packets other than PUBLISH packets due to having sent Receive Maximum PUBLISH packets without receiving acknowledgements for them. | ✅ tested | `subscribe_completes_while_many_qos1_publishes_in_flight` (src/client.rs) |
-| **[MQTT-3.3.4-9]** The Server MUST NOT send more than Receive Maximum QoS 1 and QoS 2 PUBLISH packets for which it has not received PUBACK, PUBCOMP, or PUBREC with a Reason Code of 128 or greater from the Client. | — server obligation |  |
+| **[MQTT-3.3.4-9]** The Server MUST NOT send more than Receive Maximum QoS 1 and QoS 2 PUBLISH packets for which it has not received PUBACK, PUBCOMP, or PUBREC with a Reason Code of 128 or greater from the Client. | — server obligation | `pubacks_past_the_receive_maximum_wait_for_the_writer` (src/connection/read.rs) |
 | **[MQTT-3.3.4-10]** The Server MUST NOT delay the sending of any packets other than PUBLISH packets due to having sent Receive Maximum PUBLISH packets without receiving acknowledgements for them. | — server obligation |  |
 
 ## 3.4
@@ -348,7 +348,7 @@ covered by the statement that binds the client.
 | Statement | Status | Evidence |
 |---|---|---|
 | **[MQTT-4.6.0-1]** When the Client re-sends any PUBLISH packets, it MUST re-send them in the order in which the original PUBLISH packets were sent (this applies to QoS 1 and QoS 2 messages). | ✅ tested | `unacked_qos1_is_resent_with_dup_on_session_resume` (src/client.rs) |
-| **[MQTT-4.6.0-2]** The Client MUST send PUBACK packets in the order in which the corresponding PUBLISH packets were received (QoS 1 messages). | ✅ tested | `inbound_pubacks_sent_in_publish_receipt_order` (src/connection/tests.rs) |
+| **[MQTT-4.6.0-2]** The Client MUST send PUBACK packets in the order in which the corresponding PUBLISH packets were received (QoS 1 messages). | ✅ tested | `inbound_pubacks_keep_publish_order_while_publishing` (src/connection/tests.rs)<br>`inbound_pubacks_sent_in_publish_receipt_order` (src/connection/tests.rs) |
 | **[MQTT-4.6.0-3]** The Client MUST send PUBREC packets in the order in which the corresponding PUBLISH packets were received (QoS 2 messages). | — not supported | QoS 2 is not supported |
 | **[MQTT-4.6.0-4]** The Client MUST send PUBREL packets in the order in which the corresponding PUBREC packets were received (QoS 2 messages). | — not supported | QoS 2 is not supported |
 | **[MQTT-4.6.0-5]** When a Server processes a message that has been published to an Ordered Topic, it MUST send PUBLISH packets to consumers (for the same Topic and QoS) in the order that they were received from any given Client. | — server obligation |  |

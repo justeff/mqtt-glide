@@ -24,7 +24,7 @@ use crate::error::{AppError, ProtocolError, TransportError};
 
 use super::acks::{complete_publish_ack, complete_subscribe_ack, complete_unsubscribe_ack, fail_all_waiters};
 use super::{
-    BrokerPublishLimits, MAX_READY_DRAIN, PendingOutboundPublish, PublishWaiters, SubUnsubWaiters,
+    BrokerPublishLimits, MAX_READY_DRAIN, PendingAcks, PendingOutboundPublish, PublishWaiters, SubUnsubWaiters,
     WRITE_BUFFER_SOFT_FLUSH_BYTES, WriteOutcome,
 };
 
@@ -55,6 +55,7 @@ pub(super) struct GracefulDisconnectCtx<'a> {
     pub(super) subscription_registry: &'a Arc<RwLock<SubscriptionRegistry>>,
     pub(super) generation: Generation,
     pub(super) read_stop: &'a StopSignal,
+    pub(super) pending_acks: &'a PendingAcks,
 }
 
 /// Graceful shutdown, bounded by `flush_budget`:
@@ -102,6 +103,7 @@ where
         subscription_registry,
         generation,
         read_stop,
+        pending_acks,
     } = ctx;
 
     // Normal Disconnection, unless the read task reports a packet it could not accept.
@@ -123,8 +125,8 @@ where
                         super::commands::send_parked_publishes(framed, inflight, publish_waiters)?;
                         flush_writes(framed, flush_abort).await?;
                     }
-                    Some(ControlMessage::AckInboundPublish { packet_id }) => {
-                        feed_inbound_publish_ack(framed, packet_id, None)?;
+                    Some(ControlMessage::AcksPending) => {
+                        pending_acks.feed(framed, None)?;
                         flush_writes(framed, flush_abort).await?;
                     }
                     Some(ControlMessage::SubscribeAck { ack, generation: ack_generation }) => {
@@ -164,8 +166,15 @@ where
 
         read_stop.cancel();
         let read_done = (!read_finished).then_some(&mut read_done);
-        drain_inbound_publish_acks_until_read_done(framed, control_rx, read_done, flush_abort, &mut disconnect_reason)
-            .await?;
+        drain_inbound_publish_acks_until_read_done(
+            framed,
+            control_rx,
+            pending_acks,
+            read_done,
+            flush_abort,
+            &mut disconnect_reason,
+        )
+        .await?;
         // Best-effort DISCONNECT so the broker sees a clean close after PUBACKs.
         send_packet(
             framed,
@@ -250,11 +259,13 @@ where
     Ok(())
 }
 
-/// Drains [`ControlMessage::AckInboundPublish`] until the read task has exited, then vacuums.
+/// Feeds the read task's queued PUBACKs ([`ControlMessage::AcksPending`]) until it has exited,
+/// then whatever it queued last.
 /// A [`ControlMessage::ProtocolDisconnect`] met on the way sets `disconnect_reason`.
 pub(super) async fn drain_inbound_publish_acks_until_read_done<W>(
     framed: &mut FramedWrite<W, V5Codec>,
     control_rx: &mut ControlReceiver,
+    pending_acks: &PendingAcks,
     mut read_done: Option<&mut oneshot::Receiver<()>>,
     flush_abort: FlushAbort<'_>,
     disconnect_reason: &mut DisconnectReasonCode,
@@ -270,9 +281,8 @@ where
             biased;
             msg = control_rx.recv() => {
                 match msg {
-                    Some(ControlMessage::AckInboundPublish { packet_id }) => {
-                        feed_inbound_publish_ack(framed, packet_id, None)?;
-                        dirty = true;
+                    Some(ControlMessage::AcksPending) => {
+                        dirty |= pending_acks.feed(framed, None)? > 0;
                         flush_if_buffer_large(framed, flush_abort).await?;
                     }
                     Some(ControlMessage::ProtocolDisconnect(reason)) => *disconnect_reason = reason,
@@ -280,6 +290,7 @@ where
                         // Waiters already failed; ignore non-ack control during drain.
                     }
                     None => {
+                        dirty |= pending_acks.feed(framed, None)? > 0;
                         if dirty {
                             flush_writes(framed, flush_abort).await?;
                         }
@@ -294,17 +305,14 @@ where
         }
     }
 
-    // Read has exited: any remaining Acks are already in the mpsc (or none left).
+    // Read has exited: every PUBACK it queued is in `pending_acks` now, told or not (its exit
+    // path does not wait for room in the channel).
     loop {
         match control_rx.try_recv() {
-            Ok(ControlMessage::AckInboundPublish { packet_id }) => {
-                feed_inbound_publish_ack(framed, packet_id, None)?;
-                dirty = true;
-                flush_if_buffer_large(framed, flush_abort).await?;
-            }
             Ok(ControlMessage::ProtocolDisconnect(reason)) => *disconnect_reason = reason,
             Ok(_other) => {}
             Err(mpsc::error::TryRecvError::Empty) | Err(mpsc::error::TryRecvError::Disconnected) => {
+                dirty |= pending_acks.feed(framed, None)? > 0;
                 if dirty {
                     flush_writes(framed, flush_abort).await?;
                 }
@@ -387,6 +395,7 @@ where
     pub(super) subscription_registry: &'a Arc<RwLock<SubscriptionRegistry>>,
     pub(super) generation: Generation,
     pub(super) inbound_publish_ack_counter: Option<&'a Arc<AtomicUsize>>,
+    pub(super) pending_acks: &'a PendingAcks,
     pub(super) flush_abort: FlushAbort<'a>,
 }
 
@@ -406,9 +415,8 @@ where
             break;
         }
         match ctx.control_rx.try_recv() {
-            Ok(ControlMessage::AckInboundPublish { packet_id }) => {
-                feed_inbound_publish_ack(ctx.framed, packet_id, ctx.inbound_publish_ack_counter)?;
-                fed_publish_acks += 1;
+            Ok(ControlMessage::AcksPending) => {
+                fed_publish_acks += ctx.pending_acks.feed(ctx.framed, ctx.inbound_publish_ack_counter)?;
                 flush_if_buffer_large(ctx.framed, ctx.flush_abort).await?;
             }
             Ok(ControlMessage::PublishAck {
@@ -471,7 +479,14 @@ where
     match deferred {
         // Deferred non-coalesceable control (PING / DISCONNECT / ...).
         Some(deferred) => {
-            match handle_deferred_control(deferred, ctx.framed, ctx.flush_abort, ctx.inbound_publish_ack_counter).await
+            match handle_deferred_control(
+                deferred,
+                ctx.framed,
+                ctx.flush_abort,
+                ctx.pending_acks,
+                ctx.inbound_publish_ack_counter,
+            )
+            .await
             {
                 Some(outcome) => Err(outcome),
                 None => Ok(()),
@@ -486,6 +501,7 @@ pub(super) async fn handle_deferred_control<W>(
     control: ControlMessage,
     framed: &mut FramedWrite<W, V5Codec>,
     flush_abort: FlushAbort<'_>,
+    pending_acks: &PendingAcks,
     inbound_publish_ack_counter: Option<&Arc<AtomicUsize>>,
 ) -> Option<WriteOutcome>
 where
@@ -513,8 +529,8 @@ where
             }
             Some(WriteOutcome::Cancelled)
         }
-        ControlMessage::AckInboundPublish { packet_id } => {
-            if let Err(outcome) = feed_inbound_publish_ack(framed, packet_id, inbound_publish_ack_counter) {
+        ControlMessage::AcksPending => {
+            if let Err(outcome) = pending_acks.feed(framed, inbound_publish_ack_counter) {
                 return Some(outcome);
             }
             flush_writes(framed, flush_abort).await.err()

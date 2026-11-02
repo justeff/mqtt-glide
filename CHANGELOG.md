@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Inbound PUBACKs leave in the order the PUBLISHes came in again while the client publishes too ([MQTT-4.6.0-2]). Since 0.5.0 the read task writes PUBACKs itself when the writer is free and hands them to the write task when it is not; a later burst written directly could overtake PUBACKs still waiting for the write task, within a few hundred messages under outbound load. Waiting PUBACKs are now kept in one queue that whoever writes next sends first, and the write task is woken once per batch instead of once per PUBACK
+
 ## [0.5.0] - 2026-11-02
 
 ### Changed (breaking)

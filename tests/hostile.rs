@@ -1787,3 +1787,66 @@ async fn soak_client_memory_is_flat_under_resets() {
         last.0 - first.0
     );
 }
+
+/// A graceful `shutdown()` while a broker floods past the client's Receive Maximum: the drain
+/// holds the writer until the read task has handed on the broker's PUBACK, so the read task must
+/// not wait for the writer then. The shutdown ends at once, the outbound publish is
+/// acknowledged, and every inbound one gets its PUBACK.
+#[tokio::test]
+async fn shutdown_during_a_flood_past_receive_maximum_drains_at_once() {
+    const N: u16 = 300;
+    let (port, broker) = evil(|l| async move {
+        let mut p = l.accept().await;
+        p.handshake(&[]).await;
+        let raw = loop {
+            let r = p.next_skip_ping().await.expect("publish");
+            if r.kind() == 3 {
+                break r;
+            }
+        };
+        let sent = parse_publish(&raw);
+        // The client is in its graceful drain now, waiting for this PUBACK.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let burst: Vec<u8> = (1..=N)
+            .flat_map(|pid| publish("flood", 1, pid, &[], &pid.to_be_bytes()))
+            .collect();
+        p.send(&burst).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        p.send(&puback(sent.pid)).await;
+        let mut acked = 0;
+        while let Some(r) = p.next_skip_ping().await {
+            match r.kind() {
+                4 => acked += 1,
+                14 => break,
+                _ => {}
+            }
+        }
+        acked
+    })
+    .await;
+    let mut h = Harness::start(
+        base_options(port)
+            .receive_maximum(std::num::NonZeroU16::new(2).unwrap())
+            .graceful_disconnect_timeout(Duration::from_secs(4)),
+        Reconnect::never(),
+        usize::from(N) + 8,
+    );
+    h.connected().await;
+    let completion = within(
+        10,
+        h.client
+            .start_publish(Publish::new("out", vec![1u8; 16]).qos(QoS::AtLeastOnce)),
+    )
+    .await
+    .expect("start_publish");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let started = Instant::now();
+    within(10, h.client.shutdown()).await.expect("shutdown");
+    let _ = h.finish(10).await;
+    let elapsed = started.elapsed();
+    let published = within(10, completion.wait()).await.map(drop);
+    let acked = within(10, broker).await.expect("broker");
+    assert!(published.is_ok(), "the broker acknowledged it: {published:?}");
+    assert!(elapsed < Duration::from_secs(2), "shutdown took {elapsed:?}");
+    assert_eq!(acked, usize::from(N), "every inbound publish acknowledged");
+}

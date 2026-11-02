@@ -22,9 +22,9 @@ pub const CONTROL_CHANNEL_CAPACITY: usize = 128;
 
 /// Capacity of the read→write control channel for a session.
 ///
-/// `max([`CONTROL_CHANNEL_CAPACITY`], receive_maximum)` so inbound `AckInboundPublish`
-/// (and outbound `PublishAck`) can queue up to one full MQTT receive window without
-/// parking the read task, while default sessions stay at the 128 floor.
+/// `max([`CONTROL_CHANNEL_CAPACITY`], receive_maximum)` so the broker's PUBACKs can queue up
+/// to one full MQTT receive window without parking the read task, while default sessions stay
+/// at the 128 floor.
 #[inline]
 pub fn control_channel_capacity(receive_maximum: NonZeroU16) -> usize {
     CONTROL_CHANNEL_CAPACITY.max(usize::from(receive_maximum.get()))
@@ -84,11 +84,9 @@ pub(crate) enum ControlMessage {
     /// Client → broker AUTH of a re-authentication (§4.12.1), queued by the read task, which
     /// runs the exchange.
     Auth(Box<Auth>),
-    /// Client → broker PUBACK for an inbound QoS-1 PUBLISH after successful handoff accept.
-    AckInboundPublish {
-        /// Packet identifier from the inbound PUBLISH.
-        packet_id: std::num::NonZeroU16,
-    },
+    /// The read task queued client → broker PUBACKs for accepted inbound QoS-1 PUBLISHes in
+    /// the shared writer's pending queue (`write::PendingAcks`) while the writer was taken.
+    AcksPending,
     /// The read task left PUBACKs in the shared write buffer because the socket was full;
     /// the write task flushes them.
     FlushWrites,
