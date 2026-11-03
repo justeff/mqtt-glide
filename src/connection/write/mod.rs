@@ -1014,27 +1014,28 @@ where
                             ack_generation,
                             ack,
                         );
-                        // With publishes parked behind the broker's Receive Maximum, each PUBACK
-                        // frees a slot for one of them. Take the PUBACKs that are already queued
-                        // first, so the freed slots go out in one write instead of one each.
-                        if publish_waiters.waiting_for_window() > 0
-                            && let Err(outcome) = coalesce_ready_control_and_flush(
-                                &mut ControlCoalesceCtx {
-                                    framed: &mut framed,
-                                    control_rx: &mut control_rx,
-                                    command_rx,
-                                    waiters: &mut waiters,
-                                    publish_waiters: &mut publish_waiters,
-                                    inflight: &mut inflight,
-                                    subscription_registry: &subscription_registry,
-                                    generation,
-                                    inbound_publish_ack_counter: inbound_publish_ack_counter.as_ref(),
-                            pending_acks,
-                                    flush_abort,
-                                },
-                                0,
-                            )
-                            .await
+                        // Take the control messages that are already queued too, PUBACKs from
+                        // concurrent publishers above all: one turn of this loop each cost a
+                        // writer lock, a token poll and the timers per PUBACK. With publishes
+                        // parked behind the broker's Receive Maximum, the slots they free also go
+                        // out in one write instead of one each.
+                        if let Err(outcome) = coalesce_ready_control_and_flush(
+                            &mut ControlCoalesceCtx {
+                                framed: &mut framed,
+                                control_rx: &mut control_rx,
+                                command_rx,
+                                waiters: &mut waiters,
+                                publish_waiters: &mut publish_waiters,
+                                inflight: &mut inflight,
+                                subscription_registry: &subscription_registry,
+                                generation,
+                                inbound_publish_ack_counter: inbound_publish_ack_counter.as_ref(),
+                                pending_acks,
+                                flush_abort,
+                            },
+                            0,
+                        )
+                        .await
                         {
                             return finish_hot_path_write_outcome(
                                 &mut framed,
@@ -1084,7 +1085,7 @@ where
                                 subscription_registry: &subscription_registry,
                                 generation,
                                 inbound_publish_ack_counter: inbound_publish_ack_counter.as_ref(),
-                            pending_acks,
+                                pending_acks,
                                 flush_abort,
                             },
                             fed, // the queued PUBACKs just fed, counted toward the coalesce budget

@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `AppError::PublishRefusedByDisconnect`: a QoS 1 publish given up after the broker disconnected on it three times in a row (see Fixed)
 
+### Performance
+
+- Concurrent QoS 1 publishing: after each PUBACK from the broker the write task also takes the control messages already queued, mostly more PUBACKs, instead of one turn of its loop each. 64 callers on one client against the bench's mock broker: about +18 % msg/s, 8 % less CPU per message, p99 about 220 µs → 130 µs
+
 ### Fixed
 
 - Inbound PUBACKs leave in the order the PUBLISHes came in again while the client publishes too ([MQTT-4.6.0-2]). Since 0.5.0 the read task writes PUBACKs itself when the writer is free and hands them to the write task when it is not; a later burst written directly could overtake PUBACKs still waiting for the write task, within a few hundred messages under outbound load. Waiting PUBACKs are now kept in one queue that whoever writes next sends first, and the write task is woken once per batch instead of once per PUBACK
