@@ -1433,4 +1433,13 @@ fn idle_write_buffer_shrinks_only_when_large_and_empty() {
     busy.extend_from_slice(b"unflushed");
     assert!(!release_idle_write_buffer(&mut busy));
     assert_eq!(&busy[..], b"unflushed");
+
+    // As a flush leaves it: written and advanced past, so `capacity()` reports next to nothing
+    // although the allocation is still 256 KiB.
+    let mut flushed = BytesMut::with_capacity(8 * 1024);
+    flushed.extend_from_slice(&[0u8; 256 * 1024]);
+    bytes::Buf::advance(&mut flushed, 256 * 1024);
+    assert!(flushed.capacity() < 64 * 1024, "the case this covers");
+    assert!(release_idle_write_buffer(&mut flushed));
+    assert!(flushed.capacity() >= WRITE_BUFFER_START_BYTES && flushed.capacity() < 64 * 1024);
 }

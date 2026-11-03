@@ -205,8 +205,12 @@ const WRITE_BUFFER_RETAIN_BYTES: usize = 64 * 1024;
 /// The buffer keeps its largest capacity after a write (up to [`WRITE_BUFFER_HARD_FLUSH_BYTES`]
 /// plus one publish). Called on the keep-alive tick, never on the publish path: a connection
 /// that keeps sending large bursts shrinks and regrows once per keep-alive interval.
+///
+/// `capacity()` leaves out the bytes a flush wrote and advanced past, so a buffer just emptied
+/// reports little or nothing however large its allocation is. `try_reclaim` takes that space
+/// back without allocating, and succeeds only when the allocation holds more than asked.
 fn release_idle_write_buffer(buffer: &mut bytes::BytesMut) -> bool {
-    if buffer.is_empty() && buffer.capacity() > WRITE_BUFFER_RETAIN_BYTES {
+    if buffer.is_empty() && buffer.try_reclaim(WRITE_BUFFER_RETAIN_BYTES + 1) {
         *buffer = bytes::BytesMut::with_capacity(WRITE_BUFFER_START_BYTES);
         return true;
     }
