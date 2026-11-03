@@ -364,7 +364,7 @@ pub(crate) async fn resubscribe_pending<H: InboundSink, R, W>(
     deadline: Duration,
     cancel: &CancellationToken,
     mut inbound: ResubscribeInbound<'_, H>,
-) -> Result<(), ConnectionOutcome>
+) -> Result<(), ResubscribeFailure>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -403,19 +403,19 @@ where
                 return Ok(());
             }
             let ack = tokio::select! {
-                () = cancel.cancelled() => return Err(ConnectionOutcome::Shutdown(ShutdownError::Cancelled)),
-                result = timeout(deadline, read_suback(framed_read, framed_write, &waiting, &mut inbound)) => {
-                    result.map_err(|_elapsed| {
-                        ConnectionOutcome::Protocol(ProtocolError::Violation("resubscribe SUBACK timeout".into()))
-                    })??
-                }
+                () = cancel.cancelled() => return Err(ConnectionOutcome::Shutdown(ShutdownError::Cancelled).into()),
+                result = read_suback(framed_read, framed_write, &waiting, &mut inbound, deadline) => result?,
             };
             let filters = waiting
                 .remove(&ack.packet_id)
                 .expect("read_suback returns a waiting id");
             inflight.release_subscribe(ack.packet_id);
             if let Err(outcome) = validate_resubscribe_ack(&ack, filters.len()) {
-                return Err(refuse_packet(framed_write, DisconnectReasonCode::ProtocolError, outcome).await);
+                return Err(
+                    refuse_packet(framed_write, DisconnectReasonCode::ProtocolError, outcome)
+                        .await
+                        .into(),
+                );
             }
             registry
                 .write()
@@ -432,6 +432,23 @@ where
     result
 }
 
+/// Why [`resubscribe_pending`] ended the connection.
+#[derive(Debug)]
+pub(crate) struct ResubscribeFailure {
+    pub(crate) outcome: ConnectionOutcome,
+    /// The broker ended it with a DISCONNECT, which may point at another server (§4.11).
+    pub(crate) redirect: Option<super::redirect::ServerRedirect>,
+}
+
+impl From<ConnectionOutcome> for ResubscribeFailure {
+    fn from(outcome: ConnectionOutcome) -> Self {
+        Self {
+            outcome,
+            redirect: None,
+        }
+    }
+}
+
 /// Where PUBLISHes that arrive during the resubscribe wait go: the application sink, after
 /// resolving Topic Aliases with the connection's alias state.
 pub(crate) struct ResubscribeInbound<'a, H> {
@@ -443,6 +460,10 @@ pub(crate) struct ResubscribeInbound<'a, H> {
     pub(crate) subscription_identifiers_available: bool,
     /// Request/response routing (responses bypass the inbound sink).
     pub(crate) response_router: &'a crate::request::ResponseRouter,
+    /// The connection's Keep Alive (zero: off). While a full sink holds the restore, PINGREQs
+    /// go out at this pace: nothing else is written then, and the broker closes a client that
+    /// stays silent for 1.5 times it ([MQTT-3.1.2-22]).
+    pub(crate) keep_alive: Duration,
 }
 
 /// Whether prior filters must be re-issued on a fresh session.
@@ -483,27 +504,59 @@ fn validate_resubscribe_ack(ack: &SubscribeAck, expected_filters: usize) -> Resu
     }
 }
 
-/// Reads until a SUBACK for one of the `waiting` SUBSCRIBEs arrives. A packet that is broken
-/// or has no place here ends the connection with the matching DISCONNECT reason (§4.13).
+/// Reads until a SUBACK for one of the `waiting` SUBSCRIBEs arrives, within `deadline`. A
+/// packet that is broken or has no place here ends the connection with the matching
+/// DISCONNECT reason (§4.13); a broker DISCONNECT ends it as it would a running session.
+///
+/// Time spent waiting for room in a full inbound sink does not count against `deadline`: that
+/// is the application's backpressure, not a broker that does not answer, and the read task
+/// exempts it from its watchdog for the same reason.
 async fn read_suback<H: InboundSink, R, W, V>(
     framed_read: &mut FramedRead<R, V5Codec>,
     framed_write: &mut FramedWrite<W, V5Codec>,
     waiting: &HashMap<NonZeroU16, V>,
     inbound: &mut ResubscribeInbound<'_, H>,
-) -> Result<SubscribeAck, ConnectionOutcome>
+    deadline: Duration,
+) -> Result<SubscribeAck, ResubscribeFailure>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let timer = tokio::time::sleep_until(crate::util::deadline_after(deadline));
+    tokio::pin!(timer);
     loop {
-        let (reason, outcome) = match framed_read.next().await {
+        // `FramedRead::next` is cancel-safe: a frame half read stays buffered.
+        let frame = tokio::select! {
+            frame = framed_read.next() => frame,
+            () = timer.as_mut() => {
+                return Err(ConnectionOutcome::Protocol(ProtocolError::Violation(
+                    "resubscribe SUBACK timeout".into(),
+                ))
+                .into());
+            }
+        };
+        let (reason, outcome) = match frame {
             Some(Ok((DecodedFrame::Control(Packet::SubscribeAck(ack)), _))) if waiting.contains_key(&ack.packet_id) => {
                 return Ok(ack);
             }
             Some(Ok((DecodedFrame::Control(Packet::SubscribeAck(_)), _))) => continue,
+            // The answer to a PINGREQ sent while a full sink held the restore.
+            Some(Ok((DecodedFrame::Control(Packet::PingResponse), _))) => continue,
             Some(Ok((DecodedFrame::Publish(packet), _))) => {
+                let started = tokio::time::Instant::now();
                 deliver_publish_during_resubscribe(framed_write, inbound, packet).await?;
+                let extended = crate::util::extend_deadline(timer.deadline(), started.elapsed());
+                timer.as_mut().reset(extended);
                 continue;
+            }
+            // The broker ends the connection: no DISCONNECT back ([MQTT-3.14.4-1] binds the
+            // sender), and its reason decides the reconnect as in a running session (a session
+            // taken over waits longer, a refusal is an auth failure, a redirect is followed).
+            Some(Ok((DecodedFrame::Control(Packet::Disconnect(disconnect)), _))) => {
+                return Err(ResubscribeFailure {
+                    redirect: super::redirect::ServerRedirect::from_disconnect(&disconnect),
+                    outcome: super::map_broker_disconnect_outcome(&disconnect),
+                });
             }
             Some(Ok((DecodedFrame::Control(other), _))) => (
                 DisconnectReasonCode::ProtocolError,
@@ -513,9 +566,7 @@ where
                 ))),
             ),
             Some(Err(crate::codec::DecodeError::Io(message))) => {
-                return Err(ConnectionOutcome::Transport(TransportError::Connection(
-                    message.to_string(),
-                )));
+                return Err(ConnectionOutcome::Transport(TransportError::Connection(message.to_string())).into());
             }
             Some(Err(error)) => (
                 error.to_reason_code(),
@@ -524,10 +575,11 @@ where
             None => {
                 return Err(ConnectionOutcome::Transport(TransportError::Connection(
                     "connection closed before resubscribe SUBACK".into(),
-                )));
+                ))
+                .into());
             }
         };
-        return Err(refuse_packet(framed_write, reason, outcome).await);
+        return Err(refuse_packet(framed_write, reason, outcome).await.into());
     }
 }
 
@@ -577,9 +629,30 @@ where
     if let Some(message) = inbound
         .response_router
         .route(crate::codec::InboundMessage::from(packet))
-        && inbound.handoff.send(message).await.is_err()
     {
-        return Err(ConnectionOutcome::Application(AppError::InboundSinkClosed));
+        let handed_off = inbound.handoff.send(message);
+        tokio::pin!(handed_off);
+        loop {
+            tokio::select! {
+                sent = &mut handed_off => {
+                    if sent.is_err() {
+                        return Err(ConnectionOutcome::Application(AppError::InboundSinkClosed));
+                    }
+                    break;
+                }
+                () = tokio::time::sleep(inbound.keep_alive), if !inbound.keep_alive.is_zero() => {
+                    let ping = framed_write.send(Packet::PingRequest);
+                    timeout(inbound.keep_alive, ping)
+                        .await
+                        .map_err(|_elapsed| {
+                            ConnectionOutcome::Transport(TransportError::Connection(
+                                "PINGREQ not written during resubscribe".into(),
+                            ))
+                        })?
+                        .map_err(map_resubscribe_send_error)?;
+                }
+            }
+        }
     }
     // PUBACK only after successful handoff accept (enqueue-before-ack).
     if let Some(packet_id) = puback_id {
@@ -931,10 +1004,20 @@ mod tests {
                 topic_aliases: &mut topic_aliases,
                 subscription_identifiers_available: false,
                 response_router: &response_router,
+                keep_alive: Duration::ZERO,
             },
         )
         .await;
-        assert!(matches!(result, Err(ConnectionOutcome::Protocol(_))), "{result:?}");
+        assert!(
+            matches!(
+                result,
+                Err(ResubscribeFailure {
+                    outcome: ConnectionOutcome::Protocol(_),
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
         drop((framed_read, framed_write));
 
         let mut broker = FramedRead::new(broker_end, V5Codec::with_max_packet_size(0));
@@ -1047,6 +1130,7 @@ mod tests {
                 topic_aliases: &mut topic_aliases,
                 subscription_identifiers_available: false,
                 response_router: &response_router,
+                keep_alive: Duration::ZERO,
             },
         )
         .await

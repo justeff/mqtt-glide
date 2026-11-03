@@ -553,6 +553,7 @@ impl<H: InboundSink> Connection<H> {
             let _ = framed_write
                 .send(Packet::Disconnect(Disconnect::new(DisconnectReasonCode::ProtocolError)))
                 .await;
+            drop((framed_read, framed_write));
             return self
                 .finish_session(
                     ConnectionOutcome::Application(AppError::SessionPresentInconsistent(message.into())),
@@ -570,7 +571,7 @@ impl<H: InboundSink> Connection<H> {
         // to a resume attempt proves it holds none — rebuild the subscriptions in both cases.
         if subscriptions::needs_resubscribe(self.options.clean_start, session.session_present)
             && !pending.is_empty()
-            && let Err(outcome) = subscriptions::resubscribe_pending(
+            && let Err(failure) = subscriptions::resubscribe_pending(
                 &mut framed_read,
                 &mut framed_write,
                 &mut self.inflight,
@@ -584,11 +585,21 @@ impl<H: InboundSink> Connection<H> {
                     subscription_identifiers_available,
                     response_router: &self.channels.response_router,
                     stats: &self.channels.stats,
+                    keep_alive,
                 },
             )
             .await
         {
-            return self.finish_session(outcome, false).await;
+            // Close the connection now, not after the reconnect delay.
+            drop((framed_read, framed_write));
+            // The broker refused the client after its CONNACK (DISCONNECT 0x87 / 0x8C): the
+            // cached credentials go, as for the same DISCONNECT in a running session.
+            if matches!(failure.outcome, ConnectionOutcome::Auth(AuthError::NotAuthorized)) {
+                self.invalidate_auth().await;
+            }
+            return self
+                .finish_session_or_redirect(failure.outcome, false, failure.redirect)
+                .await;
         }
 
         // Not tied to the driver cancel: `MqttClient::shutdown` cancels that too, but an

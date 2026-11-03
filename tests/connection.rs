@@ -694,3 +694,366 @@ async fn slow_but_progressing_inbound_publish_keeps_the_connection() {
     let _ = timeout(Duration::from_secs(5), run).await;
     broker.abort();
 }
+
+/// A broker DISCONNECT while the client restores its subscriptions ends the connection as it
+/// would a running session: its reason reaches the reconnect policy (a session taken over is
+/// no client protocol error) and the client sends no DISCONNECT back ([MQTT-3.14.4-1]).
+#[tokio::test]
+async fn broker_disconnect_during_resubscribe_keeps_its_reason() {
+    let (sent_back_tx, sent_back_rx) = tokio::sync::oneshot::channel();
+    let (port, peer) = spawn_peer_broker(move |broker| async move {
+        let mut session = broker.accept_session().await;
+        session.expect_connect().await;
+        session.send_connack_success().await;
+        session.expect_subscribe_grant_qos0().await;
+        drop(session);
+
+        // Session Present = 0: the client restores the subscription, and the broker hands the
+        // session to another client instead of answering.
+        let mut session = broker.accept_session().await;
+        session.expect_connect().await;
+        session.send_connack_success().await;
+        let _subscribe = session.read.next().await;
+        session.send_disconnect(DisconnectReasonCode::SessionTakenOver).await;
+        let next = timeout(Duration::from_secs(2), session.read.next()).await;
+        let _ = sent_back_tx.send(format!("{next:?}"));
+        broker.accept_session().await.hold().await;
+    })
+    .await;
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("taken-over"));
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
+    let (client, connection, mut phase) = connect(
+        options,
+        static_credentials(),
+        StandardReconnectPolicy::new(Duration::from_millis(20), Duration::from_secs(30)),
+        tx,
+        NoopLifecycle,
+    )
+    .expect("wiring");
+    let run = tokio::spawn(connection.run());
+    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
+        matches!(phase, SessionPhase::Connected { .. })
+    })
+    .await;
+    client.subscribe([("a/b", QoS::AtMostOnce)]).await.expect("subscribe");
+
+    let taken_over = |phase: &SessionPhase| {
+        matches!(
+            phase,
+            SessionPhase::Disconnected(ConnectionOutcome::Transport(
+                mqtt_glide::TransportError::BrokerDisconnect {
+                    reason: DisconnectReasonCode::SessionTakenOver,
+                    ..
+                }
+            ))
+        )
+    };
+    let mut seen = Vec::new();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            phase.changed().await.expect("driver alive");
+            let current = phase.borrow_and_update().clone();
+            if taken_over(&current) {
+                return;
+            }
+            seen.push(current);
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no SessionTakenOver outcome; phases: {seen:?}"));
+    let sent_back = timeout(Duration::from_secs(3), sent_back_rx)
+        .await
+        .expect("in time")
+        .expect("peer alive");
+    assert!(
+        sent_back.contains("None"),
+        "the client answered the DISCONNECT: {sent_back}"
+    );
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+    peer.abort();
+}
+
+/// Waiting for room in a full inbound sink while restoring subscriptions does not count
+/// against the SUBACK deadline: a slow consumer is no broker that does not answer, and the
+/// client used to reconnect into the same messages again and again.
+#[tokio::test]
+async fn slow_consumer_during_resubscribe_keeps_the_connection() {
+    use mqtt_glide::codec::{SubscribeAck, SubscribeAckReason};
+
+    let connects = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let broker = tokio::spawn({
+        let connects = Arc::clone(&connects);
+        async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let index = connects.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let (read, write) = common::framed_halves(stream);
+                    let mut session = common::PeerSession { read, write };
+                    session.expect_connect().await;
+                    session.send_connack_success().await;
+                    if index == 0 {
+                        session.expect_subscribe_grant_qos0().await;
+                        session.expect_subscribe_grant_qos0().await;
+                        return;
+                    }
+                    // Both SUBSCRIBEs of the restore, then retained messages for the first
+                    // filter between the two SUBACKs.
+                    let mut ids = Vec::new();
+                    while ids.len() < 2 {
+                        match session.read.next().await {
+                            Some(Ok((DecodedFrame::Control(Packet::Subscribe(subscribe)), _))) => {
+                                ids.push(subscribe.packet_id);
+                            }
+                            _ => return,
+                        }
+                    }
+                    let suback = |packet_id| {
+                        Packet::SubscribeAck(SubscribeAck {
+                            packet_id,
+                            status: vec![SubscribeAckReason::GrantedQos0],
+                            properties: Default::default(),
+                            reason_string: None,
+                        })
+                    };
+                    session.write.send(suback(ids[0])).await.expect("first SUBACK");
+                    for payload in ["r1", "r2", "r3"] {
+                        let message = PublishMessage::new("a/retained", payload);
+                        let delivery = PublishDelivery {
+                            dup: false,
+                            retain: true,
+                            qos: QoS::AtMostOnce,
+                            packet_id: None,
+                        };
+                        encode_publish(&message, delivery, 0, session.write.write_buffer_mut()).expect("encode");
+                    }
+                    session.write.send(suback(ids[1])).await.expect("second SUBACK");
+                    while let Some(Ok(_)) = session.read.next().await {}
+                });
+            }
+        }
+    });
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url)
+        .client_id(ClientId::from_prefix("slow-sink"))
+        .ack_timeout(Duration::from_secs(1));
+    let (tx, mut rx) = mpsc::channel::<InboundMessage>(1);
+    let (client, connection, mut phase) = connect(
+        options,
+        static_credentials(),
+        StandardReconnectPolicy::new(Duration::from_millis(20), Duration::from_millis(20)),
+        tx,
+        NoopLifecycle,
+    )
+    .expect("wiring");
+    let run = tokio::spawn(connection.run());
+    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
+        matches!(phase, SessionPhase::Connected { .. })
+    })
+    .await;
+    client
+        .subscribe([("a/#", QoS::AtMostOnce)])
+        .await
+        .expect("first subscribe");
+    client
+        .subscribe([("b/#", QoS::AtMostOnce)])
+        .await
+        .expect("second subscribe");
+
+    // One message per 1.5 s: the three retained ones hold the restore for well over the 1 s
+    // SUBACK deadline, which still leaves room for a slow scheduler.
+    let mut got = Vec::new();
+    while got.len() < 3 {
+        let message = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("in time")
+            .expect("open");
+        got.push(String::from_utf8_lossy(&message.payload).into_owned());
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+    assert_eq!(got, ["r1", "r2", "r3"]);
+    wait_for_phase(&mut phase, Duration::from_secs(2), |phase| {
+        matches!(phase, SessionPhase::Connected { .. })
+    })
+    .await;
+    assert_eq!(connects.load(Ordering::SeqCst), 2, "no reconnect after the restore");
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+    broker.abort();
+}
+
+/// A broker that refuses the client with DISCONNECT 0x87 while subscriptions are restored makes
+/// the client drop its cached credentials, as the same DISCONNECT does in a running session.
+#[tokio::test]
+async fn not_authorized_during_resubscribe_invalidates_credentials() {
+    let (port, peer) = spawn_peer_broker(move |broker| async move {
+        let mut session = broker.accept_session().await;
+        session.expect_connect().await;
+        session.send_connack_success().await;
+        session.expect_subscribe_grant_qos0().await;
+        drop(session);
+
+        let mut session = broker.accept_session().await;
+        session.expect_connect().await;
+        session.send_connack_success().await;
+        let _subscribe = session.read.next().await;
+        session.send_disconnect(DisconnectReasonCode::NotAuthorized).await;
+        session.hold().await;
+    })
+    .await;
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("refused-restore"));
+    let invalidations = Arc::new(AtomicUsize::new(0));
+    let credentials = CountingInvalidate {
+        invalidations: Arc::clone(&invalidations),
+    };
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
+    let (client, connection, mut phase) = connect(
+        options,
+        credentials,
+        StandardReconnectPolicy::new(Duration::from_millis(20), Duration::from_secs(30)),
+        tx,
+        NoopLifecycle,
+    )
+    .expect("wiring");
+    let run = tokio::spawn(connection.run());
+    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
+        matches!(phase, SessionPhase::Connected { .. })
+    })
+    .await;
+    client.subscribe([("a/b", QoS::AtMostOnce)]).await.expect("subscribe");
+    wait_until(
+        Duration::from_secs(5),
+        || invalidations.load(Ordering::SeqCst) == 1,
+        "credentials invalidated",
+    )
+    .await;
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+    peer.abort();
+}
+
+/// While a full inbound sink holds the restore of subscriptions, the client keeps the
+/// connection alive with PINGREQs and takes the PINGRESPs: nothing else is written then, and a
+/// broker closes a client that stays silent for 1.5 times the Keep Alive ([MQTT-3.1.2-22]).
+#[tokio::test]
+async fn resubscribe_held_by_a_full_sink_keeps_pinging() {
+    use mqtt_glide::codec::{SubscribeAck, SubscribeAckReason};
+
+    let (pings_tx, pings_rx) = tokio::sync::oneshot::channel();
+    let (port, peer) = spawn_peer_broker(move |broker| async move {
+        let mut session = broker.accept_session().await;
+        session.expect_connect().await;
+        session.send_connack_success().await;
+        session.expect_subscribe_grant_qos0().await;
+        session.expect_subscribe_grant_qos0().await;
+        drop(session);
+
+        let mut session = broker.accept_session().await;
+        session.expect_connect().await;
+        session.send_connack_success().await;
+        let mut ids = Vec::new();
+        while ids.len() < 2 {
+            if let Some(Ok((DecodedFrame::Control(Packet::Subscribe(subscribe)), _))) = session.read.next().await {
+                ids.push(subscribe.packet_id);
+            }
+        }
+        let suback = |packet_id| {
+            Packet::SubscribeAck(SubscribeAck {
+                packet_id,
+                status: vec![SubscribeAckReason::GrantedQos0],
+                properties: Default::default(),
+                reason_string: None,
+            })
+        };
+        session.write.send(suback(ids[0])).await.expect("first SUBACK");
+        for payload in ["r1", "r2"] {
+            let message = PublishMessage::new("a/retained", payload);
+            let delivery = PublishDelivery {
+                dup: false,
+                retain: true,
+                qos: QoS::AtMostOnce,
+                packet_id: None,
+            };
+            encode_publish(&message, delivery, 0, session.write.write_buffer_mut()).expect("encode");
+        }
+        session.write.flush().await.expect("flush");
+        // The sink holds one message and the consumer is asleep: count the PINGREQs meanwhile.
+        let mut pings = 0;
+        let listen = tokio::time::sleep(Duration::from_millis(2500));
+        tokio::pin!(listen);
+        loop {
+            tokio::select! {
+                () = &mut listen => break,
+                frame = session.read.next() => match frame {
+                    Some(Ok((DecodedFrame::Control(Packet::PingRequest), _))) => {
+                        pings += 1;
+                        session.write.send(Packet::PingResponse).await.expect("PINGRESP");
+                    }
+                    Some(Ok(_)) => {}
+                    _ => break,
+                },
+            }
+        }
+        let _ = pings_tx.send(pings);
+        session.write.send(suback(ids[1])).await.expect("second SUBACK");
+        session.hold().await;
+    })
+    .await;
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url)
+        .client_id(ClientId::from_prefix("pinging-restore"))
+        .keep_alive(Duration::from_secs(1))
+        .ack_timeout(Duration::from_secs(1));
+    let (tx, mut rx) = mpsc::channel::<InboundMessage>(1);
+    let (client, connection, mut phase) = connect(
+        options,
+        static_credentials(),
+        StandardReconnectPolicy::new(Duration::from_millis(20), Duration::from_millis(20)),
+        tx,
+        NoopLifecycle,
+    )
+    .expect("wiring");
+    let run = tokio::spawn(connection.run());
+    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
+        matches!(phase, SessionPhase::Connected { .. })
+    })
+    .await;
+    client
+        .subscribe([("a/#", QoS::AtMostOnce)])
+        .await
+        .expect("first subscribe");
+    client
+        .subscribe([("b/#", QoS::AtMostOnce)])
+        .await
+        .expect("second subscribe");
+
+    // Take nothing until the broker has counted; r1 fills the one-slot sink, r2 waits.
+    let pings = timeout(Duration::from_secs(8), pings_rx)
+        .await
+        .expect("in time")
+        .expect("peer alive");
+    assert!(pings >= 1, "no PINGREQ while the sink held the restore");
+    for expected in ["r1", "r2"] {
+        let message = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("in time")
+            .expect("open");
+        assert_eq!(&message.payload[..], expected.as_bytes());
+    }
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+    peer.abort();
+}
