@@ -548,3 +548,149 @@ async fn publish_the_broker_disconnects_on_is_given_up() {
     let _ = timeout(Duration::from_secs(5), run).await;
     broker.abort();
 }
+
+/// A PUBLISH larger than the link carries in a Keep Alive is no dead broker while its bytes
+/// keep going out: the write stall limit (1.5 x Keep Alive) is for a flush that gets nothing
+/// out. Here 2 MiB leave at about 640 KiB/s, so the flush takes about twice that limit.
+#[tokio::test]
+async fn slow_but_progressing_publish_keeps_the_connection() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const PAYLOAD_LEN: usize = 2 * 1024 * 1024;
+    // Fixed header (1 + 4 bytes Remaining Length), topic "big/blob" (2 + 8), no properties (1).
+    const PUBLISH_WIRE_LEN: usize = 5 + 10 + 1 + PAYLOAD_LEN;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let broker = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (read, write) = common::framed_halves(stream);
+        let mut session = common::PeerSession { read, write };
+        session.expect_connect().await;
+        session.send_connack_success().await;
+        // Read raw and slowly; answer the PINGREQs (0xC0 0x00) that follow the publish.
+        let mut raw = session.read.into_inner();
+        let mut raw_write = session.write.into_inner();
+        let mut chunk = vec![0u8; 64 * 1024];
+        let mut offset = 0;
+        loop {
+            match raw.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => {
+                    for (index, &byte) in chunk[..read].iter().enumerate() {
+                        if offset + index >= PUBLISH_WIRE_LEN && byte == 0xC0 {
+                            let _ = raw_write.write_all(&[0xD0, 0x00]).await;
+                        }
+                    }
+                    offset += read;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    });
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url)
+        .client_id(ClientId::from_prefix("slow-out"))
+        .keep_alive(Duration::from_secs(1))
+        .tcp_send_buffer_size(std::num::NonZeroU32::new(16 * 1024).expect("nz"));
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
+    let (client, connection, mut phase) =
+        connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
+    let run = tokio::spawn(connection.run());
+    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
+        matches!(phase, SessionPhase::Connected { .. })
+    })
+    .await;
+
+    let publish = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .publish("big/blob", bytes::Bytes::from(vec![0x55u8; PAYLOAD_LEN]))
+                .await
+        }
+    });
+    let lost = timeout(
+        Duration::from_secs(4),
+        phase.wait_for(|phase| matches!(phase, SessionPhase::Disconnected(_))),
+    )
+    .await;
+    assert!(
+        lost.is_err(),
+        "connection closed while the publish was going out: {lost:?}"
+    );
+    timeout(Duration::from_secs(5), publish)
+        .await
+        .expect("in time")
+        .expect("join")
+        .expect("written");
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+    broker.abort();
+}
+
+/// An inbound PUBLISH larger than the link carries in a Keep Alive is no dead broker while its
+/// bytes keep coming: the PINGRESP waits behind it, but every byte counts as traffic. Here
+/// 2 MiB arrive at about 640 KiB/s, about three Keep Alive intervals.
+#[tokio::test]
+async fn slow_but_progressing_inbound_publish_keeps_the_connection() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let broker = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (read, write) = common::framed_halves(stream);
+        let mut session = common::PeerSession { read, write };
+        session.expect_connect().await;
+        session.send_connack_success().await;
+        let message = PublishMessage::new("big/in", bytes::Bytes::from(vec![7u8; 2 * 1024 * 1024]));
+        let delivery = PublishDelivery {
+            dup: false,
+            retain: false,
+            qos: QoS::AtMostOnce,
+            packet_id: None,
+        };
+        let mut wire = bytes::BytesMut::new();
+        encode_publish(&message, delivery, 0, &mut wire).expect("encode");
+        // Take the client's PINGREQs so its writes never block.
+        let mut read = session.read;
+        tokio::spawn(async move { while let Some(Ok(_)) = read.next().await {} });
+        let mut raw = session.write.into_inner();
+        for chunk in wire.chunks(64 * 1024) {
+            if raw.write_all(chunk).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        std::future::pending::<()>().await;
+    });
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url)
+        .client_id(ClientId::from_prefix("slow-in"))
+        .keep_alive(Duration::from_secs(1))
+        .max_packet_size(std::num::NonZeroU32::new(4 * 1024 * 1024).expect("nz"));
+    let (tx, mut rx) = mpsc::channel::<InboundMessage>(4);
+    let (client, connection, mut phase) =
+        connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
+    let run = tokio::spawn(connection.run());
+    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
+        matches!(phase, SessionPhase::Connected { .. })
+    })
+    .await;
+
+    let message = timeout(Duration::from_secs(8), rx.recv())
+        .await
+        .expect("delivered in time")
+        .expect("connection kept");
+    // Delivered whole is the proof the connection held: a closed one delivers nothing, and the
+    // mock never answers PINGREQ, so `is_connected` afterwards would only measure the next tick.
+    assert_eq!(message.payload.len(), 2 * 1024 * 1024);
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await;
+    broker.abort();
+}

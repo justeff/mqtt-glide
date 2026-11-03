@@ -1,11 +1,11 @@
 //! Write-half I/O helpers: encode/flush, inbound PUBACK feed, control coalesce, graceful disconnect.
 
 use std::num::NonZeroU16;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use futures_util::{FutureExt, SinkExt};
+use futures_util::{FutureExt, Sink, SinkExt};
 use tokio::io::AsyncWrite;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::FramedWrite;
@@ -38,6 +38,9 @@ pub(super) enum FlushAbort<'a> {
         /// A flush that has not finished after this long means the broker stopped reading:
         /// the connection is dead even though it is open (`None`: Keep Alive off).
         stall_limit: Option<Duration>,
+        /// Set when bytes leave the socket below TLS or WebSocket, which drain their own
+        /// buffers inside the flush; `None` on plain TCP.
+        socket_written: Option<&'a AtomicBool>,
     },
     /// Graceful DISCONNECT path: do not race already-cancelled tokens; caller bounds with timeout.
     Graceful,
@@ -565,19 +568,44 @@ where
             cancel,
             shutdown_notify,
             stall_limit,
+            socket_written,
         } => {
+            // Notes whether the flush got any bytes out since the stall timer last looked.
+            let progressed = AtomicBool::new(false);
+            let flush = std::future::poll_fn(|cx| {
+                let buffered = framed.write_buffer().len();
+                let polled = Sink::<Packet>::poll_flush(std::pin::Pin::new(&mut *framed), cx);
+                if framed.write_buffer().len() < buffered {
+                    progressed.store(true, Ordering::Relaxed);
+                }
+                polled
+            });
+            tokio::pin!(flush);
             // Flush first: it is almost always ready at once, and then neither the token
             // futures (polling one locks the token's mutex) nor a stall timer are touched.
-            let flush = framed.flush();
-            tokio::pin!(flush);
             if let Some(result) = flush.as_mut().now_or_never() {
                 return result.map_err(map_encode_error);
             }
             // The socket is full. Keep-alive pings come from this task, so a broker that stops
-            // reading but keeps the connection open is only noticed here.
+            // reading but keeps the connection open is only noticed here. The limit is for a
+            // flush that gets nothing out: a large publish on a slow link takes longer than it
+            // and is no dead broker.
             let stalled = async {
                 match stall_limit {
-                    Some(limit) => tokio::time::sleep(limit).await,
+                    Some(limit) => {
+                        progressed.store(false, Ordering::Relaxed);
+                        let socket_moved =
+                            || socket_written.is_some_and(|written| written.swap(false, Ordering::Relaxed));
+                        socket_moved();
+                        loop {
+                            tokio::time::sleep(limit).await;
+                            // Both: bytes leaving this task's buffer, or the socket under TLS
+                            // or WebSocket.
+                            if !(progressed.swap(false, Ordering::Relaxed) | socket_moved()) {
+                                break;
+                            }
+                        }
+                    }
                     None => std::future::pending().await,
                 }
             };

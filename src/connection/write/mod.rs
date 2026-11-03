@@ -568,6 +568,8 @@ pub(crate) struct WriteSession {
     pub outbound_topic_aliases: u16,
     /// CONNACK Subscription Identifiers Available.
     pub subscription_identifiers_available: bool,
+    /// Set when bytes leave the socket under TLS or WebSocket; `None` on plain TCP.
+    pub socket_written: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Counters behind [`crate::MqttClient::stats`].
     pub stats: crate::stats::Stats,
     /// [`crate::ConnectOptions::ack_timeout`]: a retried restore SUBSCRIBE unanswered for
@@ -625,10 +627,12 @@ where
     // Hot-path flushes race both tokens so stuck poll_write cannot block cancel/shutdown, and
     // give up after 1.5 x Keep Alive, the span after which a broker gives up on a silent
     // client (§3.1.2.10).
+    let socket_written = session.socket_written;
     let flush_abort = FlushAbort::Hot {
         cancel: &cancel,
         shutdown_notify: &shutdown_notify,
         stall_limit: (!keep_alive.is_zero()).then(|| keep_alive * 3 / 2),
+        socket_written: socket_written.as_deref(),
     };
 
     // Each step below takes the writer only while it writes, so that the read task can write

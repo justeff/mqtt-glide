@@ -398,24 +398,47 @@ impl<H: InboundSink> Connection<H> {
         });
         let options = redirected.as_ref().unwrap_or(&self.options);
         let websocket = options.broker_url.websocket_path().is_some();
+        // Any bytes from the broker prove it alive, not only whole packets: a large PUBLISH on
+        // a slow link takes longer than the Keep Alive to arrive. Over WebSocket the bytes are
+        // counted below the WebSocket layer, which hands on only whole messages.
+        let activity = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Over TLS and WebSocket the bytes leaving the socket show a slow flush still moving
+        // (see `transport::MarkWritten`).
+        let written = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let link = |socket_written| LinkActivity {
+            inbound: Arc::clone(&activity),
+            socket_written,
+        };
         match (resolve_tls_mode(options), websocket) {
             (TlsMode::PlainTcp, false) => {
                 let dialed = dial_or_cancel(&self.cancel, transport::dial_tcp(options, deadline)).await;
-                self.session_after_dial(dialed, deadline).await
+                self.session_after_dial(dialed, deadline, link(None)).await
             }
             (TlsMode::Rustls, false) => {
-                let dialed = dial_or_cancel(&self.cancel, transport::dial_tls(options, deadline)).await;
-                self.session_after_dial(dialed, deadline).await
+                let dialed = dial_or_cancel(
+                    &self.cancel,
+                    transport::dial_tls(options, deadline, Arc::clone(&written)),
+                )
+                .await;
+                self.session_after_dial(dialed, deadline, link(Some(written))).await
             }
             #[cfg(feature = "websocket")]
             (TlsMode::PlainTcp, true) => {
-                let dialed = dial_or_cancel(&self.cancel, transport::dial_ws(options, deadline)).await;
-                self.session_after_dial(dialed, deadline).await
+                let dialed = dial_or_cancel(
+                    &self.cancel,
+                    transport::dial_ws(options, deadline, Arc::clone(&activity), Arc::clone(&written)),
+                )
+                .await;
+                self.session_after_dial(dialed, deadline, link(Some(written))).await
             }
             #[cfg(feature = "websocket")]
             (TlsMode::Rustls, true) => {
-                let dialed = dial_or_cancel(&self.cancel, transport::dial_wss(options, deadline)).await;
-                self.session_after_dial(dialed, deadline).await
+                let dialed = dial_or_cancel(
+                    &self.cancel,
+                    transport::dial_wss(options, deadline, Arc::clone(&activity), Arc::clone(&written)),
+                )
+                .await;
+                self.session_after_dial(dialed, deadline, link(Some(written))).await
             }
             // `BrokerUrl::parse` rejects ws:// / wss:// without the feature.
             #[cfg(not(feature = "websocket"))]
@@ -428,6 +451,7 @@ impl<H: InboundSink> Connection<H> {
         &mut self,
         dialed: Option<Result<(R, W), ConnectionOutcome>>,
         deadline: Instant,
+        link: LinkActivity,
     ) -> SessionDisposition
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -435,7 +459,8 @@ impl<H: InboundSink> Connection<H> {
     {
         match dialed {
             Some(Ok((read_half, write_half))) => {
-                self.run_one_session_from_halves(read_half, write_half, deadline).await
+                self.run_one_session_from_halves(read_half, write_half, deadline, link)
+                    .await
             }
             Some(Err(outcome)) => self.finish_session(outcome, false).await,
             None => {
@@ -451,12 +476,14 @@ impl<H: InboundSink> Connection<H> {
         read_half: R,
         write_half: W,
         deadline: Instant,
+        link: LinkActivity,
     ) -> SessionDisposition
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let mut redirect = None;
+        let read_half = read::MarkActivity::new(read_half, Arc::clone(&link.inbound));
         let establish = transport::establish_session_on(
             self.channels.stats.count_reads(read_half),
             self.channels.stats.count_writes(write_half),
@@ -480,7 +507,8 @@ impl<H: InboundSink> Connection<H> {
             }
         };
 
-        self.run_supervised_session(framed_read, framed_write, session).await
+        self.run_supervised_session(framed_read, framed_write, session, link)
+            .await
     }
 
     /// Post-handshake session: resubscribe, spawn read/write tasks, supervise until exit.
@@ -489,11 +517,16 @@ impl<H: InboundSink> Connection<H> {
         mut framed_read: FramedRead<R, V5Codec>,
         mut framed_write: FramedWrite<W, V5Codec>,
         session: SessionParams,
+        link: LinkActivity,
     ) -> SessionDisposition
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        let LinkActivity {
+            inbound: inbound_activity,
+            socket_written,
+        } = link;
         self.generation = self.generation.next();
         let keep_alive = session.keep_alive;
         let subscription_identifiers_available = session.subscription_identifiers_available;
@@ -599,7 +632,6 @@ impl<H: InboundSink> Connection<H> {
         let (read_done_tx, read_done_rx) = tokio::sync::oneshot::channel();
         // Shared with write-task keepalive watchdog: stall skip + any-inbound liveness.
         let handoff_stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let inbound_activity = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let framed_write = write::SharedWriter::new(framed_write);
         let read_handle = tokio::spawn(read::run(
@@ -654,6 +686,7 @@ impl<H: InboundSink> Connection<H> {
             read_stop,
             outbound_topic_aliases,
             subscription_identifiers_available,
+            socket_written,
             stats: self.channels.stats.clone(),
             ack_timeout: self.options.ack_timeout,
         };
@@ -937,6 +970,14 @@ impl<H: InboundSink> Connection<H> {
             Err(join_err) => ConnectionOutcome::Application(AppError::TaskJoin(join_err.to_string())),
         }
     }
+}
+
+/// Flags the transport sets for the session's watchdogs.
+struct LinkActivity {
+    /// Any bytes from the broker (see [`read::MarkActivity`]).
+    inbound: Arc<std::sync::atomic::AtomicBool>,
+    /// Bytes leaving the socket under TLS or WebSocket (see [`transport::MarkWritten`]).
+    socket_written: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Races a dial against the driver cancel; `None` = cancelled.

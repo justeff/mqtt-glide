@@ -304,3 +304,96 @@ async fn a_missing_ca_file_fails_the_connect_naming_the_file() {
     let message = tls_error(connect(&proxy.url("localhost"), TlsConfig::ca_pem_file(&missing)).await);
     assert!(message.contains("does-not-exist.pem"), "{message}");
 }
+
+/// A publish over TLS that drains slower than the stall limit (1.5 x Keep Alive) is no dead
+/// broker while its bytes keep leaving the socket. TLS takes up to 64 KiB at once and drains it
+/// inside its flush, where the client's own buffer shows no progress; here the first 48 KiB of
+/// 64 KiB leave at about 20 KiB/s, nearly all of it from inside TLS, for 2.4 s. The rest goes
+/// fast: the broker answers no PINGREQ, and the one after the flush must not time out first.
+#[tokio::test]
+async fn slow_but_progressing_publish_over_tls_keeps_the_connection() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const PAYLOAD_LEN: usize = 64 * 1024;
+
+    let key = PrivateKeyDer::from_pem_file(cert_path("server.key")).expect("server key");
+    let config = rustls::ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate("server.pem")], key)
+        .expect("server config");
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    // A small receive buffer, inherited by the accepted socket: the client's writes block soon.
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket.set_recv_buffer_size(4096).expect("receive buffer");
+    socket.bind("127.0.0.1:0".parse().expect("addr")).expect("bind");
+    let listener = socket.listen(8).expect("listen");
+    let port = listener.local_addr().expect("addr").port();
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    let broker = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("accept");
+        let mut tls = acceptor.accept(tcp).await.expect("TLS handshake");
+        let mut chunk = vec![0u8; 2048];
+        let _ = tls.read(&mut chunk).await.expect("CONNECT");
+        tls.write_all(&[0x20, 0x03, 0x00, 0x00, 0x00]).await.expect("CONNACK");
+        tls.flush().await.expect("flush");
+        let mut received = 0;
+        let mut received_tx = Some(received_tx);
+        loop {
+            match tls.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => {
+                    received += read;
+                    if received >= PAYLOAD_LEN {
+                        let _ = received_tx.take().map(|tx| tx.send(()));
+                    }
+                    if received < 48 * 1024 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+    });
+
+    let options = mqtt_glide::ConnectOptions::new(
+        mqtt_glide::BrokerUrl::parse(&format!("mqtts://localhost:{port}")).expect("url"),
+    )
+    .tls(TlsConfig::ca_pem(read("ca.pem")).expect("ca"))
+    .keep_alive(Duration::from_secs(1))
+    .tcp_send_buffer_size(std::num::NonZeroU32::new(4096).expect("nz"));
+    let (tx, _rx) = tokio::sync::mpsc::channel::<mqtt_glide::InboundMessage>(4);
+    let (client, connection, mut phase) = mqtt_glide::connect(
+        options,
+        mqtt_glide::AnonymousCredentials,
+        NoReconnect,
+        tx,
+        mqtt_glide::NoopLifecycle,
+    )
+    .expect("wiring");
+    let run = tokio::spawn(connection.run());
+    tokio::time::timeout(
+        TIMEOUT,
+        phase.wait_for(|phase| matches!(phase, mqtt_glide::SessionPhase::Connected { .. })),
+    )
+    .await
+    .expect("connected in time")
+    .expect("watch");
+
+    // QoS 0: queued, not yet on the wire.
+    client
+        .publish("big/blob", bytes::Bytes::from(vec![0x55u8; PAYLOAD_LEN]))
+        .await
+        .expect("queued");
+    let lost = phase.wait_for(|phase| matches!(phase, mqtt_glide::SessionPhase::Disconnected(_)));
+    tokio::select! {
+        received = tokio::time::timeout(Duration::from_secs(10), received_rx) => {
+            received.expect("received in time").expect("broker alive");
+        }
+        lost = lost => panic!("connection closed while the publish was going out: {lost:?}"),
+    }
+
+    client.shutdown().await.expect("shutdown");
+    let _ = tokio::time::timeout(TIMEOUT, run).await;
+    broker.abort();
+}

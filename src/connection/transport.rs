@@ -29,9 +29,84 @@ use crate::error::{ConnectionOutcome, ProtocolError, TransportError};
 use crate::options::ConnectOptions;
 use crate::tls::TlsConfig;
 
-type TlsIo = TlsStream<TcpStream>;
+type TlsIo = TlsStream<MarkWritten<TcpStream>>;
 #[cfg(feature = "websocket")]
-type WsIo<S> = super::websocket::WsByteStream<S>;
+type WsIo<S> = super::websocket::WsByteStream<super::read::MarkActivity<S>>;
+
+/// The socket under TLS or WebSocket, setting `written` whenever bytes leave it.
+///
+/// Those layers take up to a TLS record or a WebSocket frame (64 KiB) at once and drain it
+/// inside their flush, so the write task cannot see progress in its own buffer: a link carrying
+/// less than that per stall limit looked like a broker that stopped reading. Plain TCP needs
+/// no wrapper; there the write task's buffer is the socket's.
+pub(crate) struct MarkWritten<S> {
+    inner: S,
+    written: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<S> MarkWritten<S> {
+    pub(crate) fn new(inner: S, written: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { inner, written }
+    }
+
+    fn mark(&self, wrote: &std::task::Poll<io::Result<usize>>) {
+        use std::sync::atomic::Ordering;
+        // Load first, like `MarkActivity`: the write task clears the flag only while it waits.
+        if matches!(wrote, std::task::Poll::Ready(Ok(n)) if *n > 0) && !self.written.load(Ordering::Relaxed) {
+            self.written.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for MarkWritten<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for MarkWritten<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let wrote = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.mark(&wrote);
+        wrote
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let wrote = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.mark(&wrote);
+        wrote
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 
 /// CONNECT/CONNACK on already-split transport halves, with the enhanced authentication
 /// exchange in between when an [`Authenticator`](crate::Authenticator) is set (§4.12).
@@ -305,8 +380,9 @@ pub(crate) async fn dial_tcp(
 pub(crate) async fn dial_tls(
     options: &ConnectOptions,
     deadline: Instant,
+    written: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(ReadHalf<TlsIo>, WriteHalf<TlsIo>), ConnectionOutcome> {
-    let tcp_stream = open_tcp(options, deadline).await?;
+    let tcp_stream = MarkWritten::new(open_tcp(options, deadline).await?, written);
     Ok(split(tls_connect(options, tcp_stream, deadline).await?))
 }
 
@@ -315,8 +391,17 @@ pub(crate) async fn dial_tls(
 pub(crate) async fn dial_ws(
     options: &ConnectOptions,
     deadline: Instant,
-) -> Result<(ReadHalf<WsIo<TcpStream>>, WriteHalf<WsIo<TcpStream>>), ConnectionOutcome> {
-    let tcp_stream = open_tcp(options, deadline).await?;
+    activity: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    written: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<
+    (
+        ReadHalf<WsIo<MarkWritten<TcpStream>>>,
+        WriteHalf<WsIo<MarkWritten<TcpStream>>>,
+    ),
+    ConnectionOutcome,
+> {
+    let tcp_stream = MarkWritten::new(open_tcp(options, deadline).await?, written);
+    let tcp_stream = super::read::MarkActivity::new(tcp_stream, activity);
     Ok(split(super::websocket::handshake(options, tcp_stream, deadline).await?))
 }
 
@@ -325,15 +410,17 @@ pub(crate) async fn dial_ws(
 pub(crate) async fn dial_wss(
     options: &ConnectOptions,
     deadline: Instant,
+    activity: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    written: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(ReadHalf<WsIo<TlsIo>>, WriteHalf<WsIo<TlsIo>>), ConnectionOutcome> {
-    let tcp_stream = open_tcp(options, deadline).await?;
-    let tls_stream = tls_connect(options, tcp_stream, deadline).await?;
+    let tcp_stream = MarkWritten::new(open_tcp(options, deadline).await?, written);
+    let tls_stream = super::read::MarkActivity::new(tls_connect(options, tcp_stream, deadline).await?, activity);
     Ok(split(super::websocket::handshake(options, tls_stream, deadline).await?))
 }
 
 async fn tls_connect(
     options: &ConnectOptions,
-    tcp_stream: TcpStream,
+    tcp_stream: MarkWritten<TcpStream>,
     deadline: Instant,
 ) -> Result<TlsIo, ConnectionOutcome> {
     let default = TlsConfig::default();

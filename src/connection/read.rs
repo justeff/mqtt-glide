@@ -51,7 +51,7 @@ pub(crate) struct ReadSession {
     pub generation: Generation,
     /// Set while the read task is blocked on a full handoff — keepalive watchdog must not fire.
     pub handoff_stalled: Arc<AtomicBool>,
-    /// Set on any successfully decoded inbound frame (clears the ping watchdog).
+    /// Set on any inbound bytes and on every decoded frame (clears the ping watchdog).
     pub inbound_activity: Arc<AtomicBool>,
     /// Inbound Topic Alias bindings of this connection (continued from the resubscribe wait).
     pub topic_aliases: crate::connection::topic_alias::InboundTopicAliases,
@@ -433,6 +433,79 @@ fn write_held<W: AsyncWrite + Unpin + Send + 'static>(
         // A failed flush leaves the unsent bytes in the buffer: the write task's flush reports
         // the error and ends the connection.
         Some(Err(_)) | None => Written::Buffered,
+    }
+}
+
+/// The broker's half of the connection, marking `activity` whenever bytes arrive.
+///
+/// The keep-alive watchdog takes any inbound traffic as proof the broker is alive. Marking
+/// only decoded packets missed a PUBLISH larger than the link carries in a Keep Alive: the
+/// PINGRESP queued behind it came too late, and the client closed a connection that was busy
+/// delivering, again on every redelivery.
+pub(crate) struct MarkActivity<R> {
+    inner: R,
+    activity: Arc<AtomicBool>,
+}
+
+impl<R> MarkActivity<R> {
+    pub(crate) fn new(inner: R, activity: Arc<AtomicBool>) -> Self {
+        Self { inner, activity }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for MarkActivity<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let filled = buf.filled().len();
+        let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        // Load first: the write task clears the flag once per Keep Alive tick, so a store per
+        // read would only keep moving the cache line between the two tasks.
+        if buf.filled().len() > filled && !self.activity.load(Ordering::Relaxed) {
+            // Release pairs with the write task's AcqRel swap.
+            self.activity.store(true, Ordering::Release);
+        }
+        polled
+    }
+}
+
+/// Writes pass through: the WebSocket transports mark activity on the stream below the
+/// WebSocket layer, which reads and writes the same stream.
+impl<W: AsyncWrite + Unpin> AsyncWrite for MarkActivity<W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 

@@ -168,6 +168,7 @@ where
         read_stop: StopSignal::new(),
         outbound_topic_aliases: 0,
         subscription_identifiers_available: true,
+        socket_written: None,
         stats: Default::default(),
         ack_timeout: Duration::from_secs(30),
     };
