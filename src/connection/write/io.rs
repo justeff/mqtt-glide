@@ -203,6 +203,8 @@ where
                 send_packet(framed, Packet::Disconnect(Disconnect::default()), flush_abort),
             )
             .await;
+            // The read task may still run: `read_done` was not awaited.
+            pending_acks.close();
             WriteOutcome::Shutdown
         }
     }
@@ -552,6 +554,7 @@ where
             }
         }
         ControlMessage::ProtocolDisconnect(reason) => {
+            pending_acks.close();
             if let Err(outcome) = send_packet(framed, Packet::Disconnect(Disconnect::new(reason)), flush_abort).await {
                 return Some(outcome);
             }

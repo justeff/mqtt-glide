@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `shutdown()` while subscriptions are being restored after a reconnect sends DISCONNECT (Normal Disconnection) before closing, as it does on a running connection. The session is up from the CONNACK on, and the dropped connection made the broker publish the Will
 - Acknowledgements that arrived right before the connection ended now complete their requests. When the broker sent a PUBACK, SUBACK or UNSUBACK and then closed, the write task could fail the request with `ConnectionLost` (about one in three in a test), so a resumed session resent an acknowledged publish and a granted subscription was missing from the registry
 - In a resumed session whose broker lowered its Receive Maximum, the unacknowledged publishes waiting for window room to be resent keep their Packet Identifiers to themselves. A SUBSCRIBE could take one of them meanwhile ([MQTT-2.2.1-3]), and that publish then failed with `ConnectionLost` instead of being resent ([MQTT-4.4.0-1])
+- No inbound PUBACK follows the client's last DISCONNECT any more ([MQTT-3.14.4-1]). When the graceful `shutdown()` budget ran out, the write task sent DISCONNECT without waiting for the read task, which could still write the PUBACKs of a burst it was handling
 
 ## [0.5.0] - 2026-11-02
 

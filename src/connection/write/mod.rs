@@ -99,9 +99,22 @@ pub(crate) struct PendingAcks {
     ids: std::sync::Mutex<Vec<std::num::NonZeroU16>>,
     /// `ids.len()`, readable without the lock: the read task checks it per QoS 1 publish.
     queued: std::sync::atomic::AtomicUsize,
+    /// The write task sent its last DISCONNECT: nothing may follow it ([MQTT-3.14.4-1]).
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl PendingAcks {
+    /// Called by the write task, holding the writer, after its last DISCONNECT. A read task
+    /// still running (a graceful drain whose budget ran out) then writes no PUBACK after it.
+    pub(crate) fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether [`Self::close`] was called; read while holding the writer.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Queues `ids` (emptied) behind the PUBACKs already waiting. `true` when the queue was
     /// empty: the write task has no [`ControlMessage::AcksPending`] for them yet.
     pub(crate) fn push(&self, ids: &mut Vec<std::num::NonZeroU16>) -> bool {
@@ -773,6 +786,7 @@ where
                 if let Some(reason) = pending_disconnect {
                     send_disconnect_best_effort(&mut framed, reason).await;
                 }
+                pending_acks.close();
                 return finish_write_outcome(
                     &mut waiters,
                     &mut publish_waiters,
@@ -1341,6 +1355,7 @@ where
         WriteOutcome::Shutdown => graceful_disconnect(framed, graceful, read_done).await,
         WriteOutcome::BrokerViolation(error) => {
             send_disconnect_best_effort(framed, DisconnectReasonCode::ProtocolError).await;
+            graceful.pending_acks.close();
             finish_write_outcome(
                 graceful.waiters,
                 graceful.publish_waiters,

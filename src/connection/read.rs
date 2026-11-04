@@ -411,6 +411,12 @@ fn write_held<W: AsyncWrite + Unpin + Send + 'static>(
     pending: &crate::connection::write::PendingAcks,
     counter: Option<&Arc<AtomicUsize>>,
 ) -> Written {
+    if pending.is_closed() {
+        // The write task sent its last DISCONNECT: nothing may follow it, and the broker
+        // redelivers what goes unacknowledged.
+        ids.clear();
+        return Written::All;
+    }
     // Older PUBACKs queued while the write task held the writer go first.
     if pending.feed(writer, counter).is_err() {
         return Written::Refused;
@@ -1012,6 +1018,19 @@ mod tests {
             8,
             "both PUBACKs still buffered"
         );
+    }
+
+    /// Once the write task sent its last DISCONNECT, the read task writes no PUBACK after it
+    /// ([MQTT-3.14.4-1]); the broker redelivers what goes unacknowledged.
+    #[tokio::test]
+    async fn no_puback_after_the_last_disconnect() {
+        let mut acks = acks_on(tokio::io::sink(), 0);
+        acks.writer.pending_acks().close();
+        let (control_tx, mut control_rx) = mpsc::channel(8);
+        acks.send(&control_tx).await.expect("control channel open");
+        assert!(control_rx.try_recv().is_err(), "nothing for the write task");
+        assert!(acks.ids.is_empty());
+        assert!(acks.writer.lock().await.write_buffer().is_empty(), "nothing written");
     }
 
     /// A PUBACK the encoder refuses goes to the write task, which ends the connection with that
