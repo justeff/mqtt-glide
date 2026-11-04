@@ -439,6 +439,7 @@ where
         if inflight.has_publish_capacity() && publish_waiters.resend_parked.is_empty() {
             resend_unacked(framed, inflight, publish_waiters, entry)?;
         } else {
+            inflight.hold_publish(entry.packet_id);
             publish_waiters.resend_parked.push_back(entry);
         }
     }
@@ -459,8 +460,9 @@ fn resend_unacked<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    // The id can only be taken if a SUBSCRIBE got it while this one waited: nothing to resend
-    // it under, so it is lost like a publish of a dropped connection.
+    // Defensive: the id was held for this publish while it waited (`hold_publish`), so only a
+    // carry with the same id twice could find it taken, and that publish has nothing to be
+    // resent under.
     if !inflight.reserve_publish(entry.packet_id) {
         entry.reply.send(Err(AppError::ConnectionLost));
         return Ok(());

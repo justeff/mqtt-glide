@@ -54,6 +54,9 @@ enum Slot {
     Free,
     Publish,
     Subscribe,
+    /// An unacknowledged publish of the resumed session waits for window room to be resent
+    /// under this id ([`InflightPots::hold_publish`]): taken, but not counted in the window.
+    Held,
 }
 
 /// Separate publish and subscribe/unsubscribe inflight pots over a shared ID space.
@@ -125,13 +128,30 @@ impl InflightPots {
     /// Maximum; it still counts towards [`Self::has_publish_capacity`]. Returns `false`
     /// when the ID is already in use.
     pub(crate) fn reserve_publish(&mut self, id: NonZeroU16) -> bool {
-        if self.in_use(id) {
+        if self.in_use(id) && !self.is_held(id) {
             return false;
         }
         self.ensure_slot_len(usize::from(id.get()) + 1);
         self.slots[usize::from(id.get())] = Slot::Publish;
         self.publish_count += 1;
         true
+    }
+
+    /// Keeps `id` from every other packet while the unacknowledged publish carried under it
+    /// waits for window room, without counting it against the window: the session still owns
+    /// the id ([MQTT-2.2.1-3]), and a SUBSCRIBE that took it in the meantime left the publish
+    /// nothing to be resent under. [`Self::reserve_publish`] takes it over.
+    pub(crate) fn hold_publish(&mut self, id: NonZeroU16) -> bool {
+        if self.in_use(id) {
+            return false;
+        }
+        self.ensure_slot_len(usize::from(id.get()) + 1);
+        self.slots[usize::from(id.get())] = Slot::Held;
+        true
+    }
+
+    fn is_held(&self, id: NonZeroU16) -> bool {
+        self.slots.get(usize::from(id.get())) == Some(&Slot::Held)
     }
 
     /// Whether [`Self::alloc_publish`] can hand out another publish ID right now.
@@ -472,6 +492,21 @@ mod tests {
         pots.release_publish(reserved);
         assert!(!pots.publish_contains(reserved));
         assert!(pots.has_publish_capacity());
+    }
+
+    /// An id held for a parked resend is out of reach of SUBSCRIBE and new publishes but does
+    /// not count against the window until the resend takes it over.
+    #[test]
+    fn held_publish_id_is_kept_from_other_packets() {
+        let mut pots = InflightPots::new(nonzero!(2u16));
+        let held = nonzero!(3u16);
+        assert!(pots.hold_publish(held));
+        assert!(pots.has_publish_capacity(), "not counted against the window");
+        assert_ne!(pots.alloc_subscribe().expect("subscribe id"), held);
+        assert!(!pots.hold_publish(held), "already held");
+        assert!(pots.reserve_publish(held), "the resend takes it over");
+        assert!(pots.publish_contains(held));
+        assert!(!pots.reserve_publish(held), "now in use");
     }
 
     /// A subscribe id goes inside the publish window only once every id above it is taken.

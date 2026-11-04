@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Every step of the connect is bounded now: fetching the credentials, writing CONNECT and the AUTH answers of enhanced authentication fall under `connect_timeout`, and writing a SUBSCRIBE that restores a subscription under `ack_timeout`, which `shutdown()` can also interrupt. A credentials provider that never answered, or a broker that stopped reading while a large CONNECT or AUTH did not fit the socket buffer, kept the driver connecting for good
 - `shutdown()` while subscriptions are being restored after a reconnect sends DISCONNECT (Normal Disconnection) before closing, as it does on a running connection. The session is up from the CONNACK on, and the dropped connection made the broker publish the Will
 - Acknowledgements that arrived right before the connection ended now complete their requests. When the broker sent a PUBACK, SUBACK or UNSUBACK and then closed, the write task could fail the request with `ConnectionLost` (about one in three in a test), so a resumed session resent an acknowledged publish and a granted subscription was missing from the registry
+- In a resumed session whose broker lowered its Receive Maximum, the unacknowledged publishes waiting for window room to be resent keep their Packet Identifiers to themselves. A SUBSCRIBE could take one of them meanwhile ([MQTT-2.2.1-3]), and that publish then failed with `ConnectionLost` instead of being resent ([MQTT-4.4.0-1])
 
 ## [0.5.0] - 2026-11-02
 
