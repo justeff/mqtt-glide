@@ -329,39 +329,68 @@ where
 /// torn down; the supervisor is waiting for this task.
 const PENDING_DISCONNECT_BUDGET: Duration = Duration::from_secs(1);
 
-/// Best-effort DISCONNECT 0x82 for a [`WriteOutcome::BrokerViolation`] (§4.13).
-pub(super) async fn send_broker_violation_disconnect<W>(framed: &mut FramedWrite<W, V5Codec>)
+/// Best-effort DISCONNECT with `reason` at the end of a session: 0x82 for a
+/// [`WriteOutcome::BrokerViolation`] (§4.13), or the reason the read task queued for a packet it
+/// could not accept ([MQTT-3.14.1-1]) when the cancel won the race against that message.
+pub(super) async fn send_disconnect_best_effort<W>(framed: &mut FramedWrite<W, V5Codec>, reason: DisconnectReasonCode)
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let disconnect = send_packet(
         framed,
-        Packet::Disconnect(Disconnect::new(DisconnectReasonCode::ProtocolError)),
+        Packet::Disconnect(Disconnect::new(reason)),
         FlushAbort::Graceful,
     );
     let _ = tokio::time::timeout(PENDING_DISCONNECT_BUDGET, disconnect).await;
 }
 
-/// The supervisor cancelled the session after the read task ended. If that task queued a
-/// DISCONNECT reason first (a packet it could not accept, [MQTT-3.14.1-1]), send it now: the
-/// cancel can win the race against the queued message.
-pub(super) async fn send_pending_protocol_disconnect<W>(
-    framed: &mut FramedWrite<W, V5Codec>,
+/// At the end of a session: completes the requests whose acknowledgements are already queued,
+/// and returns the reason of a DISCONNECT the read task asked for, if any.
+pub(super) fn apply_queued_acks(
     control_rx: &mut ControlReceiver,
-) where
-    W: AsyncWrite + Unpin + Send + 'static,
-{
+    waiters: &mut SubUnsubWaiters,
+    publish_waiters: &mut PublishWaiters,
+    inflight: &mut InflightPots,
+    subscription_registry: &Arc<RwLock<SubscriptionRegistry>>,
+    generation: Generation,
+) -> Result<Option<DisconnectReasonCode>, WriteOutcome> {
+    let mut disconnect = None;
     while let Ok(message) = control_rx.try_recv() {
-        if let ControlMessage::ProtocolDisconnect(reason) = message {
-            let disconnect = send_packet(
-                framed,
-                Packet::Disconnect(Disconnect::new(reason)),
-                FlushAbort::Graceful,
-            );
-            let _ = tokio::time::timeout(PENDING_DISCONNECT_BUDGET, disconnect).await;
-            return;
+        match message {
+            ControlMessage::PublishAck {
+                ack,
+                generation: ack_generation,
+            } => complete_publish_ack(publish_waiters, inflight, generation, ack_generation, ack),
+            ControlMessage::SubscribeAck {
+                ack,
+                generation: ack_generation,
+            } => complete_subscribe_ack(
+                waiters,
+                inflight,
+                subscription_registry,
+                generation,
+                ack_generation,
+                ack,
+            )?,
+            ControlMessage::UnsubscribeAck {
+                ack,
+                generation: ack_generation,
+            } => complete_unsubscribe_ack(
+                waiters,
+                inflight,
+                subscription_registry,
+                generation,
+                ack_generation,
+                ack,
+            )?,
+            // A DISCONNECT the read task asked for is still to be sent.
+            ControlMessage::ProtocolDisconnect(reason) => {
+                disconnect.get_or_insert(reason);
+            }
+            _ => {}
         }
     }
+    Ok(disconnect)
 }
 
 /// Feeds a success PUBACK without flushing (caller coalesces + flushes).

@@ -1154,3 +1154,61 @@ async fn shutdown_during_resubscribe_sends_disconnect() {
     );
     peer.abort();
 }
+
+/// A PUBACK that arrives right before the broker closes the connection still completes the
+/// publish: the write task applies the acknowledgements already queued before it fails what
+/// is left with `ConnectionLost`. Two workers, so the read task's end and the write task race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn puback_right_before_close_completes_the_publish() {
+    use mqtt_glide::codec::{PublishAck, PublishAckReason};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let broker = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept");
+            tokio::spawn(async move {
+                let (read, write) = common::framed_halves(stream);
+                let mut session = common::PeerSession { read, write };
+                session.expect_connect().await;
+                session.send_connack_success().await;
+                while let Some(Ok((frame, _))) = session.read.next().await {
+                    if let DecodedFrame::Publish(packet) = frame
+                        && let Some(packet_id) = packet.meta.packet_id
+                    {
+                        let ack = Packet::PublishAck(PublishAck {
+                            packet_id,
+                            reason_code: PublishAckReason::Success,
+                            properties: Default::default(),
+                            reason_string: None,
+                        });
+                        let _ = session.write.send(ack).await;
+                        return; // the PUBACK is on the wire, then the close
+                    }
+                }
+            });
+        }
+    });
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let mut lost = 0;
+    for _ in 0..40 {
+        let options = ConnectOptions::new(url.clone()).client_id(ClientId::from_prefix("ack-close"));
+        let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
+        let (client, connection, mut phase) =
+            connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
+        let run = tokio::spawn(connection.run());
+        wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
+            matches!(phase, SessionPhase::Connected { .. })
+        })
+        .await;
+        match client.publish("t/ack", "x").qos(QoS::AtLeastOnce).await {
+            Ok(_) => {}
+            Err(error) if matches!(error.error, mqtt_glide::AppError::ConnectionLost) => lost += 1,
+            Err(error) => panic!("unexpected {error:?}"),
+        }
+        let _ = timeout(Duration::from_secs(5), run).await;
+    }
+    assert_eq!(lost, 0, "publishes the broker acknowledged failed with ConnectionLost");
+    broker.abort();
+}

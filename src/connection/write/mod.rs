@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use bytestring::ByteString;
 
-use crate::codec::{Disconnect, Packet, PublishMessage, QoS, SubscriptionOptions, V5Codec};
+use crate::codec::{Disconnect, DisconnectReasonCode, Packet, PublishMessage, QoS, SubscriptionOptions, V5Codec};
 use crate::connection::packet_id::{InflightPots, PacketIdMap};
 use crate::connection::subscriptions::SubscriptionRegistry;
 use crate::connection::{
@@ -41,8 +41,8 @@ use self::commands::{
     CommandDispatch, CommandDispatchCtx, dispatch_client_command, resend_carried, send_parked_publishes,
 };
 use self::io::{
-    ControlCoalesceCtx, FlushAbort, GracefulDisconnectCtx, coalesce_ready_control_and_flush, flush_writes,
-    graceful_disconnect, send_broker_violation_disconnect, send_packet, send_pending_protocol_disconnect,
+    ControlCoalesceCtx, FlushAbort, GracefulDisconnectCtx, apply_queued_acks, coalesce_ready_control_and_flush,
+    flush_writes, graceful_disconnect, send_disconnect_best_effort, send_packet,
 };
 use self::keepalive::keep_alive_ping_timer;
 
@@ -752,8 +752,27 @@ where
             () = &mut cancel_wait => {
                 let mut framed = lock_writer(&shared).await;
                 // Peer close / supervisor cancel: outstanding QoS1 waiters must not hang
-                // on connection loss.
-                send_pending_protocol_disconnect(&mut framed, &mut control_rx).await;
+                // on connection loss. Acknowledgements the read task got before the end still
+                // complete their requests: a resumed session would resend an acknowledged
+                // publish, and a granted subscription would be missing from the registry.
+                let pending_disconnect = match apply_queued_acks(
+                    &mut control_rx,
+                    &mut waiters,
+                    &mut publish_waiters,
+                    &mut inflight,
+                    &subscription_registry,
+                    generation,
+                ) {
+                    Ok(reason) => reason,
+                    Err(outcome) => {
+                        return finish_write_outcome(&mut waiters, &mut publish_waiters, &mut inflight, outcome);
+                    }
+                };
+                // The read task ended on a packet it could not accept and queued a DISCONNECT
+                // reason; the cancel can win the race against that message.
+                if let Some(reason) = pending_disconnect {
+                    send_disconnect_best_effort(&mut framed, reason).await;
+                }
                 return finish_write_outcome(
                     &mut waiters,
                     &mut publish_waiters,
@@ -783,6 +802,14 @@ where
                 // Exception: full-handoff stall (self-induced unread) must not look like a dead peer.
                 // Acquire pairs with read-task Release on handoff_stalled.
                 if awaiting_pingresp && !handoff_stalled.load(Ordering::Acquire) {
+                    let _ = apply_queued_acks(
+                        &mut control_rx,
+                        &mut waiters,
+                        &mut publish_waiters,
+                        &mut inflight,
+                        &subscription_registry,
+                        generation,
+                    );
                     return finish_write_outcome(
                         &mut waiters,
                         &mut publish_waiters,
@@ -1313,7 +1340,7 @@ where
     match outcome {
         WriteOutcome::Shutdown => graceful_disconnect(framed, graceful, read_done).await,
         WriteOutcome::BrokerViolation(error) => {
-            send_broker_violation_disconnect(framed).await;
+            send_disconnect_best_effort(framed, DisconnectReasonCode::ProtocolError).await;
             finish_write_outcome(
                 graceful.waiters,
                 graceful.publish_waiters,
@@ -1321,7 +1348,21 @@ where
                 WriteOutcome::Protocol(error),
             )
         }
-        other => finish_write_outcome(graceful.waiters, graceful.publish_waiters, graceful.inflight, other),
+        other => {
+            // The connection is gone (a write failed, the session was cancelled mid-flush):
+            // acknowledgements the read task already queued still complete their requests.
+            if matches!(other, WriteOutcome::Transport(_) | WriteOutcome::Cancelled) {
+                let _ = apply_queued_acks(
+                    graceful.control_rx,
+                    graceful.waiters,
+                    graceful.publish_waiters,
+                    graceful.inflight,
+                    graceful.subscription_registry,
+                    graceful.generation,
+                );
+            }
+            finish_write_outcome(graceful.waiters, graceful.publish_waiters, graceful.inflight, other)
+        }
     }
 }
 
