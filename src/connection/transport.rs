@@ -130,7 +130,11 @@ where
     let authenticator = options.authenticator.as_ref();
     let auth_failed = |outcome| on_auth_failure(credentials, authenticator, outcome);
 
-    let (username, password) = match credentials.credentials().await {
+    // Every step is bounded by the connect budget: a credentials provider that hangs, or a
+    // broker that stops reading while CONNECT or AUTH does not fit the socket buffer, would
+    // otherwise keep the driver connecting for good.
+    let (username, password) = match within_connect(deadline, options, "credentials", credentials.credentials()).await?
+    {
         Ok(pair) => pair,
         Err(error) => return Err(auth_failed(ConnectionOutcome::Auth(error)).await),
     };
@@ -139,24 +143,30 @@ where
     let client_id = resolve_client_id_str(options);
     let mut connect = build_connect(options, &client_id, &connect_credentials);
     let mut exchange = match authenticator {
-        Some(authenticator) => match within_connect(deadline, options, authenticator.start()).await? {
-            Ok((exchange, data)) => {
-                if let Err(error) = check_auth_data(&data) {
-                    return Err(auth_failed(ConnectionOutcome::Auth(error)).await);
+        Some(authenticator) => {
+            match within_connect(deadline, options, "enhanced authentication", authenticator.start()).await? {
+                Ok((exchange, data)) => {
+                    if let Err(error) = check_auth_data(&data) {
+                        return Err(auth_failed(ConnectionOutcome::Auth(error)).await);
+                    }
+                    connect.auth_method = Some(authenticator.method().clone());
+                    connect.auth_data = data;
+                    Some(exchange)
                 }
-                connect.auth_method = Some(authenticator.method().clone());
-                connect.auth_data = data;
-                Some(exchange)
+                Err(error) => return Err(auth_failed(ConnectionOutcome::Auth(error)).await),
             }
-            Err(error) => return Err(auth_failed(ConnectionOutcome::Auth(error)).await),
-        },
+        }
         None => None,
     };
 
-    framed_write
-        .send(Packet::Connect(Box::new(connect)))
-        .await
-        .map_err(map_connect_send_error)?;
+    within_connect(
+        deadline,
+        options,
+        "CONNECT",
+        framed_write.send(Packet::Connect(Box::new(connect))),
+    )
+    .await?
+    .map_err(map_connect_send_error)?;
 
     let ack = loop {
         let challenge = match read_connack(&mut framed_read, deadline, options.connect_timeout).await {
@@ -174,7 +184,13 @@ where
             let outcome = ConnectionOutcome::Protocol(error);
             return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::ProtocolError, outcome).await);
         }
-        let answered = within_connect(deadline, options, exchange.respond(challenge.auth_data)).await?;
+        let answered = within_connect(
+            deadline,
+            options,
+            "enhanced authentication",
+            exchange.respond(challenge.auth_data),
+        )
+        .await?;
         let data = match answered.and_then(|data| check_auth_data(&data).map(|()| data)) {
             Ok(data) => data,
             Err(error) => {
@@ -189,9 +205,8 @@ where
             auth_data: data,
             ..Auth::default()
         };
-        framed_write
-            .send(Packet::Auth(answer))
-            .await
+        within_connect(deadline, options, "AUTH", framed_write.send(Packet::Auth(answer)))
+            .await?
             .map_err(map_connect_send_error)?;
     };
     let session = match apply_connack(options.keep_alive, &ack) {
@@ -208,7 +223,14 @@ where
             let outcome = protocol_violation("CONNACK without the CONNECT's Authentication Method ([MQTT-4.12.0-5])");
             return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::ProtocolError, outcome).await);
         }
-        if let Err(error) = within_connect(deadline, options, exchange.finish(ack.auth_data)).await? {
+        if let Err(error) = within_connect(
+            deadline,
+            options,
+            "enhanced authentication",
+            exchange.finish(ack.auth_data),
+        )
+        .await?
+        {
             let outcome = auth_failed(ConnectionOutcome::Auth(error)).await;
             return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::UnspecifiedError, outcome).await);
         }
@@ -221,18 +243,19 @@ where
     Ok((framed_read, framed_write, session))
 }
 
-/// An [`Authenticator`](crate::Authenticator) step of the CONNECT exchange, bounded by the
-/// connect budget like the rest of the handshake.
+/// A step of the CONNECT exchange (`what`), bounded by the connect budget like the rest of
+/// the handshake.
 async fn within_connect<T>(
     deadline: Instant,
     options: &ConnectOptions,
+    what: &str,
     step: impl Future<Output = T>,
 ) -> Result<T, ConnectionOutcome> {
     timeout_at(tokio::time::Instant::from_std(deadline), step)
         .await
         .map_err(|_| {
             ConnectionOutcome::Transport(TransportError::Connection(format!(
-                "enhanced authentication timed out after {:?}",
+                "{what} timed out after {:?}",
                 options.connect_timeout
             )))
         })

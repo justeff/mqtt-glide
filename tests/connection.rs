@@ -1057,3 +1057,38 @@ async fn resubscribe_held_by_a_full_sink_keeps_pinging() {
     let _ = timeout(Duration::from_secs(5), run).await;
     peer.abort();
 }
+
+/// A credentials provider that never answers fails the connect within `connect_timeout`
+/// instead of keeping the driver connecting for good.
+#[tokio::test]
+async fn hanging_credentials_provider_is_bounded_by_the_connect_timeout() {
+    struct Hangs;
+    impl mqtt_glide::CredentialsProvider for Hangs {
+        async fn credentials(&self) -> Result<(String, mqtt_glide::Password), AuthError> {
+            std::future::pending().await
+        }
+    }
+
+    let (port, peer) = spawn_peer_broker(|broker| async move {
+        broker.accept_session().await.hold().await;
+    })
+    .await;
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url)
+        .client_id(ClientId::from_prefix("hanging-credentials"))
+        .connect_timeout(Duration::from_millis(300));
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
+    let (_client, connection, mut phase) = connect(options, Hangs, NoReconnect, tx, NoopLifecycle).expect("wiring");
+    let run = tokio::spawn(connection.run());
+
+    let disconnected = wait_for_phase(&mut phase, Duration::from_secs(3), |phase| {
+        matches!(phase, SessionPhase::Disconnected(_))
+    })
+    .await;
+    assert!(
+        format!("{disconnected:?}").contains("credentials timed out"),
+        "{disconnected:?}"
+    );
+    let _ = timeout(Duration::from_secs(5), run).await.expect("driver stops");
+    peer.abort();
+}

@@ -397,7 +397,21 @@ where
                     user_properties: Vec::new(),
                     topic_filters: filters,
                 });
-                framed_write.send(packet).await.map_err(map_resubscribe_send_error)?;
+                // Bounded like the SUBACK wait, and open to shutdown: a broker that stops reading
+                // would otherwise hold the connect here.
+                tokio::select! {
+                    () = cancel.cancelled() => {
+                        return Err(ConnectionOutcome::Shutdown(ShutdownError::Cancelled).into());
+                    }
+                    sent = timeout(deadline, framed_write.send(packet)) => {
+                        sent.map_err(|_elapsed| {
+                            ConnectionOutcome::Transport(TransportError::Connection(format!(
+                                "resubscribe SUBSCRIBE not written within {deadline:?}"
+                            )))
+                        })?
+                        .map_err(map_resubscribe_send_error)?;
+                    }
+                }
             }
             if waiting.is_empty() {
                 return Ok(());
