@@ -590,6 +590,12 @@ impl<H: InboundSink> Connection<H> {
             )
             .await
         {
+            // `shutdown()` while subscriptions were being restored: the session is up since the
+            // CONNACK, so end it with a Normal Disconnection, or the broker publishes the Will.
+            if matches!(failure.outcome, ConnectionOutcome::Shutdown(_)) {
+                let disconnect = framed_write.send(Packet::Disconnect(Disconnect::default()));
+                let _ = tokio::time::timeout(self.options.graceful_disconnect_timeout, disconnect).await;
+            }
             // Close the connection now, not after the reconnect delay.
             drop((framed_read, framed_write));
             // The broker refused the client after its CONNACK (DISCONNECT 0x87 / 0x8C): the

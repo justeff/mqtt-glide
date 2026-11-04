@@ -1092,3 +1092,65 @@ async fn hanging_credentials_provider_is_bounded_by_the_connect_timeout() {
     let _ = timeout(Duration::from_secs(5), run).await.expect("driver stops");
     peer.abort();
 }
+
+/// `shutdown()` while subscriptions are being restored ends the session with a Normal
+/// Disconnection: the session is up since the CONNACK, and a dropped connection would make the
+/// broker publish the Will.
+#[tokio::test]
+async fn shutdown_during_resubscribe_sends_disconnect() {
+    let (in_resubscribe_tx, in_resubscribe_rx) = tokio::sync::oneshot::channel();
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+    let (port, peer) = spawn_peer_broker(move |broker| async move {
+        let mut session = broker.accept_session().await;
+        session.expect_connect().await;
+        session.send_connack_success().await;
+        session.expect_subscribe_grant_qos0().await;
+        drop(session);
+
+        let mut session = broker.accept_session().await;
+        session.expect_connect().await;
+        session.send_connack_success().await;
+        let _subscribe = session.read.next().await; // left unanswered
+        let _ = in_resubscribe_tx.send(());
+        let next = timeout(Duration::from_secs(3), session.read.next()).await;
+        let _ = seen_tx.send(format!("{next:?}"));
+    })
+    .await;
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url)
+        .client_id(ClientId::from_prefix("will"))
+        .will("status/will", "died")
+        .ack_timeout(Duration::from_secs(10));
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
+    let (client, connection, mut phase) = connect(
+        options,
+        static_credentials(),
+        StandardReconnectPolicy::new(Duration::from_millis(20), Duration::from_millis(20)),
+        tx,
+        NoopLifecycle,
+    )
+    .expect("wiring");
+    let run = tokio::spawn(connection.run());
+    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
+        matches!(phase, SessionPhase::Connected { .. })
+    })
+    .await;
+    client.subscribe([("a/b", QoS::AtMostOnce)]).await.expect("subscribe");
+    timeout(Duration::from_secs(5), in_resubscribe_rx)
+        .await
+        .expect("restore started")
+        .expect("peer alive");
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), run).await.expect("driver stops");
+    let seen = timeout(Duration::from_secs(5), seen_rx)
+        .await
+        .expect("in time")
+        .expect("peer alive");
+    assert!(
+        seen.contains("Disconnect") && seen.contains("NormalDisconnection"),
+        "{seen}"
+    );
+    peer.abort();
+}
