@@ -181,6 +181,9 @@ impl Drop for AckDeadline {
             .slot
             .state
             .compare_exchange(WAITING, ANSWERED, Ordering::AcqRel, Ordering::Relaxed);
+        // The sweeper keeps the slot until its deadline or the next compaction; the caller's
+        // waker in it would keep the caller's task allocation alive that long.
+        drop(self.slot.waker.take());
     }
 }
 

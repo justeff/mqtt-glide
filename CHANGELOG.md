@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance
 
 - Concurrent QoS 1 publishing: after each PUBACK from the broker the write task also takes the control messages already queued, mostly more PUBACKs, instead of one turn of its loop each. 64 callers on one client against the bench's mock broker: about +18 % msg/s, 8 % less CPU per message, p99 about 220 µs → 130 µs
+- Resending the unacknowledged publishes of a resumed session flushes as the buffer fills, as new publishes do, instead of encoding them all first. With a broker announcing a large Receive Maximum and many large publishes outstanding, the write buffer grew to their sum
+- An answered publish no longer keeps its caller's waker in the ack-deadline sweeper until its deadline or the next compaction, which held the caller's task allocation that long
 - The write buffer a burst of large publishes grew is now actually given back at the next keep-alive tick. The check read `BytesMut::capacity()`, which after a flush leaves out what was written, so a buffer that had held hundreds of KiB looked small and was kept
 
 ### Fixed
