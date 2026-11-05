@@ -56,6 +56,7 @@ struct WriteSessionOverrides {
     max_qos: QoS,
     retain_available: bool,
     inflight_capacity: NonZeroU16,
+    session_carry: Option<SessionCarry>,
 }
 
 impl Default for WriteSessionOverrides {
@@ -64,6 +65,7 @@ impl Default for WriteSessionOverrides {
             max_qos: QoS::AtLeastOnce,
             retain_available: true,
             inflight_capacity: nonzero!(4u16),
+            session_carry: None,
         }
     }
 }
@@ -111,7 +113,7 @@ where
         handoff_stalled: Arc::new(AtomicBool::new(false)),
         inbound_activity: Arc::new(AtomicBool::new(false)),
         bench_inbound_publish_ack_counter: None,
-        session_carry: None,
+        session_carry: overrides.session_carry,
         read_stop: StopSignal::new(),
         outbound_topic_aliases: 0,
         subscription_identifiers_available: true,
@@ -1569,4 +1571,71 @@ fn publish_that_only_fits_without_a_new_alias_is_sent_without_one() {
         matches!(aliases.choose(&message.topic), Some(OutboundTopicAlias::Assign(_))),
         "no alias was bound"
     );
+}
+
+/// A connection that fails while the resumed session's publishes are being resent leaves the
+/// ones not resent yet, and the never-sent ones, in the carry for the next connection
+/// ([MQTT-4.4.0-1]) instead of dropping them.
+#[tokio::test]
+async fn resend_cut_off_by_a_lost_connection_keeps_the_rest() {
+    let (framed, _peer_end) = duplex_framed_write(); // peer never reads
+    let carry: SessionCarry = Arc::new(std::sync::Mutex::new(Carry::new(true)));
+    let mut tickets = Vec::new();
+    {
+        let mut slot = carry.lock().expect("test value");
+        for index in 0..5u16 {
+            let (reply, ticket) = publish_reply(true);
+            tickets.push(ticket);
+            slot.unacked.push(CarriedPublish {
+                packet_id: NonZeroU16::new(index + 1).expect("test value"),
+                message: PublishMessage {
+                    topic: ByteString::from_static("t/resend"),
+                    payload: Bytes::from(vec![0u8; 20 * 1024]),
+                    properties: Default::default(),
+                },
+                retain: false,
+                reply,
+                expiry: None,
+                seq: u64::from(index),
+                refusals: 0,
+            });
+        }
+        for _ in 0..2 {
+            let (reply, ticket) = publish_reply(true);
+            tickets.push(ticket);
+            slot.unsent.push_back(PendingOutboundPublish {
+                message: PublishMessage {
+                    topic: ByteString::from_static("t/unsent"),
+                    payload: Bytes::from_static(b"x"),
+                    properties: Default::default(),
+                },
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                reply,
+            });
+        }
+    }
+
+    let harness = spawn_write_task(
+        framed,
+        WriteSessionOverrides {
+            inflight_capacity: nonzero!(16u16),
+            session_carry: Some(Arc::clone(&carry)),
+            ..Default::default()
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    harness.cancel.cancel(); // the connection is lost while the resend is blocked in a flush
+    let outcome = timeout(Duration::from_secs(2), harness.join)
+        .await
+        .expect("ends")
+        .expect("join");
+    assert_eq!(outcome, WriteOutcome::Cancelled);
+    let slot = carry.lock().expect("test value");
+    assert_eq!(
+        slot.unacked.len(),
+        5,
+        "every unacknowledged publish stays session state"
+    );
+    assert_eq!(slot.unsent.len(), 2, "never-sent publishes go to the next connection");
 }

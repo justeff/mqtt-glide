@@ -21,7 +21,7 @@ use crate::error::AppError;
 use crate::util::{is_shared_subscription_filter, validate_share_name};
 
 use super::acks::app_error_from_write_outcome;
-use super::io::{FlushAbort, feed_publish, flush_writes, map_encode_error};
+use super::io::{FlushAbort, feed_publish, flush_if_buffer_large, flush_writes, map_encode_error};
 use super::{
     BrokerPublishLimits, CarriedPublish, MAX_READY_DRAIN, PUBLISHES_PER_SOFT_FLUSH, PendingOutboundPublish,
     PendingSubscribe, PendingUnsubscribe, PublishWaiters, SubUnsubWaiters, WRITE_BUFFER_HARD_FLUSH_BYTES,
@@ -397,7 +397,7 @@ where
 ///
 /// 1. Unacknowledged QoS-1 PUBLISHes of a resumed session: DUP = 1, original ids, original
 ///    order. Only as many as the new Receive Maximum allows go out ([MQTT-4.9.0-2]); the rest
-///    fail with [`AppError::ConnectionLost`] rather than overrun the broker window.
+///    wait for PUBACKs to free slots and go out then, still before anything new.
 /// 2. Publishes that were never sent, in their original order, like new ones (closed
 ///    replies — callers that gave up — are skipped).
 pub(super) async fn resend_carried<W>(
@@ -424,29 +424,47 @@ where
     // so they do not encode it. What does not fit the new Receive Maximum waits for PUBACKs
     // to free slots ([MQTT-4.9.0-2]) and is resent then, still before anything new.
     carried.sort_by_key(|entry| entry.seq);
-    for entry in carried {
-        // A broker that lowered its Maximum QoS or withdrew Retain since must not get the
-        // publish again ([MQTT-3.2.2-11], [MQTT-3.2.2-14]); it fails like a new one would.
-        if let Err(error) = validate_publish_against_broker_limits(
-            QoS::AtLeastOnce,
-            entry.retain,
-            limits.max_qos,
-            limits.retain_available,
-        ) {
-            entry.reply.send(Err(error));
-            continue;
+    let mut carried = std::collections::VecDeque::from(carried);
+    let mut unsent = unsent;
+    let sent = async {
+        while let Some(entry) = carried.pop_front() {
+            // A broker that lowered its Maximum QoS or withdrew Retain since must not get the
+            // publish again ([MQTT-3.2.2-11], [MQTT-3.2.2-14]); it fails like a new one would.
+            if let Err(error) = validate_publish_against_broker_limits(
+                QoS::AtLeastOnce,
+                entry.retain,
+                limits.max_qos,
+                limits.retain_available,
+            ) {
+                entry.reply.send(Err(error));
+                continue;
+            }
+            if inflight.has_publish_capacity() && publish_waiters.resend_parked.is_empty() {
+                resend_unacked(framed, inflight, publish_waiters, entry)?;
+                // A broker with a large Receive Maximum takes many large publishes at once;
+                // flush as `drain_queued_commands` does instead of buffering them all first.
+                flush_if_buffer_large(framed, flush_abort).await?;
+            } else {
+                inflight.hold_publish(entry.packet_id);
+                publish_waiters.resend_parked.push_back(entry);
+            }
         }
-        if inflight.has_publish_capacity() && publish_waiters.resend_parked.is_empty() {
-            resend_unacked(framed, inflight, publish_waiters, entry)?;
-        } else {
+        while let Some(publish) = unsent.pop_front() {
+            handle_publish(framed, inflight, publish_waiters, publish, limits).await?;
+        }
+        flush_writes(framed, flush_abort).await
+    }
+    .await;
+    if sent.is_err() {
+        // The connection failed part-way: what was not handled yet waits where the session's
+        // end carries it to the next connection from, in order, instead of being dropped.
+        for entry in carried {
             inflight.hold_publish(entry.packet_id);
             publish_waiters.resend_parked.push_back(entry);
         }
+        publish_waiters.parked.extend(unsent);
     }
-    for publish in unsent {
-        handle_publish(framed, inflight, publish_waiters, publish, limits).await?;
-    }
-    flush_writes(framed, flush_abort).await
+    sent
 }
 
 /// Feeds one carried unacknowledged QoS-1 PUBLISH again: DUP set, original Packet Identifier
