@@ -244,6 +244,10 @@ pub(super) use crate::connection::io_batch::MAX_READY_DRAIN;
 /// Upper bound on QoS-1 PUBLISHes held while the broker's Receive Maximum window is full.
 pub(super) const MAX_PARKED_PUBLISHES: usize = crate::options::COMMAND_CHANNEL_CAPACITY;
 
+/// How often the write task looks whether callers of parked publishes gave up while the
+/// command gate is closed ([`PublishWaiters::parked_full`]).
+const GATE_RECHECK: Duration = Duration::from_millis(200);
+
 /// Outcome of the write task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WriteOutcome {
@@ -501,9 +505,17 @@ impl PublishWaiters {
         );
     }
 
-    /// Whether the parked queue is full (the write task must stop reading commands).
+    /// Whether the parked publishes reached [`MAX_PARKED_PUBLISHES`] (the write task must stop
+    /// reading commands), counting only callers that still wait: the ones that gave up are
+    /// dropped first. They were never sent, and a broker that withholds PUBACKs would otherwise
+    /// keep every command out for good, QoS 0 and SUBSCRIBE included, long after those callers
+    /// timed out.
     #[inline]
-    pub(super) fn parked_full(&self) -> bool {
+    pub(super) fn parked_full(&mut self) -> bool {
+        if self.parked.len() < MAX_PARKED_PUBLISHES {
+            return false;
+        }
+        self.parked.retain(|publish| !publish.reply.is_closed());
         self.parked.len() >= MAX_PARKED_PUBLISHES
     }
 
@@ -736,6 +748,10 @@ where
         #[cfg(not(test))]
         let stub_exit = std::future::pending::<Option<()>>();
         let restore_wake = restore.wake_at();
+        // Callers of parked publishes can give up after the gate below closed, and nothing else
+        // may wake this loop (a broker withholding PUBACKs, Keep Alive off): look again now and
+        // then, so the gate opens once the parked queue holds only publishes nobody waits for.
+        let gate_closed = publish_waiters.parked_full();
 
         tokio::select! {
             biased;
@@ -1252,8 +1268,9 @@ where
                     unreachable!("stub_exit is pending in release builds");
                 }
             }
+            () = tokio::time::sleep(GATE_RECHECK), if gate_closed => {}
             // Full parked queue: leave commands in the bounded channel (backpressure).
-            command = command_rx.recv(), if !publish_waiters.parked_full() => {
+            command = command_rx.recv(), if !gate_closed => {
                 let mut framed = lock_writer(&shared).await;
                 let Some(cmd) = command else {
                     return finish_write_outcome(

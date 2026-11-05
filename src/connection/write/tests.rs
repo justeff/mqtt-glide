@@ -1443,3 +1443,97 @@ fn idle_write_buffer_shrinks_only_when_large_and_empty() {
     assert!(release_idle_write_buffer(&mut flushed));
     assert!(flushed.capacity() >= WRITE_BUFFER_START_BYTES && flushed.capacity() < 64 * 1024);
 }
+
+/// Parked publishes whose callers gave up do not keep the command gate closed: they were never
+/// sent and are dropped once the parked queue is full, and the ones still waited for stay.
+#[test]
+fn abandoned_parked_publishes_do_not_hold_the_gate() {
+    let parked = |ticket_kept: bool, tickets: &mut Vec<_>| {
+        let (reply, ticket) = publish_reply(true);
+        if ticket_kept {
+            tickets.push(ticket);
+        }
+        PendingOutboundPublish {
+            message: PublishMessage {
+                topic: ByteString::from_static("t/parked"),
+                payload: Bytes::from_static(b"x"),
+                properties: Default::default(),
+            },
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            reply,
+        }
+    };
+    let mut tickets = Vec::new();
+    let mut publish_waiters = PublishWaiters::new();
+    for index in 0..MAX_PARKED_PUBLISHES {
+        let entry = parked(index % 2 == 0, &mut tickets);
+        publish_waiters.parked.push_back(entry);
+    }
+    assert!(!publish_waiters.parked_full(), "half of them were given up");
+    assert_eq!(publish_waiters.parked.len(), MAX_PARKED_PUBLISHES / 2);
+
+    let mut publish_waiters = PublishWaiters::new();
+    for _ in 0..MAX_PARKED_PUBLISHES {
+        let entry = parked(true, &mut tickets);
+        publish_waiters.parked.push_back(entry);
+    }
+    assert!(publish_waiters.parked_full(), "every caller still waits");
+}
+
+/// Callers of parked publishes that give up after the command gate closed open it again
+/// without any other event: a broker withholding PUBACKs would otherwise keep a QoS 0
+/// publish out until the next keep-alive tick, or for good with Keep Alive off.
+#[tokio::test]
+async fn gate_reopens_when_parked_callers_give_up_later() {
+    let (framed, peer_end) = duplex_framed_write();
+    let peer = tokio::spawn(async move {
+        let mut framed = FramedRead::new(peer_end, V5Codec::with_max_packet_size(0));
+        while framed.next().await.is_some() {}
+    });
+    let harness = spawn_write_task(
+        framed,
+        WriteSessionOverrides {
+            inflight_capacity: nonzero!(1u16),
+            ..Default::default()
+        },
+    );
+    let publish = |qos, reply| ClientCommand::Publish {
+        message: PublishMessage {
+            topic: ByteString::from_static("t/parked"),
+            payload: Bytes::from_static(b"x"),
+            properties: Default::default(),
+        },
+        qos,
+        retain: false,
+        reply,
+    };
+    let mut tickets = Vec::new();
+    for _ in 0..1 + MAX_PARKED_PUBLISHES {
+        let (tx, ticket) = publish_reply(true);
+        tickets.push(ticket);
+        harness
+            .command_tx
+            .send(publish(QoS::AtLeastOnce, tx))
+            .await
+            .expect("fits");
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await; // gate is closed now
+    for ticket in &mut tickets[1..] {
+        assert!(matches!(ticket.abandon(), crate::connection::Abandoned::NotWritten));
+    }
+    let (tx, mut qos0) = publish_reply(false);
+    harness
+        .command_tx
+        .send(publish(QoS::AtMostOnce, tx))
+        .await
+        .expect("queued");
+    let answered = timeout(Duration::from_secs(2), &mut qos0.rx).await;
+    assert!(
+        answered.is_ok(),
+        "QoS 0 publish still kept out 2 s after every parked caller gave up"
+    );
+    harness.cancel.cancel();
+    let _ = timeout(Duration::from_secs(2), harness.join).await;
+    peer.abort();
+}
