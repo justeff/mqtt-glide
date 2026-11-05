@@ -702,11 +702,23 @@ where
         return encode_publish(message, delivery, max_out, framed.write_buffer_mut());
     }
     let alias = aliases.choose(&message.topic);
-    encode_publish_with_alias(message, delivery, alias, max_out, framed.write_buffer_mut())?;
-    if let Some(alias) = alias {
-        aliases.commit(&message.topic, alias);
+    match encode_publish_with_alias(message, delivery, alias, max_out, framed.write_buffer_mut()) {
+        Ok(()) => {
+            if let Some(alias) = alias {
+                aliases.commit(&message.topic, alias);
+            }
+            Ok(())
+        }
+        // Binding an alias adds its property next to the full topic, a few bytes that can tip a
+        // publish just under the broker's Maximum Packet Size over it; it fits without one.
+        // The encoder left nothing behind, and an alias not committed was never bound.
+        Err(EncodeError::OverMaxPacketSize { .. })
+            if matches!(alias, Some(crate::codec::OutboundTopicAlias::Assign(_))) =>
+        {
+            encode_publish(message, delivery, max_out, framed.write_buffer_mut())
+        }
+        Err(error) => Err(error),
     }
-    Ok(())
 }
 
 pub(super) fn map_encode_error(error: EncodeError) -> WriteOutcome {

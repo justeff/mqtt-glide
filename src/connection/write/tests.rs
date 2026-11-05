@@ -1537,3 +1537,36 @@ async fn gate_reopens_when_parked_callers_give_up_later() {
     let _ = timeout(Duration::from_secs(2), harness.join).await;
     peer.abort();
 }
+
+/// A publish that fits the broker's Maximum Packet Size only without a Topic Alias property
+/// goes out without binding one, instead of being refused for a few bytes it does not need.
+#[test]
+fn publish_that_only_fits_without_a_new_alias_is_sent_without_one() {
+    use crate::codec::OutboundTopicAlias;
+    use crate::connection::topic_alias::OutboundTopicAliases;
+
+    let message = PublishMessage {
+        topic: ByteString::from_static("t/close-to-the-limit"),
+        payload: Bytes::from(vec![7u8; 200]),
+        properties: Default::default(),
+    };
+    let delivery = PublishDelivery {
+        dup: false,
+        retain: false,
+        qos: QoS::AtMostOnce,
+        packet_id: None,
+    };
+    let mut plain = BytesMut::new();
+    encode_publish(&message, delivery, u32::MAX, &mut plain).expect("encode");
+    let mut codec = V5Codec::with_max_packet_size(0);
+    codec.set_max_outbound_size(u32::try_from(plain.len()).expect("small"));
+    let mut framed = FramedWrite::new(tokio::io::sink(), codec);
+    let mut aliases = OutboundTopicAliases::new(4);
+
+    io::feed_publish(&mut framed, &mut aliases, &message, delivery).expect("fits without an alias");
+    assert_eq!(framed.write_buffer().len(), plain.len());
+    assert!(
+        matches!(aliases.choose(&message.topic), Some(OutboundTopicAlias::Assign(_))),
+        "no alias was bound"
+    );
+}
