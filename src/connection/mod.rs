@@ -364,6 +364,13 @@ impl<H: InboundSink> Connection<H> {
     pub async fn run(mut self) -> Result<(), ConnectionOutcome> {
         // Stops with the driver, however it ends (returned or dropped).
         let _sweeper = AbortOnDrop(tokio::spawn(self.ack_deadlines.sweep()));
+        // Dropping this future ends the session (see `CancelOnDrop`), but then nothing would
+        // say so: `is_connected()` and the phase watch would show a session that is gone.
+        let _ended_on_drop = DisconnectedOnDrop {
+            connected: Arc::clone(&self.channels.connected),
+            phase_tx: self.channels.phase_tx.clone(),
+            lifecycle: Arc::clone(&self.channels.lifecycle),
+        };
         loop {
             if self.cancel.is_cancelled() {
                 self.state = ConnectionState::Stopped;
@@ -723,6 +730,10 @@ impl<H: InboundSink> Connection<H> {
             (outcome, command_rx)
         });
 
+        // The session tasks are spawned, so they would outlive this future if it were dropped
+        // (a caller of `connect` aborting the driver): connected, sending, with the publishes
+        // in flight never answered. Cancelling them on drop ends the session with it.
+        let _end_session_on_drop = CancelOnDrop([read_cancel.clone(), write_cancel.clone()]);
         let (outcome, redirect, broker_reason) = Self::supervise_tasks(
             read_handle,
             write_handle,
@@ -1028,7 +1039,35 @@ pub(crate) fn broker_detail(reason_string: Option<&str>, server_reference: Optio
     detail
 }
 
-/// Maps a broker DISCONNECT to a typed connection outcome.
+/// Reports a session the dropped driver ended (see [`Connection::run`]) as `Disconnected`.
+struct DisconnectedOnDrop {
+    connected: Arc<std::sync::atomic::AtomicBool>,
+    phase_tx: watch::Sender<SessionPhase>,
+    lifecycle: Arc<dyn LifecycleHook>,
+}
+
+impl Drop for DisconnectedOnDrop {
+    fn drop(&mut self) {
+        // Only for a session still up: a driver that returned has said how it ended.
+        if self.connected.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            let phase = SessionPhase::Disconnected(ConnectionOutcome::Shutdown(ShutdownError::Cancelled));
+            self.phase_tx.send_replace(phase.clone());
+            self.lifecycle.on_lifecycle(&phase);
+        }
+    }
+}
+
+/// Cancels the session tasks when dropped; see `run_supervised_session`.
+struct CancelOnDrop([StopSignal; 2]);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        for signal in &self.0 {
+            signal.cancel();
+        }
+    }
+}
+
 /// DISCONNECT Reason Codes a broker can send because of a PUBLISH it would not take; not
 /// those about the connection as a whole (shutting down, session taken over, keep-alive,
 /// redirects, administrative action).
@@ -1052,6 +1091,7 @@ fn refuses_publish(reason: DisconnectReasonCode) -> bool {
     )
 }
 
+/// Maps a broker DISCONNECT to a typed connection outcome.
 pub(crate) fn map_broker_disconnect_outcome(disconnect: &crate::codec::Disconnect) -> ConnectionOutcome {
     let reason = disconnect.reason_code;
     match reason {

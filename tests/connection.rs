@@ -1212,3 +1212,75 @@ async fn puback_right_before_close_completes_the_publish() {
     assert_eq!(lost, 0, "publishes the broker acknowledged failed with ConnectionLost");
     broker.abort();
 }
+
+/// Dropping the driver future of `connect` ends the session with it: the read and write tasks
+/// it spawned stop, the socket closes, a publish in flight resolves instead of hanging, and the
+/// client no longer reports the session as up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_driver_ends_the_session() {
+    use tokio::io::AsyncReadExt;
+
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let (port, peer) = spawn_peer_broker(move |broker| async move {
+        let mut session = broker.accept_session().await;
+        session.expect_connect().await;
+        session.send_connack_success().await;
+        // Never acknowledges; reports when the client closes the socket.
+        let mut raw = session.read.into_inner();
+        let mut buf = vec![0u8; 4096];
+        while let Ok(read) = raw.read(&mut buf).await {
+            if read == 0 {
+                break;
+            }
+        }
+        let _ = closed_tx.send(());
+        drop(session.write);
+    })
+    .await;
+
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
+    let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("dropped-driver"));
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
+    let (client, connection, mut phase) =
+        connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
+    let run = tokio::spawn(connection.run());
+    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
+        matches!(phase, SessionPhase::Connected { .. })
+    })
+    .await;
+
+    let publish = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .publish("t/hang", "x")
+                .qos(QoS::AtLeastOnce)
+                .ack_timeout(None)
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    run.abort();
+    let _ = run.await;
+
+    timeout(Duration::from_secs(3), closed_rx)
+        .await
+        .expect("socket closed")
+        .expect("peer alive");
+    let in_flight = timeout(Duration::from_secs(3), publish)
+        .await
+        .expect("the publish in flight resolves")
+        .expect("join");
+    assert!(in_flight.is_err(), "{in_flight:?}");
+    // A health check must not see the dropped session as up.
+    assert!(!client.is_connected(), "still reported as connected");
+    assert!(
+        matches!(
+            *phase.borrow(),
+            SessionPhase::Disconnected(ConnectionOutcome::Shutdown(_))
+        ),
+        "{:?}",
+        *phase.borrow()
+    );
+    peer.abort();
+}
