@@ -100,6 +100,23 @@ pub enum DisconnectReasonCode {
     WildcardSubscriptionsNotSupported = 162,
 }
 
+/// The DISCONNECT Reason Code of `byte`, reading an undefined failure code (0x80 and up) as
+/// the nearest defined one instead of failing the packet as malformed.
+///
+/// EMQX ends a refused re-authentication with the CONNACK code of the refusal (0x86 Bad User
+/// Name or Password, 0x8A Banned, 0x88 Server unavailable), which DISCONNECT does not define.
+/// The connection ends either way; rejecting the packet only lost the refusal: the client
+/// reported a malformed packet and answered with a DISCONNECT of its own. Codes below 0x80 stay
+/// strict: they claim success.
+fn lenient_reason_code(byte: u8) -> Result<DisconnectReasonCode, DecodeError> {
+    match DisconnectReasonCode::try_from(byte) {
+        Ok(reason) => Ok(reason),
+        Err(_) if matches!(byte, 0x86 | 0x8A) => Ok(DisconnectReasonCode::NotAuthorized),
+        Err(_) if byte >= 0x80 => Ok(DisconnectReasonCode::UnspecifiedError),
+        Err(unknown) => Err(unknown.into()),
+    }
+}
+
 impl TryFrom<u8> for DisconnectReasonCode {
     type Error = UnknownCode;
 
@@ -169,7 +186,7 @@ impl Disconnect {
 
     pub(crate) fn decode(src: &mut Bytes) -> Result<Self, DecodeError> {
         let disconnect = if src.has_remaining() {
-            let reason_code = src.get_u8().try_into()?;
+            let reason_code = lenient_reason_code(src.get_u8())?;
 
             if src.has_remaining() {
                 let mut session_exp_secs = None;
@@ -273,6 +290,19 @@ mod tests {
             Disconnect::decode(&mut src),
             Err(DecodeError::MalformedPacket(_))
         ));
+    }
+
+    /// Undefined failure codes, such as the CONNACK codes EMQX sends on a refused
+    /// re-authentication, are read as the nearest DISCONNECT code instead of a malformed packet.
+    #[rstest::rstest]
+    #[case::bad_user_name_or_password(0x86, DisconnectReasonCode::NotAuthorized)]
+    #[case::banned(0x8A, DisconnectReasonCode::NotAuthorized)]
+    #[case::server_unavailable(0x88, DisconnectReasonCode::UnspecifiedError)]
+    #[case::undefined(0xFE, DisconnectReasonCode::UnspecifiedError)]
+    fn disconnect_decode_reads_undefined_failure_codes(#[case] byte: u8, #[case] expected: DisconnectReasonCode) {
+        let wire = [byte];
+        let decoded = Disconnect::decode(&mut Bytes::copy_from_slice(&wire)).expect("decoded");
+        assert_eq!(decoded.reason_code, expected);
     }
 
     /// [MQTT-3.14.2-4] User Property is dropped rather than exceed the receiver's Maximum Packet Size.
