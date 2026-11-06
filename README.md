@@ -480,8 +480,8 @@ Broader flows live under [`examples/`](examples/) and are the better starting po
 | Packet IDs | n/a | Reserved until matching ACK or session teardown (no reap-on-cancel) |
 | Inbound QoS 1 `PUBACK` | n/a | Only after successful `InboundSink` push; custom `send` **MUST** be cancel-safe |
 | Readiness | n/a | `ClientBuilder::connect` waits for the first `Connected` (`wait_connected`, default `true`); the low-level `connect` returns a `SessionPhase` watch instead. Use the hook or the watch for side effects, not both |
-| `CredentialsProvider::invalidate` | no-op | `CONNECT`-level `NotAuthorized` only (never `SUBACK` ACL) |
-| `Authenticator::invalidate` | no-op | Same rule as `CredentialsProvider::invalidate` |
+| `CredentialsProvider::invalidate` | no-op | On `CONNACK` `NotAuthorized` / `BadUserNameOrPassword` and on a broker `DISCONNECT` `NotAuthorized` / `BadAuthenticationMethod`, which brokers also send for an ACL violation with valid credentials; never on a `SUBACK` refusal |
+| `Authenticator::invalidate` | no-op | Same rule as `CredentialsProvider::invalidate`, plus when `AuthExchange::finish` rejects the broker |
 
 `StandardReconnectPolicy::mark_live()`: call once the session is fully ready (typically after subscriptions succeed). The next transport failure then retries immediately (`Duration::ZERO`) once, before falling back to the configured delay; only if the session lasted at least that delay, so a broker that drops every connection right away is not dialled in a loop. Auth failures use the normal delay, then `max_auth_backoff` after a streak (`DEFAULT_AUTH_FAILURE_THRESHOLD`). Credential cache clearing is `CredentialsProvider::invalidate`, not this policy.
 

@@ -72,8 +72,18 @@ pub trait Authenticator: Send + Sync {
     /// Authentication Data to send first (the CONNECT's, or the AUTH 0x19 Re-authenticate's).
     fn start(&self) -> impl Future<Output = Result<(Self::Exchange, Option<Bytes>), AuthError>> + Send;
 
-    /// The broker refused the authentication (CONNACK 0x86 / 0x87 or DISCONNECT 0x87 / 0x8C):
-    /// drop cached material so the next [`Self::start`] fetches it anew. Default: nothing.
+    /// The authentication failed (CONNACK 0x86 / 0x87, DISCONNECT 0x87 / 0x8C, or
+    /// [`AuthExchange::finish`] rejecting the broker): drop cached material so the next
+    /// [`Self::start`] fetches it anew. Default: nothing.
+    ///
+    /// A broker that disconnects with 0x87 for an ACL violation, with credentials that are
+    /// fine, calls this too, and so does a broker that fails `finish`'s check: material cheap to
+    /// fetch again is the safe kind to cache.
+    ///
+    /// Each step of an exchange (`start`, [`AuthExchange::respond`], [`AuthExchange::finish`])
+    /// has the connect budget ([`ConnectOptions::connect_timeout`](crate::ConnectOptions::connect_timeout))
+    /// during CONNECT and [`ConnectOptions::ack_timeout`](crate::ConnectOptions::ack_timeout)
+    /// during a re-authentication; a step that takes longer fails the authentication.
     fn invalidate(&self) -> impl Future<Output = ()> + Send {
         async {}
     }

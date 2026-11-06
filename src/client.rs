@@ -552,6 +552,13 @@ impl MqttClient {
     /// accepted (AUTH 0x00 Success, and [`AuthExchange::finish`](crate::AuthExchange::finish)
     /// agreed). Calls made during an exchange run after it.
     ///
+    /// The exchange runs on the connection's read task. Each step (an authenticator call, the
+    /// broker's answer) has [`ConnectOptions::ack_timeout`], but time the read task waits for
+    /// room in a full inbound sink does not count, so with a stalled consumer the call is not
+    /// bounded in wall-clock time. When it must finish by a token's expiry, wrap it in your
+    /// own timeout. A call given up that way still holds its place in the queue until the read
+    /// task gets to it.
+    ///
     /// # Errors
     ///
     /// - [`AppError::InvalidRequest`]: no [`ConnectOptions::authenticator`] is set.

@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `AppError::PublishRefusedByDisconnect`: a QoS 1 publish given up after the broker disconnected on it three times in a row (see Fixed)
 
+### Documentation
+
+- `reauthenticate()` is not bounded in wall-clock time while the inbound sink is full, since time the read task waits for room does not count against `ack_timeout`; the docs say so and suggest a timeout of your own
+- The `invalidate` hooks say when they run: also on a broker DISCONNECT 0x87 / 0x8C during a session, which brokers send for ACL violations with valid credentials too, and for `Authenticator::invalidate` when `finish` rejects the broker. The README said CONNECT refusals only. The authenticator steps' time limits are documented
+
 ### Performance
 
 - Concurrent QoS 1 publishing: after each PUBACK from the broker the write task also takes the control messages already queued, mostly more PUBACKs, instead of one turn of its loop each. 64 callers on one client against the bench's mock broker: about +18 % msg/s, 8 % less CPU per message, p99 about 220 µs → 130 µs
@@ -35,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dropping or aborting the future of `Connection::run()` (from `connect`) ends the session: the read and write tasks it had spawned are cancelled, so the socket closes and publishes in flight resolve. They kept running detached before, connected and sending, with the publishes in flight never answered. `ClientBuilder` users were not affected
 - Publishes parked behind the broker's Receive Maximum whose callers gave up no longer keep other commands out. Once 32 were parked the write task stopped taking commands, QoS 0 publishes and SUBSCRIBE included, until a PUBACK freed a slot, so a broker that withheld PUBACKs blocked the client long after those callers had timed out. They were never sent and are now dropped when the queue is full
 - A broker DISCONNECT with an undefined failure Reason Code is read as the nearest defined one instead of a malformed packet: 0x86 and 0x8A as `NotAuthorized`, any other code from 0x80 up as `UnspecifiedError`. EMQX ends a refused re-authentication with the CONNACK code of the refusal, and the client reported a malformed packet, answered with a DISCONNECT 0x81 of its own and lost the auth failure: `reauthenticate()` returned `ConnectionLost` and the credentials were not invalidated
+- A re-authentication ends after 16 broker challenges with DISCONNECT 0x80 and `AppError::Auth`. A broker that kept answering with Continue Authentication, each time within `ack_timeout`, held the exchange open for good, and every later `reauthenticate()` queued behind it
 - An AUTH with Continue Authentication or Re-authenticate but no Authentication Method is answered with DISCONNECT 0x82 Protocol Error, as §3.15.2.2.2 says, instead of 0x81 Malformed Packet
 - With outbound Topic Aliases on, a publish within a few bytes of the broker's Maximum Packet Size is sent without binding a new alias instead of failing with `InvalidRequest`: the alias property next to the full topic tipped it over the limit
 
