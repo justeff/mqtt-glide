@@ -28,6 +28,11 @@ pub(crate) type ReauthReply = oneshot::Sender<Result<(), AppError>>;
 /// Requests waiting for the read task; a few, so a call made during an exchange runs after it.
 const REQUEST_CAPACITY: usize = 4;
 
+/// Broker challenges one re-authentication may take. SCRAM needs one; a broker that keeps
+/// answering with Continue Authentication would otherwise keep the exchange, and every
+/// `reauthenticate` call queued behind it, open for good, each round within `ack_timeout`.
+const MAX_CHALLENGES: u8 = 16;
+
 /// What every connection's read task needs to run re-authentications.
 #[derive(Debug, Clone)]
 pub(crate) struct ReauthLink {
@@ -110,6 +115,8 @@ pub(crate) struct Reauth {
     /// Time the read task spent away from the exchange since the timer was armed, added to the
     /// deadline only when the timer fires, so a busy inbound path does not reset it per message.
     held_up: Duration,
+    /// Broker challenges (AUTH Continue Authentication) of the running exchange.
+    challenges: u8,
 }
 
 impl Reauth {
@@ -127,6 +134,7 @@ impl Reauth {
             state: State::Idle,
             timer: Box::pin(sleep_until(Instant::now())),
             held_up: Duration::ZERO,
+            challenges: 0,
         })
     }
 
@@ -198,6 +206,7 @@ impl Reauth {
                 if !reply.is_closed() {
                     let authenticator = self.authenticator.clone();
                     let step = Box::pin(async move { authenticator.start().await });
+                    self.challenges = 0;
                     self.arm();
                     self.state = State::Starting { reply, step };
                 }
@@ -279,6 +288,14 @@ impl Reauth {
                 if let Err(error) = check_broker_auth(&auth, self.authenticator.method(), expected) {
                     let _ = reply.send(Err(AppError::ConnectionLost));
                     return Err(protocol_failure(error));
+                }
+                if expected == AuthReasonCode::ContinueAuth {
+                    self.challenges = self.challenges.saturating_add(1);
+                    if self.challenges > MAX_CHALLENGES {
+                        let error =
+                            AuthError::Provider(format!("broker kept challenging: more than {MAX_CHALLENGES} rounds"));
+                        return Err(failed(reply, error));
+                    }
                 }
                 let data = auth.auth_data;
                 self.arm();
@@ -581,6 +598,29 @@ mod tests {
         rig.step().await.expect("finished");
         assert_eq!(answer.await.expect("answered"), Ok(()));
         assert!(rig.control_rx.try_recv().is_err(), "nothing more sent");
+    }
+
+    /// A broker that keeps challenging gets at most `MAX_CHALLENGES` answers; the exchange then
+    /// fails with DISCONNECT 0x80 instead of staying open, with every later call queued behind
+    /// it ([MQTT-4.12.1-2]).
+    #[tokio::test]
+    async fn endless_challenges_end_the_exchange() {
+        let mut rig = rig(Scripted::default(), Duration::from_secs(5));
+        let answer = rig.started().await;
+        rig.sent();
+        for _ in 0..MAX_CHALLENGES {
+            rig.reauth
+                .on_broker_auth(broker_auth(AuthReasonCode::ContinueAuth, "scripted", b"again"))
+                .expect("challenge within the limit");
+            rig.step().await.expect("responded");
+            rig.sent();
+        }
+        let failure = rig
+            .reauth
+            .on_broker_auth(broker_auth(AuthReasonCode::ContinueAuth, "scripted", b"again"))
+            .expect_err("one challenge too many");
+        assert_eq!(failure.reason, Some(DisconnectReasonCode::UnspecifiedError));
+        assert!(matches!(answer.await, Ok(Err(AppError::Auth(AuthError::Provider(_))))));
     }
 
     /// A failing `start` sends nothing and leaves the connection alone.
