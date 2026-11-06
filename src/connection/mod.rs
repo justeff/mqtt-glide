@@ -544,6 +544,7 @@ impl<H: InboundSink> Connection<H> {
             .outbound_topic_aliases
             .min(session.server_topic_alias_maximum);
         let max_qos = session.max_qos;
+        let broker_max_packet_size = session.max_packet_size;
         let retain_available = session.retain_available;
         self.inflight.set_publish_capacity(session.server_receive_maximum);
 
@@ -668,7 +669,11 @@ impl<H: InboundSink> Connection<H> {
                 topic_aliases: inbound_topic_aliases,
                 response_router: Arc::clone(&self.channels.response_router),
                 stats: self.channels.stats.clone(),
-                reauth: self.channels.reauth.clone(),
+                reauth: self
+                    .channels
+                    .reauth
+                    .clone()
+                    .map(|link| link.for_connection(broker_max_packet_size)),
                 inbound_publish_ack_counter: self.options.bench_inbound_publish_ack_counter.clone(),
                 receive_maximum: self.options.receive_maximum,
                 shutdown_notify: self.shutdown_notify.clone(),

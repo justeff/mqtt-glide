@@ -40,6 +40,16 @@ pub(crate) struct ReauthLink {
     /// Taken by the read task of the current connection.
     requests: Arc<tokio::sync::Mutex<mpsc::Receiver<ReauthReply>>>,
     ack_timeout: Duration,
+    /// The broker's Maximum Packet Size on the current connection (CONNACK).
+    broker_max_packet_size: Option<u32>,
+}
+
+impl ReauthLink {
+    /// The link for a connection whose CONNACK announced `broker_max_packet_size`.
+    pub(crate) fn for_connection(mut self, broker_max_packet_size: Option<u32>) -> Self {
+        self.broker_max_packet_size = broker_max_packet_size;
+        self
+    }
 }
 
 /// The client's end of the request queue and the driver's link to it.
@@ -52,6 +62,7 @@ pub(crate) fn reauth_channel(
         authenticator,
         requests: Arc::new(tokio::sync::Mutex::new(rx)),
         ack_timeout,
+        broker_max_packet_size: None,
     };
     (tx, link)
 }
@@ -117,6 +128,7 @@ pub(crate) struct Reauth {
     held_up: Duration,
     /// Broker challenges (AUTH Continue Authentication) of the running exchange.
     challenges: u8,
+    broker_max_packet_size: Option<u32>,
 }
 
 impl Reauth {
@@ -135,6 +147,7 @@ impl Reauth {
             timer: Box::pin(sleep_until(Instant::now())),
             held_up: Duration::ZERO,
             challenges: 0,
+            broker_max_packet_size: link.broker_max_packet_size,
         })
     }
 
@@ -375,6 +388,22 @@ impl Reauth {
             auth_data: data,
             ..Auth::default()
         };
+        // An AUTH over the broker's Maximum Packet Size must not be sent ([MQTT-3.2.2-15]); the
+        // write task would meet that as an encode error and drop the connection without a
+        // word. The first one fails the call alone, nothing having been sent yet; later in
+        // the exchange the client gives up on it with DISCONNECT 0x80.
+        if let Some(max) = self.broker_max_packet_size
+            && encoded_len(&auth).is_none_or(|len| len > max)
+        {
+            let error = AuthError::Provider(format!(
+                "Authentication Data does not fit the broker's Maximum Packet Size of {max} bytes"
+            ));
+            if reason_code == AuthReasonCode::ReAuth {
+                let _ = reply.send(Err(AppError::Auth(error)));
+                return Ok(());
+            }
+            return Err(failed(reply, error));
+        }
         if control_tx.send(ControlMessage::Auth(Box::new(auth))).await.is_err() {
             let _ = reply.send(Err(AppError::ConnectionLost));
             return Err(Failure {
@@ -392,6 +421,15 @@ impl Reauth {
         self.held_up = Duration::ZERO;
         self.timer.as_mut().reset(crate::util::deadline_after(self.ack_timeout));
     }
+}
+
+/// Bytes `auth` takes on the wire; `None` when it cannot be encoded at all.
+fn encoded_len(auth: &Auth) -> Option<u32> {
+    let mut buffer = bytes::BytesMut::new();
+    crate::codec::V5Codec::default()
+        .encode_packet(crate::codec::Packet::Auth(auth.clone()), &mut buffer)
+        .ok()?;
+    u32::try_from(buffer.len()).ok()
 }
 
 /// The step's output, or `None` once its deadline passed.
@@ -516,7 +554,12 @@ mod tests {
     }
 
     fn rig(authenticator: Scripted, ack_timeout: Duration) -> Rig {
+        rig_with_max_packet_size(authenticator, ack_timeout, None)
+    }
+
+    fn rig_with_max_packet_size(authenticator: Scripted, ack_timeout: Duration, max: Option<u32>) -> Rig {
         let (requests, link) = reauth_channel(SharedAuthenticator::new(authenticator), ack_timeout);
+        let link = link.for_connection(max);
         let reauth = Reauth::new(&link).expect("request queue free");
         assert!(Reauth::new(&link).is_none(), "one read task at a time holds the queue");
         let (control_tx, control_rx) = mpsc::channel(8);
@@ -621,6 +664,44 @@ mod tests {
             .expect_err("one challenge too many");
         assert_eq!(failure.reason, Some(DisconnectReasonCode::UnspecifiedError));
         assert!(matches!(answer.await, Ok(Err(AppError::Auth(AuthError::Provider(_))))));
+    }
+
+    /// An AUTH over the broker's Maximum Packet Size is never sent ([MQTT-3.2.2-15]): the first
+    /// one fails the call and leaves the connection alone, a later one ends the exchange with
+    /// DISCONNECT 0x80.
+    #[tokio::test]
+    async fn auth_over_the_broker_maximum_packet_size_is_not_sent() {
+        let first = Auth {
+            reason_code: AuthReasonCode::ReAuth,
+            auth_method: Some("scripted".into()),
+            auth_data: Some(Bytes::from_static(b"first")),
+            ..Auth::default()
+        };
+        let first_len = encoded_len(&first).expect("encodes");
+
+        let mut rig = rig_with_max_packet_size(Scripted::default(), Duration::from_secs(5), Some(first_len - 1));
+        let answer = rig.request();
+        rig.step().await.expect("request");
+        rig.step().await.expect("a refused first AUTH ends nothing");
+        assert!(matches!(answer.await, Ok(Err(AppError::Auth(AuthError::Provider(_))))));
+        assert!(rig.control_rx.try_recv().is_err(), "nothing sent");
+        assert!(!rig.reauth.busy());
+
+        // The first fits; the answer to a long challenge does not.
+        let mut rig = rig_with_max_packet_size(Scripted::default(), Duration::from_secs(5), Some(first_len));
+        let answer = rig.started().await;
+        rig.sent();
+        rig.reauth
+            .on_broker_auth(broker_auth(
+                AuthReasonCode::ContinueAuth,
+                "scripted",
+                b"a long challenge",
+            ))
+            .expect("challenge");
+        let failure = rig.step().await.expect_err("the answer does not fit");
+        assert_eq!(failure.reason, Some(DisconnectReasonCode::UnspecifiedError));
+        assert!(matches!(answer.await, Ok(Err(AppError::Auth(AuthError::Provider(_))))));
+        assert!(rig.control_rx.try_recv().is_err(), "the answer was not sent");
     }
 
     /// A failing `start` sends nothing and leaves the connection alone.
