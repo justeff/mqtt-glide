@@ -92,8 +92,9 @@ impl Auth {
 
                 if matches!(reason_code, AuthReasonCode::ContinueAuth | AuthReasonCode::ReAuth) && auth_method.is_none()
                 {
-                    // §3.15.2.2.2 — Continue Authentication / Re-authenticate must include Authentication Method.
-                    return Err(DecodeError::MalformedPacket("invalid encoding"));
+                    // §3.15.2.2.2: Continue Authentication / Re-authenticate without the
+                    // Authentication Method is a Protocol Error, not a malformed packet.
+                    return Err(DecodeError::ProtocolViolation("AUTH without Authentication Method"));
                 }
 
                 Self {
@@ -104,9 +105,10 @@ impl Auth {
                     user_properties,
                 }
             } else {
-                // Only Success (0x00) with no Properties may omit Reason Code body.
+                // Only Success (0x00) may leave the properties out; any other code then lacks
+                // the Authentication Method (§3.15.2.2.2), a Protocol Error.
                 if reason_code != AuthReasonCode::Success {
-                    return Err(DecodeError::MalformedPacket("invalid encoding"));
+                    return Err(DecodeError::ProtocolViolation("AUTH without Authentication Method"));
                 }
                 Self {
                     reason_code,
@@ -194,7 +196,7 @@ mod tests {
         let result = Auth::decode(&mut Bytes::from_static(wire));
         assert_eq!(
             result.map_err(|e| e.to_string()),
-            Err(DecodeError::MalformedPacket("invalid encoding").to_string())
+            Err(DecodeError::ProtocolViolation("AUTH without Authentication Method").to_string())
         );
     }
 
