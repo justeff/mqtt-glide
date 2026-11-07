@@ -513,7 +513,7 @@ async fn run_attack(attack: Vec<u8>, sentinel: bool) -> (Seen, Result<(), Connec
 #[case::publish_qos2_unsupported(publish("a/b", 2, 7, &[], b"x"), 0x82)]
 #[case::publish_empty_topic_without_alias(publish("", 0, 0, &[], b"x"), 0x82)]
 #[case::publish_duplicate_property(publish("a", 0, 0, &[prop::u32(0x02, 1), prop::u32(0x02, 2)], b"x"), 0x82)]
-#[case::publish_unknown_topic_alias(publish("", 0, 0, &[prop::u16(0x23, 2)], b"x"), 0x94)]
+#[case::publish_unknown_topic_alias(publish("", 0, 0, &[prop::u16(0x23, 2)], b"x"), 0x82)]
 #[case::publish_topic_alias_zero(publish("a", 0, 0, &[prop::u16(0x23, 0)], b"x"), 0x94)]
 #[case::publish_topic_alias_above_maximum(publish("a", 0, 0, &[prop::u16(0x23, 4)], b"x"), 0x94)]
 #[case::publish_over_maximum_packet_size(publish("big", 0, 0, &[], &[b'x'; 2000]), 0x95)]
@@ -802,7 +802,7 @@ async fn unsubscribed_filter_is_not_resubscribed(#[case] reason: u8) {
 #[rstest]
 #[case::malformed_publish(publish("a", 1, 0, &[], b"x"), 0x81)]
 #[case::garbage(vec![0xFF; 16], 0x81)]
-#[case::unknown_topic_alias(publish("", 0, 0, &[prop::u16(0x23, 2)], b"x"), 0x94)]
+#[case::unknown_topic_alias(publish("", 0, 0, &[prop::u16(0x23, 2)], b"x"), 0x82)]
 #[case::topic_alias_above_maximum(publish("a", 0, 0, &[prop::u16(0x23, 4)], b"x"), 0x94)]
 #[case::qos2_publish(publish("a", 2, 4, &[], b"x"), 0x82)]
 #[case::pubrec(pkt(0x50, &[0, 1]), 0x82)]
@@ -1151,7 +1151,8 @@ async fn fragmented_packets_are_decoded(#[case] cut: Cut) {
 
 /// Topic Alias bindings belong to one Network Connection ([MQTT-3.3.2-7]). The broker binds an
 /// alias on the first connection and uses it, without binding it again, on the second: the client
-/// answers DISCONNECT 0x94, does not acknowledge that PUBLISH and delivers nothing for the stale
+/// answers DISCONNECT 0x82 (an unbound alias is a Protocol Error, §3.3.4), does not acknowledge
+/// that PUBLISH and delivers nothing for the stale
 /// alias (the message of the first connection was delivered).
 #[tokio::test]
 async fn stale_topic_alias_after_reconnect_is_not_delivered() {
@@ -1186,7 +1187,7 @@ async fn stale_topic_alias_after_reconnect_is_not_delivered() {
     .await;
     let mut h = Harness::start(attack_options(port), Reconnect::every(Duration::from_millis(50)), 16);
     let (reason, acked_stale, _peer) = within(30, broker).await.expect("broker task");
-    assert_eq!(reason, Some(0x94));
+    assert_eq!(reason, Some(0x82));
     assert!(!acked_stale, "a PUBLISH with an unbound alias was acknowledged");
     let delivered: Vec<_> = std::iter::from_fn(|| h.rx.try_recv().ok()).collect();
     assert_eq!(delivered.len(), 1, "delivered: {delivered:?}");

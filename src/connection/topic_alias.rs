@@ -47,9 +47,21 @@ impl InboundTopicAliases {
                 .ok_or_else(|| ProtocolError::Violation(format!("PUBLISH used unbound Topic Alias {alias}")))?;
             packet.message.topic = topic.clone();
         } else {
-            self.topics[index] = Some(packet.message.topic.clone());
+            // A copy, not the frame's slice: the binding lives as long as the connection, and a
+            // slice would keep the whole PUBLISH it arrived in (payload included) in memory.
+            self.topics[index] = Some(ByteString::from(&*packet.message.topic));
         }
         Ok(())
+    }
+}
+
+/// The DISCONNECT reason for a [`InboundTopicAliases::resolve`] error: 0x94 Topic Alias
+/// invalid for an alias above the maximum ([MQTT-3.3.2-10]), 0x82 Protocol Error for one that
+/// was never bound on this connection (§3.3.4).
+pub(crate) fn disconnect_reason(error: &ProtocolError) -> crate::codec::DisconnectReasonCode {
+    match error {
+        ProtocolError::TopicAliasNotSupported => crate::codec::DisconnectReasonCode::TopicAliasInvalid,
+        _ => crate::codec::DisconnectReasonCode::ProtocolError,
     }
 }
 

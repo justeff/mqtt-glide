@@ -221,9 +221,8 @@ where
                         Some(Ok((DecodedFrame::Publish(mut packet), _wire_len))) => {
                             inbound_activity.store(true, Ordering::Release);
                             if let Err(error) = topic_aliases.resolve(&mut packet) {
-                                // §3.3.2.3.4: an unknown or out-of-range alias is answered with 0x94.
-                                return protocol_error_disconnect(control_tx, error, DisconnectReasonCode::TopicAliasInvalid)
-                                    .await;
+                                let reason = super::topic_alias::disconnect_reason(&error);
+                                return protocol_error_disconnect(control_tx, error, reason).await;
                             }
                             stats.publish_received(packet.meta.qos, packet.meta.dup);
                             let reauth_waiting_since = reauth

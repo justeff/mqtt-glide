@@ -217,28 +217,29 @@ async fn unexpected_control_packet_gets_protocol_error_disconnect() {
     assert_eq!(reasons, [Some(crate::codec::DisconnectReasonCode::ProtocolError)]);
 }
 
-/// An invalid inbound Topic Alias is answered with DISCONNECT 0x94 on the wire, not only
-/// reported locally (§3.3.2.3.4): an alias above the Topic Alias Maximum we advertised,
-/// one nobody bound yet, and alias 0, which fails decoding.
+/// An invalid inbound Topic Alias is answered with a DISCONNECT on the wire, not only reported
+/// locally: alias 0, which fails decoding, with 0x94 Topic Alias invalid (§3.3.2.3.4), and one
+/// nobody bound yet with 0x82 Protocol Error (§3.3.4).
 #[rstest::rstest]
-#[case::unbound(4, &[0x30, 0x07, 0x00, 0x00, 0x03, 0x23, 0x00, 0x01, b'd'])]
-#[case::alias_zero(4, &[0x30, 0x07, 0x00, 0x00, 0x03, 0x23, 0x00, 0x00, b'd'])]
+#[case::unbound(
+    &[0x30, 0x07, 0x00, 0x00, 0x03, 0x23, 0x00, 0x01, b'd'],
+    crate::codec::DisconnectReasonCode::ProtocolError
+)]
+#[case::alias_zero(
+    &[0x30, 0x07, 0x00, 0x00, 0x03, 0x23, 0x00, 0x00, b'd'],
+    crate::codec::DisconnectReasonCode::TopicAliasInvalid
+)]
 #[tokio::test]
-async fn invalid_inbound_topic_alias_gets_topic_alias_invalid_disconnect(
-    #[case] topic_alias_maximum: u16,
+async fn invalid_inbound_topic_alias_gets_a_disconnect(
     #[case] bad_packet: &'static [u8],
+    #[case] expected: crate::codec::DisconnectReasonCode,
 ) {
-    let reasons = disconnect_reasons_with(
-        |options| options.topic_alias_maximum(topic_alias_maximum),
-        bad_packet,
-        1,
-    )
-    .await;
-    assert_eq!(reasons, [Some(crate::codec::DisconnectReasonCode::TopicAliasInvalid)]);
+    let reasons = disconnect_reasons_with(|options| options.topic_alias_maximum(4), bad_packet, 1).await;
+    assert_eq!(reasons, [Some(expected)]);
 }
 
 /// Inbound Topic Alias bindings do not survive a reconnect: an alias bound on one connection
-/// is unknown on the next, and using it is answered with DISCONNECT 0x94 ([MQTT-3.3.2-7]).
+/// is unknown on the next, and using it is answered with DISCONNECT 0x82 ([MQTT-3.3.2-7]).
 #[tokio::test]
 async fn inbound_topic_alias_binding_does_not_survive_a_reconnect() {
     use tokio::io::AsyncWriteExt;
@@ -299,7 +300,7 @@ async fn inbound_topic_alias_binding_does_not_survive_a_reconnect() {
         .await
         .expect("second connection result")
         .expect("broker result");
-    assert_eq!(reason, Some(crate::codec::DisconnectReasonCode::TopicAliasInvalid));
+    assert_eq!(reason, Some(crate::codec::DisconnectReasonCode::ProtocolError));
 
     client.shutdown().await.expect("shutdown");
     let _ = timeout(Duration::from_secs(3), run).await;

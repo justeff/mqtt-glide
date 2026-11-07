@@ -50,6 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An AUTH of a re-authentication that does not fit the broker's Maximum Packet Size is not sent. The first one fails `reauthenticate()` with `AppError::Auth` and leaves the connection alone; a later one in the exchange ends it with DISCONNECT 0x80. The connection was dropped without a DISCONNECT before, even when nothing had been sent yet
 - A re-authentication ends after 16 broker challenges with DISCONNECT 0x80 and `AppError::Auth`. A broker that kept answering with Continue Authentication, each time within `ack_timeout`, held the exchange open for good, and every later `reauthenticate()` queued behind it
 - An AUTH with Continue Authentication or Re-authenticate but no Authentication Method is answered with DISCONNECT 0x82 Protocol Error, as §3.15.2.2.2 says, instead of 0x81 Malformed Packet
+- An inbound Topic Alias binding keeps a copy of its topic instead of a slice of the PUBLISH it arrived in, which kept that whole frame, payload included, in memory for the life of the binding: up to `topic_alias_maximum × max_packet_size` with a broker that binds aliases on large messages
+- An inbound PUBLISH with a Topic Alias that was never bound on this connection is answered with DISCONNECT 0x82 Protocol Error as §3.3.4 says, not 0x94, which is for an alias of 0 or above the maximum
 - With outbound Topic Aliases on, a publish within a few bytes of the broker's Maximum Packet Size is sent without binding a new alias instead of failing with `InvalidRequest`: the alias property next to the full topic tipped it over the limit
 
 ## [0.5.0] - 2026-11-02

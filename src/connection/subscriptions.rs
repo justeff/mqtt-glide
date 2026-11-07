@@ -629,8 +629,9 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     if let Err(error) = inbound.topic_aliases.resolve(&mut packet) {
+        let reason = super::topic_alias::disconnect_reason(&error);
         let outcome = ConnectionOutcome::Protocol(error);
-        return Err(refuse_packet(framed_write, DisconnectReasonCode::TopicAliasInvalid, outcome).await);
+        return Err(refuse_packet(framed_write, reason, outcome).await);
     }
     let puback_id = match inbound_publish_policy(&packet) {
         Ok(puback_id) => puback_id,
