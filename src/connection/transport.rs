@@ -320,7 +320,7 @@ pub(crate) async fn open_tcp(options: &ConnectOptions, deadline: Instant) -> Res
         Some(proxy) => (proxy.host(), proxy.port()),
         None => (host, port),
     };
-    let dial = connect_tcp(addr.0, addr.1, options);
+    let dial = connect_tcp(addr.0, addr.1, options, deadline);
     let mut stream = match timeout_at(tokio::time::Instant::from_std(deadline), dial).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {
@@ -361,19 +361,54 @@ pub(crate) async fn open_tcp(options: &ConnectOptions, deadline: Instant) -> Res
 
 /// [`TcpStream::connect`] with the socket options that must be set before the handshake:
 /// tries each resolved address in turn and reports the last error.
-async fn connect_tcp(host: &str, port: u16, options: &ConnectOptions) -> io::Result<TcpStream> {
+///
+/// Each address but the last gets an equal share of what is left of the connect budget, at
+/// least [`MIN_ADDRESS_ATTEMPT`]: an address whose SYNs are silently dropped (often the IPv6
+/// one of a dual-stack host) would otherwise take the whole budget, and the address that works
+/// would never be tried. The last one gets the rest; the caller's deadline still ends it.
+async fn connect_tcp(host: &str, port: u16, options: &ConnectOptions, deadline: Instant) -> io::Result<TcpStream> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+    connect_any(&addrs, options, deadline).await
+}
+
+/// [`connect_tcp`] after the lookup.
+async fn connect_any(addrs: &[SocketAddr], options: &ConnectOptions, deadline: Instant) -> io::Result<TcpStream> {
     let mut last_error = None;
-    for addr in tokio::net::lookup_host((host, port)).await? {
-        match tcp_socket(addr, options) {
-            Ok(socket) => match socket.connect(addr).await {
-                Ok(stream) => return Ok(stream),
-                Err(error) => last_error = Some(error),
-            },
+    for (index, &addr) in addrs.iter().enumerate() {
+        let left = addrs.len() - index;
+        let socket = match tcp_socket(addr, options) {
+            Ok(socket) => socket,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+        let attempt = if left == 1 {
+            socket.connect(addr).await
+        } else {
+            let share = deadline
+                .saturating_duration_since(Instant::now())
+                .checked_div(u32::try_from(left).unwrap_or(u32::MAX))
+                .unwrap_or_default()
+                .max(MIN_ADDRESS_ATTEMPT);
+            match tokio::time::timeout(share, socket.connect(addr)).await {
+                Ok(attempt) => attempt,
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("TCP connect to {addr} timed out after {share:?}"),
+                )),
+            }
+        };
+        match attempt {
+            Ok(stream) => return Ok(stream),
             Err(error) => last_error = Some(error),
         }
     }
     Err(last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "could not resolve to any address")))
 }
+
+/// The least time [`connect_tcp`] gives an address before it tries the next one.
+const MIN_ADDRESS_ATTEMPT: Duration = Duration::from_millis(250);
 
 /// An unconnected socket for `addr` with the configured send / receive buffer sizes.
 fn tcp_socket(addr: SocketAddr, options: &ConnectOptions) -> io::Result<TcpSocket> {
@@ -771,5 +806,28 @@ mod tests {
         // unbounded inbound — production framed halves use ConnectOptions::max_packet_size.
         assert_eq!(framed_write.encoder().max_outbound_size(), 1024);
         assert_eq!(framed_read.decoder().max_inbound_size(), 0);
+    }
+
+    /// An address that never answers gets only its share of the connect budget, so the next
+    /// address, which works, is still reached in time.
+    #[tokio::test]
+    async fn a_silent_address_does_not_take_the_whole_connect_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let working = listener.local_addr().expect("addr");
+        // TEST-NET-1 (RFC 5737): never routed, so SYNs go unanswered or fail at once.
+        let silent: SocketAddr = format!("192.0.2.1:{}", working.port()).parse().expect("addr");
+        let options =
+            ConnectOptions::new(crate::BrokerUrl::parse(&format!("mqtt://127.0.0.1:{}", working.port())).expect("url"));
+        let started = std::time::Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let stream = super::connect_any(&[silent, working], &options, deadline)
+            .await
+            .expect("the second address connects");
+        assert_eq!(stream.peer_addr().expect("peer"), working);
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 }
