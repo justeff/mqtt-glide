@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An answered publish no longer keeps its caller's waker in the ack-deadline sweeper until its deadline or the next compaction, which held the caller's task allocation that long
 - The write buffer a burst of large publishes grew is now actually given back at the next keep-alive tick. The check read `BytesMut::capacity()`, which after a flush leaves out what was written, so a buffer that had held hundreds of KiB looked small and was kept
 
+### Security
+
+- A malformed PEM private key no longer puts the key into the error text. For a key whose line breaks were lost (an environment variable, JSON with a literal `\n`), the PEM parser's message quoted the whole key as the offending line, as a list of byte values, and it reached `TlsConfigError`, `TransportError::Tls` for the `*_file` variants, `SessionPhase::Disconnected` and whatever logged them. PEM errors now carry a fixed reason
+
 ### Fixed
 
 - Inbound PUBACKs leave in the order the PUBLISHes came in again while the client publishes too ([MQTT-4.6.0-2]). Since 0.5.0 the read task writes PUBACKs itself when the writer is free and hands them to the write task when it is not; a later burst written directly could overtake PUBACKs still waiting for the write task, within a few hundred messages under outbound load. Waiting PUBACKs are now kept in one queue that whoever writes next sends first, and the write task is woken once per batch instead of once per PUBACK

@@ -326,8 +326,20 @@ fn parse_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TlsConfigErro
     })
 }
 
+/// What went wrong in a PEM input, in fixed words. `pem::Error`'s own text quotes the
+/// offending bytes, and for a key whose line breaks were lost (an environment variable, JSON
+/// with literal `\n`) that "line" is the whole private key, which would end up in errors and
+/// the logs that print them.
 fn pem_error(error: pem::Error) -> TlsConfigError {
-    TlsConfigError::InvalidPem(error.to_string())
+    let reason = match error {
+        pem::Error::MissingSectionEnd { .. } => "a section has no END line",
+        pem::Error::IllegalSectionStart { .. } => "malformed BEGIN line (are the line breaks intact?)",
+        pem::Error::Base64Decode(_) => "invalid base64 in a section",
+        pem::Error::NoItemsFound => "no PEM section found",
+        pem::Error::SectionTooLarge => "a section is larger than 256 MB",
+        _ => "unreadable PEM",
+    };
+    TlsConfigError::InvalidPem(reason.to_owned())
 }
 
 fn root_store(anchors: &[CertificateDer<'static>]) -> Result<RootCertStore, TlsConfigError> {

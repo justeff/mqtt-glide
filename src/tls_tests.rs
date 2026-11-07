@@ -194,3 +194,28 @@ fn system_roots_fail_without_trust_anchors() {
     assert!(stdout.contains("ROOTS=tls:no system trust anchors found\n"), "{stdout}");
     assert!(stdout.contains("CUSTOM=ok\n"), "{stdout}");
 }
+
+/// A key whose line breaks were lost (an environment variable, JSON with literal `\n`) fails
+/// with a fixed reason, and neither the key's text nor its bytes appear in the error: the PEM
+/// parser's own message quotes the "line", which is then the whole key.
+#[test]
+fn mangled_key_error_does_not_contain_the_key() {
+    let key = std::str::from_utf8(CLIENT_KEY).expect("ascii");
+    let body: String = key.lines().filter(|line| !line.starts_with("-----")).collect();
+    let secret = &body[..24];
+    let secret_bytes = secret
+        .bytes()
+        .map(|byte| byte.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    for mangled in [key.replace('\n', "\\n"), key.replace('\n', " "), key.replace('\n', "")] {
+        let error = TlsConfig::ca_pem(CA)
+            .expect("ca")
+            .client_auth_pem(CLIENT, mangled.as_bytes())
+            .expect_err("mangled key");
+        let text = format!("{error} {error:?}");
+        assert!(!text.contains(secret), "key text in {text}");
+        assert!(!text.contains(&secret_bytes), "key bytes in {text}");
+        assert!(!text.contains("[45, 45"), "raw bytes in {text}");
+    }
+}
