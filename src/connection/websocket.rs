@@ -61,7 +61,7 @@ where
 
     let (ws, response) = match timeout_at(
         tokio::time::Instant::from_std(deadline),
-        tokio_tungstenite::client_async(request, stream),
+        tokio_tungstenite::client_async_with_config(request, stream, Some(ws_config(options.max_packet_size.get()))),
     )
     .await
     {
@@ -87,6 +87,18 @@ where
         read: Bytes::new(),
         write: BytesMut::new(),
     })
+}
+
+/// Frame and message limits that grow with the client's Maximum Packet Size past
+/// tungstenite's 16 MiB / 64 MiB, which let no packet above 16 MiB arrive. Twice the packet
+/// size, for servers that put several packets into one message ([MQTT-6.0.0-2]); never below
+/// tungstenite's limits, which such servers may already rely on.
+fn ws_config(max_packet_size: u32) -> tungstenite::protocol::WebSocketConfig {
+    const MIB: usize = 1024 * 1024;
+    let twice_a_packet = usize::try_from(max_packet_size).unwrap_or(usize::MAX).saturating_mul(2);
+    tungstenite::protocol::WebSocketConfig::default()
+        .max_frame_size(Some(twice_a_packet.max(16 * MIB)))
+        .max_message_size(Some(twice_a_packet.max(64 * MIB)))
 }
 
 fn ws_error(error: tungstenite::Error) -> ConnectionOutcome {
@@ -345,5 +357,18 @@ mod tests {
         let port = server(None, |_ws| Box::pin(async {})).await;
         let err = connect(port).await.err().expect("handshake must fail");
         assert!(format!("{err:?}").contains("subprotocol"), "got {err:?}");
+    }
+
+    /// The WebSocket limits grow with the client's Maximum Packet Size, with room for servers
+    /// that put several packets into one message, and never fall below tungstenite's 16 / 64 MiB.
+    #[test]
+    fn frame_limits_follow_the_maximum_packet_size() {
+        const MIB: usize = 1024 * 1024;
+        let small = super::ws_config(64 * 1024);
+        assert_eq!(small.max_frame_size, Some(16 * MIB));
+        assert_eq!(small.max_message_size, Some(64 * MIB));
+        let large = super::ws_config(48 * 1024 * 1024);
+        assert_eq!(large.max_frame_size, Some(96 * MIB));
+        assert_eq!(large.max_message_size, Some(96 * MIB));
     }
 }
