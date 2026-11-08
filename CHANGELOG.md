@@ -52,6 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An AUTH with Continue Authentication or Re-authenticate but no Authentication Method is answered with DISCONNECT 0x82 Protocol Error, as §3.15.2.2.2 says, instead of 0x81 Malformed Packet
 - An inbound Topic Alias binding keeps a copy of its topic instead of a slice of the PUBLISH it arrived in, which kept that whole frame, payload included, in memory for the life of the binding: up to `topic_alias_maximum × max_packet_size` with a broker that binds aliases on large messages
 - An inbound PUBLISH with a Topic Alias that was never bound on this connection is answered with DISCONNECT 0x82 Protocol Error as §3.3.4 says, not 0x94, which is for an alias of 0 or above the maximum
+- A `requester()` call dropped before its SUBACK (a timeout around it) no longer leaves the response topic routed: later messages on that topic were swallowed as responses nobody waits for, and `Requester::close` of a later requester on it did not unsubscribe
+- `topic_matches` returns `false` for a `$share` name with wildcards, an empty topic and a NUL, which its docs said match nothing
 - With outbound Topic Aliases on, a publish within a few bytes of the broker's Maximum Packet Size is sent without binding a new alias instead of failing with `InvalidRequest`: the alias property next to the full topic tipped it over the limit
 
 ## [0.5.0] - 2026-11-02

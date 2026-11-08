@@ -25,12 +25,14 @@
 pub fn topic_matches(filter: &str, topic: &str) -> bool {
     let filter = match filter.strip_prefix("$share/") {
         Some(rest) => match rest.split_once('/') {
-            Some((group, inner)) if !group.is_empty() => inner,
+            Some((group, inner)) if crate::util::validate_share_name(group).is_ok() => inner,
             _ => return false,
         },
         None => filter,
     };
-    if filter.is_empty() || topic.contains(['+', '#']) {
+    // An empty topic, or a NUL anywhere, is no topic a broker delivers ([MQTT-4.7.3-1],
+    // [MQTT-1.5.4-2]); a share name with wildcards is no shared subscription ([MQTT-4.8.2-2]).
+    if filter.is_empty() || topic.is_empty() || topic.contains(['+', '#', '\0']) || filter.contains('\0') {
         return false;
     }
     if topic.starts_with('$') && filter.starts_with(['+', '#']) {
@@ -93,5 +95,16 @@ mod tests {
         ] {
             assert_eq!(topic_matches(filter, topic), expected, "{filter:?} vs {topic:?}");
         }
+    }
+
+    /// A share name with wildcards, an empty topic and a NUL match nothing, as the docs say.
+    #[rstest::rstest]
+    #[case::share_name_plus("$share/+/a", "a")]
+    #[case::share_name_hash("$share/#/a", "a")]
+    #[case::empty_topic_plus("+", "")]
+    #[case::empty_topic_hash("#", "")]
+    #[case::nul("a\0", "a\0")]
+    fn invalid_filters_and_topics_match_nothing(#[case] filter: &str, #[case] topic: &str) {
+        assert!(!topic_matches(filter, topic));
     }
 }
