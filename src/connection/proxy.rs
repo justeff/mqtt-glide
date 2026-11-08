@@ -19,11 +19,14 @@ where
     } else {
         format!("{host}:{port}")
     };
-    let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+    // Every copy of the credentials is wiped when dropped, as `Password` promises.
+    let mut request = zeroize::Zeroizing::new(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n"));
     if let Some((user, password)) = proxy.credentials() {
-        let user_pass = [user.as_bytes(), b":", password.expose()].concat();
-        let token = base64(&user_pass);
-        request.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
+        let user_pass = zeroize::Zeroizing::new([user.as_bytes(), b":", password.expose()].concat());
+        let token = zeroize::Zeroizing::new(base64(&user_pass));
+        request.push_str("Proxy-Authorization: Basic ");
+        request.push_str(&token);
+        request.push_str("\r\n");
     }
     request.push_str("\r\n");
     stream.write_all(request.as_bytes()).await.map_err(proxy_io)?;
@@ -36,14 +39,38 @@ where
         .nth(1)
         .and_then(|code| code.parse::<u16>().ok())
         .filter(|_| status_line.starts_with("HTTP/1."))
-        .ok_or_else(|| TransportError::Connection(format!("HTTP proxy sent no HTTP status: {status_line:?}")))?;
+        .ok_or_else(|| {
+            TransportError::Connection(format!(
+                "HTTP proxy sent no HTTP status: \"{}\"",
+                printable(status_line)
+            ))
+        })?;
     if (200..300).contains(&status) {
         Ok(())
     } else {
         Err(TransportError::Connection(format!(
-            "HTTP proxy refused the tunnel: {status_line}"
+            "HTTP proxy refused the tunnel: {}",
+            printable(status_line)
         )))
     }
+}
+
+/// The proxy's status line as it may go into an error, and from there into logs: at most 120
+/// characters, control characters escaped, so a proxy cannot flood or drive a terminal.
+fn printable(line: &str) -> String {
+    const MAX: usize = 120;
+    let mut out = String::new();
+    for c in line.chars().take(MAX) {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    if line.chars().nth(MAX).is_some() {
+        out.push('…');
+    }
+    out
 }
 
 /// Reads up to the blank line ending the response head, one byte at a time so nothing past
@@ -164,5 +191,14 @@ mod tests {
         let error = result.expect_err("refused").to_string();
         assert!(error.contains("407"), "{error}");
         assert!(!request.contains("Proxy-Authorization"), "no credentials configured");
+    }
+
+    /// A proxy's status line reaches the error shortened and with control characters escaped.
+    #[test]
+    fn status_line_is_made_printable() {
+        let hostile = format!("HTTP/1.1 403 \u{1b}[2J{}", "x".repeat(500));
+        let shown = super::printable(&hostile);
+        assert!(!shown.contains('\u{1b}'), "{shown}");
+        assert!(shown.chars().count() <= 130, "{}", shown.len());
     }
 }
