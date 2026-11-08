@@ -1284,3 +1284,54 @@ async fn dropping_the_driver_ends_the_session() {
     );
     peer.abort();
 }
+
+/// A `requester()` call given up before its SUBACK leaves no route behind: a later message on
+/// that topic reaches the application instead of being swallowed as a response nobody waits for.
+#[tokio::test]
+async fn cancelled_requester_leaves_no_route_behind() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+    let broker = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buf = vec![0u8; 4096];
+        let _ = socket.read(&mut buf).await.expect("CONNECT");
+        socket
+            .write_all(&[0x20, 0x03, 0x00, 0x00, 0x00])
+            .await
+            .expect("CONNACK");
+        // Never answers the SUBSCRIBE; on cue delivers a QoS 0 PUBLISH with Correlation Data.
+        let _ = go_rx.await;
+        let topic = b"svc/replies";
+        let mut body = Vec::new();
+        body.extend_from_slice(&u16::try_from(topic.len()).expect("short").to_be_bytes());
+        body.extend_from_slice(topic);
+        body.extend_from_slice(&[5, 0x09, 0, 2, b'c', b'1']);
+        body.extend_from_slice(b"payload");
+        let mut frame = vec![0x30, u8::try_from(body.len()).expect("short")];
+        frame.extend_from_slice(&body);
+        socket.write_all(&frame).await.expect("PUBLISH");
+        std::future::pending::<()>().await;
+    });
+
+    let (tx, mut rx) = mpsc::channel::<InboundMessage>(4);
+    let client = mqtt_glide::ClientBuilder::new(format!("mqtt://127.0.0.1:{port}"))
+        .expect("url")
+        .inbound_sink(tx)
+        .connect()
+        .await
+        .expect("connect");
+    let gave_up = timeout(Duration::from_millis(200), client.requester("svc/replies")).await;
+    assert!(gave_up.is_err(), "the SUBACK never comes");
+
+    let _ = go_tx.send(());
+    let message = timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .expect("delivered to the application")
+        .expect("open");
+    assert_eq!(&*message.topic, "svc/replies");
+    client.shutdown().await.expect("shutdown");
+    broker.abort();
+}

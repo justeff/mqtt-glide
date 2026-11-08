@@ -158,16 +158,24 @@ impl Requester {
             ));
         }
         let router = client.response_router();
-        // Route before the subscription exists, so an early response is never missed.
+        // Route before the subscription exists, so an early response is never missed. The
+        // guard takes the route back unless the subscription is granted, also when the caller
+        // drops this future mid-way (a timeout around it): the topic would stay routed for
+        // good, its messages swallowed, and the count one too high for `close`.
         router.add_topic(response_topic.clone());
+        let mut route = RouteGuard {
+            router: &router,
+            topic: Some(&response_topic),
+        };
         let subscribed = client.subscribe([(response_topic.clone(), QoS::AtLeastOnce)]).await;
         let refused = match &subscribed {
             Ok(response) => response.iter().find(|reason| !reason.is_granted()).copied(),
             Err(_) => None,
         };
-        if subscribed.is_err() || refused.is_some() {
-            router.remove_topic(&response_topic);
+        if subscribed.is_ok() && refused.is_none() {
+            route.topic = None;
         }
+        drop(route);
         subscribed?;
         if let Some(reason) = refused {
             return Err(AppError::InvalidRequest(format!(
@@ -207,6 +215,20 @@ impl Requester {
             return Ok(());
         }
         self.client.unsubscribe([self.response_topic]).await.map(|_| ())
+    }
+}
+
+/// Takes a response topic's route back when dropped, unless `topic` was cleared.
+struct RouteGuard<'a> {
+    router: &'a ResponseRouter,
+    topic: Option<&'a ByteString>,
+}
+
+impl Drop for RouteGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(topic) = self.topic {
+            self.router.remove_topic(topic);
+        }
     }
 }
 
