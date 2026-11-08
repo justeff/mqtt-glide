@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- HTTP proxy: the copies of the proxy credentials made for each tunnel (the `user:password` string, its Basic token, the request) are wiped when dropped, as `Password` promises, and the proxy's status line goes into errors shortened to 120 characters with control characters escaped, so a hostile proxy cannot inject escape sequences into logs or terminals
 - A malformed PEM private key no longer puts the key into the error text. For a key whose line breaks were lost (an environment variable, JSON with a literal `\n`), the PEM parser's message quoted the whole key as the offending line, as a list of byte values, and it reached `TlsConfigError`, `TransportError::Tls` for the `*_file` variants, `SessionPhase::Disconnected` and whatever logged them. PEM errors now carry a fixed reason
 
 ### Fixed
@@ -53,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An inbound Topic Alias binding keeps a copy of its topic instead of a slice of the PUBLISH it arrived in, which kept that whole frame, payload included, in memory for the life of the binding: up to `topic_alias_maximum × max_packet_size` with a broker that binds aliases on large messages
 - An inbound PUBLISH with a Topic Alias that was never bound on this connection is answered with DISCONNECT 0x82 Protocol Error as §3.3.4 says, not 0x94, which is for an alias of 0 or above the maximum
 - A `requester()` call dropped before its SUBACK (a timeout around it) no longer leaves the response topic routed: later messages on that topic were swallowed as responses nobody waits for, and `Requester::close` of a later requester on it did not unsubscribe
+- `HttpProxy::parse` keeps the password as the bytes the URL encodes (`%FC` is 0xFC, not a replacement character), takes `%` only before two hex digits, and refuses a user name with `:` with the new `BrokerUrlError::InvalidProxyCredentials`, since Basic authentication cannot carry it
 - `topic_matches` returns `false` for a `$share` name with wildcards, an empty topic and a NUL, which its docs said match nothing
 - With outbound Topic Aliases on, a publish within a few bytes of the broker's Maximum Packet Size is sent without binding a new alias instead of failing with `InvalidRequest`: the alias property next to the full topic tipped it over the limit
 

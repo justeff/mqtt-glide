@@ -41,6 +41,10 @@ pub enum BrokerUrlError {
     /// A proxy URL with a scheme other than `http://` (see [`crate::HttpProxy::parse`]).
     #[error("proxy URL must start with http://")]
     UnsupportedProxyScheme,
+    /// Proxy credentials that cannot be sent as given: a user name with `:`, which Basic
+    /// authentication cannot tell from the separator, or one that is not UTF-8.
+    #[error("proxy URL user name must be UTF-8 without ':'")]
+    InvalidProxyCredentials,
 }
 
 impl BrokerUrl {

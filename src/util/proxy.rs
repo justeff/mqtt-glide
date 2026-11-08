@@ -58,7 +58,12 @@ impl HttpProxy {
         let mut proxy = Self::new(host, port);
         if let Some(userinfo) = userinfo {
             let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
-            proxy = proxy.basic_auth(percent_decode(user), percent_decode(password));
+            let user = String::from_utf8(percent_decode(user)).map_err(|_| BrokerUrlError::InvalidProxyCredentials)?;
+            if user.contains(':') {
+                return Err(BrokerUrlError::InvalidProxyCredentials);
+            }
+            // The password stays bytes: a `%FC` is the byte 0xFC, not a replacement character.
+            proxy = proxy.basic_auth(user, Password::from(percent_decode(password)));
         }
         Ok(proxy)
     }
@@ -95,23 +100,25 @@ impl fmt::Debug for HttpProxy {
     }
 }
 
-/// Decodes `%XX` escapes; anything malformed is kept as written.
-fn percent_decode(input: &str) -> String {
+/// Decodes `%XX` escapes (two hex digits; anything else is kept as written) into bytes.
+fn percent_decode(input: &str) -> Vec<u8> {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%'
-            && let Some(byte) = input.get(i + 1..i + 3).and_then(|hex| u8::from_str_radix(hex, 16).ok())
+            && let Some(hex) = bytes.get(i + 1..i + 3)
+            && hex.iter().all(u8::is_ascii_hexdigit)
         {
-            out.push(byte);
+            let hex = std::str::from_utf8(hex).expect("ASCII hex digits");
+            out.push(u8::from_str_radix(hex, 16).expect("two hex digits"));
             i += 3;
         } else {
             out.push(bytes[i]);
             i += 1;
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 #[cfg(test)]
@@ -152,5 +159,19 @@ mod tests {
         let proxy = HttpProxy::new("proxy", 3128).basic_auth("svc", "hunter2");
         let shown = format!("{proxy:?}");
         assert!(shown.contains("svc") && !shown.contains("hunter2"), "{shown}");
+    }
+
+    /// The password is decoded to bytes, as given: a `%FC` is 0xFC, a sign is no hex digit,
+    /// and a user name with `:` (which Basic cannot carry) is refused.
+    #[test]
+    fn credentials_are_decoded_exactly() {
+        let proxy = HttpProxy::parse("http://u:p%FCss@h:1").expect("valid");
+        assert_eq!(proxy.credentials().expect("credentials").1.expose(), b"p\xFCss");
+        let proxy = HttpProxy::parse("http://u:%+1@h:1").expect("valid");
+        assert_eq!(proxy.credentials().expect("credentials").1.expose(), b"%+1");
+        assert!(matches!(
+            HttpProxy::parse("http://us%3Aer:p@h:1"),
+            Err(BrokerUrlError::InvalidProxyCredentials)
+        ));
     }
 }
