@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- `InboundMessage` and the README say that a kept message holds the read buffer it came from, and with it neighbouring messages, and how to copy out what you keep
 - `reauthenticate()` is not bounded in wall-clock time while the inbound sink is full, since time the read task waits for room does not count against `ack_timeout`; the docs say so and suggest a timeout of your own
 - The `invalidate` hooks say when they run: also on a broker DISCONNECT 0x87 / 0x8C during a session, which brokers send for ACL violations with valid credentials too, and for `Authenticator::invalidate` when `finish` rejects the broker. The README said CONNECT refusals only. The authenticator steps' time limits are documented
 

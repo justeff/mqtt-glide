@@ -240,6 +240,12 @@ impl std::fmt::Debug for PublishMessage {
 /// subscribe) from a live one, [`Self::dup`] marks a possible redelivery (QoS 1), and
 /// [`Self::qos`] is the QoS the broker delivered it with. Wire-level details (packet id,
 /// topic alias) are not exposed.
+///
+/// Topic, payload and properties are slices of the buffer the message was read into, not
+/// copies. Keeping a message keeps that buffer, which can hold other messages read with it:
+/// a small message kept for long (a last-value cache) can hold large neighbours that were
+/// dropped long ago. To keep only what you need, copy it out, for example
+/// `Bytes::copy_from_slice(&message.payload)`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct InboundMessage {
     /// Topic Name (aliases already resolved).
