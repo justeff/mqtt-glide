@@ -284,11 +284,11 @@ impl ConnectAck {
                         DecodeError::ProtocolViolation("property included more than once")
                     );
                     ensure!(prop_src.has_remaining(), DecodeError::InvalidLength);
-                    let qos: QoS = prop_src.get_u8().try_into()?;
-                    ensure!(
-                        qos != QoS::ExactlyOnce,
-                        DecodeError::ProtocolViolation("CONNACK Maximum QoS must be 0 or 1")
-                    );
+                    // Any value but 0 or 1 is a Protocol Error, 3 to 255 as much as 2.
+                    let qos = QoS::try_from(prop_src.get_u8())
+                        .ok()
+                        .filter(|qos| *qos != QoS::ExactlyOnce)
+                        .ok_or(DecodeError::ProtocolViolation("CONNACK Maximum QoS must be 0 or 1"))?;
                     max_qos = Some(qos);
                 }
                 pt::RETAIN_AVAIL => retain_available.read_value(prop_src)?,
@@ -437,6 +437,10 @@ mod tests {
     #[rstest::rstest]
     #[case::receive_maximum_zero(&[0x00, 0x00, 0x03, 0x21, 0x00, 0x00])] // §3.2.2.3.3
     #[case::maximum_qos_two(&[0x00, 0x00, 0x02, 0x24, 0x02])] // §3.2.2.3.4
+    #[case::maximum_qos_three(&[0x00, 0x00, 0x02, 0x24, 0x03])] // §3.2.2.3.4
+    #[case::retain_available_two(&[0x00, 0x00, 0x02, 0x25, 0x02])] // §3.2.2.3.5
+    #[case::wildcard_available_two(&[0x00, 0x00, 0x02, 0x28, 0x02])] // §3.2.2.3.11
+    #[case::shared_available_two(&[0x00, 0x00, 0x02, 0x2A, 0x02])] // §3.2.2.3.13
     #[case::duplicate_property(&[0x00, 0x00, 0x04, 0x25, 0x01, 0x25, 0x01])] // §2.2.2.2
     fn connack_protocol_errors_map_to_reason_0x82(#[case] wire: &'static [u8]) {
         let error = ConnectAck::decode(&mut Bytes::from_static(wire)).expect_err("Protocol Error");

@@ -44,7 +44,9 @@ impl<T: Decode> Property for Option<T> {
 impl Decode for bool {
     fn decode(src: &mut Bytes) -> Result<Self, DecodeError> {
         let v = WireReader::new(src).read_u8()?;
-        ensure!(v <= 0x1, DecodeError::MalformedPacket("invalid encoding"));
+        // Every one-byte flag property of MQTT 5 says a value other than 0 or 1 is a Protocol
+        // Error (§3.1.2.11.7, §3.2.2.3.5, §3.2.2.3.11-14, §3.3.2.3.2), not a malformed packet.
+        ensure!(v <= 0x1, DecodeError::ProtocolViolation("flag property must be 0 or 1"));
         Ok(v == 0x1)
     }
 }
