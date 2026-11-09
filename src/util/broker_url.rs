@@ -45,6 +45,10 @@ pub enum BrokerUrlError {
     /// authentication cannot tell from the separator, or one that is not UTF-8.
     #[error("proxy URL user name must be UTF-8 without ':'")]
     InvalidProxyCredentials,
+    /// A `ws://` / `wss://` path with characters an HTTP request target cannot carry
+    /// (whitespace, control characters, non-ASCII) or a `#fragment`; percent-encode them.
+    #[error("WebSocket path must be ASCII without spaces, control characters or a fragment")]
+    InvalidWebSocketPath,
 }
 
 impl BrokerUrl {
@@ -92,6 +96,11 @@ impl BrokerUrl {
             Some(index) => rest.split_at(index),
             None => (rest, "/"),
         };
+        // Checked here, not on every connect: a path the HTTP request cannot carry failed each
+        // attempt after TCP (and TLS) were already up, and a fragment was dropped unsaid.
+        if path.bytes().any(|byte| !byte.is_ascii_graphic() || byte == b'#') {
+            return Err(BrokerUrlError::InvalidWebSocketPath);
+        }
         let default_port = if use_tls { DEFAULT_WSS_PORT } else { DEFAULT_WS_PORT };
         let (host, port) = split_host_port(host_port, default_port)?;
         Ok(Self {
@@ -289,6 +298,17 @@ mod tests {
             (url.host(), url.port(), url.use_tls(), url.websocket_path()),
             (host, port, tls, Some(path))
         );
+    }
+
+    /// A path the HTTP request target cannot carry is refused when the URL is parsed.
+    #[cfg(feature = "websocket")]
+    #[rstest]
+    #[case::space("wss://h/a b")]
+    #[case::fragment("ws://h/mqtt#frag")]
+    #[case::non_ascii("ws://h/m\u{e4}tt")]
+    #[case::control("ws://h/a\tb")]
+    fn websocket_paths_must_fit_a_request_target(#[case] input: &str) {
+        assert_eq!(BrokerUrl::parse(input), Err(BrokerUrlError::InvalidWebSocketPath));
     }
 
     #[cfg(not(feature = "websocket"))]
