@@ -184,7 +184,12 @@ where
             Packet::Disconnect(Disconnect::new(disconnect_reason)),
             flush_abort,
         )
-        .await
+        .await?;
+        // Then close the transport too, within the same budget: TLS sends its close_notify and
+        // WebSocket its Close frame, which brokers and gateways otherwise log as an abrupt end.
+        // Nothing follows the DISCONNECT on the MQTT level, so a failure here changes nothing.
+        let _ = SinkExt::<Packet>::close(framed).await;
+        Ok(())
     };
 
     let drained = tokio::time::timeout(flush_budget, drain).await;
