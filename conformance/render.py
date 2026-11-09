@@ -89,6 +89,8 @@ def status(row, tests, code):
         return "server"
     if row["scope"] == "unsupported":
         return "unsupported"
+    if row["scope"] == "deviates":
+        return "deviates"
     if tests.get(row["id"]):
         return "tested"
     if code.get(row["id"]):
@@ -98,6 +100,7 @@ def status(row, tests, code):
 
 LABEL = {
     "tested": "✅ tested",
+    "deviates": "⚠️ deliberate deviation",
     "implemented": "🟡 implemented, no test names it",
     "open": "❌ no reference",
     "server": "— server obligation",
@@ -121,7 +124,7 @@ def render(rows, tests, code):
     counts = defaultdict(int)
     for row in rows:
         counts[status(row, tests, code)] += 1
-    client_total = counts["tested"] + counts["implemented"] + counts["open"]
+    client_total = counts["tested"] + counts["implemented"] + counts["open"] + counts["deviates"]
     out = [
         "# MQTT 5.0 conformance",
         "",
@@ -138,6 +141,7 @@ def render(rows, tests, code):
         f"| … ✅ named by at least one test | {counts['tested']} |",
         f"| … 🟡 implemented, cited only in library code | {counts['implemented']} |",
         f"| … ❌ no reference yet | {counts['open']} |",
+        f"| … ⚠️ deliberately read or applied differently (the note says why) | {counts['deviates']} |",
         f"| Binding only the Server | {counts['server']} |",
         f"| Part of a feature this client does not implement (QoS 2) | {counts['unsupported']} |",
         "",

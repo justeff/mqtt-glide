@@ -10,9 +10,10 @@ only when a test names it.
 | | Statements |
 |---|---:|
 | Binding a client (or both peers, the sender, the receiver) | 109 |
-| … ✅ named by at least one test | 109 |
+| … ✅ named by at least one test | 107 |
 | … 🟡 implemented, cited only in library code | 0 |
 | … ❌ no reference yet | 0 |
+| … ⚠️ deliberately read or applied differently (the note says why) | 2 |
 | Binding only the Server | 117 |
 | Part of a feature this client does not implement (QoS 2) | 25 |
 
@@ -111,7 +112,7 @@ covered by the statement that binds the client.
 | **[MQTT-3.2.2-1]** Byte 1 is the "Connect Acknowledge Flags". Bits 7-1 are reserved and MUST be set to 0. | ✅ tested | `connack_rejects_reserved_ack_flags_bits_7_through_1` (src/codec/v5/packet/connack.rs) |
 | **[MQTT-3.2.2-2]** If the Server accepts a connection with Clean Start set to 1, the Server MUST set Session Present to 0 in the CONNACK packet in addition to setting a 0x00 (Success) Reason Code in the CONNACK packet. | — server obligation | `clean_start_session_present_stops_without_reconnect` (tests/connection.rs) |
 | **[MQTT-3.2.2-3]** If the Server accepts a connection with Clean Start set to 0 and the Server has Session State for the ClientID, it MUST set Session Present to 1 in the CONNACK packet, otherwise it MUST set Session Present to 0 in the CONNACK packet. In both cases it MUST set a 0x00 (Success) Reason Code in the CONNACK packet. | — server obligation |  |
-| **[MQTT-3.2.2-4]** If the Client does not have Session State and receives Session Present set to 1 it MUST close the Network Connection. | ✅ tested | With Clean Start 0 the client holds Session State (empty after a restart), so it resumes<br>`first_connect_resumes_an_existing_broker_session` (tests/connection.rs) |
+| **[MQTT-3.2.2-4]** If the Client does not have Session State and receives Session Present set to 1 it MUST close the Network Connection. | ⚠️ deliberate deviation | Not closed: with Clean Start 0 the client always holds Session State, empty after a restart, and closing would loop on every reconnect; it resumes the broker's session instead<br>`first_connect_resumes_an_existing_broker_session` (tests/connection.rs) |
 | **[MQTT-3.2.2-5]** If the Client does have Session State and receives Session Present set to 0 it MUST discard its Session State if it continues with the Network Connection. | ✅ tested | `unacked_qos1_fails_when_broker_lost_the_session` (src/client.rs) |
 | **[MQTT-3.2.2-6]** If a Server sends a CONNACK packet containing a non-zero Reason Code it MUST set Session Present to 0. | — server obligation |  |
 | **[MQTT-3.2.2-7]** If a Server sends a CONNACK packet containing a Reason code of 0x80 or greater it MUST then close the Network Connection. | — server obligation |  |
@@ -275,7 +276,7 @@ covered by the statement that binds the client.
 |---|---|---|
 | **[MQTT-3.14.0-1]** A Server MUST NOT send a DISCONNECT until after it has sent a CONNACK with Reason Code of less than 0x80. | — server obligation |  |
 | **[MQTT-3.14.1-1]** The Client or Server MUST validate that reserved bits are set to 0. If they are not zero it sends a DISCONNECT packet with a Reason code of 0x81 (Malformed Packet). | ✅ tested | `read_task_malformed_or_truncated_inbound` (src/connection/io_mock_tests.rs)<br>`malformed_packet_disconnect_always_reaches_the_broker` (src/connection/reconnect_tests.rs) |
-| **[MQTT-3.14.2-1]** The Client or Server sending the DISCONNECT packet MUST use one of the DISCONNECT Reason Codes. | ✅ tested | `test_encode_connect_packets` (src/codec/v5/encode.rs)<br>`protocol_disconnect_is_terminal_no_frames_after` (src/connection/write/tests.rs) |
+| **[MQTT-3.14.2-1]** The Client or Server sending the DISCONNECT packet MUST use one of the DISCONNECT Reason Codes. | ✅ tested | The client sends only defined codes; it reads an undefined failure code from a broker (EMQX sends CONNACK codes) as the nearest defined one instead of a malformed packet<br>`test_encode_connect_packets` (src/codec/v5/encode.rs)<br>`protocol_disconnect_is_terminal_no_frames_after` (src/connection/write/tests.rs) |
 | **[MQTT-3.14.2-2]** The Session Expiry Interval MUST NOT be sent on a DISCONNECT by the Server. | — server obligation | src/connection/read.rs |
 | **[MQTT-3.14.2-3]** The sender MUST NOT use this Property if it would increase the size of the DISCONNECT packet beyond the Maximum Packet Size specified by the receiver. | ✅ tested | `reason_string_is_sent_only_when_the_budget_holds_it` (src/codec/v5/encode.rs) |
 | **[MQTT-3.14.2-4]** The sender MUST NOT send this property if it would increase the size of the DISCONNECT packet beyond the Maximum Packet Size specified by the receiver. | ✅ tested | `disconnect_encode_omits_user_property_when_it_exceeds_max_packet_size` (src/codec/v5/packet/disconnect.rs) |
@@ -333,7 +334,7 @@ covered by the statement that binds the client.
 
 | Statement | Status | Evidence |
 |---|---|---|
-| **[MQTT-4.4.0-1]** When a Client reconnects with Clean Start set to 0 and a session is present, both the Client and Server MUST resend any unacknowledged PUBLISH packets (where QoS > 0) and PUBREL packets using their original Packet Identifiers. This is the only circumstance where a Client or Server is REQUIRED to resend messages. Clients and Servers MUST NOT resend messages at any other time. | ✅ tested | Except a publish the broker disconnected on the last three times it was sent, which fails with PublishRefusedByDisconnect<br>`unacked_qos1_beyond_a_smaller_receive_maximum_waits_and_is_resent` (src/client.rs)<br>`unacked_qos1_fails_when_broker_lost_the_session` (src/client.rs)<br>`unacked_qos1_is_resent_with_dup_on_session_resume` (src/client.rs)<br>+2 more |
+| **[MQTT-4.4.0-1]** When a Client reconnects with Clean Start set to 0 and a session is present, both the Client and Server MUST resend any unacknowledged PUBLISH packets (where QoS > 0) and PUBREL packets using their original Packet Identifiers. This is the only circumstance where a Client or Server is REQUIRED to resend messages. Clients and Servers MUST NOT resend messages at any other time. | ⚠️ deliberate deviation | Resent, except a publish the broker disconnected on in three connections in a row, which fails with PublishRefusedByDisconnect instead of looping for good<br>`unacked_qos1_beyond_a_smaller_receive_maximum_waits_and_is_resent` (src/client.rs)<br>`unacked_qos1_fails_when_broker_lost_the_session` (src/client.rs)<br>`unacked_qos1_is_resent_with_dup_on_session_resume` (src/client.rs)<br>+2 more |
 | **[MQTT-4.4.0-2]** If PUBACK or PUBREC is received containing a Reason Code of 0x80 or greater the corresponding PUBLISH packet is treated as acknowledged, and MUST NOT be retransmitted. | ✅ tested | `rejected_qos1_is_not_resent_on_session_resume` (src/client.rs) |
 
 ## 4.5
