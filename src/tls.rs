@@ -355,10 +355,11 @@ fn root_store(anchors: &[CertificateDer<'static>]) -> Result<RootCertStore, TlsC
 /// Adds the OS trust store; with `required`, finding no usable anchor is an error.
 fn system_root_store(mut store: RootCertStore, required: bool) -> Result<RootCertStore, String> {
     let native = rustls_native_certs::load_native_certs();
-    for cert in native.certs {
-        store
-            .add(cert)
-            .map_err(|error| format!("invalid system trust anchor: {error}"))?;
+    // One certificate the OS store holds but rustls cannot parse must not fail every TLS
+    // connect: it is skipped, as browsers do. Only a store with no usable anchor is an error.
+    let (_added, skipped) = store.add_parsable_certificates(native.certs);
+    if skipped > 0 {
+        tracing::warn!(skipped, "system trust store: skipped certificates rustls cannot parse");
     }
     if required && store.is_empty() {
         return Err(native
