@@ -48,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance
 
 - Concurrent QoS 1 publishing: about 12 % more throughput with 512 callers on one client
+- QoS 1 through `publish_window`: about 15 % more throughput and a quarter less CPU per message with a window of 64
 - The write buffer of an idle connection is actually released after a burst of large publishes
 - Resending a resumed session's publishes flushes as it goes instead of buffering them all first
 - An answered publish no longer keeps its caller's waker in the ack-deadline sweeper

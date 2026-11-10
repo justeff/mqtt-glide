@@ -651,6 +651,21 @@ async fn accept_publish_preferring_completed_push<H: InboundSink, W: AsyncWrite 
     }
 }
 
+/// Hands an acknowledgement to the write task, waiting only while the channel is full.
+///
+/// `Sender::send` takes a unit of Tokio's cooperative budget even with room in the channel, and
+/// tasks woken through the LIFO slot (write task, then the publisher awaiting the PUBACK) share
+/// this task's budget. A burst of PUBACKs left the publisher too little to finish its window;
+/// resuming it woke a second worker, which often moved the connection to another core.
+async fn send_ack(control_tx: &mpsc::Sender<ControlMessage>, message: ControlMessage) -> Option<ReadOutcome> {
+    let sent = match control_tx.try_send(message) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(message)) => control_tx.send(message).await.is_ok(),
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    };
+    (!sent).then_some(ReadOutcome::PeerClosed)
+}
+
 async fn dispatch_control(
     packet: Packet,
     generation: Generation,
@@ -666,36 +681,9 @@ async fn dispatch_control(
             }
             Some(ReadOutcome::BrokerDisconnect(Box::new(disconnect)))
         }
-        Packet::SubscribeAck(ack) => {
-            if control_tx
-                .send(ControlMessage::SubscribeAck { ack, generation })
-                .await
-                .is_err()
-            {
-                return Some(ReadOutcome::PeerClosed);
-            }
-            None
-        }
-        Packet::UnsubscribeAck(ack) => {
-            if control_tx
-                .send(ControlMessage::UnsubscribeAck { ack, generation })
-                .await
-                .is_err()
-            {
-                return Some(ReadOutcome::PeerClosed);
-            }
-            None
-        }
-        Packet::PublishAck(ack) => {
-            if control_tx
-                .send(ControlMessage::PublishAck { ack, generation })
-                .await
-                .is_err()
-            {
-                return Some(ReadOutcome::PeerClosed);
-            }
-            None
-        }
+        Packet::SubscribeAck(ack) => send_ack(control_tx, ControlMessage::SubscribeAck { ack, generation }).await,
+        Packet::UnsubscribeAck(ack) => send_ack(control_tx, ControlMessage::UnsubscribeAck { ack, generation }).await,
+        Packet::PublishAck(ack) => send_ack(control_tx, ControlMessage::PublishAck { ack, generation }).await,
         // QoS 2 handshake packets are out of scope: this client never sends or grants QoS 2,
         // so they are a protocol violation, answered with DISCONNECT 0x82 like any other.
         Packet::PublishReceived(_) | Packet::PublishRelease(_) | Packet::PublishComplete(_) => Some(
@@ -1049,5 +1037,50 @@ mod tests {
             .collect();
         assert_eq!(queued, [1, 2]);
         assert!(acks.ids.is_empty());
+    }
+
+    /// A burst of acknowledgements leaves the cooperative budget (128 per poll) to the tasks
+    /// that run after the read task; `Sender::send` would stop at the 129th.
+    #[tokio::test]
+    async fn acknowledgements_do_not_use_the_cooperative_budget() {
+        use futures_util::FutureExt;
+
+        let (control_tx, control_rx) = mpsc::channel(256);
+        // A spawned task: only those are polled with a budget on every runtime.
+        tokio::spawn(async move {
+            for sent in 0..200 {
+                let outcome = super::send_ack(&control_tx, super::ControlMessage::FlushWrites).now_or_never();
+                assert_eq!(outcome, Some(None), "acknowledgement {sent} waited");
+            }
+        })
+        .await
+        .expect("burst");
+        assert_eq!(control_rx.len(), 200);
+    }
+
+    /// A full channel still holds the read task back, and a closed one ends it.
+    #[tokio::test]
+    async fn acknowledgement_waits_for_room_in_a_full_channel() {
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        control_tx.try_send(super::ControlMessage::FlushWrites).expect("fill");
+
+        let waiting = super::send_ack(&control_tx, super::ControlMessage::AcksPending);
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        assert!(matches!(
+            control_rx.recv().await,
+            Some(super::ControlMessage::FlushWrites)
+        ));
+        assert_eq!(waiting.await, None);
+        assert!(matches!(
+            control_rx.recv().await,
+            Some(super::ControlMessage::AcksPending)
+        ));
+
+        drop(control_rx);
+        assert_eq!(
+            super::send_ack(&control_tx, super::ControlMessage::FlushWrites).await,
+            Some(super::ReadOutcome::PeerClosed)
+        );
     }
 }
