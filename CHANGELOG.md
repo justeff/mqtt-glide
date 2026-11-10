@@ -7,61 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- A malformed PEM private key no longer ends up in error messages. With lost line breaks (environment variable, JSON) the parser quoted the whole key
+- HTTP proxy: copies of the proxy credentials are wiped after use, and the proxy's status line is shortened and escaped before it goes into an error
+
 ### Added
 
 - `AppError::PublishRefusedByDisconnect`: a QoS 1 publish given up after the broker disconnected on it three times in a row (see Fixed)
-
-### Documentation
-
-- `InboundMessage` and the README say that a kept message holds the read buffer it came from, and with it neighbouring messages, and how to copy out what you keep
-- `reauthenticate()` is not bounded in wall-clock time while the inbound sink is full, since time the read task waits for room does not count against `ack_timeout`; the docs say so and suggest a timeout of your own
-- The `invalidate` hooks say when they run: also on a broker DISCONNECT 0x87 / 0x8C during a session, which brokers send for ACL violations with valid credentials too, and for `Authenticator::invalidate` when `finish` rejects the broker. The README said CONNECT refusals only. The authenticator steps' time limits are documented
-
-### Performance
-
-- Concurrent QoS 1 publishing: after each PUBACK from the broker the write task also takes the control messages already queued, mostly more PUBACKs, instead of one turn of its loop each. 64 callers on one client against the bench's mock broker: about +18 % msg/s, 8 % less CPU per message, p99 about 220 µs → 130 µs
-- Resending the unacknowledged publishes of a resumed session flushes as the buffer fills, as new publishes do, instead of encoding them all first. With a broker announcing a large Receive Maximum and many large publishes outstanding, the write buffer grew to their sum
-- An answered publish no longer keeps its caller's waker in the ack-deadline sweeper until its deadline or the next compaction, which held the caller's task allocation that long
-- The write buffer a burst of large publishes grew is now actually given back at the next keep-alive tick. The check read `BytesMut::capacity()`, which after a flush leaves out what was written, so a buffer that had held hundreds of KiB looked small and was kept
-
-### Security
-
-- HTTP proxy: the copies of the proxy credentials made for each tunnel (the `user:password` string, its Basic token, the request) are wiped when dropped, as `Password` promises, and the proxy's status line goes into errors shortened to 120 characters with control characters escaped, so a hostile proxy cannot inject escape sequences into logs or terminals
-- A malformed PEM private key no longer puts the key into the error text. For a key whose line breaks were lost (an environment variable, JSON with a literal `\n`), the PEM parser's message quoted the whole key as the offending line, as a list of byte values, and it reached `TlsConfigError`, `TransportError::Tls` for the `*_file` variants, `SessionPhase::Disconnected` and whatever logged them. PEM errors now carry a fixed reason
+- `BrokerUrlError::InvalidWebSocketPath` and `BrokerUrlError::InvalidProxyCredentials`
 
 ### Fixed
 
-- Inbound PUBACKs leave in the order the PUBLISHes came in again while the client publishes too ([MQTT-4.6.0-2]). Since 0.5.0 the read task writes PUBACKs itself when the writer is free and hands them to the write task when it is not; a later burst written directly could overtake PUBACKs still waiting for the write task, within a few hundred messages under outbound load. Waiting PUBACKs are now kept in one queue that whoever writes next sends first, and the write task is woken once per batch instead of once per PUBACK
-- `Duration::MAX` as `ack_timeout` or `connect_timeout` (the usual way to ask for no timeout) no longer panics. A plain `Instant + Duration` overflowed: on connect with `connect_timeout`, and with `ack_timeout` in `reauthenticate()`, which stopped the client for good, and when a publish waited for room in a full command channel. Such deadlines now lie about 30 years ahead
-- `shutdown()` closes the transport after the DISCONNECT, within the same budget: TLS sends its close_notify and WebSocket its Close frame. Brokers and gateways logged the end as abrupt before
-- `ClientBuilder::connect()` with `follow_server_redirects(true)` follows a redirecting CONNACK (0x9C / 0x9D) on the first connection instead of failing with `ConnectRefused`. The followed redirect was reported as `SessionPhase::Disconnected`, which the builder took for a failed connect and stopped the driver mid-redirect. A followed CONNACK redirect no longer reports a disconnect at all, since no session ended; a DISCONNECT redirect of a running session still does
-- A QoS 1 publish of a resumed session that the broker answers with a DISCONNECT each time (an ACL refusal with EMQX's `deny_action = disconnect`, a payload over a quota) is no longer resent on every reconnect for ever, with everything else queued behind it and, for `NotAuthorized`, the credentials invalidated on every round. When three connections in a row end with a DISCONNECT that can refuse a publish while it is the oldest unacknowledged one (the broker acknowledges in order, so the one it stopped at), it fails with the new `AppError::PublishRefusedByDisconnect` and the publishes behind it go on. A deliberate exception to [MQTT-4.4.0-1], which asks for the resend without a limit
-- A large PUBLISH on a slow link no longer looks like a dead broker. Outbound, the write stall limit (1.5 × Keep Alive) counted from the start of a flush however many bytes went out meanwhile; it now counts only time in which nothing goes out. Inbound, only whole packets counted as broker traffic, so the PINGRESP queued behind a PUBLISH that took longer than the Keep Alive to arrive came too late; every byte read counts now. Both closed a busy connection and, with the same message resent or redelivered, did so again on every reconnect
-- Over WebSocket too: the bytes are counted below the WebSocket layer, which hands on only whole messages, so a slow large PUBLISH no longer ends in `PINGRESP timed out`
-- A packet above 16 MiB that `max_packet_size` allows also arrives over WebSocket: the frame and message limits grow with it (twice it, for servers that put several packets into one message) past tungstenite's 16 MiB / 64 MiB, which stay the floor
-- While restoring subscriptions after a reconnect, a broker DISCONNECT ends the connection with its own reason, as in a running session, instead of a client `Protocol` error with a DISCONNECT 0x82 back. A session taken over (0x8E) now waits the long delay, a refusal (0x87) counts as an auth failure, and a redirect (0x9C / 0x9D) is followed. Time spent waiting for room in a full inbound sink no longer counts against the SUBACK deadline there, so a slow consumer of retained messages no longer makes the client reconnect into the same messages over and over. A connection that fails in this phase is closed at once, not after the reconnect delay
-- While a full inbound sink holds the restore of subscriptions, the client sends PINGREQs at the Keep Alive pace and takes the PINGRESPs. It wrote nothing then, so after 1.5 × Keep Alive the broker closed the connection, and the client reconnected into the same retained messages
-- A broker host with several addresses is reached through a working one even when an earlier one never answers: each address but the last gets an equal share of what is left of `connect_timeout` (at least 250 ms). The addresses were tried one after another without a limit, so a silently dropped first address (often the IPv6 one of a dual-stack host) took the whole budget and the client never connected
-- Every step of the connect is bounded now: fetching the credentials, writing CONNECT and the AUTH answers of enhanced authentication fall under `connect_timeout`, and writing a SUBSCRIBE that restores a subscription under `ack_timeout`, which `shutdown()` can also interrupt. A credentials provider that never answered, or a broker that stopped reading while a large CONNECT or AUTH did not fit the socket buffer, kept the driver connecting for good
-- `shutdown()` while subscriptions are being restored after a reconnect sends DISCONNECT (Normal Disconnection) before closing, as it does on a running connection. The session is up from the CONNACK on, and the dropped connection made the broker publish the Will
-- Acknowledgements that arrived right before the connection ended now complete their requests. When the broker sent a PUBACK, SUBACK or UNSUBACK and then closed, the write task could fail the request with `ConnectionLost` (about one in three in a test), so a resumed session resent an acknowledged publish and a granted subscription was missing from the registry
-- In a resumed session whose broker lowered its Receive Maximum, the unacknowledged publishes waiting for window room to be resent keep their Packet Identifiers to themselves. A SUBSCRIBE could take one of them meanwhile ([MQTT-2.2.1-3]), and that publish then failed with `ConnectionLost` instead of being resent ([MQTT-4.4.0-1])
-- No inbound PUBACK follows the client's last DISCONNECT any more ([MQTT-3.14.4-1]). When the graceful `shutdown()` budget ran out, the write task sent DISCONNECT without waiting for the read task, which could still write the PUBACKs of a burst it was handling
-- Dropping or aborting the future of `Connection::run()` (from `connect`) ends the session: the read and write tasks it had spawned are cancelled, so the socket closes and publishes in flight resolve. They kept running detached before, connected and sending, with the publishes in flight never answered. `ClientBuilder` users were not affected
-- Publishes parked behind the broker's Receive Maximum whose callers gave up no longer keep other commands out. Once 32 were parked the write task stopped taking commands, QoS 0 publishes and SUBSCRIBE included, until a PUBACK freed a slot, so a broker that withheld PUBACKs blocked the client long after those callers had timed out. They were never sent and are now dropped when the queue is full
-- A broker DISCONNECT with an undefined failure Reason Code is read as the nearest defined one instead of a malformed packet: 0x86 and 0x8A as `NotAuthorized`, any other code from 0x80 up as `UnspecifiedError`. EMQX ends a refused re-authentication with the CONNACK code of the refusal, and the client reported a malformed packet, answered with a DISCONNECT 0x81 of its own and lost the auth failure: `reauthenticate()` returned `ConnectionLost` and the credentials were not invalidated
-- An AUTH of a re-authentication that does not fit the broker's Maximum Packet Size is not sent. The first one fails `reauthenticate()` with `AppError::Auth` and leaves the connection alone; a later one in the exchange ends it with DISCONNECT 0x80. The connection was dropped without a DISCONNECT before, even when nothing had been sent yet
-- A re-authentication ends after 16 broker challenges with DISCONNECT 0x80 and `AppError::Auth`. A broker that kept answering with Continue Authentication, each time within `ack_timeout`, held the exchange open for good, and every later `reauthenticate()` queued behind it
-- A one-byte flag property with a value other than 0 or 1 (Retain, Wildcard, Subscription Identifier or Shared Subscription Available, Payload Format Indicator) and a CONNACK Maximum QoS of 3 to 255 are answered with DISCONNECT 0x82 Protocol Error, as the spec says for each, instead of 0x81 Malformed Packet
-- An AUTH with Continue Authentication or Re-authenticate but no Authentication Method is answered with DISCONNECT 0x82 Protocol Error, as §3.15.2.2.2 says, instead of 0x81 Malformed Packet
-- An inbound Topic Alias binding keeps a copy of its topic instead of a slice of the PUBLISH it arrived in, which kept that whole frame, payload included, in memory for the life of the binding: up to `topic_alias_maximum × max_packet_size` with a broker that binds aliases on large messages
-- An inbound PUBLISH with a Topic Alias that was never bound on this connection is answered with DISCONNECT 0x82 Protocol Error as §3.3.4 says, not 0x94, which is for an alias of 0 or above the maximum
-- A `requester()` call dropped before its SUBACK (a timeout around it) no longer leaves the response topic routed: later messages on that topic were swallowed as responses nobody waits for, and `Requester::close` of a later requester on it did not unsubscribe
-- One certificate in the operating system's trust store that rustls cannot parse is skipped with a warning instead of failing every TLS connect with `invalid system trust anchor`; only a store without any usable anchor is an error
-- A `ws://` / `wss://` path an HTTP request target cannot carry (whitespace, control characters, non-ASCII, a `#fragment`) is refused by `BrokerUrl::parse` with the new `BrokerUrlError::InvalidWebSocketPath`. It failed every connect after TCP and TLS were up, and a fragment was dropped without a word
-- `HttpProxy::parse` keeps the password as the bytes the URL encodes (`%FC` is 0xFC, not a replacement character), takes `%` only before two hex digits, and refuses a user name with `:` with the new `BrokerUrlError::InvalidProxyCredentials`, since Basic authentication cannot carry it
-- `topic_matches` returns `false` for a `$share` name with wildcards, an empty topic and a NUL, which its docs said match nothing
-- With outbound Topic Aliases on, a publish within a few bytes of the broker's Maximum Packet Size is sent without binding a new alias instead of failing with `InvalidRequest`: the alias property next to the full topic tipped it over the limit
+- Inbound PUBACKs go out in PUBLISH order again while the client publishes too ([MQTT-4.6.0-2]); broken since 0.5.0
+- A QoS 1 publish the broker refuses with a DISCONNECT every time (an ACL refusal, say) no longer makes a resumed session reconnect for ever: after three connections in a row it fails with `PublishRefusedByDisconnect`, a deliberate exception to [MQTT-4.4.0-1]
+- Restoring subscriptions after a reconnect: a broker DISCONNECT keeps its reason (session takeover, auth refusal, redirect), and a slow consumer of retained messages no longer causes a reconnect loop
+- A large PUBLISH on a slow link, over TCP, TLS or WebSocket, is no longer taken for a dead broker
+- Acknowledgements that arrive right before a connection ends are no longer lost
+- Unacknowledged publishes waiting to be resent keep their Packet Identifiers ([MQTT-2.2.1-3])
+- Publishes parked behind the Receive Maximum whose callers gave up no longer keep other commands out
+- `Duration::MAX` as `ack_timeout` or `connect_timeout` no longer panics
+- `ClientBuilder::connect()` follows a redirecting CONNACK with `follow_server_redirects(true)`
+- Every connect step, the credentials provider and the CONNECT / AUTH writes included, is bounded by `connect_timeout`
+- With several resolved addresses, one that never answers no longer uses up the whole connect budget
+- `shutdown()` sends DISCONNECT while subscriptions are restored, so the broker no longer publishes the Will, and closes TLS (close_notify) and WebSocket (Close frame) properly
+- Dropping the `Connection::run()` future ends the session instead of leaving its tasks running
+- No PUBACK is written after the client's last DISCONNECT ([MQTT-3.14.4-1])
+- A publish that fits the broker's Maximum Packet Size only without a Topic Alias is sent without one
+- An inbound Topic Alias no longer keeps the PUBLISH that bound it in memory
+- Re-authentication: ends after 16 broker challenges, fails the call instead of closing the connection when an AUTH does not fit the broker's Maximum Packet Size, and invalidates credentials on DISCONNECT 0x87 / 0x8C during the subscription restore too
+- DISCONNECT reason codes follow the spec: 0x82 instead of 0x94 for an unbound Topic Alias, 0x82 instead of 0x81 for an AUTH without method, a flag property other than 0 or 1, and Maximum QoS 3 to 255
+- An undefined failure code in a broker DISCONNECT (EMQX sends CONNACK codes) is read as the nearest defined code instead of a malformed packet
+- A packet above 16 MiB that `max_packet_size` allows also arrives over WebSocket: the frame and message limits grow with it past tungstenite's 16 / 64 MiB
+- A WebSocket path an HTTP request cannot carry is refused by `BrokerUrl::parse`
+- An unparsable certificate in the system trust store is skipped instead of failing every TLS connect
+- `HttpProxy::parse` decodes credentials exactly and refuses a user name with `:`
+- A `requester()` call dropped before its SUBACK no longer leaves the response topic routed
+- `topic_matches` returns `false` for wildcard share names, empty topics and NUL
+
+### Performance
+
+- Concurrent QoS 1 publishing: about 12 % more throughput with 512 callers on one client
+- The write buffer of an idle connection is actually released after a burst of large publishes
+- Resending a resumed session's publishes flushes as it goes instead of buffering them all first
+- An answered publish no longer keeps its caller's waker in the ack-deadline sweeper
+
+### Documentation
+
+- `reauthenticate()` has no wall-clock bound while the inbound sink is full; wrap it in your own timeout
+- When the `invalidate` hooks run, including a broker DISCONNECT 0x87 for an ACL violation
+- A kept `InboundMessage` holds the read buffer it came from, and with it neighbouring messages
+- CONFORMANCE.md marks the two deliberate spec deviations as such
 
 ## [0.5.0] - 2026-11-02
 
