@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use rumqttc::{
-    AsyncClient, ConnectReturnCode, Event, MqttOptions, NetworkOptions, Packet, PublishNotice, QoS as RumqttQoS,
+    AckMode, AsyncClient, ConnectReturnCode, Event, MqttOptions, NetworkOptions, Packet, PublishNotice, PublishOptions,
+    QoS as RumqttQoS,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -114,8 +115,8 @@ async fn setup_ingress(cfg: &SessionCfg) -> RumqttcIngress {
     let handed_off = Arc::new(AtomicUsize::new(0));
     let after_enqueue = matches!(cfg.ack, Some(AckPolicy::AfterEnqueue)) && cfg.qos == BenchQos::AtLeastOnce;
     let mut opts = base_opts(&cfg.client_id, cfg.port);
-    if cfg.qos == BenchQos::AtLeastOnce {
-        opts.set_manual_acks(after_enqueue);
+    if cfg.qos == BenchQos::AtLeastOnce && after_enqueue {
+        opts.set_ack_mode(AckMode::Manual);
     }
     let (client, mut eventloop) = AsyncClient::builder(opts).capacity(REQUEST_CAPACITY).build();
     let ack_client = client.clone();
@@ -224,14 +225,22 @@ impl OutboundSession for RumqttcOutbound {
             BenchQos::AtLeastOnce => {
                 let notice = self
                     .client
-                    .publish_tracked(OUTBOUND_TOPIC, wire_qos(self.qos), false, payload.to_vec())
+                    .publish_tracked(
+                        OUTBOUND_TOPIC,
+                        payload.to_vec(),
+                        PublishOptions::new(wire_qos(self.qos)),
+                    )
                     .await
                     .expect("rumqttc outbound publish");
                 notice.wait_completion_async().await.expect("rumqttc outbound PUBACK");
             }
             BenchQos::AtMostOnce => {
                 self.client
-                    .publish(OUTBOUND_TOPIC, wire_qos(self.qos), false, payload.to_vec())
+                    .publish(
+                        OUTBOUND_TOPIC,
+                        payload.to_vec(),
+                        PublishOptions::new(wire_qos(self.qos)),
+                    )
                     .await
                     .expect("rumqttc qos0 publish");
             }
@@ -249,7 +258,11 @@ impl OutboundSession for RumqttcOutbound {
                     }
                     let notice = self
                         .client
-                        .publish_tracked(OUTBOUND_TOPIC, RumqttQoS::AtLeastOnce, false, payload.to_vec())
+                        .publish_tracked(
+                            OUTBOUND_TOPIC,
+                            payload.to_vec(),
+                            PublishOptions::new(RumqttQoS::AtLeastOnce),
+                        )
                         .await
                         .expect("rumqttc pipelined publish");
                     in_flight.push_back(notice);
@@ -269,7 +282,7 @@ impl OutboundSession for RumqttcOutbound {
                     let body = payload.to_vec();
                     in_flight.push_back(tokio::spawn(async move {
                         client
-                            .publish(OUTBOUND_TOPIC, RumqttQoS::AtMostOnce, false, body)
+                            .publish(OUTBOUND_TOPIC, body, PublishOptions::new(RumqttQoS::AtMostOnce))
                             .await
                             .expect("rumqttc qos0 pipelined");
                     }));

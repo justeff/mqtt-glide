@@ -616,7 +616,6 @@ Tuned Mosquitto `2.1.2-alpine`, 256 B, QoS 1. Linux in a Podman VM on Apple M5 M
 - glide publishes fastest and cheapest from a few dozen callers up, and at a fixed load it has about half the latency of the peers. Against a broker that is never the bottleneck, its publishing is 3 to 15× theirs.
 - Receiving, glide spends the least CPU per message, also against rumqttc acknowledging on decode; all clients get what Mosquitto delivers (about 100k msg/s at QoS 1).
 - With a handful of callers glide and rumqttc are even; at 16 KiB with 8 callers rumqttc is ahead.
-- rumqttc is pinned to 0.33.3 because 0.34.0 scans its whole outgoing table on every flush; against a broker without a Receive Maximum that table has 65 535 slots and throughput falls to a few thousand msg/s.
 
 [`BENCHMARKS.md`](BENCHMARKS.md) also has the mock-broker ceiling, stock Mosquitto, a broker with its own in-flight cap, payload sizes up to 16 KiB, which inbound sink to use with several brokers, the fairness rules, and why each client is ahead where it is.
 

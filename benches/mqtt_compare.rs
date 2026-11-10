@@ -9,9 +9,9 @@ mod compare;
 mod support;
 
 use compare::fixtures::{
-    GLIDE_VERSION, LOAD_WINDOW, PEER_MQTT5_VERSION, PEER_RUMQTTC_VERSION, bench_runs, child_cpus,
-    client_receive_maximum, ingress_window, load_messages, mock_receive_maximum, parse_clients, parse_concurrency,
-    parse_ingress_rates, parse_rates, rate_secs,
+    GLIDE_VERSION, LOAD_WINDOW, bench_runs, child_cpus, client_receive_maximum, ingress_window, load_messages,
+    mock_receive_maximum, parse_clients, parse_concurrency, parse_ingress_rates, parse_rates, peer_mqtt5_version,
+    peer_rumqttc_version, rate_secs,
 };
 use compare::report::{ResultWriter, RunMeta, output_dir};
 use compare::run::MatrixCtx;
@@ -78,8 +78,8 @@ fn main() {
         publisher_cpus: child_cpus("MQTT_COMPARE_PUBLISHER_CPUS"),
         clients: client_labels,
         glide_version: GLIDE_VERSION,
-        rumqttc_version: PEER_RUMQTTC_VERSION,
-        mqtt5_version: PEER_MQTT5_VERSION,
+        rumqttc_version: peer_rumqttc_version(),
+        mqtt5_version: peer_mqtt5_version(),
     });
 
     eprintln!("mqtt_compare absolute matrix");
@@ -90,7 +90,9 @@ fn main() {
         clients.iter().map(|c| c.as_str()).collect::<Vec<_>>()
     );
     eprintln!(
-        "  versions: mqtt-glide {GLIDE_VERSION}, rumqttc-v5-next {PEER_RUMQTTC_VERSION}, mqtt5 {PEER_MQTT5_VERSION}"
+        "  versions: mqtt-glide {GLIDE_VERSION}, rumqttc-v5-next {}, mqtt5 {}",
+        peer_rumqttc_version(),
+        peer_mqtt5_version()
     );
     eprintln!("  cells: {}", cells.len());
     eprintln!("  runs (median-of): {}", bench_runs());

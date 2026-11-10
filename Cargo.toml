@@ -170,12 +170,11 @@ rstest = "0.28"
 # Absolute multi-client matrix for `mqtt_compare` only (not runtime deps of the library).
 # No crypto provider on rumqttc — the library feature under test supplies the single rustls provider.
 # `mqtt5` (LabOverWire) is client-only here (no broker / WS / QUIC).
-# Peer client versions are exact-pinned so the comparison is reproducible; bumping them
-# requires a full compare re-bench. rumqttc-v5-next is pinned to 0.33.3 because 0.34.0 scans its
-# whole outgoing in-flight table on every flush (the table is sized from the broker's Receive Maximum).
+# Peer client versions are exact-pinned so the comparison is reproducible, each at its latest
+# release when the numbers were measured; bumping them requires a full compare re-bench.
 async-trait = "0.1"
-mqtt5 = { version = "=0.48.0", default-features = false }
-rumqttc-v5-next = { version = "=0.33.3", default-features = false, features = ["use-rustls-no-provider"] }
+mqtt5 = { version = "=0.50.0", default-features = false }
+rumqttc-v5-next = { version = "=0.34.0", default-features = false, features = ["use-rustls-no-provider"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 testcontainers = { version = "0.28", default-features = false }

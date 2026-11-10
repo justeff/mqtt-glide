@@ -328,7 +328,6 @@ Versions: see each detail page (`meta.json` of the run).
 - **Idiomatic APIs.** Pipelined uses `publish_window` (glide), the notice future (rumqttc), spawned publishes (mqtt5). Unsupported capabilities are `n/a`, never emulated.
 - **What `publish().await` returns on at QoS 0 differs:** glide once the write task has encoded the message into its write buffer, rumqttc when the request is accepted onto its event-loop channel, mqtt5 after encode and write on the caller. QoS 0 latency columns measure that point; throughput is always wire-complete.
 - **Clients take turns.** Each of the 5 runs of a cell measures every client once, with the first client rotating per run; fan-in sinks of one table row do the same. The host drifts by up to 2× over minutes (macOS places the VM's vCPUs on performance or efficiency cores), so measuring one client's 5 runs and then the next one's would compare different minutes.
-- **Versions:** rumqttc is pinned to 0.33.3 because 0.34.0 scans its whole outgoing table on every flush; against a broker without Receive Maximum that table has 65 535 slots and throughput falls to a few thousand msg/s.
 
 ## macOS cross-check
 

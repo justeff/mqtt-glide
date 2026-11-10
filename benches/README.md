@@ -43,8 +43,8 @@ Default: all five. Rows carry an optional `level` (caller tasks for concurrent, 
 | Value | Crate | Version |
 |-------|--------|---------|
 | `glide` | mqtt-glide (this crate) | current checkout |
-| `rumqttc` | `rumqttc-v5-next` | **0.33.3** (pinned; 0.34.0 scans its whole outgoing table on every flush) |
-| `mqtt5` | LabOverWire `mqtt5` | **0.48.0** (pinned) |
+| `rumqttc` | `rumqttc-v5-next` | 0.34.0 |
+| `mqtt5` | LabOverWire `mqtt5` | 0.50.0 |
 
 Default: `glide,rumqttc,mqtt5`. Versions are written to each run's `meta.json` (`glide_version`, `rumqttc_version`, `mqtt5_version`).
 
@@ -111,7 +111,6 @@ Pin the client, broker and publisher to disjoint cores when you can; on hybrid C
 - **Harness on the runtime:** the whole matrix runs in a spawned task, so callers, the rate generator and the ingress consumer are tasks on the client's runtime, as an application's are. On the `block_on` thread, every message a waiting consumer got cost the producing client a futex wake-up, and how often depended on the client's timing.
 - **Clients take turns:** every run of a cell measures all clients once, starting with a different client each run (`ingress_fanin` does the same for the sinks of a row). This cancels host drift over minutes, which is large on a VM under macOS.
 - Client adapters use idiomatic APIs (not a lowest-common-denominator path).
-- **rumqttc version:** pinned to 0.33.3 because 0.34.0 scans its whole outgoing table on every flush. Against a broker without a Receive Maximum (tuned Mosquitto) that table has 65 535 slots and throughput falls to a few thousand msg/s.
 - Unsupported caps are `n/a`: no fake queues / fake manual ack.
 - **Ingress is always handoff:** every ingress cell uses decode, bounded app queue (`tokio::sync::mpsc`), consumer task. QoS 1 `after_enqueue` vs `before` only moves PUBACK relative to that handoff. See [`BENCHMARKS.md`](../BENCHMARKS.md).
 - **CPU ns/msg** is `getrusage` of the whole bench process (client, runtime and harness tasks). Ingress load excludes the publisher child.

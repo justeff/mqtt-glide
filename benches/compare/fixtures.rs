@@ -95,11 +95,27 @@ pub const OUTBOUND_TOPIC: &str = "bench/compare/outbound";
 /// This crate’s version under test (`CARGO_PKG_VERSION`).
 pub const GLIDE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Locked peer crate for published baselines (`rumqttc-v5-next` in `Cargo.toml`).
-pub const PEER_RUMQTTC_VERSION: &str = "0.33.3";
+/// The exact-pinned version of a peer crate in this crate's `Cargo.toml`, so the run's
+/// `meta.json` names what was measured without a second copy to keep in sync.
+fn pinned_version(krate: &str) -> &'static str {
+    const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+    MANIFEST
+        .lines()
+        .find(|line| line.starts_with(&format!("{krate} = ")))
+        .and_then(|line| line.split_once("version = \"=")?.1.split_once('"'))
+        .map(|(version, _)| version)
+        .unwrap_or_else(|| panic!("{krate} is not exact-pinned in Cargo.toml"))
+}
 
-/// Locked peer crate for published baselines (LabOverWire `mqtt5` in `Cargo.toml`).
-pub const PEER_MQTT5_VERSION: &str = "0.48.0";
+/// Peer crate `rumqttc-v5-next` as pinned in `Cargo.toml`.
+pub fn peer_rumqttc_version() -> &'static str {
+    pinned_version("rumqttc-v5-next")
+}
+
+/// Peer crate LabOverWire `mqtt5` as pinned in `Cargo.toml`.
+pub fn peer_mqtt5_version() -> &'static str {
+    pinned_version("mqtt5")
+}
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
