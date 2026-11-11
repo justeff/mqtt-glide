@@ -181,6 +181,8 @@ pub struct Connection<H: InboundSink = tokio::sync::mpsc::Sender<crate::codec::I
     session_carry: write::SessionCarry,
     /// Where the next connection goes after a 0x9C redirect (one connection only).
     redirect_once: Option<crate::util::broker_url::BrokerUrl>,
+    /// A TLS configuration still being read (see `transport::tls_connect`).
+    tls_load: transport::TlsConfigLoad,
     /// Redirects followed since a connection last ended without one.
     redirects_in_row: u8,
     /// When the current (or last) session came up.
@@ -228,6 +230,7 @@ impl<H: InboundSink> Connection<H> {
             subscription_registry,
             session_carry,
             redirect_once: None,
+            tls_load: None,
             redirects_in_row: 0,
             session_up_since: None,
         }
@@ -424,7 +427,7 @@ impl<H: InboundSink> Connection<H> {
             (TlsMode::Rustls, false) => {
                 let dialed = dial_or_cancel(
                     &self.cancel,
-                    transport::dial_tls(options, deadline, Arc::clone(&written)),
+                    transport::dial_tls(options, deadline, Arc::clone(&written), &mut self.tls_load),
                 )
                 .await;
                 self.session_after_dial(dialed, deadline, link(Some(written))).await
@@ -442,7 +445,13 @@ impl<H: InboundSink> Connection<H> {
             (TlsMode::Rustls, true) => {
                 let dialed = dial_or_cancel(
                     &self.cancel,
-                    transport::dial_wss(options, deadline, Arc::clone(&activity), Arc::clone(&written)),
+                    transport::dial_wss(
+                        options,
+                        deadline,
+                        Arc::clone(&activity),
+                        Arc::clone(&written),
+                        &mut self.tls_load,
+                    ),
                 )
                 .await;
                 self.session_after_dial(dialed, deadline, link(Some(written))).await

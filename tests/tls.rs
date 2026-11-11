@@ -295,6 +295,59 @@ async fn certificate_files_are_read_again_on_reconnect() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A certificate file whose read never returns (here a FIFO nobody writes, in practice a hung
+/// network mount) fails the connect within `connect_timeout` instead of blocking the runtime.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hanging_certificate_file_is_bounded_by_the_connect_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let url = format!("mqtts://127.0.0.1:{}", listener.local_addr().expect("addr").port());
+    let fifo = std::env::temp_dir().join(format!("mqtt-glide-fifo-{}.pem", std::process::id()));
+    let _ = std::fs::remove_file(&fifo);
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(made.success(), "mkfifo");
+    // Lets the blocked read finish after the test, or the test fail instead of hang without the fix.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let unblock = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+            drop(std::fs::OpenOptions::new().write(true).open(&fifo));
+        })
+    };
+
+    let options = mqtt_glide::ConnectOptions::new(mqtt_glide::BrokerUrl::parse(&url).expect("url"))
+        .tls(TlsConfig::ca_pem_file(&fifo))
+        .connect_timeout(Duration::from_millis(300));
+    let (tx, _rx) = tokio::sync::mpsc::channel::<mqtt_glide::InboundMessage>(1);
+    let (_client, connection, _phase) = mqtt_glide::connect(
+        options,
+        mqtt_glide::AnonymousCredentials,
+        NoReconnect,
+        tx,
+        mqtt_glide::NoopLifecycle,
+    )
+    .expect("wiring");
+    let outcome = tokio::time::timeout(Duration::from_secs(3), tokio::spawn(connection.run()))
+        .await
+        .expect("the driver gives up within the connect timeout")
+        .expect("driver task");
+    match outcome {
+        Err(mqtt_glide::ConnectionOutcome::Transport(TransportError::Tls(message))) => {
+            assert!(message.contains("timed out"), "{message}");
+        }
+        other => panic!("expected a TLS timeout, got {other:?}"),
+    }
+
+    drop(done_tx);
+    unblock.join().expect("unblock");
+    let _ = std::fs::remove_file(&fifo);
+    drop(listener);
+}
+
 #[tokio::test]
 async fn a_missing_ca_file_fails_the_connect_naming_the_file() {
     let broker = TestBroker::start().await.expect("broker");

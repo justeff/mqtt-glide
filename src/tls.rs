@@ -214,6 +214,8 @@ impl TlsConfig {
     }
 
     /// A fresh rustls configuration for one connection attempt, reading the files it names.
+    ///
+    /// Blocks: it reads files and the OS trust store. The connect runs it on the blocking pool.
     pub(crate) fn client_config(&self) -> Result<rustls::ClientConfig, String> {
         let roots = match &self.roots {
             Roots::System => system_root_store(RootCertStore::empty(), true)?,

@@ -27,9 +27,11 @@ use crate::codec::{
 };
 use crate::error::{ConnectionOutcome, ProtocolError, TransportError};
 use crate::options::ConnectOptions;
-use crate::tls::TlsConfig;
 
 type TlsIo = TlsStream<MarkWritten<TcpStream>>;
+
+/// A TLS configuration being read on the blocking pool, kept across connect attempts.
+pub(crate) type TlsConfigLoad = Option<tokio::task::JoinHandle<Result<rustls::ClientConfig, String>>>;
 #[cfg(feature = "websocket")]
 type WsIo<S> = super::websocket::WsByteStream<super::read::MarkActivity<S>>;
 
@@ -439,9 +441,10 @@ pub(crate) async fn dial_tls(
     options: &ConnectOptions,
     deadline: Instant,
     written: Arc<std::sync::atomic::AtomicBool>,
+    load: &mut TlsConfigLoad,
 ) -> Result<(ReadHalf<TlsIo>, WriteHalf<TlsIo>), ConnectionOutcome> {
     let tcp_stream = MarkWritten::new(open_tcp(options, deadline).await?, written);
-    Ok(split(tls_connect(options, tcp_stream, deadline).await?))
+    Ok(split(tls_connect(options, tcp_stream, deadline, load).await?))
 }
 
 /// TCP + WebSocket handshake, split.
@@ -470,9 +473,10 @@ pub(crate) async fn dial_wss(
     deadline: Instant,
     activity: std::sync::Arc<std::sync::atomic::AtomicBool>,
     written: Arc<std::sync::atomic::AtomicBool>,
+    load: &mut TlsConfigLoad,
 ) -> Result<(ReadHalf<WsIo<TlsIo>>, WriteHalf<WsIo<TlsIo>>), ConnectionOutcome> {
     let tcp_stream = MarkWritten::new(open_tcp(options, deadline).await?, written);
-    let tls_stream = super::read::MarkActivity::new(tls_connect(options, tcp_stream, deadline).await?, activity);
+    let tls_stream = super::read::MarkActivity::new(tls_connect(options, tcp_stream, deadline, load).await?, activity);
     Ok(split(super::websocket::handshake(options, tls_stream, deadline).await?))
 }
 
@@ -480,12 +484,32 @@ async fn tls_connect(
     options: &ConnectOptions,
     tcp_stream: MarkWritten<TcpStream>,
     deadline: Instant,
+    load: &mut TlsConfigLoad,
 ) -> Result<TlsIo, ConnectionOutcome> {
-    let default = TlsConfig::default();
-    let tls = options.tls.as_ref().unwrap_or(&default);
+    let tls = options.tls.clone().unwrap_or_default();
     let tls_error = |message| ConnectionOutcome::Transport(TransportError::Tls(message));
-    let connector = TlsConnector::from(Arc::new(tls.client_config().map_err(tls_error)?));
     let server_name = tls.server_name_for(options.broker_url.host()).map_err(tls_error)?;
+    // Reading certificate files and the OS trust store blocks (a hung network mount for good),
+    // so it runs on the blocking pool under the connect deadline, and shutdown can end the wait.
+    // A read that outlives the attempt is kept, and the next attempt waits for it instead of
+    // tying up another blocking thread.
+    let loading = load.get_or_insert_with(|| tokio::task::spawn_blocking(move || tls.client_config()));
+    let config = match timeout_at(tokio::time::Instant::from_std(deadline), loading).await {
+        Ok(loaded) => {
+            *load = None;
+            match loaded {
+                Ok(config) => config.map_err(tls_error)?,
+                Err(error) => return Err(tls_error(format!("TLS configuration failed: {error}"))),
+            }
+        }
+        Err(_) => {
+            return Err(tls_error(format!(
+                "reading the TLS configuration timed out after {:?}",
+                options.connect_timeout
+            )));
+        }
+    };
+    let connector = TlsConnector::from(Arc::new(config));
     match timeout_at(
         tokio::time::Instant::from_std(deadline),
         connector.connect(server_name, tcp_stream),
