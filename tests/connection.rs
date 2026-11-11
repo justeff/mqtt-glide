@@ -1072,3 +1072,84 @@ async fn cancelled_requester_leaves_no_route_behind() {
     client.shutdown().await.expect("shutdown");
     broker.abort();
 }
+
+/// `shutdown()` while the CONNACK is still due ends the attempt with a Normal Disconnection: the
+/// broker may have accepted the CONNECT already, and a dropped connection would make it publish
+/// the Will. DISCONNECT may precede the CONNACK ([MQTT-3.1.2-30]).
+#[tokio::test]
+async fn shutdown_before_the_connack_sends_disconnect() {
+    let (connect_seen_tx, connect_seen_rx) = tokio::sync::oneshot::channel();
+    let (port, peer) = spawn_peer_broker(move |broker| async move {
+        let mut session = broker.accept_session().await;
+        session.expect_connect().await;
+        let _ = connect_seen_tx.send(());
+        timeout(
+            Duration::from_secs(3),
+            session.expect_disconnect(DisconnectReasonCode::NormalDisconnection),
+        )
+        .await
+        .expect("DISCONNECT in time");
+    })
+    .await;
+
+    let options = local_options(port, "will-before-connack").will("status/will", "died");
+    let (tx, _rx) = mpsc::channel(4);
+    let started = TestClient::spawn(options, static_credentials(), NoReconnect, tx);
+    timeout(Duration::from_secs(5), connect_seen_rx)
+        .await
+        .expect("CONNECT in time")
+        .expect("peer alive");
+
+    started.client.shutdown().await.expect("shutdown");
+    let _ = timeout(Duration::from_secs(5), started.run)
+        .await
+        .expect("driver stops");
+    join_peer(peer).await;
+}
+
+/// `shutdown()` in the moment the CONNACK arrives (here from the lifecycle hook, which runs
+/// right after it) still ends the session with a Normal Disconnection instead of dropping it.
+#[tokio::test]
+async fn shutdown_racing_the_connack_sends_disconnect() {
+    use futures_util::FutureExt;
+
+    struct ShutdownOnConnected(Arc<std::sync::OnceLock<mqtt_glide::MqttClient>>);
+    impl mqtt_glide::LifecycleHook for ShutdownOnConnected {
+        fn on_lifecycle(&self, phase: &SessionPhase) {
+            if matches!(phase, SessionPhase::Connected { .. })
+                && let Some(client) = self.0.get()
+            {
+                let _ = client.shutdown().now_or_never();
+            }
+        }
+    }
+
+    let (port, peer) = spawn_peer_broker(move |broker| async move {
+        let mut session = broker.accept_connected().await;
+        timeout(
+            Duration::from_secs(3),
+            session.expect_disconnect(DisconnectReasonCode::NormalDisconnection),
+        )
+        .await
+        .expect("DISCONNECT in time");
+    })
+    .await;
+
+    let shared = Arc::new(std::sync::OnceLock::new());
+    let options = local_options(port, "will-at-connack").will("status/will", "died");
+    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
+    let (client, connection, _phase) = connect(
+        options,
+        static_credentials(),
+        NoReconnect,
+        tx,
+        ShutdownOnConnected(Arc::clone(&shared)),
+    )
+    .expect("wiring");
+    let _ = shared.set(client);
+    let outcome = timeout(Duration::from_secs(5), connection.run())
+        .await
+        .expect("driver stops");
+    assert!(outcome.is_ok(), "a shutdown ends the driver cleanly: {outcome:?}");
+    join_peer(peer).await;
+}

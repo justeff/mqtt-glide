@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ClientBuilder::connect()` follows a redirecting CONNACK with `follow_server_redirects(true)`
 - Every connect step, the credentials provider and the CONNECT / AUTH writes included, is bounded by `connect_timeout`
 - With several resolved addresses, one that never answers no longer uses up the whole connect budget
-- `shutdown()` sends DISCONNECT while subscriptions are restored, so the broker no longer publishes the Will, and closes TLS (close_notify) and WebSocket (Close frame) properly
+- `shutdown()` sends DISCONNECT while the CONNACK is due or subscriptions are restored, so the broker no longer publishes the Will, and closes TLS (close_notify) and WebSocket (Close frame) properly
 - Dropping the `Connection::run()` future ends the session instead of leaving its tasks running
 - No PUBACK is written after the client's last DISCONNECT ([MQTT-3.14.4-1])
 - A publish that fits the broker's Maximum Packet Size only without a Topic Alias is sent without one

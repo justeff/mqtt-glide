@@ -113,22 +113,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for MarkWritten<S> {
 /// CONNECT/CONNACK on already-split transport halves, with the enhanced authentication
 /// exchange in between when an [`Authenticator`](crate::Authenticator) is set (§4.12).
 ///
-/// A CONNACK that redirects (§4.11) leaves its target in `redirect`.
+/// How far it got is left in `progress`, also when the caller drops it half way.
 pub(crate) async fn establish_session_on<R, W>(
-    read_half: R,
-    write_half: W,
+    framed_read: &mut FramedRead<R, V5Codec>,
+    framed_write: &mut FramedWrite<W, V5Codec>,
     options: &ConnectOptions,
     credentials: &SharedCredentials,
     deadline: Instant,
-    redirect: &mut Option<ServerRedirect>,
-) -> Result<(FramedRead<R, V5Codec>, FramedWrite<W, V5Codec>, SessionParams), ConnectionOutcome>
+    progress: &mut HandshakeProgress,
+) -> Result<SessionParams, ConnectionOutcome>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (read_codec, write_codec) = distinct_v5_codecs_for_framed_halves(options.max_packet_size.get());
-    let mut framed_read = FramedRead::new(read_half, read_codec);
-    let mut framed_write = FramedWrite::new(write_half, write_codec);
     let authenticator = options.authenticator.as_ref();
     let auth_failed = |outcome| on_auth_failure(credentials, authenticator, outcome);
 
@@ -161,6 +158,9 @@ where
         None => None,
     };
 
+    // Set first: from its first poll the CONNECT is in the write buffer, and a caller giving
+    // up must end it with a DISCONNECT rather than drop it.
+    progress.disconnect_owed = true;
     within_connect(
         deadline,
         options,
@@ -171,20 +171,26 @@ where
     .map_err(map_connect_send_error)?;
 
     let ack = loop {
-        let challenge = match read_connack(&mut framed_read, deadline, options.connect_timeout).await {
+        let challenge = match read_connack(framed_read, deadline, options.connect_timeout).await {
             Ok(HandshakePacket::ConnectAck(ack)) => break ack,
             Ok(HandshakePacket::Auth(auth)) => auth,
             Err((outcome, None)) => return Err(outcome),
-            Err((outcome, Some(reason))) => return Err(refuse_packet(&mut framed_write, reason, outcome).await),
+            Err((outcome, Some(reason))) => {
+                return Err(refuse_after_connect(progress, framed_write, reason, outcome).await);
+            }
         };
         // Only AUTH or DISCONNECT may go out before CONNACK ([MQTT-3.1.2-30]).
         let (Some(authenticator), Some(exchange)) = (authenticator, exchange.as_mut()) else {
             let outcome = protocol_violation("AUTH before CONNACK without an Authentication Method in CONNECT");
-            return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::ProtocolError, outcome).await);
+            return Err(
+                refuse_after_connect(progress, framed_write, DisconnectReasonCode::ProtocolError, outcome).await,
+            );
         };
         if let Err(error) = check_broker_auth(&challenge, authenticator.method(), AuthReasonCode::ContinueAuth) {
             let outcome = ConnectionOutcome::Protocol(error);
-            return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::ProtocolError, outcome).await);
+            return Err(
+                refuse_after_connect(progress, framed_write, DisconnectReasonCode::ProtocolError, outcome).await,
+            );
         }
         let answered = within_connect(
             deadline,
@@ -197,7 +203,13 @@ where
             Ok(data) => data,
             Err(error) => {
                 let outcome = auth_failed(ConnectionOutcome::Auth(error)).await;
-                return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::UnspecifiedError, outcome).await);
+                return Err(refuse_after_connect(
+                    progress,
+                    framed_write,
+                    DisconnectReasonCode::UnspecifiedError,
+                    outcome,
+                )
+                .await);
             }
         };
         // [MQTT-4.12.0-3] Continue authentication, [MQTT-4.12.0-5] with the CONNECT's method.
@@ -214,7 +226,9 @@ where
     let session = match apply_connack(options.keep_alive, &ack) {
         Ok(session) => session,
         Err(outcome) => {
-            *redirect = ServerRedirect::from_connack(&ack);
+            // The broker refused the CONNECT; it closes the connection, nothing more is owed.
+            progress.disconnect_owed = false;
+            progress.redirect = ServerRedirect::from_connack(&ack);
             return Err(auth_failed(outcome).await);
         }
     };
@@ -223,7 +237,9 @@ where
         // then accept a client that was not authenticated with this method at all.
         if ack.auth_method.as_ref() != Some(authenticator.method()) {
             let outcome = protocol_violation("CONNACK without the CONNECT's Authentication Method ([MQTT-4.12.0-5])");
-            return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::ProtocolError, outcome).await);
+            return Err(
+                refuse_after_connect(progress, framed_write, DisconnectReasonCode::ProtocolError, outcome).await,
+            );
         }
         if let Err(error) = within_connect(
             deadline,
@@ -234,15 +250,55 @@ where
         .await?
         {
             let outcome = auth_failed(ConnectionOutcome::Auth(error)).await;
-            return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::UnspecifiedError, outcome).await);
+            return Err(
+                refuse_after_connect(progress, framed_write, DisconnectReasonCode::UnspecifiedError, outcome).await,
+            );
         }
     } else if ack.auth_method.is_some() {
         // [MQTT-4.12.0-6] Without a method in CONNECT the broker must not name one.
         let outcome = protocol_violation("CONNACK Authentication Method without one in CONNECT ([MQTT-4.12.0-6])");
-        return Err(refuse_packet(&mut framed_write, DisconnectReasonCode::ProtocolError, outcome).await);
+        return Err(refuse_after_connect(progress, framed_write, DisconnectReasonCode::ProtocolError, outcome).await);
     }
-    apply_session_limits_to_codecs(&mut framed_write, &session);
-    Ok((framed_read, framed_write, session))
+    apply_session_limits_to_codecs(framed_write, &session);
+    Ok(session)
+}
+
+/// What [`establish_session_on`] got done.
+#[derive(Debug, Default)]
+pub(crate) struct HandshakeProgress {
+    /// The CONNECT went to the write buffer and the broker may accept it: a caller giving up
+    /// ends the connection with a DISCONNECT. Not once the handshake sent its own, or the
+    /// broker refused the CONNECT ([MQTT-3.14.4-1]: nothing after a DISCONNECT).
+    pub(crate) disconnect_owed: bool,
+    /// Where a CONNACK that refused the client redirected it (§4.11).
+    pub(crate) redirect: Option<ServerRedirect>,
+}
+
+/// [`refuse_packet`] during the handshake: after its DISCONNECT none is owed any more.
+async fn refuse_after_connect<W>(
+    progress: &mut HandshakeProgress,
+    framed_write: &mut FramedWrite<W, V5Codec>,
+    reason: DisconnectReasonCode,
+    outcome: ConnectionOutcome,
+) -> ConnectionOutcome
+where
+    W: AsyncWrite + Unpin,
+{
+    progress.disconnect_owed = false;
+    refuse_packet(framed_write, reason, outcome).await
+}
+
+/// Framed halves with this client's codec limits, for [`establish_session_on`].
+pub(crate) fn framed_halves<R: AsyncRead, W: AsyncWrite>(
+    read_half: R,
+    write_half: W,
+    options: &ConnectOptions,
+) -> (FramedRead<R, V5Codec>, FramedWrite<W, V5Codec>) {
+    let (read_codec, write_codec) = distinct_v5_codecs_for_framed_halves(options.max_packet_size.get());
+    (
+        FramedRead::new(read_half, read_codec),
+        FramedWrite::new(write_half, write_codec),
+    )
 }
 
 /// A step of the CONNECT exchange (`what`), bounded by the connect budget like the rest of
@@ -690,7 +746,9 @@ mod tests {
         let deadline = crate::util::std_deadline_after(options.connect_timeout);
         let tcp_stream = open_tcp(&options, deadline).await.expect("tcp");
         let (read_half, write_half) = tcp_stream.into_split();
-        establish_session_on(read_half, write_half, &options, &credentials, deadline, &mut None)
+        let (mut read, mut write) = framed_halves(read_half, write_half, &options);
+        let mut progress = HandshakeProgress::default();
+        establish_session_on(&mut read, &mut write, &options, &credentials, deadline, &mut progress)
             .await
             .expect("handshake");
 
@@ -732,10 +790,13 @@ mod tests {
         let deadline = crate::util::std_deadline_after(options.connect_timeout);
         let tcp_stream = open_tcp(&options, deadline).await.expect("tcp");
         let (read_half, write_half) = tcp_stream.into_split();
-        let err = match establish_session_on(read_half, write_half, &options, &credentials, deadline, &mut None).await {
-            Err(outcome) => outcome,
-            Ok(_) => panic!("CONNACK must time out"),
-        };
+        let (mut read, mut write) = framed_halves(read_half, write_half, &options);
+        let mut progress = HandshakeProgress::default();
+        let err =
+            match establish_session_on(&mut read, &mut write, &options, &credentials, deadline, &mut progress).await {
+                Err(outcome) => outcome,
+                Ok(_) => panic!("CONNACK must time out"),
+            };
         match err {
             ConnectionOutcome::Transport(TransportError::Connection(message)) => {
                 assert!(message.contains("CONNACK timed out"), "unexpected message: {message}");

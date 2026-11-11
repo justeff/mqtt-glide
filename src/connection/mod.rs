@@ -498,25 +498,36 @@ impl<H: InboundSink> Connection<H> {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let mut redirect = None;
         let read_half = read::MarkActivity::new(read_half, Arc::clone(&link.inbound));
-        let establish = transport::establish_session_on(
+        let (mut framed_read, mut framed_write) = transport::framed_halves(
             self.channels.stats.count_reads(read_half),
             self.channels.stats.count_writes(write_half),
             &self.options,
+        );
+        let mut progress = transport::HandshakeProgress::default();
+        let establish = transport::establish_session_on(
+            &mut framed_read,
+            &mut framed_write,
+            &self.options,
             &self.credentials,
             deadline,
-            &mut redirect,
+            &mut progress,
         );
 
         let established = tokio::select! {
             result = establish => Some(result),
             () = self.cancel.cancelled() => None,
         };
-        let (framed_read, framed_write, session) = match established {
-            Some(Ok(established)) => established,
-            Some(Err(outcome)) => return self.finish_session_or_redirect(outcome, false, redirect).await,
+        let session = match established {
+            Some(Ok(session)) => session,
+            Some(Err(outcome)) => return self.finish_session_or_redirect(outcome, false, progress.redirect).await,
             None => {
+                // `shutdown()` after the CONNECT went out: the broker may have accepted it
+                // already, and a dropped connection would make it publish the Will. DISCONNECT
+                // may precede the CONNACK ([MQTT-3.1.2-30]).
+                if progress.disconnect_owed {
+                    self.disconnect_normally(&mut framed_write).await;
+                }
                 return self
                     .finish_session(ConnectionOutcome::Shutdown(ShutdownError::Cancelled), false)
                     .await;
@@ -525,6 +536,16 @@ impl<H: InboundSink> Connection<H> {
 
         self.run_supervised_session(framed_read, framed_write, session, link)
             .await
+    }
+
+    /// Ends a connection the tasks never took over with DISCONNECT 0x00, which tells the broker
+    /// not to publish the Will; bounded by the graceful disconnect timeout.
+    async fn disconnect_normally<W>(&self, framed_write: &mut FramedWrite<W, V5Codec>)
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let disconnect = framed_write.send(Packet::Disconnect(Disconnect::default()));
+        let _ = tokio::time::timeout(self.options.graceful_disconnect_timeout, disconnect).await;
     }
 
     /// Post-handshake session: resubscribe, spawn read/write tasks, supervise until exit.
@@ -610,8 +631,7 @@ impl<H: InboundSink> Connection<H> {
             // `shutdown()` while subscriptions were being restored: the session is up since the
             // CONNACK, so end it with a Normal Disconnection, or the broker publishes the Will.
             if matches!(failure.outcome, ConnectionOutcome::Shutdown(_)) {
-                let disconnect = framed_write.send(Packet::Disconnect(Disconnect::default()));
-                let _ = tokio::time::timeout(self.options.graceful_disconnect_timeout, disconnect).await;
+                self.disconnect_normally(&mut framed_write).await;
             }
             // Close the connection now, not after the reconnect delay.
             drop((framed_read, framed_write));
@@ -656,6 +676,9 @@ impl<H: InboundSink> Connection<H> {
         self.channels.stats.session_up();
         self.session_up_since = Some(Instant::now());
         if self.cancel.is_cancelled() {
+            // `shutdown()` raced the CONNACK: the session is up, so end it with a Normal
+            // Disconnection, or the broker publishes the Will.
+            self.disconnect_normally(&mut framed_write).await;
             return self
                 .finish_session(ConnectionOutcome::Shutdown(ShutdownError::Cancelled), false)
                 .await;
