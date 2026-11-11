@@ -66,9 +66,7 @@ async fn disconnect_with_redirect(session: &mut PeerSession, reason: DisconnectR
 #[tokio::test]
 async fn connack_redirect_is_followed_at_once() {
     let (target_port, target) = spawn_peer_broker(|broker| async move {
-        let mut session = broker.accept_session().await;
-        session.expect_connect().await;
-        session.send_connack_success().await;
+        let session = broker.accept_connected().await;
         session.hold().await;
     })
     .await;
@@ -111,9 +109,7 @@ async fn connack_redirect_is_followed_at_once() {
 #[tokio::test]
 async fn builder_connect_follows_a_connack_redirect() {
     let (target_port, target) = spawn_peer_broker(|broker| async move {
-        let mut session = broker.accept_session().await;
-        session.expect_connect().await;
-        session.send_connack_success().await;
+        let session = broker.accept_connected().await;
         session.hold().await;
     })
     .await;
@@ -191,9 +187,7 @@ async fn server_moved_is_permanent() {
         let target_sessions = Arc::clone(&target_sessions);
         move |broker| async move {
             for _ in 0..2 {
-                let mut session = broker.accept_session().await;
-                session.expect_connect().await;
-                session.send_connack_success().await;
+                let session = broker.accept_connected().await;
                 target_sessions.fetch_add(1, Ordering::SeqCst);
                 // First session: drop the connection so the client reconnects.
                 if target_sessions.load(Ordering::SeqCst) == 1 {
@@ -206,9 +200,7 @@ async fn server_moved_is_permanent() {
     })
     .await;
     let (port, origin) = spawn_peer_broker(move |broker| async move {
-        let mut session = broker.accept_session().await;
-        session.expect_connect().await;
-        session.send_connack_success().await;
+        let mut session = broker.accept_connected().await;
         disconnect_with_redirect(
             &mut session,
             DisconnectReasonCode::ServerMoved,
@@ -250,9 +242,7 @@ async fn server_moved_is_permanent() {
 #[tokio::test]
 async fn use_another_server_is_one_connection_only() {
     let (target_port, target) = spawn_peer_broker(|broker| async move {
-        let mut session = broker.accept_session().await;
-        session.expect_connect().await;
-        session.send_connack_success().await;
+        let session = broker.accept_connected().await;
         drop(session);
     })
     .await;
@@ -260,9 +250,7 @@ async fn use_another_server_is_one_connection_only() {
     let (port, origin) = spawn_peer_broker({
         let returned = Arc::clone(&returned);
         move |broker| async move {
-            let mut session = broker.accept_session().await;
-            session.expect_connect().await;
-            session.send_connack_success().await;
+            let mut session = broker.accept_connected().await;
             disconnect_with_redirect(
                 &mut session,
                 DisconnectReasonCode::UseAnotherServer,

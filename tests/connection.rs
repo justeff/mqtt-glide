@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::{
-    CountingInvalidate, NoReconnect, join_peer, spawn_connack_then_disconnect, spawn_peer_broker, static_credentials,
-    wait_for_phase, wait_until,
+    CountingInvalidate, NoReconnect, TestClient, join_peer, local_options, local_url, quick_retry,
+    spawn_connack_then_disconnect, spawn_peer_broker, static_credentials, wait_for_phase, wait_until,
 };
 use std::num::NonZeroU16;
 
@@ -17,7 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use mqtt_glide::Password;
 use mqtt_glide::codec::{ConnectAck, DecodedFrame, Packet, PublishDelivery, encode_publish};
 use mqtt_glide::{
-    AuthError, BrokerUrl, ClientId, ConnectAckReason, ConnectOptions, ConnectionOutcome, DEFAULT_MAX_PACKET_SIZE,
+    AuthError, ClientId, ConnectAckReason, ConnectOptions, ConnectionOutcome, DEFAULT_MAX_PACKET_SIZE,
     DisconnectReasonCode, InboundMessage, NoopLifecycle, ProtocolError, Publish, PublishMessage, QoS, SessionPhase,
     StandardReconnectPolicy, connect,
 };
@@ -34,14 +34,14 @@ async fn unreachable_broker_returns_transport_error() {
     let port = listener.local_addr().expect("local addr").port();
     drop(listener);
 
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid broker url");
-    let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("connect-down"));
-    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
-    let (_client, connection, mut phase) =
-        connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("connect wiring");
-
-    let run = tokio::spawn(connection.run());
-    let first = wait_for_phase(&mut phase, Duration::from_secs(5), |p| {
+    let (tx, _rx) = mpsc::channel(4);
+    let mut started = TestClient::spawn(
+        local_options(port, "connect-down"),
+        static_credentials(),
+        NoReconnect,
+        tx,
+    );
+    let first = wait_for_phase(&mut started.phase, Duration::from_secs(5), |p| {
         matches!(p, SessionPhase::Disconnected(_) | SessionPhase::Connected { .. })
     })
     .await;
@@ -51,7 +51,7 @@ async fn unreachable_broker_returns_transport_error() {
         other => panic!("expected Disconnected(Transport(_)), got {other:?}"),
     }
 
-    let outcome = timeout(Duration::from_secs(5), run)
+    let outcome = timeout(Duration::from_secs(5), started.run)
         .await
         .expect("run must finish after transport failure")
         .expect("run task join");
@@ -86,18 +86,15 @@ async fn broker_disconnect_reason_classifies_auth_transport_protocol(
     #[case] expected_invalidations: usize,
 ) {
     let (port, peer) = spawn_connack_then_disconnect(reason).await;
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("disc-reason"));
     let invalidations = Arc::new(AtomicUsize::new(0));
     let creds = CountingInvalidate {
         invalidations: Arc::clone(&invalidations),
     };
-    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
-    let (_client, connection, mut phase) = connect(options, creds, NoReconnect, tx, NoopLifecycle).expect("wiring");
-    let run = tokio::spawn(connection.run());
+    let (tx, _rx) = mpsc::channel(4);
+    let mut started = TestClient::spawn(local_options(port, "disc-reason"), creds, NoReconnect, tx);
 
     // Broker DISCONNECT right after CONNACK — watch may skip Connected.
-    let disconnected = wait_for_phase(&mut phase, Duration::from_secs(5), |event| {
+    let disconnected = wait_for_phase(&mut started.phase, Duration::from_secs(5), |event| {
         matches!(event, SessionPhase::Disconnected(_))
     })
     .await;
@@ -107,7 +104,7 @@ async fn broker_disconnect_reason_classifies_auth_transport_protocol(
     );
     assert_eq!(invalidations.load(Ordering::SeqCst), expected_invalidations);
 
-    let outcome = timeout(Duration::from_secs(5), run)
+    let outcome = timeout(Duration::from_secs(5), started.run)
         .await
         .expect("run join")
         .expect("join");
@@ -146,9 +143,7 @@ async fn auth_failure_reconnect_replenishes_channel_before_invalidate() {
     let (port, peer) = spawn_peer_broker({
         let second_connect = Arc::clone(&second_connect);
         move |broker| async move {
-            let mut session = broker.accept_session().await;
-            session.expect_connect().await;
-            session.send_connack_success().await;
+            let mut session = broker.accept_connected().await;
             session.send_disconnect(DisconnectReasonCode::NotAuthorized).await;
 
             let mut session = broker.accept_session().await;
@@ -159,25 +154,21 @@ async fn auth_failure_reconnect_replenishes_channel_before_invalidate() {
     })
     .await;
 
-    let started = Arc::new(AtomicUsize::new(0));
+    let invalidate_started = Arc::new(AtomicUsize::new(0));
     let invalidations = Arc::new(AtomicUsize::new(0));
     let release = Arc::new(tokio::sync::Notify::new());
     let creds = LatchedInvalidate {
-        started: Arc::clone(&started),
+        started: Arc::clone(&invalidate_started),
         invalidations: Arc::clone(&invalidations),
         release: Arc::clone(&release),
     };
     let policy = StandardReconnectPolicy::new(Duration::from_millis(300), Duration::from_secs(5));
 
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url)
-        .client_id(ClientId::from_prefix("invalidate-order"))
-        .connect_timeout(Duration::from_secs(1));
-    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
-    let (client, connection, mut phase) = connect(options, creds, policy, tx, NoopLifecycle).expect("wiring");
-    let run = tokio::spawn(connection.run());
+    let options = local_options(port, "invalidate-order").connect_timeout(Duration::from_secs(1));
+    let (tx, _rx) = mpsc::channel(4);
+    let mut started = TestClient::spawn(options, creds, policy, tx);
 
-    let disconnected = wait_for_phase(&mut phase, Duration::from_secs(5), |event| {
+    let disconnected = wait_for_phase(&mut started.phase, Duration::from_secs(5), |event| {
         matches!(event, SessionPhase::Disconnected(_))
     })
     .await;
@@ -188,14 +179,14 @@ async fn auth_failure_reconnect_replenishes_channel_before_invalidate() {
 
     wait_until(
         Duration::from_secs(5),
-        || started.load(Ordering::SeqCst) > 0,
+        || invalidate_started.load(Ordering::SeqCst) > 0,
         "invalidate start",
     )
     .await;
 
     // While the credentials provider is refreshing, the replenished command channel must
     // accept application work (not AppError::CommandChannelClosed).
-    let queued = client.try_start_publish(Publish::new("invalidate/order", "x"));
+    let queued = started.client.try_start_publish(Publish::new("invalidate/order", "x"));
     assert!(
         queued.is_ok(),
         "command channel must stay open during invalidation, got {queued:?}"
@@ -212,11 +203,7 @@ async fn auth_failure_reconnect_replenishes_channel_before_invalidate() {
         "invalidate must run exactly once"
     );
 
-    client.shutdown().await.expect("shutdown");
-    let _ = timeout(Duration::from_secs(5), run)
-        .await
-        .expect("run must finish after shutdown")
-        .expect("run task join");
+    started.shutdown().await;
     peer.abort();
 }
 
@@ -236,8 +223,7 @@ async fn refused_connack_invalidates_credentials_once() {
     })
     .await;
 
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("refused-creds"));
+    let options = local_options(port, "refused-creds");
     let invalidations = Arc::new(AtomicUsize::new(0));
     let creds = CountingInvalidate {
         invalidations: Arc::clone(&invalidations),
@@ -277,18 +263,14 @@ async fn clean_start_session_present_stops_without_reconnect() {
     })
     .await;
 
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url)
-        .client_id(ClientId::from_prefix("desync-clean"))
+    let options = local_options(port, "desync-clean")
         .clean_start(true)
         .connect_timeout(Duration::from_secs(1));
     let policy = StandardReconnectPolicy::new(Duration::from_millis(50), Duration::from_secs(1));
-    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
-    let (_client, connection, mut phase) =
-        connect(options, static_credentials(), policy, tx, NoopLifecycle).expect("wiring");
-    let run = tokio::spawn(connection.run());
+    let (tx, _rx) = mpsc::channel(4);
+    let mut started = TestClient::spawn(options, static_credentials(), policy, tx);
 
-    let disconnected = wait_for_phase(&mut phase, Duration::from_secs(5), |event| {
+    let disconnected = wait_for_phase(&mut started.phase, Duration::from_secs(5), |event| {
         matches!(event, SessionPhase::Disconnected(_))
     })
     .await;
@@ -302,7 +284,7 @@ async fn clean_start_session_present_stops_without_reconnect() {
         "expected SessionPresentInconsistent stop, got {disconnected:?}"
     );
 
-    let outcome = timeout(Duration::from_secs(5), run)
+    let outcome = timeout(Duration::from_secs(5), started.run)
         .await
         .expect("run join")
         .expect("join");
@@ -357,19 +339,16 @@ async fn first_connect_resumes_an_existing_broker_session() {
     })
     .await;
 
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url)
+    let options = ConnectOptions::new(local_url(port))
         .client_id(ClientId::try_new("restarted-service").expect("client id"))
         .clean_start(false)
         .session_expiry(Some(Duration::from_secs(60)))
         .connect_timeout(Duration::from_secs(1));
-    let (tx, mut rx) = mpsc::channel::<InboundMessage>(4);
-    let (client, connection, mut phase) =
-        connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
-    let run = tokio::spawn(connection.run());
+    let (tx, mut rx) = mpsc::channel(4);
+    let mut started = TestClient::spawn(options, static_credentials(), NoReconnect, tx);
 
     wait_for_phase(
-        &mut phase,
+        &mut started.phase,
         Duration::from_secs(5),
         |event| matches!(event, SessionPhase::Connected { session, .. } if session.session_present),
     )
@@ -379,13 +358,9 @@ async fn first_connect_resumes_an_existing_broker_session() {
         .expect("queued message in time")
         .expect("sink open");
     assert_eq!(&*message.topic, "queued/while/offline");
-    assert!(client.is_connected(), "resuming must not end the session");
+    assert!(started.client.is_connected(), "resuming must not end the session");
 
-    client.shutdown().await.expect("shutdown");
-    let _ = timeout(Duration::from_secs(5), run)
-        .await
-        .expect("run finish")
-        .expect("join");
+    started.shutdown().await;
     peer.abort();
 }
 
@@ -396,15 +371,11 @@ async fn lost_session_resubscribes_on_reconnect() {
     let (port, peer) = spawn_peer_broker({
         let saw_resubscribe = Arc::clone(&saw_resubscribe);
         move |broker| async move {
-            let mut session = broker.accept_session().await;
-            session.expect_connect().await;
-            session.send_connack_success().await;
+            let mut session = broker.accept_connected().await;
             session.expect_subscribe_grant_qos0().await;
             session.send_disconnect(DisconnectReasonCode::NormalDisconnection).await;
 
-            let mut session = broker.accept_session().await;
-            session.expect_connect().await;
-            session.send_connack_success().await;
+            let mut session = broker.accept_connected().await;
             session.expect_subscribe_grant_qos0().await;
             saw_resubscribe.fetch_add(1, Ordering::SeqCst);
             session.hold().await;
@@ -412,23 +383,15 @@ async fn lost_session_resubscribes_on_reconnect() {
     })
     .await;
 
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url)
-        .client_id(ClientId::from_prefix("resub"))
+    let options = local_options(port, "resub")
         .clean_start(false)
         .session_expiry(Some(Duration::from_secs(60)))
         .connect_timeout(Duration::from_secs(1));
     let policy = StandardReconnectPolicy::new(Duration::from_millis(50), Duration::from_secs(1));
-    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
-    let (client, connection, mut phase) =
-        connect(options, static_credentials(), policy, tx, NoopLifecycle).expect("wiring");
-    let run = tokio::spawn(connection.run());
-
-    wait_for_phase(&mut phase, Duration::from_secs(5), |event| {
-        matches!(event, SessionPhase::Connected { .. })
-    })
-    .await;
-    client
+    let (tx, _rx) = mpsc::channel(4);
+    let started = TestClient::connected(options, static_credentials(), policy, tx).await;
+    started
+        .client
         .subscribe([("resub/topic", QoS::AtMostOnce)])
         .await
         .expect("subscribe");
@@ -440,11 +403,7 @@ async fn lost_session_resubscribes_on_reconnect() {
     )
     .await;
 
-    client.shutdown().await.expect("shutdown");
-    let _ = timeout(Duration::from_secs(5), run)
-        .await
-        .expect("run finish")
-        .expect("join");
+    started.shutdown().await;
     peer.abort();
 }
 
@@ -454,23 +413,17 @@ async fn lost_session_resubscribes_on_reconnect() {
 /// the one it stopped at.
 #[tokio::test]
 async fn publish_the_broker_disconnects_on_is_given_up() {
-    use mqtt_glide::codec::{PublishAck, PublishAckReason};
-
     let connects = Arc::new(AtomicUsize::new(0));
     let refused_sends = Arc::new(AtomicUsize::new(0));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    let broker = tokio::spawn({
+    let (port, broker) = spawn_peer_broker({
         let connects = Arc::clone(&connects);
         let refused_sends = Arc::clone(&refused_sends);
-        async move {
+        move |broker| async move {
             loop {
-                let (stream, _) = listener.accept().await.expect("accept");
+                let mut session = broker.accept_session().await;
                 let index = connects.fetch_add(1, Ordering::SeqCst);
                 let refused_sends = Arc::clone(&refused_sends);
                 tokio::spawn(async move {
-                    let (read, write) = common::framed_halves(stream);
-                    let mut session = common::PeerSession { read, write };
                     session.expect_connect().await;
                     session
                         .send_connack(ConnectAck {
@@ -487,39 +440,21 @@ async fn publish_the_broker_disconnects_on_is_given_up() {
                             session.send_disconnect(DisconnectReasonCode::NotAuthorized).await;
                             return;
                         }
-                        let packet_id = packet.meta.packet_id.expect("QoS 1");
-                        let ack = Packet::PublishAck(PublishAck {
-                            packet_id,
-                            reason_code: PublishAckReason::Success,
-                            properties: Default::default(),
-                            reason_string: None,
-                        });
-                        let _ = session.write.send(ack).await;
+                        session.send_puback(packet.meta.packet_id.expect("QoS 1")).await;
                     }
                 });
             }
         }
-    });
+    })
+    .await;
 
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url)
+    let options = ConnectOptions::new(local_url(port))
         .client_id(ClientId::try_new("refused-publish").expect("client id"))
         .clean_start(false)
         .session_expiry(Some(Duration::from_secs(3600)));
-    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
-    let (client, connection, mut phase) = connect(
-        options,
-        static_credentials(),
-        StandardReconnectPolicy::new(Duration::from_millis(20), Duration::from_millis(20)),
-        tx,
-        NoopLifecycle,
-    )
-    .expect("wiring");
-    let run = tokio::spawn(connection.run());
-    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
-        matches!(phase, SessionPhase::Connected { .. })
-    })
-    .await;
+    let (tx, _rx) = mpsc::channel(4);
+    let started = TestClient::connected(options, static_credentials(), quick_retry(), tx).await;
+    let client = &started.client;
 
     let refused = timeout(
         Duration::from_secs(5),
@@ -544,8 +479,7 @@ async fn publish_the_broker_disconnects_on_is_given_up() {
     assert_eq!(refused_sends.load(Ordering::SeqCst), 3, "not sent again");
     assert_eq!(connects.load(Ordering::SeqCst), 4);
 
-    client.shutdown().await.expect("shutdown");
-    let _ = timeout(Duration::from_secs(5), run).await;
+    started.shutdown().await;
     broker.abort();
 }
 
@@ -560,14 +494,8 @@ async fn slow_but_progressing_publish_keeps_the_connection() {
     // Fixed header (1 + 4 bytes Remaining Length), topic "big/blob" (2 + 8), no properties (1).
     const PUBLISH_WIRE_LEN: usize = 5 + 10 + 1 + PAYLOAD_LEN;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    let broker = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        let (read, write) = common::framed_halves(stream);
-        let mut session = common::PeerSession { read, write };
-        session.expect_connect().await;
-        session.send_connack_success().await;
+    let (port, broker) = spawn_peer_broker(|broker| async move {
+        let session = broker.accept_connected().await;
         // Read raw and slowly; answer the PINGREQs (0xC0 0x00) that follow the publish.
         let mut raw = session.read.into_inner();
         let mut raw_write = session.write.into_inner();
@@ -587,24 +515,17 @@ async fn slow_but_progressing_publish_keeps_the_connection() {
                 }
             }
         }
-    });
-
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url)
-        .client_id(ClientId::from_prefix("slow-out"))
-        .keep_alive(Duration::from_secs(1))
-        .tcp_send_buffer_size(std::num::NonZeroU32::new(16 * 1024).expect("nz"));
-    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
-    let (client, connection, mut phase) =
-        connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
-    let run = tokio::spawn(connection.run());
-    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
-        matches!(phase, SessionPhase::Connected { .. })
     })
     .await;
 
+    let options = local_options(port, "slow-out")
+        .keep_alive(Duration::from_secs(1))
+        .tcp_send_buffer_size(std::num::NonZeroU32::new(16 * 1024).expect("nz"));
+    let (tx, _rx) = mpsc::channel(4);
+    let mut started = TestClient::connected(options, static_credentials(), NoReconnect, tx).await;
+
     let publish = tokio::spawn({
-        let client = client.clone();
+        let client = started.client.clone();
         async move {
             client
                 .publish("big/blob", bytes::Bytes::from(vec![0x55u8; PAYLOAD_LEN]))
@@ -613,9 +534,12 @@ async fn slow_but_progressing_publish_keeps_the_connection() {
     });
     let lost = timeout(
         Duration::from_secs(4),
-        phase.wait_for(|phase| matches!(phase, SessionPhase::Disconnected(_))),
+        started
+            .phase
+            .wait_for(|phase| matches!(phase, SessionPhase::Disconnected(_))),
     )
-    .await;
+    .await
+    .map(|seen| seen.map(|phase| phase.clone()));
     assert!(
         lost.is_err(),
         "connection closed while the publish was going out: {lost:?}"
@@ -626,8 +550,7 @@ async fn slow_but_progressing_publish_keeps_the_connection() {
         .expect("join")
         .expect("written");
 
-    client.shutdown().await.expect("shutdown");
-    let _ = timeout(Duration::from_secs(5), run).await;
+    started.shutdown().await;
     broker.abort();
 }
 
@@ -638,23 +561,10 @@ async fn slow_but_progressing_publish_keeps_the_connection() {
 async fn slow_but_progressing_inbound_publish_keeps_the_connection() {
     use tokio::io::AsyncWriteExt;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    let broker = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        let (read, write) = common::framed_halves(stream);
-        let mut session = common::PeerSession { read, write };
-        session.expect_connect().await;
-        session.send_connack_success().await;
-        let message = PublishMessage::new("big/in", bytes::Bytes::from(vec![7u8; 2 * 1024 * 1024]));
-        let delivery = PublishDelivery {
-            dup: false,
-            retain: false,
-            qos: QoS::AtMostOnce,
-            packet_id: None,
-        };
-        let mut wire = bytes::BytesMut::new();
-        encode_publish(&message, delivery, 0, &mut wire).expect("encode");
+    let (port, broker) = spawn_peer_broker(|broker| async move {
+        let mut session = broker.accept_connected().await;
+        session.feed_publish("big/in", vec![7u8; 2 * 1024 * 1024], false);
+        let wire = session.write.write_buffer_mut().split();
         // Take the client's PINGREQs so its writes never block.
         let mut read = session.read;
         tokio::spawn(async move { while let Some(Ok(_)) = read.next().await {} });
@@ -666,21 +576,14 @@ async fn slow_but_progressing_inbound_publish_keeps_the_connection() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         std::future::pending::<()>().await;
-    });
-
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url)
-        .client_id(ClientId::from_prefix("slow-in"))
-        .keep_alive(Duration::from_secs(1))
-        .max_packet_size(std::num::NonZeroU32::new(4 * 1024 * 1024).expect("nz"));
-    let (tx, mut rx) = mpsc::channel::<InboundMessage>(4);
-    let (client, connection, mut phase) =
-        connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
-    let run = tokio::spawn(connection.run());
-    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
-        matches!(phase, SessionPhase::Connected { .. })
     })
     .await;
+
+    let options = local_options(port, "slow-in")
+        .keep_alive(Duration::from_secs(1))
+        .max_packet_size(std::num::NonZeroU32::new(4 * 1024 * 1024).expect("nz"));
+    let (tx, mut rx) = mpsc::channel(4);
+    let started = TestClient::connected(options, static_credentials(), NoReconnect, tx).await;
 
     let message = timeout(Duration::from_secs(8), rx.recv())
         .await
@@ -690,8 +593,7 @@ async fn slow_but_progressing_inbound_publish_keeps_the_connection() {
     // mock never answers PINGREQ, so `is_connected` afterwards would only measure the next tick.
     assert_eq!(message.payload.len(), 2 * 1024 * 1024);
 
-    client.shutdown().await.expect("shutdown");
-    let _ = timeout(Duration::from_secs(5), run).await;
+    started.shutdown().await;
     broker.abort();
 }
 
@@ -702,17 +604,11 @@ async fn slow_but_progressing_inbound_publish_keeps_the_connection() {
 async fn broker_disconnect_during_resubscribe_keeps_its_reason() {
     let (sent_back_tx, sent_back_rx) = tokio::sync::oneshot::channel();
     let (port, peer) = spawn_peer_broker(move |broker| async move {
-        let mut session = broker.accept_session().await;
-        session.expect_connect().await;
-        session.send_connack_success().await;
-        session.expect_subscribe_grant_qos0().await;
-        drop(session);
+        broker.accept_connected().await.expect_subscribe_grant_qos0().await;
 
         // Session Present = 0: the client restores the subscription, and the broker hands the
         // session to another client instead of answering.
-        let mut session = broker.accept_session().await;
-        session.expect_connect().await;
-        session.send_connack_success().await;
+        let mut session = broker.accept_connected().await;
         let _subscribe = session.read.next().await;
         session.send_disconnect(DisconnectReasonCode::SessionTakenOver).await;
         let next = timeout(Duration::from_secs(2), session.read.next()).await;
@@ -721,23 +617,14 @@ async fn broker_disconnect_during_resubscribe_keeps_its_reason() {
     })
     .await;
 
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("taken-over"));
-    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
-    let (client, connection, mut phase) = connect(
-        options,
-        static_credentials(),
-        StandardReconnectPolicy::new(Duration::from_millis(20), Duration::from_secs(30)),
-        tx,
-        NoopLifecycle,
-    )
-    .expect("wiring");
-    let run = tokio::spawn(connection.run());
-    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
-        matches!(phase, SessionPhase::Connected { .. })
-    })
-    .await;
-    client.subscribe([("a/b", QoS::AtMostOnce)]).await.expect("subscribe");
+    let policy = StandardReconnectPolicy::new(Duration::from_millis(20), Duration::from_secs(30));
+    let (tx, _rx) = mpsc::channel(4);
+    let mut started = TestClient::connected(local_options(port, "taken-over"), static_credentials(), policy, tx).await;
+    started
+        .client
+        .subscribe([("a/b", QoS::AtMostOnce)])
+        .await
+        .expect("subscribe");
 
     let taken_over = |phase: &SessionPhase| {
         matches!(
@@ -753,8 +640,8 @@ async fn broker_disconnect_during_resubscribe_keeps_its_reason() {
     let mut seen = Vec::new();
     timeout(Duration::from_secs(5), async {
         loop {
-            phase.changed().await.expect("driver alive");
-            let current = phase.borrow_and_update().clone();
+            started.phase.changed().await.expect("driver alive");
+            let current = started.phase.borrow_and_update().clone();
             if taken_over(&current) {
                 return;
             }
@@ -772,8 +659,7 @@ async fn broker_disconnect_during_resubscribe_keeps_its_reason() {
         "the client answered the DISCONNECT: {sent_back}"
     );
 
-    client.shutdown().await.expect("shutdown");
-    let _ = timeout(Duration::from_secs(5), run).await;
+    started.shutdown().await;
     peer.abort();
 }
 
@@ -782,20 +668,14 @@ async fn broker_disconnect_during_resubscribe_keeps_its_reason() {
 /// client used to reconnect into the same messages again and again.
 #[tokio::test]
 async fn slow_consumer_during_resubscribe_keeps_the_connection() {
-    use mqtt_glide::codec::{SubscribeAck, SubscribeAckReason};
-
     let connects = Arc::new(AtomicUsize::new(0));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    let broker = tokio::spawn({
+    let (port, broker) = spawn_peer_broker({
         let connects = Arc::clone(&connects);
-        async move {
+        move |broker| async move {
             loop {
-                let (stream, _) = listener.accept().await.expect("accept");
+                let mut session = broker.accept_session().await;
                 let index = connects.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
-                    let (read, write) = common::framed_halves(stream);
-                    let mut session = common::PeerSession { read, write };
                     session.expect_connect().await;
                     session.send_connack_success().await;
                     if index == 0 {
@@ -805,67 +685,29 @@ async fn slow_consumer_during_resubscribe_keeps_the_connection() {
                     }
                     // Both SUBSCRIBEs of the restore, then retained messages for the first
                     // filter between the two SUBACKs.
-                    let mut ids = Vec::new();
-                    while ids.len() < 2 {
-                        match session.read.next().await {
-                            Some(Ok((DecodedFrame::Control(Packet::Subscribe(subscribe)), _))) => {
-                                ids.push(subscribe.packet_id);
-                            }
-                            _ => return,
-                        }
-                    }
-                    let suback = |packet_id| {
-                        Packet::SubscribeAck(SubscribeAck {
-                            packet_id,
-                            status: vec![SubscribeAckReason::GrantedQos0],
-                            properties: Default::default(),
-                            reason_string: None,
-                        })
-                    };
-                    session.write.send(suback(ids[0])).await.expect("first SUBACK");
+                    let ids = session.expect_subscribe_ids(2).await;
+                    session.send_suback_qos0(ids[0], 1).await;
                     for payload in ["r1", "r2", "r3"] {
-                        let message = PublishMessage::new("a/retained", payload);
-                        let delivery = PublishDelivery {
-                            dup: false,
-                            retain: true,
-                            qos: QoS::AtMostOnce,
-                            packet_id: None,
-                        };
-                        encode_publish(&message, delivery, 0, session.write.write_buffer_mut()).expect("encode");
+                        session.feed_publish("a/retained", payload, true);
                     }
-                    session.write.send(suback(ids[1])).await.expect("second SUBACK");
+                    session.send_suback_qos0(ids[1], 1).await;
                     while let Some(Ok(_)) = session.read.next().await {}
                 });
             }
         }
-    });
-
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url)
-        .client_id(ClientId::from_prefix("slow-sink"))
-        .ack_timeout(Duration::from_secs(1));
-    let (tx, mut rx) = mpsc::channel::<InboundMessage>(1);
-    let (client, connection, mut phase) = connect(
-        options,
-        static_credentials(),
-        StandardReconnectPolicy::new(Duration::from_millis(20), Duration::from_millis(20)),
-        tx,
-        NoopLifecycle,
-    )
-    .expect("wiring");
-    let run = tokio::spawn(connection.run());
-    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
-        matches!(phase, SessionPhase::Connected { .. })
     })
     .await;
-    client
-        .subscribe([("a/#", QoS::AtMostOnce)])
-        .await
-        .expect("first subscribe");
-    client
-        .subscribe([("b/#", QoS::AtMostOnce)])
-        .await
-        .expect("second subscribe");
+
+    let options = local_options(port, "slow-sink").ack_timeout(Duration::from_secs(1));
+    let (tx, mut rx) = mpsc::channel(1);
+    let mut started = TestClient::connected(options, static_credentials(), quick_retry(), tx).await;
+    for filter in ["a/#", "b/#"] {
+        started
+            .client
+            .subscribe([(filter, QoS::AtMostOnce)])
+            .await
+            .expect("subscribe");
+    }
 
     // One message per 1.5 s: the three retained ones hold the restore for well over the 1 s
     // SUBACK deadline, which still leaves room for a slow scheduler.
@@ -879,14 +721,13 @@ async fn slow_consumer_during_resubscribe_keeps_the_connection() {
         tokio::time::sleep(Duration::from_millis(1500)).await;
     }
     assert_eq!(got, ["r1", "r2", "r3"]);
-    wait_for_phase(&mut phase, Duration::from_secs(2), |phase| {
+    wait_for_phase(&mut started.phase, Duration::from_secs(2), |phase| {
         matches!(phase, SessionPhase::Connected { .. })
     })
     .await;
     assert_eq!(connects.load(Ordering::SeqCst), 2, "no reconnect after the restore");
 
-    client.shutdown().await.expect("shutdown");
-    let _ = timeout(Duration::from_secs(5), run).await;
+    started.shutdown().await;
     broker.abort();
 }
 
@@ -895,42 +736,27 @@ async fn slow_consumer_during_resubscribe_keeps_the_connection() {
 #[tokio::test]
 async fn not_authorized_during_resubscribe_invalidates_credentials() {
     let (port, peer) = spawn_peer_broker(move |broker| async move {
-        let mut session = broker.accept_session().await;
-        session.expect_connect().await;
-        session.send_connack_success().await;
-        session.expect_subscribe_grant_qos0().await;
-        drop(session);
+        broker.accept_connected().await.expect_subscribe_grant_qos0().await;
 
-        let mut session = broker.accept_session().await;
-        session.expect_connect().await;
-        session.send_connack_success().await;
+        let mut session = broker.accept_connected().await;
         let _subscribe = session.read.next().await;
         session.send_disconnect(DisconnectReasonCode::NotAuthorized).await;
         session.hold().await;
     })
     .await;
 
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("refused-restore"));
     let invalidations = Arc::new(AtomicUsize::new(0));
     let credentials = CountingInvalidate {
         invalidations: Arc::clone(&invalidations),
     };
-    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
-    let (client, connection, mut phase) = connect(
-        options,
-        credentials,
-        StandardReconnectPolicy::new(Duration::from_millis(20), Duration::from_secs(30)),
-        tx,
-        NoopLifecycle,
-    )
-    .expect("wiring");
-    let run = tokio::spawn(connection.run());
-    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
-        matches!(phase, SessionPhase::Connected { .. })
-    })
-    .await;
-    client.subscribe([("a/b", QoS::AtMostOnce)]).await.expect("subscribe");
+    let policy = StandardReconnectPolicy::new(Duration::from_millis(20), Duration::from_secs(30));
+    let (tx, _rx) = mpsc::channel(4);
+    let started = TestClient::connected(local_options(port, "refused-restore"), credentials, policy, tx).await;
+    started
+        .client
+        .subscribe([("a/b", QoS::AtMostOnce)])
+        .await
+        .expect("subscribe");
     wait_until(
         Duration::from_secs(5),
         || invalidations.load(Ordering::SeqCst) == 1,
@@ -938,8 +764,7 @@ async fn not_authorized_during_resubscribe_invalidates_credentials() {
     )
     .await;
 
-    client.shutdown().await.expect("shutdown");
-    let _ = timeout(Duration::from_secs(5), run).await;
+    started.shutdown().await;
     peer.abort();
 }
 
@@ -948,44 +773,18 @@ async fn not_authorized_during_resubscribe_invalidates_credentials() {
 /// broker closes a client that stays silent for 1.5 times the Keep Alive ([MQTT-3.1.2-22]).
 #[tokio::test]
 async fn resubscribe_held_by_a_full_sink_keeps_pinging() {
-    use mqtt_glide::codec::{SubscribeAck, SubscribeAckReason};
-
     let (pings_tx, pings_rx) = tokio::sync::oneshot::channel();
     let (port, peer) = spawn_peer_broker(move |broker| async move {
-        let mut session = broker.accept_session().await;
-        session.expect_connect().await;
-        session.send_connack_success().await;
+        let mut session = broker.accept_connected().await;
         session.expect_subscribe_grant_qos0().await;
         session.expect_subscribe_grant_qos0().await;
         drop(session);
 
-        let mut session = broker.accept_session().await;
-        session.expect_connect().await;
-        session.send_connack_success().await;
-        let mut ids = Vec::new();
-        while ids.len() < 2 {
-            if let Some(Ok((DecodedFrame::Control(Packet::Subscribe(subscribe)), _))) = session.read.next().await {
-                ids.push(subscribe.packet_id);
-            }
-        }
-        let suback = |packet_id| {
-            Packet::SubscribeAck(SubscribeAck {
-                packet_id,
-                status: vec![SubscribeAckReason::GrantedQos0],
-                properties: Default::default(),
-                reason_string: None,
-            })
-        };
-        session.write.send(suback(ids[0])).await.expect("first SUBACK");
+        let mut session = broker.accept_connected().await;
+        let ids = session.expect_subscribe_ids(2).await;
+        session.send_suback_qos0(ids[0], 1).await;
         for payload in ["r1", "r2"] {
-            let message = PublishMessage::new("a/retained", payload);
-            let delivery = PublishDelivery {
-                dup: false,
-                retain: true,
-                qos: QoS::AtMostOnce,
-                packet_id: None,
-            };
-            encode_publish(&message, delivery, 0, session.write.write_buffer_mut()).expect("encode");
+            session.feed_publish("a/retained", payload, true);
         }
         session.write.flush().await.expect("flush");
         // The sink holds one message and the consumer is asleep: count the PINGREQs meanwhile.
@@ -1006,38 +805,23 @@ async fn resubscribe_held_by_a_full_sink_keeps_pinging() {
             }
         }
         let _ = pings_tx.send(pings);
-        session.write.send(suback(ids[1])).await.expect("second SUBACK");
+        session.send_suback_qos0(ids[1], 1).await;
         session.hold().await;
     })
     .await;
 
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url)
-        .client_id(ClientId::from_prefix("pinging-restore"))
+    let options = local_options(port, "pinging-restore")
         .keep_alive(Duration::from_secs(1))
         .ack_timeout(Duration::from_secs(1));
-    let (tx, mut rx) = mpsc::channel::<InboundMessage>(1);
-    let (client, connection, mut phase) = connect(
-        options,
-        static_credentials(),
-        StandardReconnectPolicy::new(Duration::from_millis(20), Duration::from_millis(20)),
-        tx,
-        NoopLifecycle,
-    )
-    .expect("wiring");
-    let run = tokio::spawn(connection.run());
-    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
-        matches!(phase, SessionPhase::Connected { .. })
-    })
-    .await;
-    client
-        .subscribe([("a/#", QoS::AtMostOnce)])
-        .await
-        .expect("first subscribe");
-    client
-        .subscribe([("b/#", QoS::AtMostOnce)])
-        .await
-        .expect("second subscribe");
+    let (tx, mut rx) = mpsc::channel(1);
+    let started = TestClient::connected(options, static_credentials(), quick_retry(), tx).await;
+    for filter in ["a/#", "b/#"] {
+        started
+            .client
+            .subscribe([(filter, QoS::AtMostOnce)])
+            .await
+            .expect("subscribe");
+    }
 
     // Take nothing until the broker has counted; r1 fills the one-slot sink, r2 waits.
     let pings = timeout(Duration::from_secs(8), pings_rx)
@@ -1053,8 +837,7 @@ async fn resubscribe_held_by_a_full_sink_keeps_pinging() {
         assert_eq!(&message.payload[..], expected.as_bytes());
     }
 
-    client.shutdown().await.expect("shutdown");
-    let _ = timeout(Duration::from_secs(5), run).await;
+    started.shutdown().await;
     peer.abort();
 }
 
@@ -1073,15 +856,11 @@ async fn hanging_credentials_provider_is_bounded_by_the_connect_timeout() {
         broker.accept_session().await.hold().await;
     })
     .await;
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url)
-        .client_id(ClientId::from_prefix("hanging-credentials"))
-        .connect_timeout(Duration::from_millis(300));
-    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
-    let (_client, connection, mut phase) = connect(options, Hangs, NoReconnect, tx, NoopLifecycle).expect("wiring");
-    let run = tokio::spawn(connection.run());
+    let options = local_options(port, "hanging-credentials").connect_timeout(Duration::from_millis(300));
+    let (tx, _rx) = mpsc::channel(4);
+    let mut started = TestClient::spawn(options, Hangs, NoReconnect, tx);
 
-    let disconnected = wait_for_phase(&mut phase, Duration::from_secs(3), |phase| {
+    let disconnected = wait_for_phase(&mut started.phase, Duration::from_secs(3), |phase| {
         matches!(phase, SessionPhase::Disconnected(_))
     })
     .await;
@@ -1089,7 +868,9 @@ async fn hanging_credentials_provider_is_bounded_by_the_connect_timeout() {
         format!("{disconnected:?}").contains("credentials timed out"),
         "{disconnected:?}"
     );
-    let _ = timeout(Duration::from_secs(5), run).await.expect("driver stops");
+    let _ = timeout(Duration::from_secs(5), started.run)
+        .await
+        .expect("driver stops");
     peer.abort();
 }
 
@@ -1099,60 +880,38 @@ async fn hanging_credentials_provider_is_bounded_by_the_connect_timeout() {
 #[tokio::test]
 async fn shutdown_during_resubscribe_sends_disconnect() {
     let (in_resubscribe_tx, in_resubscribe_rx) = tokio::sync::oneshot::channel();
-    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
     let (port, peer) = spawn_peer_broker(move |broker| async move {
-        let mut session = broker.accept_session().await;
-        session.expect_connect().await;
-        session.send_connack_success().await;
-        session.expect_subscribe_grant_qos0().await;
-        drop(session);
+        broker.accept_connected().await.expect_subscribe_grant_qos0().await;
 
-        let mut session = broker.accept_session().await;
-        session.expect_connect().await;
-        session.send_connack_success().await;
+        let mut session = broker.accept_connected().await;
         let _subscribe = session.read.next().await; // left unanswered
         let _ = in_resubscribe_tx.send(());
-        let next = timeout(Duration::from_secs(3), session.read.next()).await;
-        let _ = seen_tx.send(format!("{next:?}"));
+        timeout(
+            Duration::from_secs(3),
+            session.expect_disconnect(DisconnectReasonCode::NormalDisconnection),
+        )
+        .await
+        .expect("DISCONNECT in time");
     })
     .await;
 
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url)
-        .client_id(ClientId::from_prefix("will"))
+    let options = local_options(port, "will")
         .will("status/will", "died")
         .ack_timeout(Duration::from_secs(10));
-    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
-    let (client, connection, mut phase) = connect(
-        options,
-        static_credentials(),
-        StandardReconnectPolicy::new(Duration::from_millis(20), Duration::from_millis(20)),
-        tx,
-        NoopLifecycle,
-    )
-    .expect("wiring");
-    let run = tokio::spawn(connection.run());
-    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
-        matches!(phase, SessionPhase::Connected { .. })
-    })
-    .await;
-    client.subscribe([("a/b", QoS::AtMostOnce)]).await.expect("subscribe");
+    let (tx, _rx) = mpsc::channel(4);
+    let started = TestClient::connected(options, static_credentials(), quick_retry(), tx).await;
+    started
+        .client
+        .subscribe([("a/b", QoS::AtMostOnce)])
+        .await
+        .expect("subscribe");
     timeout(Duration::from_secs(5), in_resubscribe_rx)
         .await
         .expect("restore started")
         .expect("peer alive");
 
-    client.shutdown().await.expect("shutdown");
-    let _ = timeout(Duration::from_secs(5), run).await.expect("driver stops");
-    let seen = timeout(Duration::from_secs(5), seen_rx)
-        .await
-        .expect("in time")
-        .expect("peer alive");
-    assert!(
-        seen.contains("Disconnect") && seen.contains("NormalDisconnection"),
-        "{seen}"
-    );
-    peer.abort();
+    started.shutdown().await;
+    join_peer(peer).await;
 }
 
 /// A PUBACK that arrives right before the broker closes the connection still completes the
@@ -1160,54 +919,36 @@ async fn shutdown_during_resubscribe_sends_disconnect() {
 /// is left with `ConnectionLost`. Two workers, so the read task's end and the write task race.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn puback_right_before_close_completes_the_publish() {
-    use mqtt_glide::codec::{PublishAck, PublishAckReason};
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    let broker = tokio::spawn(async move {
+    let (port, broker) = spawn_peer_broker(|broker| async move {
         loop {
-            let (stream, _) = listener.accept().await.expect("accept");
+            let mut session = broker.accept_session().await;
             tokio::spawn(async move {
-                let (read, write) = common::framed_halves(stream);
-                let mut session = common::PeerSession { read, write };
                 session.expect_connect().await;
                 session.send_connack_success().await;
                 while let Some(Ok((frame, _))) = session.read.next().await {
                     if let DecodedFrame::Publish(packet) = frame
                         && let Some(packet_id) = packet.meta.packet_id
                     {
-                        let ack = Packet::PublishAck(PublishAck {
-                            packet_id,
-                            reason_code: PublishAckReason::Success,
-                            properties: Default::default(),
-                            reason_string: None,
-                        });
-                        let _ = session.write.send(ack).await;
+                        session.send_puback(packet_id).await;
                         return; // the PUBACK is on the wire, then the close
                     }
                 }
             });
         }
-    });
+    })
+    .await;
 
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
     let mut lost = 0;
     for _ in 0..40 {
-        let options = ConnectOptions::new(url.clone()).client_id(ClientId::from_prefix("ack-close"));
-        let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
-        let (client, connection, mut phase) =
-            connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
-        let run = tokio::spawn(connection.run());
-        wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
-            matches!(phase, SessionPhase::Connected { .. })
-        })
-        .await;
-        match client.publish("t/ack", "x").qos(QoS::AtLeastOnce).await {
+        let (tx, _rx) = mpsc::channel(4);
+        let started =
+            TestClient::connected(local_options(port, "ack-close"), static_credentials(), NoReconnect, tx).await;
+        match started.client.publish("t/ack", "x").qos(QoS::AtLeastOnce).await {
             Ok(_) => {}
             Err(error) if matches!(error.error, mqtt_glide::AppError::ConnectionLost) => lost += 1,
             Err(error) => panic!("unexpected {error:?}"),
         }
-        let _ = timeout(Duration::from_secs(5), run).await;
+        let _ = timeout(Duration::from_secs(5), started.run).await;
     }
     assert_eq!(lost, 0, "publishes the broker acknowledged failed with ConnectionLost");
     broker.abort();
@@ -1222,9 +963,7 @@ async fn dropping_the_driver_ends_the_session() {
 
     let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
     let (port, peer) = spawn_peer_broker(move |broker| async move {
-        let mut session = broker.accept_session().await;
-        session.expect_connect().await;
-        session.send_connack_success().await;
+        let session = broker.accept_connected().await;
         // Never acknowledges; reports when the client closes the socket.
         let mut raw = session.read.into_inner();
         let mut buf = vec![0u8; 4096];
@@ -1238,19 +977,17 @@ async fn dropping_the_driver_ends_the_session() {
     })
     .await;
 
-    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url");
-    let options = ConnectOptions::new(url).client_id(ClientId::from_prefix("dropped-driver"));
-    let (tx, _rx) = mpsc::channel::<InboundMessage>(4);
-    let (client, connection, mut phase) =
-        connect(options, static_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
-    let run = tokio::spawn(connection.run());
-    wait_for_phase(&mut phase, Duration::from_secs(5), |phase| {
-        matches!(phase, SessionPhase::Connected { .. })
-    })
+    let (tx, _rx) = mpsc::channel(4);
+    let started = TestClient::connected(
+        local_options(port, "dropped-driver"),
+        static_credentials(),
+        NoReconnect,
+        tx,
+    )
     .await;
 
     let publish = tokio::spawn({
-        let client = client.clone();
+        let client = started.client.clone();
         async move {
             client
                 .publish("t/hang", "x")
@@ -1260,8 +997,8 @@ async fn dropping_the_driver_ends_the_session() {
         }
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    run.abort();
-    let _ = run.await;
+    started.run.abort();
+    let _ = started.run.await;
 
     timeout(Duration::from_secs(3), closed_rx)
         .await
@@ -1273,14 +1010,14 @@ async fn dropping_the_driver_ends_the_session() {
         .expect("join");
     assert!(in_flight.is_err(), "{in_flight:?}");
     // A health check must not see the dropped session as up.
-    assert!(!client.is_connected(), "still reported as connected");
+    assert!(!started.client.is_connected(), "still reported as connected");
     assert!(
         matches!(
-            *phase.borrow(),
+            *started.phase.borrow(),
             SessionPhase::Disconnected(ConnectionOutcome::Shutdown(_))
         ),
         "{:?}",
-        *phase.borrow()
+        *started.phase.borrow()
     );
     peer.abort();
 }

@@ -17,13 +17,17 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use mqtt_glide::Password;
-use mqtt_glide::codec::{Connect, ConnectAck, DecodedFrame, Disconnect, Packet, SubscribeAck, V5Codec};
+use mqtt_glide::codec::{
+    Connect, ConnectAck, DecodedFrame, Disconnect, Packet, PublishAck, PublishDelivery, PublishMessage, QoS,
+    SubscribeAck, V5Codec, encode_publish,
+};
 use mqtt_glide::{
-    AuthError, ConnectionOutcome, CredentialsProvider, DisconnectReasonCode, ReconnectPolicy, SessionPhase,
-    SubscribeAckReason,
+    AuthError, BrokerUrl, ClientId, ConnectOptions, ConnectionOutcome, CredentialsProvider, DisconnectReasonCode,
+    InboundMessage, MqttClient, NoopLifecycle, PublishAckReason, ReconnectPolicy, SessionPhase,
+    StandardReconnectPolicy, SubscribeAckReason, connect,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -59,6 +63,66 @@ pub struct NoReconnect;
 impl ReconnectPolicy for NoReconnect {
     fn delay_after(&self, _outcome: &ConnectionOutcome) -> Option<Duration> {
         None
+    }
+}
+
+/// Reconnect policy that retries 20 ms after every failure.
+pub fn quick_retry() -> StandardReconnectPolicy {
+    StandardReconnectPolicy::new(Duration::from_millis(20), Duration::from_millis(20))
+}
+
+/// URL of a peer broker listening on `127.0.0.1:port`.
+pub fn local_url(port: u16) -> BrokerUrl {
+    BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("valid url")
+}
+
+/// Options for a peer broker on `127.0.0.1:port` with a fresh client id starting with `prefix`.
+pub fn local_options(port: u16, prefix: &str) -> ConnectOptions {
+    ConnectOptions::new(local_url(port)).client_id(ClientId::from_prefix(prefix))
+}
+
+/// A client wired with [`connect`] whose driver runs in its own task.
+pub struct TestClient {
+    pub client: MqttClient,
+    pub phase: watch::Receiver<SessionPhase>,
+    pub run: JoinHandle<Result<(), ConnectionOutcome>>,
+}
+
+impl TestClient {
+    /// Wire the client and spawn its driver.
+    pub fn spawn(
+        options: ConnectOptions,
+        credentials: impl CredentialsProvider + 'static,
+        policy: impl ReconnectPolicy + 'static,
+        sink: mpsc::Sender<InboundMessage>,
+    ) -> Self {
+        let (client, connection, phase) = connect(options, credentials, policy, sink, NoopLifecycle).expect("wiring");
+        let run = tokio::spawn(connection.run());
+        Self { client, phase, run }
+    }
+
+    /// Like [`TestClient::spawn`], then wait for the first `Connected`.
+    pub async fn connected(
+        options: ConnectOptions,
+        credentials: impl CredentialsProvider + 'static,
+        policy: impl ReconnectPolicy + 'static,
+        sink: mpsc::Sender<InboundMessage>,
+    ) -> Self {
+        let mut started = Self::spawn(options, credentials, policy, sink);
+        wait_for_phase(&mut started.phase, Duration::from_secs(5), |phase| {
+            matches!(phase, SessionPhase::Connected { .. })
+        })
+        .await;
+        started
+    }
+
+    /// Shut the client down and wait for its driver to stop.
+    pub async fn shutdown(self) {
+        self.client.shutdown().await.expect("shutdown");
+        let _ = timeout(Duration::from_secs(5), self.run)
+            .await
+            .expect("driver stops after shutdown")
+            .expect("driver task");
     }
 }
 
@@ -115,6 +179,14 @@ impl PeerBroker {
         PeerSession { read, write }
     }
 
+    /// Accept the next client, expect its CONNECT and answer with a success CONNACK.
+    pub async fn accept_connected(&self) -> PeerSession {
+        let mut session = self.accept_session().await;
+        session.expect_connect().await;
+        session.send_connack_success().await;
+        session
+    }
+
     /// Returns `true` if another client dials within `deadline` (used to detect unwanted reconnects).
     pub async fn try_accept_within(&self, deadline: Duration) -> bool {
         timeout(deadline, self.listener.accept()).await.is_ok()
@@ -167,6 +239,42 @@ impl PeerSession {
             Some(Ok((DecodedFrame::Control(Packet::Subscribe(sub)), _))) => (sub.packet_id, sub.topic_filters.len()),
             other => panic!("peer expected SUBSCRIBE, got {other:?}"),
         };
+        self.send_suback_qos0(packet_id, filter_count).await;
+        packet_id
+    }
+
+    /// Collect the Packet Identifiers of the next `count` SUBSCRIBEs, skipping other packets.
+    pub async fn expect_subscribe_ids(&mut self, count: usize) -> Vec<NonZeroU16> {
+        let mut ids = Vec::with_capacity(count);
+        while ids.len() < count {
+            match self.read.next().await {
+                Some(Ok((DecodedFrame::Control(Packet::Subscribe(subscribe)), _))) => ids.push(subscribe.packet_id),
+                Some(Ok(_)) => {}
+                other => panic!("peer expected SUBSCRIBE, got {other:?}"),
+            }
+        }
+        ids
+    }
+
+    /// Queue a QoS 0 PUBLISH in the write buffer without flushing it.
+    pub fn feed_publish(&mut self, topic: &'static str, payload: impl Into<bytes::Bytes>, retain: bool) {
+        let delivery = PublishDelivery {
+            dup: false,
+            retain,
+            qos: QoS::AtMostOnce,
+            packet_id: None,
+        };
+        encode_publish(
+            &PublishMessage::new(topic, payload.into()),
+            delivery,
+            0,
+            self.write.write_buffer_mut(),
+        )
+        .expect("encode PUBLISH");
+    }
+
+    /// Reply with a SUBACK granting QoS 0 to `filter_count` filters.
+    pub async fn send_suback_qos0(&mut self, packet_id: NonZeroU16, filter_count: usize) {
         self.write
             .send(Packet::SubscribeAck(SubscribeAck {
                 packet_id,
@@ -176,7 +284,17 @@ impl PeerSession {
             }))
             .await
             .expect("peer send SUBACK");
-        packet_id
+    }
+
+    /// Reply with a success PUBACK; ignores a closed connection.
+    pub async fn send_puback(&mut self, packet_id: NonZeroU16) {
+        let ack = Packet::PublishAck(PublishAck {
+            packet_id,
+            reason_code: PublishAckReason::Success,
+            properties: Default::default(),
+            reason_string: None,
+        });
+        let _ = self.write.send(ack).await;
     }
 
     /// Keep the TCP session open until the test aborts the peer task.
