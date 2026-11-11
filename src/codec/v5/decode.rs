@@ -227,9 +227,9 @@ mod tests {
         );
 
         assert_eq!(
-            ConnectAck::decode(&mut Bytes::from_static(b"\x01\x86\x00")).unwrap(),
+            ConnectAck::decode(&mut Bytes::from_static(b"\x00\x86\x00")).unwrap(),
             ConnectAck {
-                session_present: true,
+                session_present: false,
                 reason_code: ConnectAckReason::BadUserNameOrPassword,
                 ..ConnectAck::default()
             }
@@ -242,15 +242,25 @@ mod tests {
         );
 
         assert_decode_frame(
-            b"\x20\x03\x01\x86\x00",
+            b"\x20\x03\x01\x00\x00",
             control(Packet::ConnectAck(Box::new(ConnectAck {
                 session_present: true,
-                reason_code: ConnectAckReason::BadUserNameOrPassword,
+                reason_code: ConnectAckReason::Success,
                 ..ConnectAck::default()
             }))),
         );
 
         assert_decode_frame([0b1110_0000, 0], control(Packet::Disconnect(Disconnect::default())));
+    }
+
+    /// A refusing CONNACK with Session Present set is a protocol error, not a refusal.
+    #[test]
+    fn connack_session_present_on_refusal_is_a_protocol_error() {
+        // [MQTT-3.2.2-6]: Session Present must be 0 when the Reason Code is not 0.
+        assert!(matches!(
+            ConnectAck::decode(&mut Bytes::from_static(b"\x01\x86\x00")),
+            Err(DecodeError::ProtocolViolation(_))
+        ));
     }
 
     #[test]

@@ -250,6 +250,129 @@ mod tests {
         assert_code_table::<QoS>(&[0, 1, 2]);
     }
 
+    /// What a decoder made of one reason-code byte.
+    #[derive(Debug, PartialEq)]
+    enum Read {
+        /// The packet decoded and carries this code.
+        Code(u8),
+        /// The packet was refused as malformed.
+        Malformed,
+    }
+
+    /// The (first) reason code of a decoded ack, DISCONNECT or AUTH.
+    fn code_of(packet: Packet) -> u8 {
+        match packet {
+            Packet::ConnectAck(ack) => ack.reason_code.into(),
+            Packet::PublishAck(ack) | Packet::PublishReceived(ack) => ack.reason_code.into(),
+            Packet::PublishRelease(ack) | Packet::PublishComplete(ack) => ack.reason_code.into(),
+            Packet::SubscribeAck(ack) => ack.status[0].into(),
+            Packet::UnsubscribeAck(ack) => ack.status[0].into(),
+            Packet::Disconnect(packet) => packet.reason_code.into(),
+            Packet::Auth(packet) => packet.reason_code.into(),
+            other => panic!("no reason code in {other:?}"),
+        }
+    }
+
+    fn read_code(first_byte: u8, body: Vec<u8>) -> Read {
+        match super::super::decode::decode_packet(bytes::Bytes::from(body), first_byte) {
+            Ok(DecodedFrame::Control(packet)) => Read::Code(code_of(packet)),
+            Ok(DecodedFrame::Publish(_)) => panic!("{first_byte:#04x} decoded as PUBLISH"),
+            Err(DecodeError::MalformedPacket(_)) => Read::Malformed,
+            Err(other) => panic!("{first_byte:#04x}: unexpected {other:?}"),
+        }
+    }
+
+    /// Every reason-code byte through the real packet decoders (§2.4): a defined code decodes
+    /// to itself; an undefined one below 0x80 claims success and makes the packet malformed
+    /// (for CONNACK [MQTT-3.2.2-8]); an undefined one from 0x80 is read as a failure where the
+    /// packet has failure codes (`lenient`), and refused where it has none.
+    #[test]
+    fn every_reason_code_byte_is_classified_by_the_decoders() {
+        // (name, first byte, body around the code, defined?, lenient?)
+        type Case = (&'static str, u8, fn(u8) -> Vec<u8>, fn(u8) -> bool, bool);
+        let cases: [Case; 9] = [
+            (
+                "CONNACK",
+                0x20,
+                |c| vec![0x00, c, 0x00],
+                |b| !matches!(ConnectAckReason::from(b), ConnectAckReason::Unknown(_)),
+                true,
+            ),
+            (
+                "PUBACK",
+                0x40,
+                |c| vec![0x00, 0x01, c, 0x00],
+                |b| PublishAckReason::try_from(b).is_ok(),
+                true,
+            ),
+            (
+                "PUBREC",
+                0x50,
+                |c| vec![0x00, 0x01, c, 0x00],
+                |b| PublishAckReason::try_from(b).is_ok(),
+                true,
+            ),
+            (
+                "PUBREL",
+                0x62,
+                |c| vec![0x00, 0x01, c, 0x00],
+                |b| PubRelCompReason::try_from(b).is_ok(),
+                false,
+            ),
+            (
+                "PUBCOMP",
+                0x70,
+                |c| vec![0x00, 0x01, c, 0x00],
+                |b| PubRelCompReason::try_from(b).is_ok(),
+                false,
+            ),
+            (
+                "SUBACK",
+                0x90,
+                |c| vec![0x00, 0x01, 0x00, c],
+                |b| SubscribeAckReason::try_from(b).is_ok(),
+                true,
+            ),
+            (
+                "UNSUBACK",
+                0xB0,
+                |c| vec![0x00, 0x01, 0x00, c],
+                |b| UnsubscribeAckReason::try_from(b).is_ok(),
+                true,
+            ),
+            (
+                "DISCONNECT",
+                0xE0,
+                |c| vec![c, 0x00],
+                |b| DisconnectReasonCode::try_from(b).is_ok(),
+                true,
+            ),
+            // With an Authentication Method, which Continue and Re-authenticate need.
+            (
+                "AUTH",
+                0xF0,
+                |c| vec![c, 0x04, 0x15, 0x00, 0x01, b'm'],
+                |b| AuthReasonCode::try_from(b).is_ok(),
+                false,
+            ),
+        ];
+        for (name, first_byte, body, defined, lenient) in cases {
+            for byte in 0..=u8::MAX {
+                let read = read_code(first_byte, body(byte));
+                if defined(byte) {
+                    assert_eq!(read, Read::Code(byte), "{name} {byte:#04x}");
+                } else if byte >= 0x80 && lenient {
+                    assert!(
+                        matches!(read, Read::Code(code) if code >= 0x80),
+                        "{name} {byte:#04x} must read as a failure, got {read:?}"
+                    );
+                } else {
+                    assert_eq!(read, Read::Malformed, "{name} {byte:#04x}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn connack_reason_codes_match_the_spec_table() {
         // §3.2.2.2: codes outside the table are kept as `Unknown` instead of refused.

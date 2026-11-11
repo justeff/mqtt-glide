@@ -11,7 +11,7 @@ use std::num::NonZeroU16;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use bytestring::ByteString;
 
-use crate::codec::error::{DecodeError, EncodeError};
+use crate::codec::error::{DecodeError, EncodeError, UnknownCode};
 use crate::codec::properties::{
     encode_opt_props, encode_property, encode_property_default, encoded_property_size, encoded_property_size_default,
     encoded_size_opt_props, reduce_limit, var_int_len, var_int_len_from_size,
@@ -240,6 +240,16 @@ impl ConnectAck {
         let flags = ConnectAckFlags::from_bits(src.get_u8()).ok_or(DecodeError::ConnectAckReservedFlagSet)?; // [MQTT-3.2.2-1]
 
         let reason_code = ConnectAckReason::from(src.get_u8());
+        // An undefined code below 0x80 claims success (§2.4), so the packet is malformed; an
+        // undefined failure code still refuses the connection.
+        if let ConnectAckReason::Unknown(code) = reason_code {
+            ensure!(code >= 0x80, DecodeError::from(UnknownCode(code)));
+        }
+        // [MQTT-3.2.2-6]: a refusing CONNACK has Session Present 0.
+        ensure!(
+            reason_code == ConnectAckReason::Success || !flags.contains(ConnectAckFlags::SESSION_PRESENT),
+            DecodeError::ProtocolViolation("Session Present set on a refusing CONNACK")
+        );
 
         let prop_src = &mut utils::take_properties(src)?;
 

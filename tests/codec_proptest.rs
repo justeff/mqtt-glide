@@ -355,8 +355,9 @@ const RETAIN_HANDLINGS: &[RetainHandling] = &[
 fn arb_v5_connack_reason() -> impl Strategy<Value = ConnectAckReason> {
     prop_oneof![
         8 => prop::sample::select(CONNACK_REASONS),
-        // Unassigned wire values decode as `Unknown(code)` and must survive a round trip.
-        1 => any::<u8>()
+        // Unassigned failure codes decode as `Unknown(code)` and must survive a round trip;
+        // below 0x80 they would claim success, which makes the CONNACK malformed (§2.4).
+        1 => (0x80..=u8::MAX)
             .prop_filter("unassigned code", |code| !CONNACK_ASSIGNED_CODES.contains(code))
             .prop_map(ConnectAckReason::Unknown),
     ]
@@ -401,7 +402,8 @@ fn arb_v5_connack() -> impl Strategy<Value = ConnectAck> {
                     user_properties,
                 ),
             )| ConnectAck {
-                session_present,
+                // A refusing CONNACK has Session Present 0 ([MQTT-3.2.2-6]).
+                session_present: session_present && reason_code == ConnectAckReason::Success,
                 reason_code,
                 session_expiry_interval,
                 receive_max,
