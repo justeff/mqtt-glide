@@ -682,7 +682,24 @@ pub(super) async fn send_packet<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    flush_before_feed(framed, flush_abort).await?;
     feed_packet(framed, packet).await?;
+    flush_writes(framed, flush_abort).await
+}
+
+/// Flushes what is still buffered before a `feed`: `feed` flushes inside `poll_ready` once the
+/// buffer reaches the backpressure boundary, where no cancel, shutdown or stall limit reaches
+/// it. PUBACKs the read task wrote but could not flush can fill the buffer that far.
+pub(super) async fn flush_before_feed<W>(
+    framed: &mut FramedWrite<W, V5Codec>,
+    flush_abort: FlushAbort<'_>,
+) -> Result<(), WriteOutcome>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    if framed.write_buffer().is_empty() {
+        return Ok(());
+    }
     flush_writes(framed, flush_abort).await
 }
 

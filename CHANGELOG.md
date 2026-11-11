@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A QoS 1 publish the broker refuses with a DISCONNECT every time (an ACL refusal, say) no longer makes a resumed session reconnect for ever: after three connections in a row it fails with `PublishRefusedByDisconnect`, a deliberate exception to [MQTT-4.4.0-1]
 - Restoring subscriptions after a reconnect: a broker DISCONNECT keeps its reason (session takeover, auth refusal, redirect), a slow consumer of retained messages no longer causes a reconnect loop, and a filter the broker's CONNACK says it does not accept (no Wildcard or Shared Subscriptions), or one too long for its Maximum Packet Size, is listed as refused and restored by a later connection that takes it, instead of ending the connection on every reconnect or being forgotten
 - A large PUBLISH on a slow link, over TCP, TLS or WebSocket, is no longer taken for a dead broker
+- A PINGREQ, SUBSCRIBE or AUTH behind PUBACKs the socket could not take yet no longer waits in a flush that neither a cancel nor the stall limit ends
 - Acknowledgements that arrive right before a connection ends are no longer lost
 - A connection lost while the inbound sink is full no longer stops the driver as if the application had closed the sink; it reconnects
 - Unacknowledged publishes waiting to be resent keep their Packet Identifiers ([MQTT-2.2.1-3])

@@ -726,6 +726,7 @@ async fn send_request<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    super::io::flush_before_feed(framed, flush_abort).await?;
     match framed.feed(packet).await {
         Ok(()) => flush_writes(framed, flush_abort).await.map(Ok),
         Err(EncodeError::OverMaxPacketSize { size, max }) => Ok(Err(AppError::InvalidRequest(format!(

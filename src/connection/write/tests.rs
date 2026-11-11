@@ -1640,3 +1640,36 @@ async fn resend_cut_off_by_a_lost_connection_keeps_the_rest() {
     );
     assert_eq!(slot.unsent.len(), 2, "never-sent publishes go to the next connection");
 }
+
+/// A control packet queued behind bytes the read task could not flush (its PUBACKs, with a
+/// large Receive Maximum) still obeys the cancel: `feed` alone would flush them inside
+/// `poll_ready`, where nothing ends a flush to a broker that stopped reading.
+#[tokio::test]
+async fn control_packet_behind_a_full_buffer_still_obeys_the_cancel() {
+    let (task_end, _peer_end) = tokio::io::duplex(64); // the broker stopped reading
+    let mut framed = FramedWrite::new(task_end, V5Codec::with_max_packet_size(0));
+    framed.write_buffer_mut().extend_from_slice(&[0u8; 16 * 1024]);
+    let cancel = StopSignal::new();
+    let shutdown_notify = CancellationToken::new();
+    let abort = io::FlushAbort::Hot {
+        cancel: &cancel,
+        shutdown_notify: &shutdown_notify,
+        stall_limit: None,
+        socket_written: None,
+    };
+    let send = io::send_packet(&mut framed, crate::codec::Packet::PingRequest, abort);
+    let cancel_soon = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        std::future::pending::<()>().await
+    };
+    let outcome = timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            outcome = send => outcome,
+            () = cancel_soon => unreachable!(),
+        }
+    })
+    .await
+    .expect("the cancel ends the send");
+    assert!(outcome.is_err(), "a cancelled send reports the cancel");
+}
