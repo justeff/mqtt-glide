@@ -243,12 +243,12 @@ def ingress_rows(by: dict, label: str, scenario: str, qos: int, level=None, payl
     ]
 
 
-def block_summary(mosq, mock) -> str:
+def block_summary(stock, mock) -> str:
     out = []
-    if mosq is None:
+    if stock is None:
         out.append(NOT_MEASURED)
     else:
-        by = mosq[0]
+        by = stock[0]
         rows = (
             ("Outbound concurrent, 8 callers", ("outbound_concurrent", 1, PAYLOAD, 8, None)),
             ("Outbound concurrent, 64 callers", ("outbound_concurrent", 1, PAYLOAD, 64, None)),
@@ -256,7 +256,7 @@ def block_summary(mosq, mock) -> str:
             ("Outbound pipelined", ("outbound_pipelined", 1, PAYLOAD, None, None)),
             ("Outbound rate, 50 000 msg/s offered", ("outbound_rate", 1, PAYLOAD, 50000, None)),
         )
-        out += ["**Real broker**: tuned Mosquitto, QoS 1 unless noted, 256 B.", ""] + header("Scenario")
+        out += ["**Real broker**: stock Mosquitto (its default flow control), QoS 1 unless noted, 256 B.", ""] + header("Scenario")
         for label, key in rows:
             out.append(f"| {label} | {client_row(by.get(key, {}))} |")
         for qos in (0, 1):
@@ -292,10 +292,10 @@ def block_capped(capped) -> str:
     return "\n".join(out + ["", "Units: msg/s ±spread · CPU ns/msg · p50 / p99 / p99.9 µs. " + ACK_NOTE]) + "\n"
 
 
-def block_stock(stock) -> str:
-    if stock is None:
+def block_tuned(tuned) -> str:
+    if tuned is None:
         return NOT_MEASURED
-    by = stock[0]
+    by = tuned[0]
     out = header("Scenario")
     for label, key in (
         ("Outbound concurrent, 64 callers", ("outbound_concurrent", 1, PAYLOAD, 64, None)),
@@ -407,8 +407,8 @@ def main() -> None:
     patch_blocks(
         args.out,
         {
-            "summary": block_summary(mosq, mock),
-            "stock": block_stock(stock),
+            "summary": block_summary(stock, mock),
+            "tuned": block_tuned(mosq),
             "capped": block_capped(load_run(r / "capped-mock")),
             "payload": block_payload(load_run(r / "payload"), mock),
             "fanin": block_fanin(load_fanin(r / "fanin")),
@@ -416,10 +416,10 @@ def main() -> None:
     )
     args.detail.mkdir(parents=True, exist_ok=True)
     pages = (
-        ("mosquitto.md", "Peer comparison: tuned Mosquitto", mosq,
-         "eclipse-mosquitto 2.1.2-alpine with unlimited inflight / queue, `set_tcp_nodelay`, no persistence. Outbound QoS 0 is not run: without a wire counter the end of a burst is unknown."),
         ("mosquitto-stock.md", "Peer comparison: stock Mosquitto (Receive Maximum 20)", stock,
-         "Same image with Mosquitto's default flow control: `max_inflight_messages 20` (CONNACK Receive Maximum 20), `max_queued_messages 1000`. QoS 1 only."),
+         "eclipse-mosquitto 2.1.2-alpine with its default flow control: `max_inflight_messages 20` (CONNACK Receive Maximum 20), `max_queued_messages 1000`; `set_tcp_nodelay`, no persistence. Outbound QoS 0 is not run: without a wire counter the end of a burst is unknown."),
+        ("mosquitto.md", "Peer comparison: Mosquitto without flow control (tuned)", mosq,
+         "Same image with the flow control switched off: `max_inflight_messages 0` (CONNACK Receive Maximum 65 535), `max_queued_messages 0`. Outbound QoS 0 is not run: without a wire counter the end of a burst is unknown."),
         ("mock.md", "Peer comparison: mock broker (client ceiling)", mock,
          "Out-of-process mock MQTT 5 broker: multi-thread, honours the client's Receive Maximum, handles every buffered frame before it writes, counts decoded PUBLISH frames so outbound QoS 0 has a wire-complete end. It is faster than every client, so these tables show what each client can do."),
     )

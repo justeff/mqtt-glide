@@ -7,8 +7,9 @@ use testcontainers::ImageExt;
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 
-/// Bench-oriented Mosquitto config: anonymous, no persistence, no artificial
-/// inflight/queue caps, TCP_NODELAY, quiet logs / no `$SYS` spam.
+/// Mosquitto with its flow control switched off (`MQTT_COMPARE_BROKER=mosquitto-tuned`, the
+/// cross-check): anonymous, no persistence, no inflight/queue caps, TCP_NODELAY, quiet logs /
+/// no `$SYS` spam.
 ///
 /// Does **not** remove Docker/testcontainers networking overhead or Mosquitto's
 /// own single-threaded processing cost — only config-level client flow limits.
@@ -27,7 +28,7 @@ max_queued_messages 0\n\
 ";
 
 /// Same as [`CONF_BENCH`] but with Mosquitto's stock flow-control limits, i.e. what a
-/// client meets on an untuned broker (Receive Maximum 20 in CONNACK).
+/// client meets on a broker as it ships (Receive Maximum 20 in CONNACK); the default.
 const CONF_STOCK: &str = "\
 listener 1883\n\
 allow_anonymous true\n\
@@ -48,7 +49,7 @@ fn mosquitto_image(conf: &'static str) -> ContainerRequest<GenericImage> {
         .with_cmd(["mosquitto", "-c", "/mosquitto-test.conf"])
 }
 
-/// Starts anonymous Mosquitto (bench-tuned, or `stock` limits) and returns `(container, host_port)`.
+/// Starts anonymous Mosquitto (`stock` limits, or flow control off) and returns `(container, host_port)`.
 pub async fn start_mosquitto(stock: bool) -> (ContainerAsync<GenericImage>, u16) {
     let container = mosquitto_image(if stock { CONF_STOCK } else { CONF_BENCH })
         .start()

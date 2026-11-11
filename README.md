@@ -603,20 +603,20 @@ Broker-dependent: Message Expiry *drop after interval* (property round-trip is t
 
 All results and the reading guide: [`BENCHMARKS.md`](BENCHMARKS.md). How to run them yourself: [`benches/README.md`](benches/README.md).
 
-Tuned Mosquitto `2.1.2-alpine`, 256 B, QoS 1. Linux in a Podman VM on Apple M5 Max, client on 4 pinned vCPUs, broker and publisher on their own. Median of 5 runs, clients taking turns (msg/s · CPU ns/msg; **bold** = best in row):
+Mosquitto `2.1.2-alpine` with its default flow control, 256 B, QoS 1. Linux in a Podman VM on Apple M5 Max, client on 4 pinned vCPUs, broker and publisher on their own. Median of 5 runs, clients taking turns (msg/s · CPU ns/msg; **bold** = best in row):
 
 | Scenario | glide | rumqttc-v5-next 0.34.0 | mqtt5 0.50.0 |
 |----------|------:|--------:|------:|
-| 8 callers sharing one client | **143 701** · **7 762** | 7 867 · 133 967 | 81 068 · 13 938 |
-| 64 callers sharing one client | **232 187** · **6 374** | 7 887 · 133 802 | 79 870 · 14 230 |
-| 512 callers sharing one client | **249 235** · **6 067** | 7 842 · 134 664 | 78 660 · 14 441 |
-| 50 000 msg/s offered, p50 / p99 | **666 / 1 454 µs** · **15 961** | 16.2 / 19.2 s · 272 952 | 842 / 3 017 µs · 26 675 |
-| Receiving, PUBACK after the app queue | **106 543** · **3 538** | 16 215 · 57 639 | n/a |
+| 8 callers sharing one client | **148 635** · **7 429** | 137 952 · 7 727 | 83 025 · 13 476 |
+| 64 callers sharing one client | **245 808** · **5 970** | 162 071 · 9 578 | 114 131 · 14 295 |
+| 512 callers sharing one client | **245 557** · **6 006** | 162 979 · 9 483 | 114 442 · 14 324 |
+| 50 000 msg/s offered, p50 / p99 | **642 / 1 624 µs** · **18 619** | 832 / 1 870 µs · 21 993 | 826 / 1 879 µs · 27 229 |
+| Receiving, PUBACK after the app queue | **102 461** · **3 550** | 102 166 · 4 698 | n/a |
 
 - glide publishes fastest and cheapest at every caller count and has the lowest latency at a fixed load. Against a broker that is never the bottleneck (mock), its pipelined publishing is 5 to 22× the peers'.
-- Receiving, glide reaches Mosquitto's ceiling (about 105k msg/s at QoS 1) at the least CPU per message.
+- Receiving, all three reach Mosquitto's ceiling (about 100k msg/s at QoS 1); glide at the least CPU per message.
 
-[`BENCHMARKS.md`](BENCHMARKS.md) also has the mock-broker ceiling, stock Mosquitto, a broker with its own in-flight cap, payload sizes up to 16 KiB, which inbound sink to use with several brokers, the fairness rules and an x86 cross-check.
+[`BENCHMARKS.md`](BENCHMARKS.md) also has the mock-broker ceiling, Mosquitto without flow control, a broker with its own in-flight cap, payload sizes up to 16 KiB, which inbound sink to use with several brokers, the fairness rules and an x86 cross-check.
 
 The wire codec alone, without broker or client, is measured by `cargo bench --bench codec_throughput` ([`benches/README.md`](benches/README.md)).
 

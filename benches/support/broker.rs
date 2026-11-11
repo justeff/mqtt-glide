@@ -1,4 +1,4 @@
-//! Pluggable broker backend (`MQTT_COMPARE_BROKER=mosquitto|mock`).
+//! Pluggable broker backend (`MQTT_COMPARE_BROKER=mosquitto|mosquitto-tuned|mock|external`).
 
 use std::process::{Child, Stdio};
 
@@ -8,10 +8,12 @@ use crate::compare::fixtures::{mock_receive_maximum, pinned_command};
 /// Selectable broker backend for benches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BenchBrokerBackend {
-    /// eclipse-mosquitto via testcontainers (default baseline).
+    /// eclipse-mosquitto via testcontainers with its stock flow control (Receive Maximum 20,
+    /// 1000 queued), as a broker ships (default).
     Mosquitto,
-    /// eclipse-mosquitto with its stock flow-control limits (Receive Maximum 20, 1000 queued).
-    MosquittoStock,
+    /// eclipse-mosquitto with its flow control switched off (Receive Maximum 65 535, no queue
+    /// limit): the cross-check.
+    MosquittoTuned,
     /// Out-of-process minimal MQTT 5 broker (no Podman/Docker).
     Mock,
     /// A broker that is already running on `127.0.0.1:$MQTT_COMPARE_BROKER_PORT`, e.g. a pinned
@@ -24,10 +26,10 @@ impl BenchBrokerBackend {
     pub fn report_label(self) -> &'static str {
         match self {
             Self::Mosquitto => {
-                "eclipse-mosquitto:2.1.2-alpine (anonymous, bench-tuned: nodelay, inflight/queue unlimited, no $SYS/persistence; testcontainers)"
+                "eclipse-mosquitto:2.1.2-alpine (anonymous, nodelay, stock max_inflight_messages 20 / max_queued_messages 1000, no $SYS/persistence; testcontainers)"
             }
-            Self::MosquittoStock => {
-                "eclipse-mosquitto:2.1.2-alpine (anonymous, nodelay, STOCK max_inflight_messages 20 / max_queued_messages 1000; testcontainers)"
+            Self::MosquittoTuned => {
+                "eclipse-mosquitto:2.1.2-alpine (anonymous, nodelay, flow control off: inflight/queue unlimited, no $SYS/persistence; testcontainers)"
             }
             Self::Mock => {
                 "out-of-process mock MQTT 5 (honours client Receive Maximum, multi-thread, Arc fanout, nodelay, publish counter; MQTT_COMPARE_BROKER=mock)"
@@ -44,12 +46,12 @@ pub fn bench_broker_backend() -> BenchBrokerBackend {
         .to_ascii_lowercase()
         .as_str()
     {
-        "mosquitto" => BenchBrokerBackend::Mosquitto,
-        "mosquitto-stock" | "mosquitto_stock" => BenchBrokerBackend::MosquittoStock,
+        "mosquitto" | "mosquitto-stock" | "mosquitto_stock" => BenchBrokerBackend::Mosquitto,
+        "mosquitto-tuned" | "mosquitto_tuned" => BenchBrokerBackend::MosquittoTuned,
         "mock" => BenchBrokerBackend::Mock,
         "external" => BenchBrokerBackend::External,
         other => panic!(
-            "invalid MQTT_COMPARE_BROKER={other:?}: expected \"mosquitto\" (default), \"mosquitto-stock\", \"mock\" or \"external\""
+            "invalid MQTT_COMPARE_BROKER={other:?}: expected \"mosquitto\" (default, stock flow control), \"mosquitto-tuned\", \"mock\" or \"external\""
         ),
     }
 }
@@ -120,8 +122,8 @@ impl Drop for KillChildOnDrop {
 /// Starts the configured broker backend and returns port + lifetime guard.
 pub async fn start_bench_broker() -> BenchBroker {
     match bench_broker_backend() {
-        backend @ (BenchBrokerBackend::Mosquitto | BenchBrokerBackend::MosquittoStock) => {
-            let stock = backend == BenchBrokerBackend::MosquittoStock;
+        backend @ (BenchBrokerBackend::Mosquitto | BenchBrokerBackend::MosquittoTuned) => {
+            let stock = backend == BenchBrokerBackend::Mosquitto;
             let (container, port) = super::mosquitto::start_mosquitto(stock).await;
             let id = container.id().to_owned();
             // Keep the container alive for the whole process; Drop needs a reactor on this thread.

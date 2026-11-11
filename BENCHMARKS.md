@@ -2,14 +2,14 @@
 
 mqtt-glide against rumqttc-v5-next and LabOverWire mqtt5: same broker, payload, harness and pinning, every client with its default settings apart from the [shared knobs](#fairness-rules), clients taking turns run by run. Numbers are absolute and only hold under the conditions in [Setup](#setup).
 
-Detail pages with every scenario and level: [tuned Mosquitto](benches/results/mosquitto.md), [stock Mosquitto](benches/results/mosquitto-stock.md), [mock broker](benches/results/mock.md). Running the harness and its env knobs: [`benches/README.md`](benches/README.md).
+Detail pages with every scenario and level: [stock Mosquitto](benches/results/mosquitto-stock.md), [Mosquitto without flow control](benches/results/mosquitto.md), [mock broker](benches/results/mock.md). Running the harness and its env knobs: [`benches/README.md`](benches/README.md).
 
 ## Verdict
 
-- **Publishing (tuned Mosquitto, QoS 1):** glide leads at every caller count with the lowest CPU and latency: 144k / 232k / 249k msg/s at 8 / 64 / 512 callers, mqtt5 79k to 81k, rumqttc 7.9k.
-- **Publishing at 50 000 msg/s offered:** glide 16.0 µs CPU per publish, p50 0.67 ms; mqtt5 26.7 µs, 0.84 ms; rumqttc reaches 4.7k msg/s.
-- **Receiving QoS 1 from Mosquitto:** the broker is the limit. glide 107k msg/s at 3.5 µs CPU per message (PUBACK after the app queue); rumqttc 16k with the same policy, 137k with PUBACK on decode at 7.1 µs; mqtt5 106k at 4.2 µs.
-- **Stock Mosquitto:** glide publishes 242k msg/s with 64 callers against 159k (rumqttc) and 114k (mqtt5); receiving, all three get about 100k, glide at the lowest CPU.
+- **Publishing (Mosquitto, QoS 1):** glide leads at every caller count with the lowest CPU and latency: 149k / 246k / 246k msg/s at 8 / 64 / 512 callers, rumqttc 138k to 163k, mqtt5 83k to 114k.
+- **Publishing at 50 000 msg/s offered:** all three keep up; glide 18.6 µs CPU per publish, p50 / p99 0.64 / 1.6 ms; rumqttc 22.0 µs, 0.83 / 1.9 ms; mqtt5 27.2 µs, 0.83 / 1.9 ms.
+- **Receiving from Mosquitto:** the broker is the limit, all three get about 102k msg/s at QoS 1 and 220k at QoS 0. glide at the lowest CPU: 3.6 µs per QoS 1 message (PUBACK after the app queue), rumqttc 4.7 µs with the same policy and 4.1 µs with PUBACK on decode, mqtt5 4.3 µs.
+- **Mosquitto without flow control** (Receive Maximum 65 535, a separate run): glide about the same at 232k / 249k msg/s with 64 / 512 callers; mqtt5 80k, rumqttc 7.9k.
 - **Client ceiling (mock):** publishing QoS 0 pipelined 3.23M msg/s against 195k and 146k; QoS 1 882k against 174k and 135k. Receiving QoS 0 3.81M against 2.60M and 1.40M; QoS 1 2.51M, 11× rumqttc with the same ack policy.
 - **QoS 0 publish latency:** rumqttc's `publish().await` returns sooner (p50 51 vs 110 µs at 50 000 msg/s on the mock); the return points differ, see [Fairness rules](#fairness-rules).
 - **Broker capping deliveries at 32:** glide receives 836k msg/s, rumqttc 245k with the same policy and 781k with PUBACK on decode, mqtt5 244k.
@@ -19,20 +19,20 @@ Detail pages with every scenario and level: [tuned Mosquitto](benches/results/mo
 
 <!-- bench:summary:start -->
 
-**Real broker**: tuned Mosquitto, QoS 1 unless noted, 256 B.
+**Real broker**: stock Mosquitto (its default flow control), QoS 1 unless noted, 256 B.
 
 | Scenario | glide | rumqttc | mqtt5 |
 |---|---:|---:|---:|
-| Outbound concurrent, 8 callers | **143 701** ±1% · **7 762** · **55.0** / **97.3** / **113** µs | 7 867 ±1% · 133 967 · 1 012 / 1 099 / 1 147 µs | 81 068 ±2% · 13 938 · 100.0 / 146 / 166 µs |
-| Outbound concurrent, 64 callers | **232 187** ±0% · **6 374** · **274** / **367** / **458** µs | 7 887 ±2% · 133 802 · 8 103 / 8 484 / 8 842 µs | 79 870 ±1% · 14 230 · 804 / 966 / 1 019 µs |
-| Outbound concurrent, 512 callers | **249 235** ±5% · **6 067** · **2 053** / **2 221** / **2 310** µs | 7 842 ±1% · 134 664 · 65 075 / 67 234 / 73 554 µs | 78 660 ±1% · 14 441 · 6 514 / 7 132 / 7 339 µs |
-| Outbound pipelined | **256 599** ±1% · **3 103** | 8 963 ±2% · 108 819 | 124 254 ±1% · 15 607 |
-| Outbound rate, 50 000 msg/s offered | 49 033 ±0% · **15 961** · **666** / **1 454** / **1 705** µs | 4 698 ±1% · 272 952 · 16 203 557 / 19 244 763 / 19 280 966 µs | **49 124** ±0% · 26 675 · 842 / 3 017 / 4 853 µs |
-| Ingress load, QoS 0 | 213 187 ±2% · **1 641** | **231 683** ±15% · 4 763 | 220 986 ±1% · 1 930 |
-| Ingress load, QoS 1, PUBACK after the app queue | **106 543** ±1% · **3 538** | 16 215 ±1% · 57 639 | n/a (`no_manual_ack`) |
-| Ingress load, QoS 1, PUBACK on decode | n/a (`no_auto_ack`) | **136 952** ±4% · 7 100 | 105 742 ±0% · **4 224** |
-| Ingress rate 50 000 msg/s, QoS 1, PUBACK after the app queue | **49 819** ±0% · **5 622** · **778** / **1 633** / **1 892** µs | 15 479 ±2% · 60 447 · 2 243 824 / 4 406 696 / 4 446 292 µs | n/a (`no_manual_ack`) |
-| Ingress rate 50 000 msg/s, QoS 1, PUBACK on decode | n/a (`no_auto_ack`) | **49 805** ±0% · 13 908 · 927 / 1 918 / 3 093 µs | 49 783 ±0% · **6 802** · **801** / **1 638** / **1 855** µs |
+| Outbound concurrent, 8 callers | **148 635** ±1% · **7 429** · **53.0** / **94.5** / **110** µs | 137 952 ±1% · 7 727 · 58.3 / 102 / 118 µs | 83 025 ±1% · 13 476 · 97.3 / 143 / 162 µs |
+| Outbound concurrent, 64 callers | **245 808** ±0% · **5 970** · **259** / **325** / **360** µs | 162 071 ±1% · 9 578 · 393 / 478 / 514 µs | 114 131 ±1% · 14 295 · 558 / 784 / 851 µs |
+| Outbound concurrent, 512 callers | **245 557** ±1% · **6 006** · **2 085** / **2 222** / **2 262** µs | 162 979 ±1% · 9 483 · 3 140 / 3 365 / 3 432 µs | 114 442 ±1% · 14 324 · 4 473 / 5 066 / 5 211 µs |
+| Outbound pipelined | **254 104** ±1% · **3 056** | 218 380 ±11% · 3 883 | 130 316 ±1% · 16 060 |
+| Outbound rate, 50 000 msg/s offered | 49 041 ±0% · **18 619** · **642** / **1 624** / **2 151** µs | 49 259 ±0% · 21 993 · 832 / 1 870 / 2 444 µs | **49 357** ±0% · 27 229 · 826 / 1 879 / 2 243 µs |
+| Ingress load, QoS 0 | 216 919 ±1% · **1 602** | **222 875** ±0% · 1 977 | 221 468 ±2% · 1 849 |
+| Ingress load, QoS 1, PUBACK after the app queue | **102 461** ±0% · **3 550** | 102 166 ±1% · 4 698 | n/a (`no_manual_ack`) |
+| Ingress load, QoS 1, PUBACK on decode | n/a (`no_auto_ack`) | 103 706 ±1% · **4 080** | **104 431** ±0% · 4 254 |
+| Ingress rate 50 000 msg/s, QoS 1, PUBACK after the app queue | **49 848** ±0% · **4 495** · **237** / 317 / **353** µs | 49 847 ±0% · 5 808 · 240 / **316** / 369 µs | n/a (`no_manual_ack`) |
+| Ingress rate 50 000 msg/s, QoS 1, PUBACK on decode | n/a (`no_auto_ack`) | 49 849 ±0% · **5 209** · **237** / **313** / **358** µs | **49 860** ±0% · 5 471 · 243 / 318 / 462 µs |
 
 **Client ceiling**: mock broker, 256 B.
 
@@ -52,23 +52,23 @@ Ingress QoS 1 has a row per ack policy: `after_enqueue` sends PUBACK once the me
 
 <!-- bench:summary:end -->
 
-## Stock Mosquitto
+## Mosquitto without flow control
 
-Mosquitto's defaults: Receive Maximum 20, at most 1000 queued messages per client. QoS 1, 256 B.
+A cross-check with Mosquitto's flow control switched off (`max_inflight_messages 0`, `max_queued_messages 0`): CONNACK Receive Maximum 65 535, no queue limit. QoS 1, 256 B.
 
-<!-- bench:stock:start -->
+<!-- bench:tuned:start -->
 
 | Scenario | glide | rumqttc | mqtt5 |
 |---|---:|---:|---:|
-| Outbound concurrent, 64 callers | **241 712** ±1% · **6 124** · **263** / **332** / **371** µs | 158 861 ±1% · 9 775 · 401 / 492 / 527 µs | 114 419 ±1% · 14 389 · 558 / 783 / 851 µs |
-| Outbound concurrent, 512 callers | **244 712** ±0% · **6 067** · **2 089** / **2 241** / **2 311** µs | 159 903 ±1% · 9 693 · 3 198 / 3 423 / 3 520 µs | 112 265 ±1% · 14 562 · 4 566 / 5 162 / 5 327 µs |
-| Outbound pipelined | **259 664** ±1% · **3 019** | 249 778 ±11% · 3 036 | 129 535 ±0% · 15 924 |
-| Ingress load, QoS 1, PUBACK after the app queue | 102 211 ±4% · **3 566** | **102 804** ±1% · 4 669 | n/a (`no_manual_ack`) |
-| Ingress load, QoS 1, PUBACK on decode | n/a (`no_auto_ack`) | 99 460 ±2% · **4 226** | **101 361** ±1% · 4 380 |
+| Outbound concurrent, 64 callers | **232 187** ±0% · **6 374** · **274** / **367** / **458** µs | 7 887 ±2% · 133 802 · 8 103 / 8 484 / 8 842 µs | 79 870 ±1% · 14 230 · 804 / 966 / 1 019 µs |
+| Outbound concurrent, 512 callers | **249 235** ±5% · **6 067** · **2 053** / **2 221** / **2 310** µs | 7 842 ±1% · 134 664 · 65 075 / 67 234 / 73 554 µs | 78 660 ±1% · 14 441 · 6 514 / 7 132 / 7 339 µs |
+| Outbound pipelined | **256 599** ±1% · **3 103** | 8 963 ±2% · 108 819 | 124 254 ±1% · 15 607 |
+| Ingress load, QoS 1, PUBACK after the app queue | **106 543** ±1% · **3 538** | 16 215 ±1% · 57 639 | n/a (`no_manual_ack`) |
+| Ingress load, QoS 1, PUBACK on decode | n/a (`no_auto_ack`) | **136 952** ±4% · 7 100 | 105 742 ±0% · **4 224** |
 
 Units: msg/s ±spread · CPU ns/msg · p50 / p99 / p99.9 µs per publish.
 
-<!-- bench:stock:end -->
+<!-- bench:tuned:end -->
 
 ## Broker with its own in-flight cap
 
@@ -278,7 +278,7 @@ Linux, because that is where MQTT clients run in production and the only place a
 | Mock broker Receive Maximum | 1024 |
 | Ingress publisher window | 1024 QoS 1 PUBLISHes in flight, up to 64 per write |
 | App queue (ingress handoff) | `tokio::sync::mpsc`, capacity 10 000, drained by a consumer task |
-| QoS | mock 0 and 1; tuned Mosquitto 0 and 1 (outbound QoS 0 only on the mock); stock Mosquitto 1 |
+| QoS | 0 and 1 (outbound QoS 0 only on the mock) |
 
 Client versions: each detail page (`meta.json` of the run).
 
@@ -286,8 +286,8 @@ Client versions: each detail page (`meta.json` of the run).
 
 | Broker | Config |
 |--------|--------|
-| Tuned Mosquitto | `max_inflight_messages 0` (CONNACK Receive Maximum 65 535), `max_queued_messages 0`, `set_tcp_nodelay true`, no persistence, `$SYS` or logs |
-| Stock Mosquitto | The same without the two flow-control lines: Receive Maximum 20, 1000 queued |
+| Stock Mosquitto | Mosquitto's default flow control (CONNACK Receive Maximum 20, 1000 queued), `set_tcp_nodelay true`, no persistence, `$SYS` or logs |
+| Mosquitto without flow control | The same plus `max_inflight_messages 0` (CONNACK Receive Maximum 65 535) and `max_queued_messages 0` |
 | Mock | Out-of-process MQTT 5 broker built for the bench: multi-thread, `TCP_NODELAY`, honours the client's Receive Maximum, one write per batch of PUBACKs or deliveries, counts decoded PUBLISH frames. Faster than every client, so it shows each client's ceiling. Not a broker claim |
 
 ## Fairness rules
@@ -345,7 +345,7 @@ python3 benches/render_benchmarks.py   # rewrites the blocks above and benches/r
 |---|---|
 | `peers-mock` | as shown |
 | `peers-mosquitto` | `MQTT_COMPARE_BROKER=external MQTT_COMPARE_BROKER_PORT=1883`, 200 000 messages |
-| `peers-mosquitto-stock` | port 1884, QoS 1, 200 000 messages, `MQTT_COMPARE_SCENARIOS=ingress_load,outbound_pipelined,outbound_concurrent` |
+| `peers-mosquitto-stock` | `MQTT_COMPARE_BROKER=external MQTT_COMPARE_BROKER_PORT=1884`, 200 000 messages |
 | `capped-mock` | QoS 1, `MQTT_COMPARE_MOCK_DELIVERY_INFLIGHT=32`, `MQTT_COMPARE_SCENARIOS=ingress_load,ingress_rate` |
 | `payload` | 500 000 messages, `MQTT_COMPARE_SCENARIOS=ingress_load,outbound_pipelined`, `MQTT_COMPARE_PAYLOADS=16,1024,16384` |
 | `fanin` | `cargo bench --features __bench,stats,flume,async-channel --bench ingress_fanin`, QoS 0 and 1, default matrix |

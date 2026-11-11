@@ -59,8 +59,8 @@ Default: `glide,rumqttc,mqtt5`. Versions are written to each run's `meta.json` (
 
 | Value | Backend | Requires |
 |-------|---------|----------|
-| `mosquitto` (default) | eclipse-mosquitto `2.1.2-alpine` via testcontainers; tuned (`set_tcp_nodelay`, `max_inflight_messages 0`, `max_queued_messages 0`, no persistence/`$SYS`/logs) | Podman or Docker |
-| `mosquitto-stock` | Same image with stock `max_inflight_messages 20` / `max_queued_messages 1000` (CONNACK Receive Maximum 20); shows behaviour against an untuned broker | Podman or Docker |
+| `mosquitto` (default) | eclipse-mosquitto `2.1.2-alpine` via testcontainers with its stock flow control (`max_inflight_messages 20` / `max_queued_messages 1000`, CONNACK Receive Maximum 20), `set_tcp_nodelay`, no persistence/`$SYS`/logs | Podman or Docker |
+| `mosquitto-tuned` | Same image with the flow control switched off (`max_inflight_messages 0`, `max_queued_messages 0`, CONNACK Receive Maximum 65 535): the cross-check | Podman or Docker |
 | `mock` | Out-of-process minimal MQTT 5 broker (multi-thread Tokio, Arc fanout, `TCP_NODELAY`, inbound PUBLISH counter on a stats port, announces `MQTT_COMPARE_MOCK_RM`, delivers at the lower of publish and subscription QoS, honours the client's Receive Maximum for QoS 1 deliveries, handles every frame already in its read buffer before writing, so PUBACKs to a publisher and deliveries freed by a subscriber's PUBACKs go out one write per batch, as a real broker does) | None |
 | `external` | A broker that is already running on `127.0.0.1:$MQTT_COMPARE_BROKER_PORT`, described in reports by `MQTT_COMPARE_BROKER_LABEL`. The published Mosquitto numbers use this with Mosquitto containers in the same Podman pod (see [Reproduce](../BENCHMARKS.md#reproduce)); the bench neither starts nor pins it | A running broker |
 
