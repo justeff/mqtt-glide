@@ -47,7 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `HttpProxy::parse` decodes credentials exactly and refuses a user name with `:`
 - A `requester()` call dropped before its SUBACK no longer leaves the response topic routed
 - Closing several clones of one `Requester` no longer takes the response topic away from another requester on the same topic
-- `testing::TestBroker` delivers to each shared subscription, a share name with two filters being two of them
+- `testing::TestBroker` delivers to each shared subscription, a share name with two filters being two of them; `testing::FaultProxy` resets connections still dialing upstream
 - `topic_matches` returns `false` for wildcard share names, empty topics and NUL
 
 ### Performance

@@ -76,11 +76,14 @@ impl FaultProxy {
                     continue;
                 }
                 let faults = Arc::clone(&accept_faults);
+                // Taken now: a reset (or the proxy's drop) while dialing upstream must end this
+                // connection too.
+                let epoch = faults.epoch.load(Ordering::SeqCst);
                 tokio::spawn(async move {
                     let Ok(upstream) = TcpStream::connect(upstream).await else {
                         return;
                     };
-                    serve(client, upstream, faults).await;
+                    serve(client, upstream, faults, epoch).await;
                 });
             }
         });
@@ -152,10 +155,9 @@ impl Drop for FaultProxy {
     }
 }
 
-async fn serve(client: TcpStream, upstream: TcpStream, faults: Arc<Faults>) {
+async fn serve(client: TcpStream, upstream: TcpStream, faults: Arc<Faults>, epoch: u64) {
     let _ = client.set_nodelay(true);
     let _ = upstream.set_nodelay(true);
-    let epoch = faults.epoch.load(Ordering::SeqCst);
     // Linger 0 → dropping the socket sends RST instead of FIN, like a crashed peer.
     #[allow(deprecated)] // tokio marks set_linger deprecated (blocking close); the RST is the point
     let _ = client.set_linger(Some(Duration::ZERO));
