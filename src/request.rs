@@ -148,6 +148,8 @@ impl Drop for PendingGuard {
 pub struct Requester {
     client: MqttClient,
     response_topic: ByteString,
+    /// Shared by the clones: they hold one use of the topic between them, given back once.
+    closed: Arc<AtomicBool>,
 }
 
 impl Requester {
@@ -185,6 +187,7 @@ impl Requester {
         Ok(Self {
             client: client.clone(),
             response_topic,
+            closed: Arc::default(),
         })
     }
 
@@ -207,10 +210,14 @@ impl Requester {
     }
 
     /// Stops routing the response topic and unsubscribes from it. Requests still in flight
-    /// on other clones of this requester will time out. Another requester the client made for
-    /// the same topic keeps working: the topic stays routed and subscribed until the last one
+    /// on other clones of this requester will time out, and closing one of them does nothing.
+    /// Another requester the client made for the same topic keeps working: the topic stays routed and subscribed until the last one
     /// closes.
     pub async fn close(self) -> Result<(), AppError> {
+        // Another clone closed it already: the topic may be another requester's now.
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
         if !self.client.response_router().remove_topic(&self.response_topic) {
             return Ok(());
         }

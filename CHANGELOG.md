@@ -46,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS certificate files and the system trust store are read off the runtime thread and within `connect_timeout`, and a client certificate and key replaced one after the other are read again instead of failing the connect
 - `HttpProxy::parse` decodes credentials exactly and refuses a user name with `:`
 - A `requester()` call dropped before its SUBACK no longer leaves the response topic routed
+- Closing several clones of one `Requester` no longer takes the response topic away from another requester on the same topic
 - `topic_matches` returns `false` for wildcard share names, empty topics and NUL
 
 ### Performance

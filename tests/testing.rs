@@ -569,3 +569,33 @@ async fn response_information_is_a_prefix_for_response_topics() {
     let response = request.await.expect("join").expect("response");
     assert_eq!(&response.payload[..], b"noon");
 }
+
+/// Closing every clone of one requester gives the response topic back once: another requester
+/// the client made for the same topic keeps its route and subscription.
+#[tokio::test]
+async fn closing_clones_of_a_requester_leaves_another_requester_working() {
+    let broker = TestBroker::start().await.expect("broker");
+    let (responder, mut responder_rx) = client(&broker.url(), "responder").await;
+    responder
+        .subscribe([("service/echo", QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe");
+    let (asking, _rx) = client(&broker.url(), "asking").await;
+    let first = asking.requester("replies/shared").await.expect("first requester");
+    let second = asking.requester("replies/shared").await.expect("second requester");
+    let clone = first.clone();
+    first.close().await.expect("close");
+    clone.close().await.expect("close the clone");
+
+    let request = tokio::spawn(async move { second.request("service/echo", "ping").await });
+    let incoming = next(&mut responder_rx).await;
+    responder
+        .send(Publish::reply_to(&incoming, "pong").expect("reply"))
+        .await
+        .expect("reply");
+    let response = request
+        .await
+        .expect("join")
+        .expect("the second requester still gets it");
+    assert_eq!(&response.payload[..], b"pong");
+}
