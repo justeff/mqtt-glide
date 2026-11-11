@@ -23,6 +23,7 @@ use crate::codec::{
 use crate::connection::session_policy::inbound_publish_policy;
 use crate::error::{AppError, ConnectionOutcome, ProtocolError, ShutdownError, TransportError};
 use crate::inbound_sink::InboundSink;
+use crate::util::is_shared_subscription_filter;
 
 /// Active topic filters + options remembered across reconnects (lives on [`super::Connection`]).
 #[derive(Debug)]
@@ -174,6 +175,21 @@ impl SubscriptionRegistry {
         self.publish_refused();
     }
 
+    /// Marks `filters` refused without asking the broker, with the reason it would give and
+    /// `why` as the reason string; `false` when each was refused that way already.
+    fn refuse_locally(&mut self, filters: &[(ByteString, SubscribeAckReason)], why: &'static str) -> bool {
+        let mut changed = false;
+        for (filter, reason) in filters {
+            if let Some(entry) = self.entries.get_mut(filter) {
+                let refused = Some((*reason, Some(ByteString::from_static(why))));
+                changed |= entry.refused != refused;
+                entry.refused = refused;
+            }
+        }
+        self.publish_refused();
+        changed
+    }
+
     fn publish_refused(&self) {
         let mut refused: Vec<RefusedSubscription> = self
             .entries
@@ -284,6 +300,82 @@ pub(crate) fn apply_unsubscribe_ack_to_registry(
     registry.remove(to_remove);
 }
 
+/// The kinds of Topic Filter the broker accepts on this connection (CONNACK Wildcard and Shared
+/// Subscription Available, both `true` when absent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FilterSupport {
+    pub(crate) wildcard: bool,
+    pub(crate) shared: bool,
+}
+
+impl Default for FilterSupport {
+    fn default() -> Self {
+        Self {
+            wildcard: true,
+            shared: true,
+        }
+    }
+}
+
+impl FilterSupport {
+    /// The SUBACK reason the broker would refuse `filter` with, if it would: it treats such a
+    /// SUBSCRIBE as a Protocol Error and may close the connection over it (DISCONNECT 0xA2,
+    /// 0x9E).
+    pub(crate) fn refusal(self, filter: &str) -> Option<SubscribeAckReason> {
+        let shared = is_shared_subscription_filter(filter);
+        if shared && !self.shared {
+            return Some(SubscribeAckReason::SharedSubscriptionNotSupported);
+        }
+        // `$share/{name}/{filter}`: the name holds no wildcard ([MQTT-4.8.2-2]).
+        let topic = if shared {
+            filter.splitn(3, '/').nth(2).unwrap_or_default()
+        } else {
+            filter
+        };
+        (!self.wildcard && topic.bytes().any(|byte| matches!(byte, b'+' | b'#')))
+            .then_some(SubscribeAckReason::WildcardSubscriptionsNotSupported)
+    }
+}
+
+/// Leaves out the filters this connection's broker does not accept; `refuse` also records them
+/// as refused. Restoring one would end the connection, and every reconnect would restore it
+/// again; a broker reached after a failover can announce less than the one that granted it.
+pub(crate) fn without_unsupported(
+    groups: Vec<ResubscribeGroup>,
+    support: FilterSupport,
+    registry: &RwLock<SubscriptionRegistry>,
+    refuse: bool,
+) -> Vec<ResubscribeGroup> {
+    if support == FilterSupport::default() {
+        return groups;
+    }
+    let mut refused = Vec::new();
+    let groups = groups
+        .into_iter()
+        .filter_map(|(id, filters)| {
+            let mut kept = Vec::with_capacity(filters.len());
+            for (filter, options) in filters {
+                match support.refusal(&filter) {
+                    None => kept.push((filter, options)),
+                    Some(reason) => refused.push((filter, reason)),
+                }
+            }
+            (!kept.is_empty()).then_some((id, kept))
+        })
+        .collect();
+    if refuse
+        && !refused.is_empty()
+        && let Ok(mut registry) = registry.write()
+        && registry.refuse_locally(&refused, "not offered by the broker on this connection (CONNACK)")
+    {
+        tracing::warn!(
+            filters = ?refused.iter().map(|(filter, _)| filter).collect::<Vec<_>>(),
+            "broker does not accept these subscriptions on this connection (CONNACK); not restored"
+        );
+    }
+    groups
+}
+
 /// SUBSCRIBEs a resubscribe keeps waiting for their SUBACK at once.
 const RESUBSCRIBE_WINDOW: usize = 10;
 
@@ -332,15 +424,21 @@ pub(crate) fn fit_to_packet_size(
             fitted.push((id, part));
         }
     }
-    if !unsendable.is_empty() {
+    // Kept and listed as refused, not forgotten: a later connection with a larger limit
+    // restores it, and the application sees why its messages do not arrive meanwhile.
+    let unsendable: Vec<_> = unsendable
+        .into_iter()
+        .map(|filter| (filter, SubscribeAckReason::UnspecifiedError))
+        .collect();
+    if !unsendable.is_empty()
+        && let Ok(mut registry) = registry.write()
+        && registry.refuse_locally(&unsendable, "too long for the broker's Maximum Packet Size")
+    {
         tracing::warn!(
-            filters = ?unsendable,
+            filters = ?unsendable.iter().map(|(filter, _)| filter).collect::<Vec<_>>(),
             max_packet_size = codec.max_outbound_size(),
-            "subscription too long for the broker's Maximum Packet Size; not restored"
+            "subscription too long for the broker's Maximum Packet Size; not restored on this connection"
         );
-        if let Ok(mut registry) = registry.write() {
-            registry.remove(unsendable);
-        }
     }
     fitted
 }
@@ -374,6 +472,7 @@ where
         // the subscription itself still matters more than the routing hint.
         tracing::warn!("broker no longer supports Subscription Identifiers; restoring without");
     }
+    let groups = without_unsupported(groups, inbound.filter_support, registry, true);
     let groups = fit_to_packet_size(
         groups,
         framed_write.encoder(),
@@ -472,6 +571,8 @@ pub(crate) struct ResubscribeInbound<'a, H> {
     pub(crate) topic_aliases: &'a mut super::topic_alias::InboundTopicAliases,
     /// CONNACK Subscription Identifiers Available.
     pub(crate) subscription_identifiers_available: bool,
+    /// CONNACK Wildcard and Shared Subscription Available.
+    pub(crate) filter_support: FilterSupport,
     /// Request/response routing (responses bypass the inbound sink).
     pub(crate) response_router: &'a crate::request::ResponseRouter,
     /// The connection's Keep Alive (zero: off). While a full sink holds the restore, PINGREQs
@@ -800,6 +901,34 @@ mod tests {
         assert_eq!(registry.snapshot().len(), 1, "the unsubscribed filter is not re-added");
     }
 
+    /// Wildcards count in the filter of a shared subscription, not in its share name.
+    #[test]
+    fn filter_support_names_the_refusal_the_broker_would_give() {
+        let none = FilterSupport {
+            wildcard: false,
+            shared: false,
+        };
+        let no_wildcards = FilterSupport {
+            wildcard: false,
+            shared: true,
+        };
+        assert_eq!(FilterSupport::default().refusal("a/#"), None);
+        assert_eq!(none.refusal("a/b"), None);
+        assert_eq!(
+            none.refusal("a/+/c"),
+            Some(SubscribeAckReason::WildcardSubscriptionsNotSupported)
+        );
+        assert_eq!(
+            none.refusal("$share/g/a/b"),
+            Some(SubscribeAckReason::SharedSubscriptionNotSupported)
+        );
+        assert_eq!(no_wildcards.refusal("$share/g/a/b"), None);
+        assert_eq!(
+            no_wildcards.refusal("$share/g/a/#"),
+            Some(SubscribeAckReason::WildcardSubscriptionsNotSupported)
+        );
+    }
+
     /// Doubling from the first delay up to the cap, each wait between half and all of it.
     #[test]
     fn restore_retry_delay_doubles_up_to_the_cap() {
@@ -1018,6 +1147,7 @@ mod tests {
                 stats: &stats,
                 topic_aliases: &mut topic_aliases,
                 subscription_identifiers_available: false,
+                filter_support: FilterSupport::default(),
                 response_router: &response_router,
                 keep_alive: Duration::ZERO,
             },
@@ -1050,8 +1180,9 @@ mod tests {
     }
 
     /// A restore SUBSCRIBE over the broker's (now smaller) Maximum Packet Size is split, in
-    /// order and with its Subscription Identifier; a filter that cannot fit alone is
-    /// forgotten instead of failing every restore ([MQTT-3.2.2-15]).
+    /// order and with its Subscription Identifier; a filter that cannot fit alone is left out
+    /// and listed as refused instead of failing every restore ([MQTT-3.2.2-15]), and kept for
+    /// a connection that takes it.
     #[test]
     fn restore_subscribes_are_split_to_the_packet_size() {
         let long = "l".repeat(100);
@@ -1083,8 +1214,10 @@ mod tests {
             .into_iter()
             .map(|(f, _)| f)
             .collect();
-        assert_eq!(kept.len(), 3);
-        assert!(!kept.iter().any(|f| *f == *long));
+        assert_eq!(kept.len(), 4, "the long filter is kept for a later connection");
+        let refused = registry.read().unwrap().refused_grouped();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(&*refused[0].1[0].0, long.as_str(), "and listed as refused");
 
         let roomy = V5Codec::new(0, 0);
         let whole = vec![(id, filters[..2].to_vec())];
@@ -1144,6 +1277,7 @@ mod tests {
                 stats: &stats,
                 topic_aliases: &mut topic_aliases,
                 subscription_identifiers_available: false,
+                filter_support: FilterSupport::default(),
                 response_router: &response_router,
                 keep_alive: Duration::ZERO,
             },

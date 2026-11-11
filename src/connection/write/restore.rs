@@ -14,7 +14,9 @@ use tokio_util::codec::FramedWrite;
 
 use crate::codec::{Packet, Subscribe, V5Codec};
 use crate::connection::packet_id::InflightPots;
-use crate::connection::subscriptions::{SubscriptionRegistry, fit_to_packet_size, restore_retry_delay};
+use crate::connection::subscriptions::{
+    FilterSupport, SubscriptionRegistry, fit_to_packet_size, restore_retry_delay, without_unsupported,
+};
 use crate::error::ProtocolError;
 
 use super::io::{FlushAbort, send_packet};
@@ -29,16 +31,23 @@ pub(super) struct RestoreRetry {
     /// When the retries in flight must have been answered.
     deadline: Option<Instant>,
     ack_timeout: Duration,
+    /// What this connection's broker accepts: the rest waits for another connection.
+    filter_support: FilterSupport,
 }
 
 impl RestoreRetry {
-    pub(super) fn new(registry: &RwLock<SubscriptionRegistry>, ack_timeout: Duration) -> Self {
+    pub(super) fn new(
+        registry: &RwLock<SubscriptionRegistry>,
+        ack_timeout: Duration,
+        filter_support: FilterSupport,
+    ) -> Self {
         let refused = registry.read().is_ok_and(|registry| registry.has_refused());
         Self {
             attempt: 0,
             next_at: refused.then(|| Instant::now() + restore_retry_delay(0)),
             deadline: None,
             ack_timeout,
+            filter_support,
         }
     }
 
@@ -80,6 +89,7 @@ impl RestoreRetry {
             .read()
             .map(|registry| registry.refused_grouped())
             .unwrap_or_default();
+        let groups = without_unsupported(groups, self.filter_support, registry, false);
         let groups = fit_to_packet_size(groups, framed.encoder(), subscription_identifiers_available, registry);
         if groups.is_empty() {
             self.next_at = None;
@@ -186,7 +196,7 @@ mod tests {
     #[tokio::test]
     async fn retry_in_flight_keeps_until_its_ack_timeout() {
         let mut harness = Harness::new();
-        let mut retry = RestoreRetry::new(&harness.registry, Duration::from_secs(30));
+        let mut retry = RestoreRetry::new(&harness.registry, Duration::from_secs(30), FilterSupport::default());
 
         harness.wake(&mut retry).await.expect("first retry");
         assert_eq!(harness.waiters.subscribe.len(), 1, "one retry in flight");
@@ -207,7 +217,7 @@ mod tests {
     #[tokio::test]
     async fn answered_retry_waits_for_the_backoff() {
         let mut harness = Harness::new();
-        let mut retry = RestoreRetry::new(&harness.registry, Duration::from_millis(1));
+        let mut retry = RestoreRetry::new(&harness.registry, Duration::from_millis(1), FilterSupport::default());
         // A later attempt, so the backoff (200–400 ms) dwarfs the ack timeout.
         retry.attempt = 4;
 
@@ -228,12 +238,40 @@ mod tests {
         );
     }
 
+    /// A refused filter this connection's broker does not accept at all (a wildcard filter, no
+    /// Wildcard Subscription Available) is not asked for again on it: the broker would end the
+    /// connection over it. The retries stop until the next connection.
+    #[tokio::test]
+    async fn filter_the_broker_does_not_accept_is_not_retried() {
+        let mut harness = Harness::new();
+        let filters = vec![(ByteString::from_static("restore/#"), SubscriptionOptions::default())];
+        {
+            let mut registry = harness.registry.write().expect("registry");
+            registry.upsert(filters.clone());
+            registry.apply_restore_ack(&filters, &[SubscribeAckReason::NotAuthorized], None, false);
+        }
+        let support = FilterSupport {
+            wildcard: false,
+            shared: true,
+        };
+        let mut retry = RestoreRetry::new(&harness.registry, Duration::from_secs(30), support);
+
+        harness.wake(&mut retry).await.expect("retry");
+        let sent: Vec<_> = harness
+            .waiters
+            .subscribe
+            .values()
+            .flat_map(|pending| pending.filters.iter().map(|(filter, _)| filter.clone()))
+            .collect();
+        assert_eq!(sent, ["restore/acl"], "only the filter the broker accepts");
+    }
+
     /// `Duration::MAX` as `ack_timeout` (no timeout) does not panic when a refused
     /// subscription is asked for again.
     #[tokio::test]
     async fn unbounded_ack_timeout_does_not_panic_on_retry() {
         let mut harness = Harness::new();
-        let mut retry = RestoreRetry::new(&harness.registry, Duration::MAX);
+        let mut retry = RestoreRetry::new(&harness.registry, Duration::MAX, FilterSupport::default());
         harness.wake(&mut retry).await.expect("first retry");
     }
 }

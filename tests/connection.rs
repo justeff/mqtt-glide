@@ -1153,3 +1153,157 @@ async fn shutdown_racing_the_connack_sends_disconnect() {
     assert!(outcome.is_ok(), "a shutdown ends the driver cleanly: {outcome:?}");
     join_peer(peer).await;
 }
+
+/// A broker reached on reconnect that announces no Wildcard or Shared Subscriptions (a failover
+/// node configured differently) gets only the filters it accepts; the others are listed as
+/// refused with the reason it would give, instead of a SUBSCRIBE it ends the connection over
+/// and a reconnect that restores it again, for ever.
+#[tokio::test]
+async fn restore_leaves_out_filters_the_broker_does_not_accept() {
+    let (restored_tx, restored_rx) = tokio::sync::oneshot::channel();
+    let (port, peer) = spawn_peer_broker(move |broker| async move {
+        broker.accept_connected().await.expect_subscribe_grant_qos0().await;
+
+        let mut session = broker.accept_session().await;
+        session.expect_connect().await;
+        session
+            .send_connack(ConnectAck {
+                wildcard_subscription_available: false,
+                shared_subscription_available: false,
+                ..ConnectAck::default()
+            })
+            .await;
+        let mut restored = Vec::new();
+        while let Ok(Some(Ok((frame, _)))) = timeout(Duration::from_millis(500), session.read.next()).await {
+            if let DecodedFrame::Control(Packet::Subscribe(subscribe)) = frame {
+                restored.extend(subscribe.topic_filters.iter().map(|(filter, _)| filter.to_string()));
+                session
+                    .send_suback_qos0(subscribe.packet_id, subscribe.topic_filters.len())
+                    .await;
+            }
+        }
+        let _ = restored_tx.send(restored);
+        session.hold().await;
+    })
+    .await;
+
+    let (tx, _rx) = mpsc::channel(4);
+    let started = TestClient::connected(local_options(port, "failover"), static_credentials(), quick_retry(), tx).await;
+    let mut refused = started.client.refused_subscriptions();
+    started
+        .client
+        .subscribe([
+            ("plain/topic", QoS::AtMostOnce),
+            ("wild/#", QoS::AtMostOnce),
+            ("$share/group/shared/topic", QoS::AtMostOnce),
+        ])
+        .await
+        .expect("subscribe");
+
+    let restored = timeout(Duration::from_secs(5), restored_rx)
+        .await
+        .expect("restore in time")
+        .expect("peer alive");
+    assert_eq!(restored, ["plain/topic"]);
+    let listed = timeout(Duration::from_secs(5), refused.wait_for(|refused| refused.len() == 2))
+        .await
+        .expect("listed in time")
+        .expect("watch")
+        .clone();
+    let reasons: Vec<_> = listed
+        .iter()
+        .map(|refused| (&*refused.filter, refused.reason))
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            (
+                "$share/group/shared/topic",
+                mqtt_glide::SubscribeAckReason::SharedSubscriptionNotSupported
+            ),
+            (
+                "wild/#",
+                mqtt_glide::SubscribeAckReason::WildcardSubscriptionsNotSupported
+            ),
+        ]
+    );
+    assert!(started.client.is_connected(), "the restore kept the connection");
+    started.shutdown().await;
+    peer.abort();
+}
+
+/// A filter too long for the Maximum Packet Size a broker announces on reconnect is listed as
+/// refused instead of forgotten, and restored by a later connection whose limit takes it.
+#[tokio::test]
+async fn filter_too_long_for_one_connection_is_restored_by_the_next() {
+    let long = format!("long/{}", "x".repeat(200));
+    let (restored_tx, mut restored_rx) = mpsc::channel::<Vec<String>>(4);
+    let (port, peer) = spawn_peer_broker(move |broker| async move {
+        broker.accept_connected().await.expect_subscribe_grant_qos0().await;
+        for max_packet_size in [Some(128), None] {
+            let mut session = broker.accept_session().await;
+            session.expect_connect().await;
+            session
+                .send_connack(ConnectAck {
+                    max_packet_size,
+                    ..ConnectAck::default()
+                })
+                .await;
+            let mut restored = Vec::new();
+            while let Ok(Some(Ok((frame, _)))) = timeout(Duration::from_millis(300), session.read.next()).await {
+                if let DecodedFrame::Control(Packet::Subscribe(subscribe)) = frame {
+                    restored.extend(subscribe.topic_filters.iter().map(|(filter, _)| filter.to_string()));
+                    session
+                        .send_suback_qos0(subscribe.packet_id, subscribe.topic_filters.len())
+                        .await;
+                }
+            }
+            // The registry keeps no order among the filters of one SUBSCRIBE.
+            restored.sort();
+            let _ = restored_tx.send(restored).await;
+        }
+        broker.accept_session().await.hold().await;
+    })
+    .await;
+
+    let (tx, _rx) = mpsc::channel(4);
+    let started = TestClient::connected(
+        local_options(port, "packet-size"),
+        static_credentials(),
+        quick_retry(),
+        tx,
+    )
+    .await;
+    let mut refused = started.client.refused_subscriptions();
+    started
+        .client
+        .subscribe([("short/topic", QoS::AtMostOnce), (long.as_str(), QoS::AtMostOnce)])
+        .await
+        .expect("subscribe");
+
+    let small = timeout(Duration::from_secs(5), restored_rx.recv())
+        .await
+        .expect("in time");
+    assert_eq!(small, Some(vec!["short/topic".to_owned()]));
+    let listed = timeout(Duration::from_secs(5), refused.wait_for(|refused| refused.len() == 1))
+        .await
+        .expect("listed in time")
+        .expect("watch")
+        .clone();
+    assert_eq!(&*listed[0].filter, long.as_str());
+    assert_eq!(
+        listed[0].reason_string.as_deref(),
+        Some("too long for the broker's Maximum Packet Size")
+    );
+
+    let roomy = timeout(Duration::from_secs(5), restored_rx.recv())
+        .await
+        .expect("in time");
+    assert_eq!(roomy, Some(vec![long.clone(), "short/topic".to_owned()]));
+    timeout(Duration::from_secs(5), refused.wait_for(Vec::is_empty))
+        .await
+        .expect("cleared in time")
+        .expect("watch");
+    started.shutdown().await;
+    peer.abort();
+}

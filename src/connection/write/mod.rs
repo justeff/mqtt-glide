@@ -597,6 +597,8 @@ pub(crate) struct WriteSession {
     pub outbound_topic_aliases: u16,
     /// CONNACK Subscription Identifiers Available.
     pub subscription_identifiers_available: bool,
+    /// CONNACK Wildcard and Shared Subscription Available.
+    pub filter_support: crate::connection::subscriptions::FilterSupport,
     /// Set when bytes leave the socket under TLS or WebSocket; `None` on plain TCP.
     pub socket_written: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Counters behind [`crate::MqttClient::stats`].
@@ -646,7 +648,7 @@ where
     let read_stop = session.read_stop;
     let pending_acks = shared.pending_acks();
     let subscription_identifiers_available = session.subscription_identifiers_available;
-    let mut restore = restore::RestoreRetry::new(&subscription_registry, session.ack_timeout);
+    let mut restore = restore::RestoreRetry::new(&subscription_registry, session.ack_timeout, session.filter_support);
     let mut awaiting_pingresp = false;
     let generation = session.generation;
     let publish_limits = BrokerPublishLimits {

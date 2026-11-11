@@ -526,7 +526,10 @@ impl MqttClient {
     /// listed here with the SUBACK reason code, and the client asks again on the same
     /// connection, first after about 5 s, then doubling up to every 5 min, until the broker
     /// grants it or the application calls [`Self::unsubscribe`] for it. Each refusal is also
-    /// logged at `warn`.
+    /// logged at `warn`. A filter the broker's CONNACK says it does not accept (Wildcard or
+    /// Shared Subscription Available 0), or one too long for its Maximum Packet Size, is not
+    /// sent on that connection at all; it is listed with a reason string saying why and
+    /// restored on the next connection that takes it.
     ///
     /// A non-empty list means messages on those filters are not arriving, which makes it a
     /// natural health check:

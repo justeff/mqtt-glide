@@ -21,6 +21,9 @@ pub struct SessionParams {
     pub keep_alive: Duration,
     /// Broker Shared Subscription Available flag from CONNACK.
     pub shared_subscription_available: bool,
+    /// Broker Wildcard Subscription Available flag from CONNACK (`true` when the property is
+    /// absent).
+    pub wildcard_subscription_available: bool,
     /// Broker Maximum Packet Size from CONNACK (`None` = unlimited / absent).
     pub max_packet_size: Option<u32>,
     /// Broker Maximum QoS from CONNACK (`ExactlyOnce` when the property is absent).
@@ -204,6 +207,7 @@ pub(crate) fn apply_connack(client_keep_alive: Duration, ack: &ConnectAck) -> Re
         from_connack: true,
         keep_alive,
         shared_subscription_available: ack.shared_subscription_available,
+        wildcard_subscription_available: ack.wildcard_subscription_available,
         max_packet_size: ack.max_packet_size,
         max_qos: ack.max_qos,
         retain_available: ack.retain_available,
