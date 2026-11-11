@@ -335,7 +335,7 @@ covered by the statement that binds the client.
 | Statement | Status | Evidence |
 |---|---|---|
 | **[MQTT-4.4.0-1]** When a Client reconnects with Clean Start set to 0 and a session is present, both the Client and Server MUST resend any unacknowledged PUBLISH packets (where QoS > 0) and PUBREL packets using their original Packet Identifiers. This is the only circumstance where a Client or Server is REQUIRED to resend messages. Clients and Servers MUST NOT resend messages at any other time. | ⚠️ deliberate deviation | Resent, except a publish the broker disconnected on in three connections in a row, which fails with PublishRefusedByDisconnect instead of looping for good<br>`unacked_qos1_beyond_a_smaller_receive_maximum_waits_and_is_resent` (src/client.rs)<br>`unacked_qos1_fails_when_broker_lost_the_session` (src/client.rs)<br>`unacked_qos1_is_resent_with_dup_on_session_resume` (src/client.rs)<br>+2 more |
-| **[MQTT-4.4.0-2]** If PUBACK or PUBREC is received containing a Reason Code of 0x80 or greater the corresponding PUBLISH packet is treated as acknowledged, and MUST NOT be retransmitted. | ✅ tested | `rejected_qos1_is_not_resent_on_session_resume` (src/client.rs) |
+| **[MQTT-4.4.0-2]** If PUBACK or PUBREC is received containing a Reason Code of 0x80 or greater the corresponding PUBLISH packet is treated as acknowledged, and MUST NOT be retransmitted. | ✅ tested | `rejected_qos1_is_not_resent_on_session_resume` (src/client.rs)<br>`puback_decode_success` (src/codec/v5/packet/pubacks.rs) |
 
 ## 4.5
 

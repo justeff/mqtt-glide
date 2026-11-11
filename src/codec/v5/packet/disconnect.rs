@@ -100,20 +100,17 @@ pub enum DisconnectReasonCode {
     WildcardSubscriptionsNotSupported = 162,
 }
 
-/// The DISCONNECT Reason Code of `byte`, reading an undefined failure code (0x80 and up) as
-/// the nearest defined one instead of failing the packet as malformed.
+/// The DISCONNECT Reason Code of `byte`, read as [`super::lenient_failure_code`] reads it, with
+/// the two undefined refusal codes as Not authorized.
 ///
 /// EMQX ends a refused re-authentication with the CONNACK code of the refusal (0x86 Bad User
 /// Name or Password, 0x8A Banned, 0x88 Server unavailable), which DISCONNECT does not define.
 /// The connection ends either way; rejecting the packet only lost the refusal: the client
-/// reported a malformed packet and answered with a DISCONNECT of its own. Codes below 0x80 stay
-/// strict: they claim success.
+/// reported a malformed packet and answered with a DISCONNECT of its own.
 fn lenient_reason_code(byte: u8) -> Result<DisconnectReasonCode, DecodeError> {
-    match DisconnectReasonCode::try_from(byte) {
-        Ok(reason) => Ok(reason),
-        Err(_) if matches!(byte, 0x86 | 0x8A) => Ok(DisconnectReasonCode::NotAuthorized),
-        Err(_) if byte >= 0x80 => Ok(DisconnectReasonCode::UnspecifiedError),
-        Err(unknown) => Err(unknown.into()),
+    match byte {
+        0x86 | 0x8A => Ok(DisconnectReasonCode::NotAuthorized),
+        _ => super::lenient_failure_code(byte, DisconnectReasonCode::UnspecifiedError),
     }
 }
 

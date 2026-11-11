@@ -21,6 +21,25 @@ pub use disconnect::*;
 pub use pubacks::*;
 pub use subscribe::*;
 
+use crate::codec::error::{DecodeError, UnknownCode};
+
+/// Decodes an acknowledgement Reason Code, reading an undefined failure code (0x80 and up) as
+/// `unspecified` instead of failing the packet as malformed.
+///
+/// The broker has refused either way, and a refusal is final for that request. Rejecting the
+/// packet instead ended the connection, and a refused subscription restored on every reconnect
+/// was refused the same way again. Codes below 0x80 stay strict: they claim success.
+pub(crate) fn lenient_failure_code<T: TryFrom<u8, Error = UnknownCode>>(
+    byte: u8,
+    unspecified: T,
+) -> Result<T, DecodeError> {
+    match T::try_from(byte) {
+        Ok(reason) => Ok(reason),
+        Err(_) if byte >= 0x80 => Ok(unspecified),
+        Err(unknown) => Err(unknown.into()),
+    }
+}
+
 /// Decoded inbound MQTT frame: PUBLISH data path or a control packet.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum DecodedFrame {

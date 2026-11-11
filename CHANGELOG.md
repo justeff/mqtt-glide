@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An inbound Topic Alias no longer keeps the PUBLISH that bound it in memory
 - Re-authentication: ends after 16 broker challenges, fails the call instead of closing the connection when an AUTH does not fit the broker's Maximum Packet Size, and invalidates credentials on DISCONNECT 0x87 / 0x8C during the subscription restore too
 - DISCONNECT reason codes follow the spec: 0x82 instead of 0x94 for an unbound Topic Alias, 0x82 instead of 0x81 for an AUTH without method, a flag property other than 0 or 1, and Maximum QoS 3 to 255
-- An undefined failure code in a broker DISCONNECT (EMQX sends CONNACK codes) is read as the nearest defined code instead of a malformed packet
+- An undefined failure code in a broker DISCONNECT (EMQX sends CONNACK codes), PUBACK, SUBACK or UNSUBACK is read as the nearest defined code instead of a malformed packet
 - A packet above 16 MiB that `max_packet_size` allows also arrives over WebSocket: the frame and message limits grow with it past tungstenite's 16 / 64 MiB
 - A WebSocket path an HTTP request cannot carry is refused by `BrokerUrl::parse`
 - An unparsable certificate in the system trust store is skipped instead of failing every TLS connect

@@ -151,7 +151,7 @@ impl PublishAck {
             });
         }
 
-        let reason_code = reader.read_u8()?.try_into()?;
+        let reason_code = super::lenient_failure_code(reader.read_u8()?, PublishAckReason::UnspecifiedError)?;
         if reader.remaining() == 0 {
             return Ok(Self {
                 packet_id,
@@ -329,6 +329,8 @@ mod tests {
     #[case::no_success_no_prop_len(b"\x00\x01\x87", 1, PublishAckReason::NotAuthorized, vec![], None)]
     #[case::no_success_min(b"\x00\x01\x83\x00", 1, PublishAckReason::ImplementationSpecificError, vec![], None)]
     #[case::all_out(b"\x00\xFF\x80\x0D\x26\x00\x01a\x00\x01b\x1F\x00\x03123", 255, PublishAckReason::UnspecifiedError, vec![("a", "b")], Some("123"))]
+    // An undefined failure code is still a refusal ([MQTT-4.4.0-2]), not a malformed packet.
+    #[case::undefined_failure(b"\x00\x01\x8C", 1, PublishAckReason::UnspecifiedError, vec![], None)]
     fn puback_decode_success(
         #[case] input: &'static [u8],
         #[case] packet_id: u16,
@@ -353,6 +355,7 @@ mod tests {
     #[rstest]
     #[case::packet_id_zero(b"\x00\x00", DecodeError::MalformedPacket("invalid encoding"))]
     #[case::properties_promised(b"\x00\x01\x00\x01", DecodeError::InvalidLength)]
+    #[case::undefined_success(b"\x00\x01\x05", DecodeError::MalformedPacket("unknown property or reason code"))]
     fn puback_decode_must_fail(#[case] input: &'static [u8], #[case] error: DecodeError) {
         let mut input = input.into();
         let result = PublishAck::decode(&mut input);

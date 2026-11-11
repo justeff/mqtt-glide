@@ -249,7 +249,7 @@ impl SubscribeAck {
         ensure!(src.has_remaining(), DecodeError::MalformedPacket("invalid encoding"));
         let mut status = Vec::with_capacity(src.remaining());
         for code in src.as_ref().iter().copied() {
-            status.push(code.try_into()?);
+            status.push(super::lenient_failure_code(code, SubscribeAckReason::UnspecifiedError)?);
         }
         Ok(Self {
             packet_id,
@@ -300,7 +300,10 @@ impl UnsubscribeAck {
         ensure!(src.has_remaining(), DecodeError::MalformedPacket("invalid encoding"));
         let mut status = Vec::with_capacity(src.remaining());
         for code in src.as_ref().iter().copied() {
-            status.push(code.try_into()?);
+            status.push(super::lenient_failure_code(
+                code,
+                UnsubscribeAckReason::UnspecifiedError,
+            )?);
         }
         Ok(Self {
             packet_id,
@@ -543,6 +546,26 @@ mod tests {
             SubscriptionOptions::decode(&mut src),
             Err(DecodeError::MalformedPacket("invalid encoding"))
         ));
+    }
+
+    /// Undefined failure codes in SUBACK and UNSUBACK are read as Unspecified error: the broker
+    /// refused that filter, and a malformed packet would end the connection and restore the
+    /// refused subscription again on every reconnect.
+    #[test]
+    fn ack_decode_reads_undefined_failure_codes_as_unspecified() {
+        let mut src = Bytes::from_static(&[0x12, 0x34, 0x00, 0x00, 0x9F]);
+        let suback = SubscribeAck::decode(&mut src).expect("decoded");
+        assert_eq!(
+            suback.status,
+            [SubscribeAckReason::GrantedQos0, SubscribeAckReason::UnspecifiedError]
+        );
+
+        let mut src = Bytes::from_static(&[0x12, 0x34, 0x00, 0x99, 0x00]);
+        let unsuback = UnsubscribeAck::decode(&mut src).expect("decoded");
+        assert_eq!(
+            unsuback.status,
+            [UnsubscribeAckReason::UnspecifiedError, UnsubscribeAckReason::Success]
+        );
     }
 
     #[test]
