@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Restoring subscriptions after a reconnect: a broker DISCONNECT keeps its reason (session takeover, auth refusal, redirect), a slow consumer of retained messages no longer causes a reconnect loop, and a filter the broker's CONNACK says it does not accept (no Wildcard or Shared Subscriptions), or one too long for its Maximum Packet Size, is listed as refused and restored by a later connection that takes it, instead of ending the connection on every reconnect or being forgotten
 - A large PUBLISH on a slow link, over TCP, TLS or WebSocket, is no longer taken for a dead broker
 - Acknowledgements that arrive right before a connection ends are no longer lost
+- A connection lost while the inbound sink is full no longer stops the driver as if the application had closed the sink; it reconnects
 - Unacknowledged publishes waiting to be resent keep their Packet Identifiers ([MQTT-2.2.1-3])
 - Publishes parked behind the Receive Maximum whose callers gave up no longer keep other commands out
 - `Duration::MAX` as `ack_timeout` or `connect_timeout` no longer panics

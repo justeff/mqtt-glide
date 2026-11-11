@@ -577,6 +577,7 @@ async fn handle_inbound_publish<H: InboundSink, W: AsyncWrite + Unpin + Send + '
             PublishAccept::Accepted => {}
             PublishAccept::CutOff => return Some(ReadOutcome::Cancelled),
             PublishAccept::Closed => return Some(ReadOutcome::InboundSinkClosed),
+            PublishAccept::WriteTaskGone => return Some(ReadOutcome::PeerClosed),
         }
     }
     // PUBACK only after successful handoff accept (enqueue-before-ack); written with the burst.
@@ -595,6 +596,9 @@ enum PublishAccept {
     CutOff,
     /// Handoff channel closed.
     Closed,
+    /// The write task has ended, so the held PUBACKs could not go to it: the connection is
+    /// going down, which is no reason to stop the driver the way a closed sink is.
+    WriteTaskGone,
 }
 
 /// Clears [`AtomicBool`] stall flag on drop (including cancel/cutoff paths).
@@ -640,7 +644,7 @@ async fn accept_publish_preferring_completed_push<H: InboundSink, W: AsyncWrite 
         Err(InboundTrySendError::Full(message)) => {
             // The wait can be long: let the broker have the PUBACKs it is owed meanwhile.
             if acks.send(control_tx).await.is_err() {
-                return PublishAccept::Closed;
+                return PublishAccept::WriteTaskGone;
             }
             handoff_stalled.store(true, Ordering::Release);
             let _stall_guard = HandoffStallGuard { flag: handoff_stalled };
@@ -980,6 +984,35 @@ mod tests {
             cancel: StopSignal::new(),
             shutdown_notify: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// A write task that ended while the sink is full (the connection broke under a slow
+    /// consumer) is a lost connection, not a closed sink: the driver reconnects instead of
+    /// stopping with `InboundSinkClosed`.
+    #[tokio::test]
+    async fn write_task_gone_while_the_sink_is_full_is_no_closed_sink() {
+        let (tx, _rx) = flume::bounded::<InboundMessage>(1);
+        tx.try_send(sample_publish(b"fill")).expect("fill");
+        let mut acks = acks_on(tokio::io::sink(), 0);
+        let writer = acks.writer.clone();
+        let _held = writer.lock().await; // the PUBACKs must go to the write task
+        let (control_tx, control_rx) = mpsc::channel(8);
+        drop(control_rx); // the write task has ended
+
+        let outcome = accept_publish_preferring_completed_push(
+            &tx,
+            sample_publish(b"next"),
+            &control_tx,
+            &mut acks,
+            &crate::stats::Stats::default(),
+            &StopSignal::new(),
+            &StopSignal::new(),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .await;
+        assert_eq!(outcome, PublishAccept::WriteTaskGone);
+        assert!(!tx.is_disconnected(), "the application's sink is open");
     }
 
     /// Past the client's Receive Maximum (a broker breaking [MQTT-3.3.4-9]) the read task waits
