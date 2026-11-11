@@ -481,6 +481,7 @@ where
     );
     let mut groups = groups.into_iter();
     let mut waiting: HashMap<NonZeroU16, Vec<(ByteString, SubscriptionOptions)>> = HashMap::new();
+    let mut ping = RestorePing::new(inbound.keep_alive);
     let result = async {
         loop {
             while waiting.len() < RESUBSCRIBE_WINDOW
@@ -496,19 +497,14 @@ where
                     user_properties: Vec::new(),
                     topic_filters: filters,
                 });
-                // Bounded like the SUBACK wait, and open to shutdown: a broker that stops reading
-                // would otherwise hold the connect here.
+                // Open to shutdown too.
                 tokio::select! {
                     () = cancel.cancelled() => {
                         return Err(ConnectionOutcome::Shutdown(ShutdownError::Cancelled).into());
                     }
-                    sent = timeout(deadline, framed_write.send(packet)) => {
-                        sent.map_err(|_elapsed| {
-                            ConnectionOutcome::Transport(TransportError::Connection(format!(
-                                "resubscribe SUBSCRIBE not written within {deadline:?}"
-                            )))
-                        })?
-                        .map_err(map_resubscribe_send_error)?;
+                    sent = bounded_write(deadline, "SUBSCRIBE", framed_write.send(packet)) => {
+                        sent?;
+                        ping.wrote();
                     }
                 }
             }
@@ -517,7 +513,7 @@ where
             }
             let ack = tokio::select! {
                 () = cancel.cancelled() => return Err(ConnectionOutcome::Shutdown(ShutdownError::Cancelled).into()),
-                result = read_suback(framed_read, framed_write, &waiting, &mut inbound, deadline) => result?,
+                result = read_suback(framed_read, framed_write, &waiting, &mut inbound, &mut ping, deadline) => result?,
             };
             let filters = waiting
                 .remove(&ack.packet_id)
@@ -575,9 +571,7 @@ pub(crate) struct ResubscribeInbound<'a, H> {
     pub(crate) filter_support: FilterSupport,
     /// Request/response routing (responses bypass the inbound sink).
     pub(crate) response_router: &'a crate::request::ResponseRouter,
-    /// The connection's Keep Alive (zero: off). While a full sink holds the restore, PINGREQs
-    /// go out at this pace: nothing else is written then, and the broker closes a client that
-    /// stays silent for 1.5 times it ([MQTT-3.1.2-22]).
+    /// The connection's Keep Alive (zero: off); see [`RestorePing`].
     pub(crate) keep_alive: Duration,
 }
 
@@ -631,6 +625,7 @@ async fn read_suback<H: InboundSink, R, W, V>(
     framed_write: &mut FramedWrite<W, V5Codec>,
     waiting: &HashMap<NonZeroU16, V>,
     inbound: &mut ResubscribeInbound<'_, H>,
+    ping: &mut RestorePing,
     deadline: Duration,
 ) -> Result<SubscribeAck, ResubscribeFailure>
 where
@@ -649,6 +644,10 @@ where
                 ))
                 .into());
             }
+            () = tokio::time::sleep_until(ping.due), if ping.enabled() => {
+                ping.send(framed_write).await?;
+                continue;
+            }
         };
         let (reason, outcome) = match frame {
             Some(Ok((DecodedFrame::Control(Packet::SubscribeAck(ack)), _))) if waiting.contains_key(&ack.packet_id) => {
@@ -659,7 +658,7 @@ where
             Some(Ok((DecodedFrame::Control(Packet::PingResponse), _))) => continue,
             Some(Ok((DecodedFrame::Publish(packet), _))) => {
                 let started = tokio::time::Instant::now();
-                deliver_publish_during_resubscribe(framed_write, inbound, packet).await?;
+                deliver_publish_during_resubscribe(framed_write, inbound, ping, deadline, packet).await?;
                 let extended = crate::util::extend_deadline(timer.deadline(), started.elapsed());
                 timer.as_mut().reset(extended);
                 continue;
@@ -724,6 +723,8 @@ const REFUSE_DISCONNECT_BUDGET: Duration = Duration::from_secs(1);
 async fn deliver_publish_during_resubscribe<H: InboundSink, W>(
     framed_write: &mut FramedWrite<W, V5Codec>,
     inbound: &mut ResubscribeInbound<'_, H>,
+    ping: &mut RestorePing,
+    write_budget: Duration,
     mut packet: crate::codec::PublishPacket,
 ) -> Result<(), ConnectionOutcome>
 where
@@ -756,16 +757,8 @@ where
                     }
                     break;
                 }
-                () = tokio::time::sleep(inbound.keep_alive), if !inbound.keep_alive.is_zero() => {
-                    let ping = framed_write.send(Packet::PingRequest);
-                    timeout(inbound.keep_alive, ping)
-                        .await
-                        .map_err(|_elapsed| {
-                            ConnectionOutcome::Transport(TransportError::Connection(
-                                "PINGREQ not written during resubscribe".into(),
-                            ))
-                        })?
-                        .map_err(map_resubscribe_send_error)?;
+                () = tokio::time::sleep_until(ping.due), if ping.enabled() => {
+                    ping.send(framed_write).await?;
                 }
             }
         }
@@ -774,9 +767,64 @@ where
     if let Some(packet_id) = puback_id {
         let max_out = framed_write.encoder().max_outbound_size();
         encode_publish_ack(packet_id, max_out, framed_write.write_buffer_mut()).map_err(map_resubscribe_send_error)?;
-        framed_write.flush().await.map_err(map_resubscribe_send_error)?;
+        bounded_write(write_budget, "PUBACK", framed_write.flush()).await?;
+        ping.wrote();
     }
     Ok(())
+}
+
+/// Keep Alive while subscriptions are restored, before the write task runs: one PINGREQ
+/// when nothing was written for `keep_alive` ([MQTT-3.1.2-22]), across the whole restore. A
+/// timer per delivered message would never fire while a slow sink takes QoS 0 messages
+/// just under `keep_alive` apart, and the broker would close the silent client.
+struct RestorePing {
+    keep_alive: Duration,
+    due: tokio::time::Instant,
+}
+
+impl RestorePing {
+    fn new(keep_alive: Duration) -> Self {
+        Self {
+            keep_alive,
+            due: crate::util::deadline_after(keep_alive),
+        }
+    }
+
+    /// Zero Keep Alive turns the mechanism off.
+    fn enabled(&self) -> bool {
+        !self.keep_alive.is_zero()
+    }
+
+    /// Something went out: the next PINGREQ is due a Keep Alive from now.
+    fn wrote(&mut self) {
+        self.due = crate::util::deadline_after(self.keep_alive);
+    }
+
+    async fn send<W>(&mut self, framed_write: &mut FramedWrite<W, V5Codec>) -> Result<(), ConnectionOutcome>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        bounded_write(self.keep_alive, "PINGREQ", framed_write.send(Packet::PingRequest)).await?;
+        self.wrote();
+        Ok(())
+    }
+}
+
+/// A write while subscriptions are restored, bounded by `budget`: a broker that stops reading
+/// must not hold the connect for good.
+async fn bounded_write(
+    budget: Duration,
+    what: &str,
+    write: impl Future<Output = Result<(), crate::codec::EncodeError>>,
+) -> Result<(), ConnectionOutcome> {
+    timeout(budget, write)
+        .await
+        .map_err(|_elapsed| {
+            ConnectionOutcome::Transport(TransportError::Connection(format!(
+                "resubscribe {what} not written within {budget:?}"
+            )))
+        })?
+        .map_err(map_resubscribe_send_error)
 }
 
 fn map_resubscribe_send_error(error: crate::codec::EncodeError) -> ConnectionOutcome {

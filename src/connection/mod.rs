@@ -592,16 +592,15 @@ impl<H: InboundSink> Connection<H> {
         // DISCONNECT before dropping TCP when the write half is still open.
         if !subscriptions::session_resume_consistent(self.options.clean_start, session.session_present) {
             let message = "broker set Session Present = 1 after Clean Start = 1 ([MQTT-3.2.2-2])";
-            let _ = framed_write
-                .send(Packet::Disconnect(Disconnect::new(DisconnectReasonCode::ProtocolError)))
-                .await;
+            // Bounded: a broker that stops reading must not hold the driver here.
+            let outcome = subscriptions::refuse_packet(
+                &mut framed_write,
+                DisconnectReasonCode::ProtocolError,
+                ConnectionOutcome::Application(AppError::SessionPresentInconsistent(message.into())),
+            )
+            .await;
             drop((framed_read, framed_write));
-            return self
-                .finish_session(
-                    ConnectionOutcome::Application(AppError::SessionPresentInconsistent(message.into())),
-                    false,
-                )
-                .await;
+            return self.finish_session(outcome, false).await;
         }
         // No session on the broker: the client MUST discard its own state too
         // ([MQTT-3.2.2-5]), so unacknowledged publishes are not resent. Never-sent ones still go.

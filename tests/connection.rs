@@ -841,6 +841,82 @@ async fn resubscribe_held_by_a_full_sink_keeps_pinging() {
     peer.abort();
 }
 
+/// A slow consumer that takes each retained QoS 0 message just under the Keep Alive apart
+/// never fills the wait for one message to a full Keep Alive, and QoS 0 needs no PUBACK: the
+/// restore still sends PINGREQs, or the broker closes the silent client ([MQTT-3.1.2-22]).
+#[tokio::test]
+async fn resubscribe_with_a_slow_consumer_of_qos0_messages_keeps_pinging() {
+    const MESSAGES: usize = 6;
+    let (pings_tx, pings_rx) = tokio::sync::oneshot::channel();
+    let (port, peer) = spawn_peer_broker(move |broker| async move {
+        let mut session = broker.accept_connected().await;
+        session.expect_subscribe_grant_qos0().await;
+        session.expect_subscribe_grant_qos0().await;
+        drop(session);
+
+        let mut session = broker.accept_connected().await;
+        let ids = session.expect_subscribe_ids(2).await;
+        session.send_suback_qos0(ids[0], 1).await;
+        for index in 0..MESSAGES {
+            session.feed_publish("a/retained", format!("r{index}"), true);
+        }
+        session.write.flush().await.expect("flush");
+        let mut pings = 0;
+        let listen = tokio::time::sleep(Duration::from_millis(3000));
+        tokio::pin!(listen);
+        loop {
+            tokio::select! {
+                () = &mut listen => break,
+                frame = session.read.next() => match frame {
+                    Some(Ok((DecodedFrame::Control(Packet::PingRequest), _))) => {
+                        pings += 1;
+                        session.write.send(Packet::PingResponse).await.expect("PINGRESP");
+                    }
+                    Some(Ok(_)) => {}
+                    _ => break,
+                },
+            }
+        }
+        let _ = pings_tx.send(pings);
+        session.send_suback_qos0(ids[1], 1).await;
+        session.hold().await;
+    })
+    .await;
+
+    let options = local_options(port, "slow-restore")
+        .keep_alive(Duration::from_secs(1))
+        .ack_timeout(Duration::from_secs(1));
+    let (tx, mut rx) = mpsc::channel(1);
+    let started = TestClient::connected(options, static_credentials(), quick_retry(), tx).await;
+    for filter in ["a/#", "b/#"] {
+        started
+            .client
+            .subscribe([(filter, QoS::AtMostOnce)])
+            .await
+            .expect("subscribe");
+    }
+    // Each message waits 600 ms in the one-slot sink: under the Keep Alive every time.
+    let consumer = tokio::spawn(async move {
+        for _ in 0..MESSAGES {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            rx.recv().await.expect("open");
+        }
+    });
+
+    let pings = timeout(Duration::from_secs(10), pings_rx)
+        .await
+        .expect("in time")
+        .expect("peer alive");
+    assert!(pings >= 2, "{pings} PINGREQs in 3 s of restore at a 1 s Keep Alive");
+    timeout(Duration::from_secs(10), consumer)
+        .await
+        .expect("in time")
+        .expect("consumer");
+
+    started.shutdown().await;
+    peer.abort();
+}
+
 /// A credentials provider that never answers fails the connect within `connect_timeout`
 /// instead of keeping the driver connecting for good.
 #[tokio::test]
