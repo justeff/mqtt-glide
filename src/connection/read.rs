@@ -4,7 +4,7 @@ use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use futures_util::{FutureExt, SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio_util::codec::FramedRead;
@@ -179,6 +179,8 @@ where
     let cancel_wait = cancel.cancelled();
     let stop_wait = stop.cancelled();
     tokio::pin!(cancel_wait, stop_wait);
+    // A frame read ahead of a re-authentication timeout, handled before anything else.
+    let mut read_ahead = None;
 
     loop {
         // Do not put `#[cfg(test)]` on a `tokio::select!` arm — the macro rejects it.
@@ -191,11 +193,20 @@ where
             // Session cancel or graceful-shutdown notify — stop consuming the read half.
             () = &mut cancel_wait => return ReadOutcome::Cancelled,
             () = &mut stop_wait => return ReadOutcome::Cancelled,
-            event = next_reauth_event(reauth), if reauth.is_some() => {
-                if let Some(state) = reauth.as_mut()
-                    && let Err(failure) = state.handle(event, control_tx).await
-                {
-                    return reauth_failure(control_tx, failure).await;
+            event = next_reauth_event(reauth), if reauth.is_some() && read_ahead.is_none() => {
+                if let Some(state) = reauth.as_mut() {
+                    // The broker's answer may have arrived while the timer ran out: read what
+                    // is there first, so the answer is not lost to the timeout.
+                    if matches!(event, reauth::Event::TimedOut)
+                        && state.defer_timeout()
+                        && let Some(frame) = framed.next().now_or_never()
+                    {
+                        read_ahead = Some(frame);
+                        continue;
+                    }
+                    if let Err(failure) = state.handle(event, control_tx).await {
+                        return reauth_failure(control_tx, failure).await;
+                    }
                 }
             }
             msg = stub_exit => {
@@ -212,7 +223,7 @@ where
                     unreachable!("stub_exit is pending in release builds");
                 }
             }
-            frame = framed.next() => {
+            frame = next_frame(&mut read_ahead, &mut framed) => {
                 let mut pending = frame;
                 for burst_idx in 0..read_burst {
                     match pending {
@@ -711,6 +722,14 @@ async fn dispatch_control(
             ));
             Some(protocol_error_disconnect(control_tx, error, DisconnectReasonCode::ProtocolError).await)
         }
+    }
+}
+
+/// The frame read ahead, or the next one from the socket.
+async fn next_frame<S: Stream + Unpin>(read_ahead: &mut Option<Option<S::Item>>, framed: &mut S) -> Option<S::Item> {
+    match read_ahead.take() {
+        Some(frame) => frame,
+        None => framed.next().await,
     }
 }
 

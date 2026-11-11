@@ -341,6 +341,41 @@ async fn broker_failing_a_reauthentication_loses_the_connection() {
     }
 }
 
+/// A read task kept from running past the deadline (here by a busy runtime thread) finds the
+/// timer and the broker's answer ready at once; the answer wins instead of, half the time, a
+/// timeout that closes the connection. Several rounds: without the fix each fails by chance.
+#[tokio::test]
+async fn answer_that_arrived_while_the_read_task_was_away_beats_the_timeout() {
+    for _ in 0..8 {
+        let (client, driver, _report) = run(
+            Some(Scripted::default()),
+            |options| options.ack_timeout(Duration::from_millis(50)),
+            move |mut read, mut write| async move {
+                let _ = next(&mut read).await;
+                let _ = write.send(connack_with_method(METHOD)).await;
+                let _ = next(&mut read).await; // AUTH 0x19
+                let _ = write.send(auth(AuthReasonCode::Success, METHOD, b"done")).await;
+                // Blocks the only runtime thread past the deadline, with the answer in the
+                // socket: the read task cannot run in between.
+                std::thread::sleep(Duration::from_millis(150));
+                let _ = disconnect_reason(&mut read).await;
+            },
+        )
+        .await;
+        let mut phase = client.session_phase();
+        timeout(WAIT, phase.wait_for(|_| client.is_connected()))
+            .await
+            .expect("connected")
+            .expect("watch");
+
+        let reauthenticated = timeout(WAIT, client.reauthenticate()).await.expect("in time");
+        assert_eq!(reauthenticated, Ok(()));
+
+        client.shutdown().await.expect("shutdown");
+        let _ = driver_result(driver).await;
+    }
+}
+
 /// A re-authentication running into a graceful shutdown still gets its answers out while the
 /// drain waits for PUBACKs; the shutdown then ends with a normal DISCONNECT.
 #[tokio::test]
@@ -462,4 +497,44 @@ async fn reauthenticate_calls_that_gave_up_leave_room() {
 
     client.shutdown().await.expect("shutdown");
     let _ = timeout(WAIT, driver).await;
+}
+
+/// The timeout of the broker's answer waits for frames already received only once: a broker that
+/// keeps sending other packets and never answers still meets the timeout.
+#[tokio::test]
+async fn reauthentication_times_out_against_a_chatty_broker() {
+    let (client, driver, _report) = run(
+        Some(Scripted::default()),
+        |options| options.ack_timeout(Duration::from_millis(200)),
+        move |mut read, mut write| async move {
+            let _ = next(&mut read).await;
+            let _ = write.send(connack_with_method(METHOD)).await;
+            let _ = next(&mut read).await; // AUTH 0x19, never answered
+            for _ in 0..1000 {
+                if write.send(Packet::PingResponse).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        },
+    )
+    .await;
+    let mut phase = client.session_phase();
+    timeout(WAIT, phase.wait_for(|_| client.is_connected()))
+        .await
+        .expect("connected")
+        .expect("watch");
+
+    let started = std::time::Instant::now();
+    let reauthenticated = timeout(WAIT, client.reauthenticate()).await.expect("in time");
+    assert_eq!(
+        reauthenticated,
+        Err(AppError::ReauthenticationTimeout(Duration::from_millis(200)))
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "took {:?}",
+        started.elapsed()
+    );
+    let _ = driver_result(driver).await;
 }

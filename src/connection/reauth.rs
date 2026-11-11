@@ -193,6 +193,9 @@ pub(crate) struct Reauth {
     held_up: Duration,
     /// Broker challenges (AUTH Continue Authentication) of the running exchange.
     challenges: u8,
+    /// The deadline of the broker's answer passed once already and the frames received by then
+    /// were read first (see [`Self::defer_timeout`]).
+    timeout_deferred: bool,
     broker_max_packet_size: Option<u32>,
 }
 
@@ -213,6 +216,7 @@ impl Reauth {
             timer: Box::pin(sleep_until(Instant::now())),
             held_up: Duration::ZERO,
             challenges: 0,
+            timeout_deferred: false,
             broker_max_packet_size: link.broker_max_packet_size,
         })
     }
@@ -226,6 +230,17 @@ impl Reauth {
     #[cfg(test)]
     fn waiting(&self) -> bool {
         matches!(self.state, State::Waiting { .. })
+    }
+
+    /// Whether a timeout of the broker's answer waits for frames already received to be read.
+    ///
+    /// Once per answer: a read task that was not polled for a while (a busy runtime, a full
+    /// control channel) finds the timer and the broker's answer ready at the same time, and the
+    /// answer must win. A broker that keeps sending other packets cannot postpone it twice.
+    pub(crate) fn defer_timeout(&mut self) -> bool {
+        let defer = matches!(self.state, State::Waiting { .. }) && !self.timeout_deferred;
+        self.timeout_deferred |= defer;
+        defer
     }
 
     /// Moves the deadline by time the read task spent away from the exchange (a full inbound
@@ -481,6 +496,7 @@ impl Reauth {
     /// Starts the deadline of a step that begins now.
     fn arm(&mut self) {
         self.held_up = Duration::ZERO;
+        self.timeout_deferred = false;
         self.timer.as_mut().reset(crate::util::deadline_after(self.ack_timeout));
     }
 }
