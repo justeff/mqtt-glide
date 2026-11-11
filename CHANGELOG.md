@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-11
+
 ### Security
 
 - A malformed PEM private key no longer ends up in error messages. With lost line breaks (environment variable, JSON) the parser quoted the whole key
