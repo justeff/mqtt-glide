@@ -248,8 +248,7 @@ where
                         reply,
                     },
                     limits,
-                )
-                .await?;
+                )?;
                 flush_if_buffer_large(framed, FlushAbort::Graceful).await?;
             }
             ClientCommand::Subscribe { reply, .. } => {

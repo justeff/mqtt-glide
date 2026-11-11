@@ -85,8 +85,7 @@ where
                 reply,
             },
             ctx.publish_limits,
-        )
-        .await?;
+        )?;
         if !coalesce_publishes {
             return Ok(CommandDispatch::Continue);
         }
@@ -136,8 +135,7 @@ where
                     reply,
                 },
                 ctx.publish_limits,
-            )
-            .await?;
+            )?;
             Ok(CommandDispatch::Continue)
         }
         #[cfg(test)]
@@ -238,8 +236,7 @@ where
                         reply,
                     },
                     ctx.publish_limits,
-                )
-                .await?;
+                )?;
                 fed_publishes += 1;
                 since_flush += 1;
                 // Mid-burst flush: by bytes for small publishes (as for every other frame), but
@@ -271,7 +268,11 @@ where
     Ok(None)
 }
 
-pub(super) async fn handle_publish<W>(
+/// Sends one publish, or parks it until the broker's Receive Maximum has room.
+///
+/// Not `async`: it never waits, and a future would hold the publish in its state, so every
+/// message on the hot path would be moved into that state and, on the poll, out of it again.
+pub(super) fn handle_publish<W>(
     framed: &mut FramedWrite<W, V5Codec>,
     inflight: &mut InflightPots,
     publish_waiters: &mut PublishWaiters,
@@ -450,7 +451,7 @@ where
             }
         }
         while let Some(publish) = unsent.pop_front() {
-            handle_publish(framed, inflight, publish_waiters, publish, limits).await?;
+            handle_publish(framed, inflight, publish_waiters, publish, limits)?;
         }
         flush_writes(framed, flush_abort).await
     }
