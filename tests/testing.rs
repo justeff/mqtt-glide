@@ -131,6 +131,25 @@ async fn injects_messages_and_balances_shared_subscriptions() {
     assert_eq!(got, [2, 2], "each job goes to exactly one worker, in turn");
 }
 
+/// Two filters under one share name are two shared subscriptions ([MQTT-4.8.2]): a message
+/// matching both is delivered once to each, not once to the group.
+#[tokio::test]
+async fn one_share_name_with_two_filters_delivers_to_each() {
+    let broker = TestBroker::start().await.expect("broker");
+    let (a, mut a_rx) = client(&broker.url(), "share-hash").await;
+    let (b, mut b_rx) = client(&broker.url(), "share-plus").await;
+    a.subscribe([("$share/g/a/#", QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe");
+    b.subscribe([("$share/g/a/+", QoS::AtLeastOnce)])
+        .await
+        .expect("subscribe");
+
+    broker.publish(Publish::new("a/b", "both").qos(QoS::AtLeastOnce));
+    assert_eq!(&next(&mut a_rx).await.payload[..], b"both");
+    assert_eq!(&next(&mut b_rx).await.payload[..], b"both");
+}
+
 /// The shutdown sequence of `examples/graceful_shutdown.rs`: a worker leaving a shared group
 /// unsubscribes, shuts down, and its inbound channel ends once the driver has finished, while
 /// the rest of the group takes over.

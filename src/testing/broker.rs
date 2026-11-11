@@ -1037,7 +1037,9 @@ fn route(shared: &Shared, from: Option<u64>, delivery: Delivery) {
         }
     }
     let topic = delivery.message.topic.clone();
-    let mut groups: BTreeMap<ByteString, Vec<(u64, QoS)>> = BTreeMap::new();
+    // A shared subscription is its share name and its filter ([MQTT-4.8.2]): two filters in one
+    // group are two subscriptions, each delivering a copy.
+    let mut groups: BTreeMap<(ByteString, ByteString), Vec<(u64, QoS)>> = BTreeMap::new();
     let mut targets = Vec::new();
     for (id, conn) in &state.connections {
         // Several matching subscriptions of one client: one copy at the highest QoS.
@@ -1047,7 +1049,10 @@ fn route(shared: &Shared, from: Option<u64>, delivery: Delivery) {
                 continue;
             }
             match &sub.group {
-                Some(group) => groups.entry(group.clone()).or_default().push((*id, sub.qos)),
+                Some(group) => groups
+                    .entry((group.clone(), sub.filter.clone()))
+                    .or_default()
+                    .push((*id, sub.qos)),
                 None => best = Some(best.map_or(sub.qos, |qos| qos.max(sub.qos))),
             }
         }
