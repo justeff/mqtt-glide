@@ -34,6 +34,9 @@ struct WriteTaskHandle {
     /// Queues inbound PUBACKs in the shared writer as the read task does when the writer is
     /// taken; `true` when the queue was empty.
     queue_acks: QueueAcks,
+    /// Whether the write task closed the shared PUBACK queue (no PUBACK may follow its
+    /// DISCONNECT).
+    acks_closed: Box<dyn Fn() -> bool + Send + Sync>,
 }
 
 type QueueAcks = Box<dyn Fn(&[u16]) -> bool + Send + Sync>;
@@ -97,6 +100,8 @@ where
 
     let writer = SharedWriter::new(framed);
     let queue_writer = writer.clone();
+    let closed_writer = writer.clone();
+    let acks_closed = Box::new(move || closed_writer.pending_acks().is_closed());
     let queue_acks = Box::new(move |ids: &[u16]| {
         let mut ids = ids.iter().map(|&id| NonZeroU16::new(id).expect("nz")).collect();
         queue_writer.pending_acks().push(&mut ids)
@@ -144,6 +149,7 @@ where
         join,
         _stub_tx: stub_tx,
         queue_acks,
+        acks_closed,
     }
 }
 
@@ -574,6 +580,12 @@ async fn protocol_disconnect_is_terminal_no_frames_after() {
         frames,
         vec!["disconnect:ProtocolError".to_string()],
         "only protocol DISCONNECT may appear on the wire; got {frames:?}"
+    );
+    // The read task writes held PUBACKs itself once the writer is free: the closed queue is
+    // what keeps them off the wire after the DISCONNECT ([MQTT-3.14.4-1]).
+    assert!(
+        (harness.acks_closed)(),
+        "PUBACK queue must be closed after the DISCONNECT"
     );
 
     harness.cancel.cancel();

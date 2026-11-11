@@ -990,6 +990,9 @@ where
                             )
                             .await;
                         }
+                        // Nothing may follow the DISCONNECT ([MQTT-3.14.4-1]), also not the
+                        // PUBACKs the read task writes once the writer is dropped below.
+                        pending_acks.close();
                         fail_waiters_for_outcome(
                             &mut waiters,
                             &mut publish_waiters,
