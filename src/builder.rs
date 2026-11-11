@@ -317,6 +317,9 @@ async fn finish_connect<S: InboundSink>(
     let (client, connection, mut phase) = connect_with_shared(options, credentials, reconnect, sink, lifecycle)?;
 
     let run_handle = tokio::spawn(connection.run());
+    // A caller that gives up on this future (a timeout around `connect()`) gets no client, so
+    // nothing could stop the driver: it would connect and reconnect for good on its own.
+    let mut given_up = ShutdownUnlessReturned(Some(client.clone()));
 
     if wait_connected && let Err(err) = wait_until_connected(&mut phase, connect_timeout).await {
         // `finish_session` notifies Disconnected before reconnect delay — wait can
@@ -326,8 +329,22 @@ async fn finish_connect<S: InboundSink>(
         return Err(err);
     }
 
+    given_up.0 = None;
     tokio::spawn(supervise_driver(run_handle));
     Ok(client)
+}
+
+/// Shuts the client down when dropped before [`finish_connect`] returned it. The driver then
+/// ends its session with a DISCONNECT, as after an explicit [`MqttClient::shutdown`].
+struct ShutdownUnlessReturned(Option<MqttClient>);
+
+impl Drop for ShutdownUnlessReturned {
+    fn drop(&mut self) {
+        if let Some(client) = self.0.take() {
+            // Only sets the shutdown signals; never pending.
+            let _ = futures_util::FutureExt::now_or_never(client.shutdown());
+        }
+    }
 }
 
 /// Bounded discard handoff capacity = CONNECT `Receive Maximum`.

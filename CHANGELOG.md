@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - With several resolved addresses, one that never answers no longer uses up the whole connect budget
 - `shutdown()` sends DISCONNECT while the CONNACK is due or subscriptions are restored, so the broker no longer publishes the Will, and closes TLS (close_notify) and WebSocket (Close frame) properly
 - Dropping the `Connection::run()` future ends the session instead of leaving its tasks running
+- A `ClientBuilder::connect()` the caller gives up on (a timeout around it) no longer leaves the driver connecting and reconnecting on its own
 - No PUBACK is written after the client's last DISCONNECT ([MQTT-3.14.4-1])
 - A publish that fits the broker's Maximum Packet Size only without a Topic Alias is sent without one
 - An inbound Topic Alias no longer keeps the PUBLISH that bound it in memory

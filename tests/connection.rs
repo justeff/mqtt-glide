@@ -1307,3 +1307,49 @@ async fn filter_too_long_for_one_connection_is_restored_by_the_next() {
     started.shutdown().await;
     peer.abort();
 }
+
+/// A `ClientBuilder::connect()` the caller gives up on (a timeout around it) does not leave
+/// the driver behind: the attempt ends and no reconnect follows, although the policy retries.
+#[tokio::test]
+async fn connect_given_up_by_the_caller_stops_the_driver() {
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let (port, peer) = spawn_peer_broker(move |broker| async move {
+        let mut session = broker.accept_session().await;
+        session.expect_connect().await; // never answered
+        // A Normal Disconnection (the CONNECT may have been accepted), then the socket closes.
+        let closed = timeout(Duration::from_secs(3), async {
+            loop {
+                match session.read.next().await {
+                    Some(Ok((DecodedFrame::Control(Packet::Disconnect(_)), _))) => continue,
+                    Some(Ok(_)) => return false,
+                    None | Some(Err(_)) => return true,
+                }
+            }
+        })
+        .await;
+        let _ = closed_tx.send(closed.unwrap_or(false));
+        assert!(
+            !broker.try_accept_within(Duration::from_millis(1500)).await,
+            "the driver dialed again after connect() was given up"
+        );
+    })
+    .await;
+
+    let connecting = mqtt_glide::ClientBuilder::new(format!("mqtt://127.0.0.1:{port}"))
+        .expect("url")
+        .options(|options| options.connect_timeout(Duration::from_millis(500)))
+        .reconnect(quick_retry())
+        .discard_inbound()
+        .connect();
+    assert!(
+        timeout(Duration::from_millis(100), connecting).await.is_err(),
+        "no CONNACK, no client"
+    );
+
+    let closed = timeout(Duration::from_secs(5), closed_rx)
+        .await
+        .expect("in time")
+        .expect("peer alive");
+    assert!(closed, "the connection the caller gave up on was left open");
+    join_peer(peer).await;
+}
