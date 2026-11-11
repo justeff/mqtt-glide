@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A CONNACK with an undefined Reason Code below 0x80 is a malformed packet instead of a refused connection, and one that refuses the connection with Session Present set is a protocol error ([MQTT-3.2.2-6]); a table test now runs every reason-code byte through every decoder
+- On 32-bit targets, thousands of User Properties or filters sharing one buffer can no longer wrap the size sum to a small value that passes the packet size checks
 
 ## [0.5.1] - 2026-11-11
 

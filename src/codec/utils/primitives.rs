@@ -306,7 +306,7 @@ impl Encode for ByteString {
 
 impl Encode for crate::codec::v5::UserProperty {
     fn encoded_size(&self) -> usize {
-        self.name.encoded_size() + self.value.encoded_size()
+        super::capped_size_sum(self.name.encoded_size(), self.value.encoded_size())
     }
 
     fn encode(&self, buf: &mut BytesMut) -> Result<(), EncodeError> {

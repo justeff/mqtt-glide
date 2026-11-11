@@ -8,7 +8,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use bytestring::ByteString;
 
 use crate::codec::error::{DecodeError, EncodeError};
-use crate::codec::utils::{Decode, Encode, Property, take_properties, write_variable_length};
+use crate::codec::utils::{Decode, Encode, Property, capped_size_sum, take_properties, write_variable_length};
 use crate::codec::v5::{UserProperties, UserProperty, property_type as pt};
 
 /// Calculates encoded size of optional user properties and reason string, respecting size limit.
@@ -145,11 +145,8 @@ pub(crate) fn reduce_limit(limit: u32, reduction: usize) -> u32 {
 
 impl Encode for UserProperties {
     fn encoded_size(&self) -> usize {
-        let mut len = 0;
-        for prop in self {
-            len += 1 + prop.encoded_size();
-        }
-        len
+        self.iter()
+            .fold(0, |len, prop| capped_size_sum(len, 1 + prop.encoded_size()))
     }
     fn encode(&self, buf: &mut BytesMut) -> Result<(), EncodeError> {
         for prop in self {

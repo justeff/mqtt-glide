@@ -14,8 +14,8 @@ use crate::codec::publish::{PublishDelivery, PublishMessage, PublishProperties};
 use crate::codec::types::QoS;
 use crate::codec::types::packet_type;
 use crate::codec::utils::{
-    Encode, MAX_VARIABLE_LENGTH, contains_nul, encode_minimal_packet_id_ack, topic_name_bytes_forbidden,
-    write_variable_length,
+    Encode, MAX_VARIABLE_LENGTH, capped_size_sum, contains_nul, encode_minimal_packet_id_ack,
+    topic_name_bytes_forbidden, write_variable_length,
 };
 use crate::codec::v5::property_type as pt;
 
@@ -65,7 +65,8 @@ fn canonical_props_len(props: &PublishProperties, alias: Option<OutboundTopicAli
         if contains_nul(property.name.as_bytes()) || contains_nul(property.value.as_bytes()) {
             return Err(EncodeError::MalformedPacket);
         }
-        user_props_len += 1 + property.encoded_size(); // prop type byte + name + value
+        // prop type byte + name + value
+        user_props_len = capped_size_sum(user_props_len, 1 + property.encoded_size());
     }
     let prop_len = encoded_property_size(&props.correlation_data)
         + encoded_property_size(&props.message_expiry_interval)
@@ -401,6 +402,58 @@ mod tests {
 
     fn packet_id(v: u16) -> NonZeroU16 {
         NonZeroU16::new(v).unwrap()
+    }
+
+    /// 5 000 clones of one 64 KiB string share one buffer but add up to ~320 MiB. Every sum
+    /// over a caller's collection stops just past the Remaining Length limit instead of
+    /// adding on: on a 32-bit target the plain sum would wrap at about 66 000 clones to a
+    /// small size that passes the packet size checks.
+    #[test]
+    fn size_sums_over_cloned_strings_saturate() {
+        use crate::codec::v5::body_encode::WireBodyEncode;
+        use crate::codec::v5::{Subscribe, SubscriptionOptions, Unsubscribe, UserProperty};
+
+        let over = MAX_VARIABLE_LENGTH as usize + 1;
+        let long = ByteString::try_from(Bytes::from(vec![b'v'; 65_000])).expect("utf8");
+        let properties = vec![
+            UserProperty {
+                name: "k".into(),
+                value: long.clone()
+            };
+            5_000
+        ];
+        assert_eq!(properties.encoded_size(), over);
+
+        let mut message = PublishMessage::new("t", Bytes::new());
+        message.properties.user_properties = properties;
+        let props_len = canonical_props_len(&message.properties, None).expect("size");
+        assert!((over..=over + 5).contains(&props_len), "{props_len}");
+        let delivery = PublishDelivery {
+            dup: false,
+            retain: false,
+            qos: QoS::AtMostOnce,
+            packet_id: None,
+        };
+        assert!(matches!(
+            encode_publish(&message, delivery, 0, &mut BytesMut::new()),
+            Err(EncodeError::InvalidLength)
+        ));
+
+        let subscribe = Subscribe {
+            packet_id: packet_id(1),
+            id: None,
+            user_properties: Vec::new(),
+            topic_filters: vec![(long.clone(), SubscriptionOptions::default()); 5_000],
+        };
+        let body = subscribe.encoded_body_len(0).expect("size");
+        assert!((over..=over + 5).contains(&body), "{body}");
+        let unsubscribe = Unsubscribe {
+            packet_id: packet_id(1),
+            user_properties: Vec::new(),
+            topic_filters: vec![long; 5_000],
+        };
+        let body = unsubscribe.encoded_body_len(0).expect("size");
+        assert!((over..=over + 5).contains(&body), "{body}");
     }
 
     #[test]

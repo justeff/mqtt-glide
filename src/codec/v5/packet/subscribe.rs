@@ -318,10 +318,9 @@ impl WireBodyEncode for Subscribe {
     fn encoded_body_len(&self, _max_out: u32) -> Result<usize, EncodeError> {
         let prop_len = self.id.map_or(0, |v| 1 + var_int_len(v.get() as usize) as usize) // +1 to account for property type byte
             + self.user_properties.encoded_size();
-        let payload_len = self
-            .topic_filters
-            .iter()
-            .fold(0, |acc, (filter, _opts)| acc + filter.encoded_size() + 1);
+        let payload_len = self.topic_filters.iter().fold(0, |acc, (filter, _opts)| {
+            utils::capped_size_sum(acc, filter.encoded_size() + 1)
+        });
         Ok(self.packet_id.encoded_size() + var_int_len(prop_len) as usize + prop_len + payload_len)
     }
 
@@ -444,7 +443,10 @@ impl WireBodyEncode for Unsubscribe {
         let prop_len = self.user_properties.encoded_size();
         Ok(2 + var_int_len(prop_len) as usize
             + prop_len
-            + self.topic_filters.iter().fold(0, |acc, filter| acc + 2 + filter.len()))
+            + self
+                .topic_filters
+                .iter()
+                .fold(0, |acc, filter| utils::capped_size_sum(acc, 2 + filter.len())))
     }
 
     fn encode_body(&self, buf: &mut BytesMut, _max_out: u32) -> Result<(), EncodeError> {

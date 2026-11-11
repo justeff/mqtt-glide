@@ -98,6 +98,14 @@ pub(crate) fn decode_variable_length_cursor<B: Buf>(src: &mut B) -> Result<u32, 
 /// MQTT maximum encodable remaining length (268,435,455).
 pub(crate) const MAX_VARIABLE_LENGTH: u32 = 268_435_455;
 
+/// Adds encoded sizes and stops just past what any packet can hold. Sums over a caller's
+/// collections use it: on a 32-bit target, thousands of cheap `Bytes` clones could otherwise
+/// wrap `usize` to a small size that passes the Remaining Length and Maximum Packet Size checks.
+#[inline]
+pub(crate) fn capped_size_sum(a: usize, b: usize) -> usize {
+    a.saturating_add(b).min(MAX_VARIABLE_LENGTH as usize + 1)
+}
+
 /// Writes MQTT variable-length integer to buffer.
 #[inline]
 pub(crate) fn write_variable_length(len: u32, dst: &mut BytesMut) -> Result<(), EncodeError> {
@@ -128,6 +136,14 @@ pub(crate) fn write_variable_length(len: u32, dst: &mut BytesMut) -> Result<(), 
 mod tests {
     use super::*;
     use crate::codec::error::EncodeError;
+
+    #[test]
+    fn capped_size_sum_cannot_wrap_below_the_remaining_length_limit() {
+        let over = MAX_VARIABLE_LENGTH as usize + 1;
+        assert_eq!(capped_size_sum(usize::MAX, 5), over);
+        assert_eq!(capped_size_sum(over, over), over);
+        assert_eq!(capped_size_sum(3, 4), 7);
+    }
 
     #[test]
     fn variable_length_encoding_keeps_every_bit_at_each_width() {
