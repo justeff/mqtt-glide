@@ -139,6 +139,9 @@ where
     };
 
     let connect_credentials = ConnectCredentials { username, password };
+    if let Err(error) = connect_credentials.check() {
+        return Err(auth_failed(ConnectionOutcome::Auth(error)).await);
+    }
     let client_id = resolve_client_id_str(options);
     let mut connect = build_connect(options, &client_id, &connect_credentials);
     let mut exchange = match authenticator {

@@ -874,6 +874,51 @@ async fn hanging_credentials_provider_is_bounded_by_the_connect_timeout() {
     peer.abort();
 }
 
+/// Credentials the CONNECT cannot carry (a token over 65 535 bytes, U+0000 in the user name)
+/// fail as the provider's error before anything is written, instead of looping as a protocol
+/// error on every reconnect.
+#[rstest]
+#[case::long_password(String::from("device"), Password::new(vec![b'x'; 70_000]))]
+#[case::nul_in_user_name(String::from("dev\0ice"), Password::new("secret"))]
+#[tokio::test]
+async fn credentials_the_connect_cannot_carry_fail_as_a_provider_error(
+    #[case] username: String,
+    #[case] password: Password,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let peer = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let (mut tcp, _) = listener.accept().await.expect("accept");
+        let mut received = Vec::new();
+        let _ = timeout(Duration::from_secs(5), tcp.read_to_end(&mut received)).await;
+        received
+    });
+    let (tx, _rx) = mpsc::channel(4);
+    let mut started = TestClient::spawn(
+        local_options(port, "bad-credentials"),
+        mqtt_glide::StaticCredentials::new(username, password),
+        NoReconnect,
+        tx,
+    );
+
+    let disconnected = wait_for_phase(&mut started.phase, Duration::from_secs(3), |phase| {
+        matches!(phase, SessionPhase::Disconnected(_))
+    })
+    .await;
+    assert!(
+        matches!(
+            disconnected,
+            SessionPhase::Disconnected(ConnectionOutcome::Auth(AuthError::Provider(_)))
+        ),
+        "{disconnected:?}"
+    );
+    let _ = timeout(Duration::from_secs(5), started.run)
+        .await
+        .expect("driver stops");
+    assert!(peer.await.expect("peer").is_empty(), "nothing may reach the broker");
+}
+
 /// `shutdown()` while subscriptions are being restored ends the session with a Normal
 /// Disconnection: the session is up since the CONNACK, and a dropped connection would make the
 /// broker publish the Will.

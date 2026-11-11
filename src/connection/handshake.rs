@@ -82,6 +82,31 @@ pub(crate) struct ConnectCredentials {
     pub password: Password,
 }
 
+impl ConnectCredentials {
+    /// What the CONNECT encoder would refuse ([MQTT-1.5.4-2], §1.5.4 and §1.5.6: no U+0000,
+    /// at most 65 535 bytes each), as the provider's error. Checked before the CONNECT so a
+    /// bad token is an authentication failure, not a protocol error retried for good.
+    pub(crate) fn check(&self) -> Result<(), AuthError> {
+        let max = usize::from(u16::MAX);
+        if self.username.len() > max {
+            return Err(AuthError::Provider(format!(
+                "user name of {} bytes is longer than {max}",
+                self.username.len()
+            )));
+        }
+        if self.username.contains('\0') {
+            return Err(AuthError::Provider("user name contains U+0000".into()));
+        }
+        let password = self.password.expose().len();
+        if password > max {
+            return Err(AuthError::Provider(format!(
+                "password of {password} bytes is longer than {max}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Builds the MQTT 5 CONNECT packet from options + credentials.
 ///
 /// Empty username / password strings are omitted on the wire (no USERNAME /
