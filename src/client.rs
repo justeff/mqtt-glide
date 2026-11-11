@@ -439,7 +439,7 @@ pub struct MqttClient {
     /// Response routing for [`crate::Requester`] (shared with the driver's read path).
     router: Arc<crate::request::ResponseRouter>,
     /// Re-authentication requests to the read task; `None` without an authenticator.
-    reauth: Option<mpsc::Sender<crate::connection::reauth::ReauthReply>>,
+    reauth: Option<Arc<crate::connection::reauth::ReauthRequests>>,
     /// Acknowledgement timeouts of publishes, swept by the driver.
     ack_deadlines: AckDeadlines,
     /// Counters kept by the driver.
@@ -459,7 +459,7 @@ struct DriverShared {
     phase: watch::Receiver<SessionPhase>,
     refused: watch::Receiver<Vec<crate::RefusedSubscription>>,
     router: Arc<crate::request::ResponseRouter>,
-    reauth: Option<mpsc::Sender<crate::connection::reauth::ReauthReply>>,
+    reauth: Option<Arc<crate::connection::reauth::ReauthRequests>>,
     ack_deadlines: AckDeadlines,
     #[cfg(feature = "stats")]
     stats: crate::stats::Stats,
@@ -556,8 +556,7 @@ impl MqttClient {
     /// broker's answer) has [`ConnectOptions::ack_timeout`], but time the read task waits for
     /// room in a full inbound sink does not count, so with a stalled consumer the call is not
     /// bounded in wall-clock time. When it must finish by a token's expiry, wrap it in your
-    /// own timeout. A call given up that way still holds its place in the queue until the read
-    /// task gets to it.
+    /// own timeout.
     ///
     /// # Errors
     ///
@@ -589,12 +588,9 @@ impl MqttClient {
             _ => return Err(AppError::NotConnected),
         };
         let (reply, answer) = oneshot::channel();
-        requests.try_send(reply).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => {
-                AppError::Backpressure("re-authentications are waiting already".into())
-            }
-            mpsc::error::TrySendError::Closed(_) => AppError::CommandChannelClosed,
-        })?;
+        requests
+            .push(reply)
+            .map_err(|_| AppError::Backpressure("re-authentications are waiting already".into()))?;
         let ended = phase.wait_for(
             |phase| !matches!(phase, SessionPhase::Connected { generation: current, .. } if *current == generation),
         );

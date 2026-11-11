@@ -6,6 +6,7 @@
 //! packets on the control path to the write task. Publishes and acknowledgements keep flowing
 //! meanwhile.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +29,67 @@ pub(crate) type ReauthReply = oneshot::Sender<Result<(), AppError>>;
 /// Requests waiting for the read task; a few, so a call made during an exchange runs after it.
 const REQUEST_CAPACITY: usize = 4;
 
+/// The `reauthenticate` calls waiting for the read task.
+///
+/// Not a channel: a caller that gave up must not keep its place while the read task is held up
+/// (a stalled consumer), or a few given-up calls refused every later one as backpressure.
+#[derive(Debug, Default)]
+pub(crate) struct ReauthRequests {
+    waiting: std::sync::Mutex<VecDeque<ReauthReply>>,
+    /// `waiting.len()`: the idle read task looks at it on every pass, without the lock.
+    len: std::sync::atomic::AtomicUsize,
+    added: futures_util::task::AtomicWaker,
+}
+
+// `AtomicWaker` holds its waker in an `UnsafeCell`, which would take `RefUnwindSafe` from
+// `MqttClient` and everything holding one (as in 0.5.0, they keep it). A panic cannot leave the
+// queue half-changed: its mutex poisons, and the waker slot only ever holds a whole waker.
+impl std::panic::RefUnwindSafe for ReauthRequests {}
+
+impl ReauthRequests {
+    /// Queues `reply`, or hands it back when [`REQUEST_CAPACITY`] callers still wait.
+    pub(crate) fn push(&self, reply: ReauthReply) -> Result<(), ReauthReply> {
+        let mut waiting = self.lock();
+        waiting.retain(|reply| !reply.is_closed());
+        if waiting.len() >= REQUEST_CAPACITY {
+            self.len.store(waiting.len(), std::sync::atomic::Ordering::Release);
+            return Err(reply);
+        }
+        waiting.push_back(reply);
+        self.len.store(waiting.len(), std::sync::atomic::Ordering::Release);
+        drop(waiting);
+        self.added.wake();
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<ReauthReply> {
+        if self.len.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return None;
+        }
+        let mut waiting = self.lock();
+        let reply = waiting.pop_front();
+        self.len.store(waiting.len(), std::sync::atomic::Ordering::Release);
+        reply
+    }
+
+    /// The next request. Cancel-safe: a request is taken only when this returns it.
+    async fn next(&self) -> ReauthReply {
+        std::future::poll_fn(|cx| {
+            if let Some(reply) = self.pop() {
+                return std::task::Poll::Ready(reply);
+            }
+            // Registered before looking again: a push in between wakes this task.
+            self.added.register(cx.waker());
+            self.pop().map_or(std::task::Poll::Pending, std::task::Poll::Ready)
+        })
+        .await
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<ReauthReply>> {
+        self.waiting.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// Broker challenges one re-authentication may take. SCRAM needs one; a broker that keeps
 /// answering with Continue Authentication would otherwise keep the exchange, and every
 /// `reauthenticate` call queued behind it, open for good, each round within `ack_timeout`.
@@ -37,8 +99,9 @@ const MAX_CHALLENGES: u8 = 16;
 #[derive(Debug, Clone)]
 pub(crate) struct ReauthLink {
     authenticator: SharedAuthenticator,
-    /// Taken by the read task of the current connection.
-    requests: Arc<tokio::sync::Mutex<mpsc::Receiver<ReauthReply>>>,
+    requests: Arc<ReauthRequests>,
+    /// Held by the read task of the current connection.
+    taken: Arc<tokio::sync::Mutex<()>>,
     ack_timeout: Duration,
     /// The broker's Maximum Packet Size on the current connection (CONNACK).
     broker_max_packet_size: Option<u32>,
@@ -56,15 +119,16 @@ impl ReauthLink {
 pub(crate) fn reauth_channel(
     authenticator: SharedAuthenticator,
     ack_timeout: Duration,
-) -> (mpsc::Sender<ReauthReply>, ReauthLink) {
-    let (tx, rx) = mpsc::channel(REQUEST_CAPACITY);
+) -> (Arc<ReauthRequests>, ReauthLink) {
+    let requests = Arc::new(ReauthRequests::default());
     let link = ReauthLink {
         authenticator,
-        requests: Arc::new(tokio::sync::Mutex::new(rx)),
+        requests: Arc::clone(&requests),
+        taken: Arc::new(tokio::sync::Mutex::new(())),
         ack_timeout,
         broker_max_packet_size: None,
     };
-    (tx, link)
+    (requests, link)
 }
 
 type Step<T> = std::pin::Pin<Box<dyn Future<Output = T> + Send>>;
@@ -117,7 +181,8 @@ pub(crate) struct Failure {
 /// Re-authentication state of one connection's read task.
 pub(crate) struct Reauth {
     authenticator: SharedAuthenticator,
-    requests: OwnedMutexGuard<mpsc::Receiver<ReauthReply>>,
+    requests: Arc<ReauthRequests>,
+    _taken: OwnedMutexGuard<()>,
     ack_timeout: Duration,
     state: State,
     /// Deadline of the running step. One timer per connection, re-armed per step: the read
@@ -135,13 +200,14 @@ impl Reauth {
     /// Takes the request queue for this connection. `None` if another read task still holds
     /// it, which the supervisor rules out (it joins a session's tasks before the next starts).
     pub(crate) fn new(link: &ReauthLink) -> Option<Self> {
-        let Ok(requests) = Arc::clone(&link.requests).try_lock_owned() else {
+        let Ok(taken) = Arc::clone(&link.taken).try_lock_owned() else {
             tracing::warn!("re-authentication requests still held by the previous connection");
             return None;
         };
         Some(Self {
             authenticator: link.authenticator.clone(),
-            requests,
+            requests: Arc::clone(&link.requests),
+            _taken: taken,
             ack_timeout: link.ack_timeout,
             state: State::Idle,
             timer: Box::pin(sleep_until(Instant::now())),
@@ -182,11 +248,7 @@ impl Reauth {
             ..
         } = self;
         match state {
-            State::Idle => match requests.recv().await {
-                Some(reply) => Event::Request(reply),
-                // Every client handle is gone; nobody can ask any more.
-                None => std::future::pending().await,
-            },
+            State::Idle => Event::Request(requests.next().await),
             // Every step is bounded like the broker's answer: a hung token endpoint must not
             // hold the caller (or, mid-exchange, the broker) forever.
             State::Starting { step, .. } => match bounded(step, timer, held_up).await {
@@ -369,7 +431,7 @@ impl Reauth {
             let _ = reply.send(Err(error));
         }
         // Queued requests asked about this connection; the next one authenticates afresh.
-        while let Ok(reply) = self.requests.try_recv() {
+        while let Some(reply) = self.requests.pop() {
             let _ = reply.send(Err(AppError::ConnectionLost));
         }
     }
@@ -547,7 +609,7 @@ mod tests {
     }
 
     struct Rig {
-        requests: mpsc::Sender<ReauthReply>,
+        requests: Arc<ReauthRequests>,
         reauth: Reauth,
         control_tx: mpsc::Sender<ControlMessage>,
         control_rx: mpsc::Receiver<ControlMessage>,
@@ -574,7 +636,7 @@ mod tests {
     impl Rig {
         fn request(&self) -> oneshot::Receiver<Result<(), AppError>> {
             let (reply, answer) = oneshot::channel();
-            self.requests.try_send(reply).expect("queued");
+            self.requests.push(reply).expect("queued");
             answer
         }
 
@@ -607,6 +669,27 @@ mod tests {
             auth_data: Some(Bytes::from_static(data)),
             ..Auth::default()
         }
+    }
+
+    /// A few callers still waiting refuse the next one, but callers that gave up (their future
+    /// dropped while the read task was held up) do not hold their place.
+    #[test]
+    fn given_up_requests_leave_room_in_the_queue() {
+        let requests = ReauthRequests::default();
+        let mut waiting: Vec<_> = (0..REQUEST_CAPACITY)
+            .map(|_| {
+                let (reply, answer) = oneshot::channel();
+                requests.push(reply).expect("room");
+                answer
+            })
+            .collect();
+        let (reply, _answer) = oneshot::channel();
+        assert!(requests.push(reply).is_err(), "full while every caller waits");
+
+        waiting.truncate(1);
+        let (reply, _answer) = oneshot::channel();
+        requests.push(reply).expect("room after three callers gave up");
+        assert_eq!(requests.lock().len(), 2);
     }
 
     /// The whole exchange: AUTH 0x19 with the CONNECT's method ([MQTT-4.12.1-1]), a challenge

@@ -417,3 +417,49 @@ async fn reauthentication_answers_go_out_during_the_shutdown_drain() {
     );
     driver_result(driver).await.expect("clean stop");
 }
+
+/// Calls given up while the read task is held up by a full inbound sink do not keep their
+/// places: a later call waits for its turn instead of failing with `Backpressure`.
+#[tokio::test]
+async fn reauthenticate_calls_that_gave_up_leave_room() {
+    let port = spawn_broker_once(|mut read, mut write| async move {
+        let _ = next(&mut read).await;
+        let _ = write.send(connack_with_method(METHOD)).await;
+        // More messages than the one-slot sink takes: the read task waits for room.
+        for payload in ["a", "b", "c"] {
+            let message = crate::codec::PublishMessage::new("held/up", payload);
+            let delivery = crate::codec::PublishDelivery {
+                dup: false,
+                retain: false,
+                qos: QoS::AtMostOnce,
+                packet_id: None,
+            };
+            crate::codec::encode_publish(&message, delivery, 0, write.write_buffer_mut()).expect("encode");
+        }
+        let _ = write.flush().await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    })
+    .await;
+    let url = BrokerUrl::parse(&format!("mqtt://127.0.0.1:{port}")).expect("url");
+    let options = ConnectOptions::new(url).authenticator(Scripted::default());
+    let (tx, _rx) = flume::bounded::<InboundMessage>(1);
+    let (client, connection, _phase) =
+        connect(options, static_test_credentials(), NoReconnect, tx, NoopLifecycle).expect("wiring");
+    let driver = tokio::spawn(connection.run());
+    let mut phase = client.session_phase();
+    timeout(WAIT, phase.wait_for(|_| client.is_connected()))
+        .await
+        .expect("connected")
+        .expect("watch");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    for _ in 0..8 {
+        let gave_up = timeout(Duration::from_millis(20), client.reauthenticate()).await;
+        assert!(gave_up.is_err(), "the read task is held up: {gave_up:?}");
+    }
+    let waiting = timeout(Duration::from_millis(200), client.reauthenticate()).await;
+    assert!(waiting.is_err(), "waits for its turn instead of failing: {waiting:?}");
+
+    client.shutdown().await.expect("shutdown");
+    let _ = timeout(WAIT, driver).await;
+}
