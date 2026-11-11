@@ -130,6 +130,30 @@ fn files_are_read_when_the_connection_is_built() {
     tls.client_config().expect("config from files");
 }
 
+/// A key file read between the two writes of a rotation (new chain, old key) is read again,
+/// so the connect gets the finished pair instead of failing once.
+#[test]
+fn a_key_that_does_not_fit_the_chain_is_read_again() {
+    let dir = std::env::temp_dir().join(format!("mqtt-glide-rotation-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let (chain, key) = (dir.join("tls.crt"), dir.join("tls.key"));
+    std::fs::write(&chain, CLIENT).expect("chain");
+    std::fs::write(&key, CLIENT2_KEY).expect("old key");
+    let rotation = {
+        let key = key.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::fs::write(&key, CLIENT_KEY).expect("new key");
+        })
+    };
+
+    let tls = TlsConfig::ca_pem(CA).expect("ca").client_auth_pem_files(&chain, &key);
+    let config = tls.client_config();
+    rotation.join().expect("rotation");
+    let _ = std::fs::remove_dir_all(&dir);
+    config.expect("the finished pair");
+}
+
 #[test]
 fn a_missing_file_names_its_path() {
     let missing = certs_dir().join("missing-ca.pem");

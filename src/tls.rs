@@ -233,27 +233,53 @@ impl TlsConfig {
 
         // Explicit provider: MQTT TLS works even if the host process also enables
         // another rustls crypto feature (no reliance on process-global install_default).
-        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(selected_crypto_provider()))
-            .with_safe_default_protocol_versions()
-            .map_err(|error| format!("rustls protocol versions unavailable for selected crypto provider: {error}"))?
-            .with_root_certificates(roots);
+        let roots = Arc::new(roots);
+        let builder = || {
+            rustls::ClientConfig::builder_with_provider(Arc::new(selected_crypto_provider()))
+                .with_safe_default_protocol_versions()
+                .map_err(|error| format!("rustls protocol versions unavailable for selected crypto provider: {error}"))
+                .map(|builder| builder.with_root_certificates(Arc::clone(&roots)))
+        };
         let mut config = match &self.client_auth {
-            None => builder.with_no_client_auth(),
-            Some(ClientAuth::Parsed { chain, key }) => builder
+            None => builder()?.with_no_client_auth(),
+            Some(ClientAuth::Parsed { chain, key }) => builder()?
                 .with_client_auth_cert(chain.to_vec(), key.clone_key())
                 .map_err(|error| format!("client certificate: {error}"))?,
             Some(ClientAuth::Files { chain, key }) => {
-                let certificates = parse_certificates(&read_file(chain)?).map_err(at(chain))?;
-                let key_pem = Zeroizing::new(read_file(key)?);
-                let key_der = parse_private_key(&key_pem).map_err(at(key))?;
-                builder
-                    .with_client_auth_cert(certificates, key_der)
-                    .map_err(|error| format!("client certificate {}: {error}", chain.display()))?
+                let (chain_pem, key_pem) = (read_file(chain)?, Zeroizing::new(read_file(key)?));
+                match client_auth_from_pem(builder()?, chain, &chain_pem, key, &key_pem) {
+                    Ok(config) => config,
+                    // Rotation replaces the chain and the key one file after the other: a read in
+                    // between pairs the new chain with the old key, or meets a file half
+                    // written. One more read after a pause gets the finished pair.
+                    Err(_) => {
+                        std::thread::sleep(ROTATION_RETRY_DELAY);
+                        let (chain_pem, key_pem) = (read_file(chain)?, Zeroizing::new(read_file(key)?));
+                        client_auth_from_pem(builder()?, chain, &chain_pem, key, &key_pem)?
+                    }
+                }
             }
         };
         config.alpn_protocols = self.alpn.clone();
         Ok(config)
     }
+}
+
+/// Pause before reading the client certificate and key files a second time.
+const ROTATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn client_auth_from_pem(
+    builder: rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>,
+    chain: &Path,
+    chain_pem: &[u8],
+    key: &Path,
+    key_pem: &[u8],
+) -> Result<rustls::ClientConfig, String> {
+    let certificates = parse_certificates(chain_pem).map_err(at(chain))?;
+    let key_der = parse_private_key(key_pem).map_err(at(key))?;
+    builder
+        .with_client_auth_cert(certificates, key_der)
+        .map_err(|error| format!("client certificate {}: {error}", chain.display()))
 }
 
 impl fmt::Debug for TlsConfig {

@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A packet above 16 MiB that `max_packet_size` allows also arrives over WebSocket: the frame and message limits grow with it past tungstenite's 16 / 64 MiB
 - A WebSocket path an HTTP request cannot carry is refused by `BrokerUrl::parse`
 - An unparsable certificate in the system trust store is skipped instead of failing every TLS connect
+- A client certificate and key replaced one after the other are read again instead of failing the connect
 - `HttpProxy::parse` decodes credentials exactly and refuses a user name with `:`
 - A `requester()` call dropped before its SUBACK no longer leaves the response topic routed
 - `topic_matches` returns `false` for wildcard share names, empty topics and NUL
