@@ -4,7 +4,7 @@ Thanks for contributing to **mqtt-glide**.
 
 ## Development
 
-These are the checks CI runs (see `.github/workflows/ci.yml`). Never use `--all-features`: the two TLS features are mutually exclusive.
+These are the checks CI runs (see `.github/workflows/ci.yml`). They name their features instead of `--all-features`: with both TLS features enabled ring is used (see the README), so the default aws-lc-rs provider would go untested.
 
 ```shell
 cargo fmt --check
@@ -135,4 +135,4 @@ docs: clarify Cap vs Receive Maximum
 
 - Keep changes focused; match existing module style
 - Update `README.md` when scope changes, and `conformance/statements.tsv` plus `CONFORMANCE.md` when spec coverage changes
-- Do not enable both TLS features or use `--all-features`
+- Run the checks with the features they name, not `--all-features` (see [Development](#development))
