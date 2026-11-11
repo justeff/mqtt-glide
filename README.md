@@ -605,19 +605,18 @@ All results and the reading guide: [`BENCHMARKS.md`](BENCHMARKS.md). How to run 
 
 Tuned Mosquitto `2.1.2-alpine`, 256 B, QoS 1. Linux in a Podman VM on Apple M5 Max, client on 4 pinned vCPUs, broker and publisher on their own. Median of 5 runs, clients taking turns (msg/s · CPU ns/msg; **bold** = best in row):
 
-| Scenario | glide | rumqttc-v5-next 0.33.3 | mqtt5 0.48.0 |
+| Scenario | glide | rumqttc-v5-next 0.34.0 | mqtt5 0.50.0 |
 |----------|------:|--------:|------:|
-| 8 callers sharing one client | 145 013 · 7 587 | **147 261** · **7 115** | 83 870 · 13 816 |
-| 64 callers sharing one client | **234 701** · **6 201** | 201 105 · 6 508 | 85 024 · 13 738 |
-| 512 callers sharing one client | **252 546** · **5 918** | 193 985 · 6 609 | 83 387 · 13 847 |
-| 50 000 msg/s offered, p50 / p99 | **494 / 1 274 µs** · **12 311** | 968 / 1 989 µs · 14 315 | 894 / 2 544 µs · 22 596 |
-| Receiving, PUBACK after the app queue | 102 577 · **3 545** | **103 092** · 4 438 | n/a |
+| 8 callers sharing one client | **143 701** · **7 762** | 7 867 · 133 967 | 81 068 · 13 938 |
+| 64 callers sharing one client | **232 187** · **6 374** | 7 887 · 133 802 | 79 870 · 14 230 |
+| 512 callers sharing one client | **249 235** · **6 067** | 7 842 · 134 664 | 78 660 · 14 441 |
+| 50 000 msg/s offered, p50 / p99 | **666 / 1 454 µs** · **15 961** | 16.2 / 19.2 s · 272 952 | 842 / 3 017 µs · 26 675 |
+| Receiving, PUBACK after the app queue | **106 543** · **3 538** | 16 215 · 57 639 | n/a |
 
-- glide publishes fastest and cheapest from a few dozen callers up, and at a fixed load it has about half the latency of the peers. Against a broker that is never the bottleneck, its publishing is 3 to 15× theirs.
-- Receiving, glide spends the least CPU per message, also against rumqttc acknowledging on decode; all clients get what Mosquitto delivers (about 100k msg/s at QoS 1).
-- With a handful of callers glide and rumqttc are even; at 16 KiB with 8 callers rumqttc is ahead.
+- glide publishes fastest and cheapest at every caller count and has the lowest latency at a fixed load. Against a broker that is never the bottleneck (mock), its pipelined publishing is 5 to 22× the peers'.
+- Receiving, glide reaches Mosquitto's ceiling (about 105k msg/s at QoS 1) at the least CPU per message.
 
-[`BENCHMARKS.md`](BENCHMARKS.md) also has the mock-broker ceiling, stock Mosquitto, a broker with its own in-flight cap, payload sizes up to 16 KiB, which inbound sink to use with several brokers, the fairness rules, and why each client is ahead where it is.
+[`BENCHMARKS.md`](BENCHMARKS.md) also has the mock-broker ceiling, stock Mosquitto, a broker with its own in-flight cap, payload sizes up to 16 KiB, which inbound sink to use with several brokers, the fairness rules and an x86 cross-check.
 
 The wire codec alone, without broker or client, is measured by `cargo bench --bench codec_throughput` ([`benches/README.md`](benches/README.md)).
 
