@@ -291,6 +291,11 @@ impl ClientBuilder<InboundSinkDiscard> {
     }
 }
 
+/// How much longer than `connect_timeout` [`ClientBuilder::connect`] waits for the driver's
+/// own result. The driver bounds every connect step by `connect_timeout` and names the one that
+/// ran out; waiting exactly as long would race it and usually win with a generic error.
+const CONNECT_RESULT_GRACE: Duration = Duration::from_millis(500);
+
 async fn finish_connect<S: InboundSink>(
     config: BuilderConfig,
     sink: S,
@@ -321,7 +326,8 @@ async fn finish_connect<S: InboundSink>(
     // nothing could stop the driver: it would connect and reconnect for good on its own.
     let mut given_up = ShutdownUnlessReturned(Some(client.clone()));
 
-    if wait_connected && let Err(err) = wait_until_connected(&mut phase, connect_timeout).await {
+    let wait = connect_timeout.saturating_add(CONNECT_RESULT_GRACE);
+    if wait_connected && let Err(err) = wait_until_connected(&mut phase, wait).await {
         // `finish_session` notifies Disconnected before reconnect delay — wait can
         // fail while a retrying policy would still loop. Stop the driver first.
         let _ = client.shutdown().await;
@@ -666,6 +672,26 @@ mod tests {
         }
         assert!(tx.try_send(stub()).is_err(), "8th send must fail on capacity 7");
         drop(rx);
+    }
+
+    /// A broker that takes the CONNECT and never answers fails `connect()` with the driver's
+    /// own error naming the step, not a generic timeout of the wait for it.
+    #[tokio::test]
+    async fn connect_timeout_names_the_step_that_ran_out() {
+        let port = spawn_broker_once(|mut framed_read, framed_write| async move {
+            let _connect = framed_read.next().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop((framed_read, framed_write));
+        })
+        .await;
+        let error = ClientBuilder::new(format!("mqtt://127.0.0.1:{port}"))
+            .expect("url")
+            .options(|o| o.connect_timeout(Duration::from_millis(300)))
+            .discard_inbound()
+            .connect()
+            .await
+            .expect_err("no CONNACK");
+        assert!(format!("{error}").contains("CONNACK timed out"), "{error}");
     }
 
     /// Retrying reconnect + wait failure must shut the driver down (no orphan reconnect loop).

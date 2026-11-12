@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A connection the broker resets while `shutdown()` drains it ends as a shutdown, no longer as a lost connection counted in `ConnectionStats::connection_losses`
 - `MqttClient::requester` refuses a `$share/` response topic, whose responses could never arrive, and a request through a clone of a closed requester fails at once with `InvalidRequest` instead of being published and timing out
 - WebSocket over TLS: with `TlsConfig::server_name` set, the upgrade request's `Host` header carries that name like the TLS SNI, so a virtual-hosting proxy or ingress reached through an IP address routes it
+- `ClientBuilder::connect()` reports which connect step ran out of `connect_timeout` (TCP, TLS, proxy, CONNACK) instead of a generic "timed out waiting for Connected"
 
 ## [0.5.1] - 2026-11-11
 
