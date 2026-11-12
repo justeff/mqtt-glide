@@ -348,7 +348,7 @@ impl TestBroker {
     /// Waits until clients have published at least `count` messages or `timeout` passes, and
     /// returns what arrived by then (possibly fewer than `count`).
     pub async fn wait_for_publishes(&self, count: usize, timeout: Duration) -> Vec<ReceivedPublish> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = crate::util::deadline_after(timeout);
         loop {
             let changed = self.shared.changed.notified();
             {
@@ -384,7 +384,7 @@ impl TestBroker {
     /// Waits until at least `count` CONNECTs were accepted or `timeout` passes; returns whether
     /// they were.
     pub async fn wait_for_connects(&self, count: usize, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = crate::util::deadline_after(timeout);
         loop {
             let changed = self.shared.changed.notified();
             if self.connect_count() >= count {
@@ -417,7 +417,7 @@ impl TestBroker {
     /// before [`publish`](Self::publish) so the message does not go out before the code under
     /// test has subscribed, also after a reconnect.
     pub async fn wait_for_subscription(&self, client_id: &str, filter: &str, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = crate::util::deadline_after(timeout);
         loop {
             let changed = self.shared.changed.notified();
             if self.subscriptions(client_id).iter().any(|sub| sub == filter) {

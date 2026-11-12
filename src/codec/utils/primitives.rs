@@ -40,6 +40,22 @@ impl<T: Decode> Property for Option<T> {
     }
 }
 
+/// Reads a property whose value 0 is a Protocol Error, not a malformed packet as for the
+/// `NonZero*` decoders (Receive Maximum, Maximum Packet Size: §3.1.2.11.3, §3.1.2.11.4).
+pub(in crate::codec) fn read_nonzero_value<T: Decode, N>(
+    slot: &mut Option<N>,
+    src: &mut Bytes,
+    nonzero: fn(T) -> Option<N>,
+    zero: &'static str,
+) -> Result<(), DecodeError> {
+    ensure!(
+        slot.is_none(),
+        DecodeError::ProtocolViolation("property included more than once")
+    );
+    *slot = Some(nonzero(T::decode(src)?).ok_or(DecodeError::ProtocolViolation(zero))?);
+    Ok(())
+}
+
 // Primitive type decoding implementations
 impl Decode for bool {
     fn decode(src: &mut Bytes) -> Result<Self, DecodeError> {

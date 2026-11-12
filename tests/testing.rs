@@ -589,6 +589,26 @@ async fn response_information_is_a_prefix_for_response_topics() {
     assert_eq!(&response.payload[..], b"noon");
 }
 
+/// `Duration::MAX` means "wait as long as it takes" for the `wait_for_*` helpers, not an
+/// overflowing deadline.
+#[tokio::test]
+async fn wait_helpers_take_an_endless_timeout() {
+    let broker = TestBroker::start().await.expect("broker");
+    let (client, _rx) = client(&broker.url(), "patient").await;
+    client
+        .subscribe([("endless/#", QoS::AtMostOnce)])
+        .await
+        .expect("subscribe");
+    client.publish("endless/t", "x").await.expect("publish");
+    assert_eq!(broker.wait_for_publishes(1, Duration::MAX).await.len(), 1);
+    assert!(broker.wait_for_connects(1, Duration::MAX).await);
+    assert!(
+        broker
+            .wait_for_subscription("patient", "endless/#", Duration::MAX)
+            .await
+    );
+}
+
 /// A shared subscription cannot be a response topic (responses go to the topic itself, the
 /// subscription to the topic after the group), and a requester closed through one clone fails
 /// a request on another at once instead of publishing it and waiting out the timeout.

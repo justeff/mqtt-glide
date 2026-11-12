@@ -276,18 +276,29 @@ impl Connect {
                 pt::AUTH_DATA => auth_data.read_value(prop_src)?,
                 pt::REQ_PROB_INFO => request_problem_info.read_value(prop_src)?,
                 pt::REQ_RESP_INFO => request_response_info.read_value(prop_src)?,
-                pt::RECEIVE_MAX => receive_max.read_value(prop_src)?,
+                pt::RECEIVE_MAX => utils::read_nonzero_value(
+                    &mut receive_max,
+                    prop_src,
+                    NonZeroU16::new,
+                    "Receive Maximum 0 is not allowed",
+                )?,
                 pt::TOPIC_ALIAS_MAX => topic_alias_max.read_value(prop_src)?,
                 pt::USER => user_properties.push(UserProperty::decode(prop_src)?),
-                pt::MAX_PACKET_SIZE => max_packet_size.read_value(prop_src)?,
+                pt::MAX_PACKET_SIZE => utils::read_nonzero_value(
+                    &mut max_packet_size,
+                    prop_src,
+                    NonZeroU32::new,
+                    "Maximum Packet Size 0 is not allowed",
+                )?,
                 _ => return Err(DecodeError::MalformedPacket("unknown CONNECT property")),
             }
         }
 
         // CONNECT property rules: Authentication Data requires Authentication Method
+        // §3.1.2.11.10: a Protocol Error (0x82).
         ensure!(
             auth_data.is_none() || auth_method.is_some(),
-            DecodeError::MalformedPacket("Authentication Data without Authentication Method")
+            DecodeError::ProtocolViolation("Authentication Data without Authentication Method")
         );
 
         let client_id = ByteString::decode(src)?;
@@ -576,8 +587,12 @@ mod tests {
     #[case::will_qos_bits_set_without_will_flag(0x08, b"\x00".as_slice(), b"\x00\x0512345".as_slice(), DecodeError::MalformedPacket("Will QoS set without Will Flag"))]
     // [MQTT-3.1.2-13] Will Retain must be 0 when Will Flag is 0
     #[case::will_retain_set_without_will_flag(0x20, b"\x00".as_slice(), b"\x00\x0512345".as_slice(), DecodeError::MalformedPacket("Will Retain set without Will Flag"))]
-    // CONNECT property rules: Authentication Data requires Authentication Method
-    #[case::auth_data_without_auth_method(0x02, b"\x05\x16\x00\x02ab".as_slice(), b"\x00\x0512345".as_slice(), DecodeError::MalformedPacket("Authentication Data without Authentication Method"))]
+    // §3.1.2.11.10: Authentication Data without Authentication Method is a Protocol Error
+    #[case::auth_data_without_auth_method(0x02, b"\x05\x16\x00\x02ab".as_slice(), b"\x00\x0512345".as_slice(), DecodeError::ProtocolViolation("Authentication Data without Authentication Method"))]
+    // §3.1.2.11.3 / §3.1.2.11.4: a Receive Maximum or Maximum Packet Size of 0 is a Protocol Error
+    #[case::receive_maximum_zero(0x02, b"\x03\x21\x00\x00".as_slice(), b"\x00\x0512345".as_slice(), DecodeError::ProtocolViolation("Receive Maximum 0 is not allowed"))]
+    #[case::maximum_packet_size_zero(0x02, b"\x05\x27\x00\x00\x00\x00".as_slice(), b"\x00\x0512345".as_slice(), DecodeError::ProtocolViolation("Maximum Packet Size 0 is not allowed"))]
+    #[case::receive_maximum_twice(0x02, b"\x06\x21\x00\x01\x21\x00\x02".as_slice(), b"\x00\x0512345".as_slice(), DecodeError::ProtocolViolation("property included more than once"))]
     fn connect_decode_rejects_invalid_flags(
         #[case] flags: u8,
         #[case] properties: &[u8],
