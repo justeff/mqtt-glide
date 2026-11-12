@@ -9,8 +9,8 @@ pub enum ShareNameError {
     /// ShareName must contain at least one character.
     #[error("share name must not be empty")]
     Empty,
-    /// ShareName must not contain `/`, `+`, or `#`.
-    #[error("share name must not contain '/', '+', or '#'")]
+    /// ShareName must not contain `/`, `+`, `#` or U+0000.
+    #[error("share name must not contain '/', '+', '#' or U+0000")]
     InvalidCharacter,
 }
 
@@ -24,7 +24,8 @@ pub fn validate_share_name(name: &str) -> Result<(), ShareNameError> {
     if name.is_empty() {
         return Err(ShareNameError::Empty);
     }
-    if name.as_bytes().iter().any(|&b| matches!(b, b'/' | b'+' | b'#')) {
+    // U+0000 is never allowed in a UTF-8 string ([MQTT-1.5.4-2]).
+    if name.as_bytes().iter().any(|&b| matches!(b, b'/' | b'+' | b'#' | b'\0')) {
         return Err(ShareNameError::InvalidCharacter);
     }
     Ok(())
@@ -77,6 +78,12 @@ mod tests {
     #[test]
     fn validate_share_name_rejects_empty() {
         assert_eq!(validate_share_name(""), Err(ShareNameError::Empty));
+    }
+
+    /// [MQTT-1.5.4-2] No U+0000 in a UTF-8 string.
+    #[test]
+    fn validate_share_name_rejects_nul() {
+        assert_eq!(validate_share_name("a\0b"), Err(ShareNameError::InvalidCharacter));
     }
 
     /// [MQTT-4.8.2-2] A ShareName never contains `/`, `+` or `#`.

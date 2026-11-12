@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `BrokerUrlError::UnsupportedScheme`
+
 ### Fixed
 
 - A CONNACK with an undefined Reason Code below 0x80 is a malformed packet instead of a refused connection, and one that refuses the connection with Session Present set is a protocol error ([MQTT-3.2.2-6]); a table test now runs every reason-code byte through every decoder
@@ -18,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `MqttClient::requester` refuses a `$share/` response topic, whose responses could never arrive, and a request through a clone of a closed requester fails at once with `InvalidRequest` instead of being published and timing out
 - WebSocket over TLS: with `TlsConfig::server_name` set, the upgrade request's `Host` header carries that name like the TLS SNI, so a virtual-hosting proxy or ingress reached through an IP address routes it
 - `ClientBuilder::connect()` reports which connect step ran out of `connect_timeout` (TCP, TLS, proxy, CONNACK) instead of a generic "timed out waiting for Connected"
+- `BrokerUrl::parse` accepts schemes in any letter case and names an unsupported one (`tcp://`, `http://`) with `UnsupportedScheme` instead of a misleading host or port error; `validate_share_name` and `shared_filter` refuse U+0000 ([MQTT-1.5.4-2]); a proxy user name with `:` set through `HttpProxy::basic_auth` fails before the request instead of sending other credentials
 
 ## [0.5.1] - 2026-11-11
 

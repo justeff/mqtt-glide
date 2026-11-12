@@ -46,8 +46,11 @@ impl HttpProxy {
     /// Parses `http://[user:password@]host[:port]` (port defaults to 80; percent-escapes in
     /// user and password are decoded). Only `http://` proxies are supported.
     pub fn parse(url: &str) -> Result<Self, BrokerUrlError> {
+        // Schemes are case-insensitive (RFC 3986 §3.1), as in `BrokerUrl::parse`.
         let rest = url
-            .strip_prefix("http://")
+            .split_once("://")
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("http"))
+            .map(|(_, rest)| rest)
             .ok_or(BrokerUrlError::UnsupportedProxyScheme)?;
         let rest = rest.trim_end_matches('/');
         let (userinfo, host_port) = match rest.rsplit_once('@') {
@@ -69,7 +72,8 @@ impl HttpProxy {
     }
 
     /// Authenticates to the proxy with HTTP Basic (`Proxy-Authorization`). Basic sends the
-    /// credentials in clear text to the proxy; use it only on a network you trust.
+    /// credentials in clear text to the proxy; use it only on a network you trust. A user name
+    /// with `:` cannot be sent (Basic splits at the first one): `connect` refuses it.
     pub fn basic_auth(mut self, user: impl Into<String>, password: impl Into<Password>) -> Self {
         self.credentials = Some((user.into(), password.into()));
         self
@@ -135,6 +139,9 @@ mod tests {
         let bare = HttpProxy::parse("http://[fd00::1]").expect("valid");
         assert_eq!((bare.host(), bare.port()), ("fd00::1", 80));
         assert!(bare.credentials().is_none());
+
+        let upper = HttpProxy::parse("HTTP://proxy:3128").expect("scheme in any case");
+        assert_eq!((upper.host(), upper.port()), ("proxy", 3128));
     }
 
     #[test]
@@ -145,6 +152,10 @@ mod tests {
         );
         assert_eq!(
             HttpProxy::parse("socks5://proxy:1080").unwrap_err(),
+            BrokerUrlError::UnsupportedProxyScheme
+        );
+        assert_eq!(
+            HttpProxy::parse("proxy:3128").unwrap_err(),
             BrokerUrlError::UnsupportedProxyScheme
         );
         assert_eq!(HttpProxy::parse("http://:3128").unwrap_err(), BrokerUrlError::EmptyHost);

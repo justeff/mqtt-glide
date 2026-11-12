@@ -49,12 +49,15 @@ pub enum BrokerUrlError {
     /// (whitespace, control characters, non-ASCII) or a `#fragment`; percent-encode them.
     #[error("WebSocket path must be ASCII without spaces, control characters or a fragment")]
     InvalidWebSocketPath,
+    /// A `scheme://` other than `mqtt`, `mqtts`, `ssl`, `ws` or `wss`.
+    #[error("mqtt broker URL scheme must be mqtt://, mqtts://, ssl://, ws:// or wss://")]
+    UnsupportedScheme,
 }
 
 impl BrokerUrl {
     /// Parses host, port, TLS requirement and (for WebSocket) the path from a broker URL.
     ///
-    /// Supported schemes:
+    /// Supported schemes (in any letter case):
     /// - `ssl://host` / `mqtts://host` — TLS (default port 8883)
     /// - `mqtt://host` — plain TCP (default port 1883)
     /// - `ws://host/path` / `wss://host/path` — MQTT over WebSocket, plain or TLS (default
@@ -64,20 +67,18 @@ impl BrokerUrl {
     /// An explicit port overrides the scheme default: `ssl://host:9883`.
     /// Trailing slashes on the host segment of TCP URLs are stripped.
     pub fn parse(url: &str) -> Result<Self, BrokerUrlError> {
-        if let Some(rest) = url.strip_prefix("ws://") {
-            return Self::parse_websocket(rest, false);
-        }
-        if let Some(rest) = url.strip_prefix("wss://") {
-            return Self::parse_websocket(rest, true);
-        }
-        let (host_port, use_tls) =
-            if let Some(rest) = url.strip_prefix("ssl://").or_else(|| url.strip_prefix("mqtts://")) {
-                (rest, true)
-            } else if let Some(rest) = url.strip_prefix("mqtt://") {
-                (rest, false)
-            } else {
-                (url, false)
-            };
+        // Schemes are case-insensitive (RFC 3986 §3.1). Any other one is named as such: read
+        // as a bare host it gave a misleading host or port error.
+        let (host_port, use_tls) = match url.split_once("://") {
+            None => (url, false),
+            Some((scheme, rest)) => match scheme.to_ascii_lowercase().as_str() {
+                "ws" => return Self::parse_websocket(rest, false),
+                "wss" => return Self::parse_websocket(rest, true),
+                "ssl" | "mqtts" => (rest, true),
+                "mqtt" => (rest, false),
+                _ => return Err(BrokerUrlError::UnsupportedScheme),
+            },
+        };
         let default_port = if use_tls { DEFAULT_MQTTS_PORT } else { DEFAULT_MQTT_PORT };
         let (host, port) = split_host_port(host_port.trim_end_matches('/'), default_port)?;
         Ok(Self {
@@ -214,6 +215,9 @@ mod tests {
     #[case::mqtt_v6_explicit_port("mqtt://[::1]:11883", "::1", 11883, false)]
     #[case::mqtts_v6_default_port("mqtts://[2001:db8::1]", "2001:db8::1", 8883, true)]
     #[case::mqtts_v6_explicit_port("mqtts://[2001:db8::1]:8884", "2001:db8::1", 8884, true)]
+    // Schemes are case-insensitive (RFC 3986 §3.1).
+    #[case::upper_case_scheme("MQTTS://broker.example.com", "broker.example.com", 8883, true)]
+    #[case::mixed_case_scheme("Mqtt://localhost:11883", "localhost", 11883, false)]
     fn parse_extracts_components(
         #[case] input: &str,
         #[case] expected_host: &str,
@@ -224,6 +228,19 @@ mod tests {
         assert_eq!(addr.host(), expected_host, "host mismatch for {input}");
         assert_eq!(addr.port(), expected_port, "port mismatch for {input}");
         assert_eq!(addr.use_tls(), expected_tls, "tls mismatch for {input}");
+    }
+
+    /// A scheme this client does not speak is named as such, not taken for a host or port.
+    #[rstest]
+    #[case::tcp("tcp://broker:1883")]
+    #[case::http("http://broker")]
+    #[case::https("https://broker:443/mqtt")]
+    fn parse_names_an_unsupported_scheme(#[case] input: &str) {
+        assert_eq!(
+            BrokerUrl::parse(input),
+            Err(BrokerUrlError::UnsupportedScheme),
+            "{input}"
+        );
     }
 
     /// Server Reference forms seen in practice; the configured transport always stays.

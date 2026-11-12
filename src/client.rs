@@ -1171,6 +1171,15 @@ pub(crate) fn connect_with_shared<H: InboundSink>(
     if let Some(authenticator) = options.authenticator.as_ref() {
         authenticator.validate()?;
     }
+    // Basic splits at the first ':'; `HttpProxy::parse` refuses such a name, `basic_auth`
+    // cannot, and every attempt would send other credentials than the ones given.
+    if let Some((user, _)) = options.http_proxy.as_ref().and_then(crate::HttpProxy::credentials)
+        && user.contains(':')
+    {
+        return Err(ConnectError::Application(AppError::InvalidRequest(
+            "HTTP proxy user name must not contain ':' (Basic authentication)".into(),
+        )));
+    }
     let (reauth_tx, reauth_link) = match options.authenticator.clone() {
         Some(authenticator) => {
             let (tx, link) = crate::connection::reauth::reauth_channel(authenticator, options.ack_timeout);
@@ -1365,6 +1374,17 @@ mod tests {
         let (tx, _rx) = flume::bounded(1);
         let err = connect(options, AnonymousCredentials, NoReconnect, tx, NoopLifecycle)
             .expect_err("empty client id with clean_start=false");
+        assert!(matches!(err, ConnectError::Application(AppError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn connect_rejects_a_proxy_user_name_with_a_colon() {
+        let url = BrokerUrl::parse("mqtt://127.0.0.1:9").expect("url");
+        let proxy = crate::HttpProxy::new("proxy", 3128).basic_auth("dom:user", "secret");
+        let options = ConnectOptions::new(url).http_proxy(proxy);
+        let (tx, _rx) = flume::bounded(1);
+        let err = connect(options, AnonymousCredentials, NoReconnect, tx, NoopLifecycle)
+            .expect_err("Basic cannot carry the name");
         assert!(matches!(err, ConnectError::Application(AppError::InvalidRequest(_))));
     }
 
