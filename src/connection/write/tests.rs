@@ -1242,6 +1242,57 @@ async fn queued_pubacks_send_the_parked_publishes_in_one_write() {
     let _ = timeout(Duration::from_secs(2), peer).await;
 }
 
+/// Runs [`graceful_disconnect`] with a free window and one publish still parked, the read
+/// task already gone.
+async fn graceful_disconnect_with_one_parked_publish<W>(framed: &mut FramedWrite<W, V5Codec>) -> WriteOutcome
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (_control_tx, mut control_rx) = mpsc::channel(8);
+    let (_command_tx, mut command_rx) = mpsc::channel(8);
+    let mut waiters = SubUnsubWaiters::new();
+    let mut publish_waiters = PublishWaiters::new();
+    // The window has room again, yet a publish still waits in the parked queue.
+    let mut inflight = InflightPots::new(nonzero!(1u16));
+    let (reply, _reply_ticket) = publish_reply(true);
+    publish_waiters.parked.push_back(PendingOutboundPublish {
+        message: PublishMessage {
+            topic: ByteString::from_static("t/parked"),
+            payload: Bytes::from_static(b"x"),
+            properties: Default::default(),
+        },
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        reply,
+    });
+    // The read task is gone: nothing more is acknowledged.
+    let (_, read_done) = oneshot::channel();
+    let registry = Arc::new(RwLock::new(SubscriptionRegistry::default()));
+    let read_stop = StopSignal::new();
+
+    graceful_disconnect(
+        framed,
+        GracefulDisconnectCtx {
+            control_rx: &mut control_rx,
+            waiters: &mut waiters,
+            publish_waiters: &mut publish_waiters,
+            inflight: &mut inflight,
+            flush_budget: Duration::from_secs(2),
+            command_rx: &mut command_rx,
+            publish_limits: BrokerPublishLimits {
+                max_qos: QoS::AtLeastOnce,
+                retain_available: true,
+            },
+            subscription_registry: &registry,
+            generation: Generation(1),
+            read_stop: &read_stop,
+            pending_acks: &PendingAcks::default(),
+        },
+        read_done,
+    )
+    .await
+}
+
 /// The PUBACK that frees the window can be handled in the same step that then runs into
 /// shutdown (coalesced with inbound PUBACKs, followed by a flush that waits for room). The
 /// publish parked behind it must still go out on the graceful path: no further PUBACK is
@@ -1267,49 +1318,7 @@ async fn graceful_disconnect_sends_publishes_parked_behind_a_freed_window() {
         wire
     });
 
-    let (_control_tx, mut control_rx) = mpsc::channel(8);
-    let (_command_tx, mut command_rx) = mpsc::channel(8);
-    let mut waiters = SubUnsubWaiters::new();
-    let mut publish_waiters = PublishWaiters::new();
-    // The window has room again, yet a publish still waits in the parked queue.
-    let mut inflight = InflightPots::new(nonzero!(1u16));
-    let (reply, _reply_ticket) = publish_reply(true);
-    publish_waiters.parked.push_back(PendingOutboundPublish {
-        message: PublishMessage {
-            topic: ByteString::from_static("t/parked"),
-            payload: Bytes::from_static(b"x"),
-            properties: Default::default(),
-        },
-        qos: QoS::AtLeastOnce,
-        retain: false,
-        reply,
-    });
-    // The read task is gone: nothing more is acknowledged.
-    let (_, read_done) = oneshot::channel();
-    let registry = Arc::new(RwLock::new(SubscriptionRegistry::default()));
-    let read_stop = StopSignal::new();
-
-    let outcome = graceful_disconnect(
-        &mut framed,
-        GracefulDisconnectCtx {
-            control_rx: &mut control_rx,
-            waiters: &mut waiters,
-            publish_waiters: &mut publish_waiters,
-            inflight: &mut inflight,
-            flush_budget: Duration::from_secs(2),
-            command_rx: &mut command_rx,
-            publish_limits: BrokerPublishLimits {
-                max_qos: QoS::AtLeastOnce,
-                retain_available: true,
-            },
-            subscription_registry: &registry,
-            generation: Generation(1),
-            read_stop: &read_stop,
-            pending_acks: &PendingAcks::default(),
-        },
-        read_done,
-    )
-    .await;
+    let outcome = graceful_disconnect_with_one_parked_publish(&mut framed).await;
     assert_eq!(outcome, WriteOutcome::Shutdown);
     drop(framed);
 
@@ -1318,6 +1327,16 @@ async fn graceful_disconnect_sends_publishes_parked_behind_a_freed_window() {
         .expect("peer timeout")
         .expect("peer join");
     assert_eq!(wire, ["t/parked", "DISCONNECT"]);
+}
+
+/// A connection reset while `shutdown()` drains still ends as a shutdown, not as a lost
+/// connection.
+#[tokio::test]
+async fn graceful_disconnect_into_a_reset_connection_is_still_a_shutdown() {
+    let (mut framed, peer_end) = duplex_framed_write();
+    drop(peer_end);
+    let outcome = graceful_disconnect_with_one_parked_publish(&mut framed).await;
+    assert_eq!(outcome, WriteOutcome::Shutdown);
 }
 
 /// Inbound PUBACKs queued together are coalesced into one write, and a protocol DISCONNECT

@@ -199,6 +199,9 @@ where
     crate::connection::channels::fail_queued_commands(command_rx, &AppError::ShuttingDown);
     match drained {
         Ok(Ok(())) => WriteOutcome::Shutdown,
+        // The application asked to end the session: a peer that resets the connection while
+        // it drains does not make that a lost connection (`ConnectionStats::connection_losses`).
+        Ok(Err(WriteOutcome::Transport(_))) => WriteOutcome::Shutdown,
         Ok(Err(outcome)) => outcome,
         Err(_elapsed) => {
             // Budget exhausted: still attempt DISCONNECT so the peer sees a clean reason.

@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Credentials the CONNECT cannot carry (a user name or password over 65 535 bytes, U+0000 in the user name) fail as `AuthError::Provider` before anything is sent, instead of a protocol error retried on every reconnect; a CONNECT the encoder refuses is no longer followed by a DISCONNECT ([MQTT-3.1.0-1])
 - After the DISCONNECT for a broker packet the client could not accept, no PUBACK can follow it ([MQTT-3.14.4-1])
 - Restoring subscriptions after a reconnect: PINGREQs keep going out while a slow consumer takes QoS 0 messages just under the Keep Alive apart ([MQTT-3.1.2-22]), and a PUBACK the broker does not read, like the DISCONNECT for an inconsistent Session Present ([MQTT-3.2.2-2]), can no longer hold the connection for good
+- A connection the broker resets while `shutdown()` drains it ends as a shutdown, no longer as a lost connection counted in `ConnectionStats::connection_losses`
 
 ## [0.5.1] - 2026-11-11
 
