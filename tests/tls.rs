@@ -363,7 +363,15 @@ async fn a_missing_ca_file_fails_the_connect_naming_the_file() {
 /// inside its flush, where the client's own buffer shows no progress; here the first 48 KiB of
 /// 64 KiB leave at about 20 KiB/s, nearly all of it from inside TLS, for 2.4 s. The rest goes
 /// fast: the broker answers no PINGREQ, and the one after the flush must not time out first.
+///
+/// On macOS the kernel takes the whole 64 KiB despite the 4 KiB buffers asked for, so the
+/// flush ends at once and the PINGREQ queues behind bytes the broker has not read yet: the
+/// PINGRESP watchdog cannot see those, a known limit, so the test does not run there.
 #[tokio::test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the macOS kernel buffers the whole publish; the PINGRESP watchdog cannot see that"
+)]
 async fn slow_but_progressing_publish_over_tls_keeps_the_connection() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

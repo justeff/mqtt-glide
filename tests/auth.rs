@@ -186,7 +186,15 @@ async fn refused_or_distrusted_authentication_fails_the_first_connect() {
         matches!(error, ConnectError::Auth(AuthError::NotAuthorized)),
         "{error:?}"
     );
-    assert_eq!(broker.connected_clients(), Vec::<String>::new());
+    // The client returns once it has sent its DISCONNECT; the broker unregisters it when it
+    // reads that, a moment later.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !broker.connected_clients().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the distrusted client is gone");
 
     authenticator.fail_start.store(true, Ordering::SeqCst);
     let error = client(&broker, &authenticator).await.expect_err("no token");
