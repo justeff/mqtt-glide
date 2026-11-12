@@ -168,7 +168,7 @@ impl StandardReconnectPolicy {
     /// backoff, but **does not** invalidate credentials (CONNECT succeeded).
     pub fn record_subscribe_auth_failure(&self) -> Duration {
         self.inner.take_live_since();
-        let failures = self.inner.consecutive_auth_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        let failures = self.inner.count_auth_failure();
         auth_failure_delay(
             failures,
             self.inner.auth_failure_threshold,
@@ -178,13 +178,35 @@ impl StandardReconnectPolicy {
     }
 }
 
+impl StandardReconnectPolicyInner {
+    /// One more consecutive auth failure; the new streak length. Saturates instead of
+    /// wrapping to 0, which would reset the backoff to `reconnect_delay`.
+    fn count_auth_failure(&self) -> u32 {
+        // A CAS loop: `fetch_update` is deprecated on current Rust, `try_update` is newer
+        // than the MSRV.
+        let mut current = self.consecutive_auth_failures.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(1);
+            match self.consecutive_auth_failures.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
 impl ReconnectPolicy for StandardReconnectPolicy {
     fn delay_after(&self, outcome: &ConnectionOutcome) -> Option<Duration> {
         match outcome {
             ConnectionOutcome::Shutdown(_) | ConnectionOutcome::Application(_) => None,
             ConnectionOutcome::Auth(_) => {
                 self.inner.take_live_since();
-                let failures = self.inner.consecutive_auth_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                let failures = self.inner.count_auth_failure();
                 Some(auth_failure_delay(
                     failures,
                     self.inner.auth_failure_threshold,
@@ -237,6 +259,21 @@ mod tests {
 
     fn auth() -> ConnectionOutcome {
         ConnectionOutcome::Auth(AuthError::NotAuthorized)
+    }
+
+    /// A streak at `u32::MAX` stays there: wrapping to 0 would drop the backoff to the
+    /// plain reconnect delay.
+    #[test]
+    fn auth_failure_streak_saturates() {
+        let policy = policy();
+        policy
+            .inner
+            .consecutive_auth_failures
+            .store(u32::MAX - 1, Ordering::Relaxed);
+        let capped = policy.delay_after(&auth()).expect("retry");
+        assert_eq!(policy.delay_after(&auth()), Some(capped));
+        assert_eq!(policy.record_subscribe_auth_failure(), capped);
+        assert_eq!(policy.inner.consecutive_auth_failures.load(Ordering::Relaxed), u32::MAX);
     }
 
     // ── auth_failure_delay ───────────────────────────────────────────────────

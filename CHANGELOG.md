@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - WebSocket over TLS: with `TlsConfig::server_name` set, the upgrade request's `Host` header carries that name like the TLS SNI, so a virtual-hosting proxy or ingress reached through an IP address routes it
 - `ClientBuilder::connect()` reports which connect step ran out of `connect_timeout` (TCP, TLS, proxy, CONNACK) instead of a generic "timed out waiting for Connected"
 - `BrokerUrl::parse` accepts schemes in any letter case and names an unsupported one (`tcp://`, `http://`) with `UnsupportedScheme` instead of a misleading host or port error; `validate_share_name` and `shared_filter` refuse U+0000 ([MQTT-1.5.4-2]); a proxy user name with `:` set through `HttpProxy::basic_auth` fails before the request instead of sending other credentials
+- `StandardReconnectPolicy`: the auth failure streak saturates instead of overflowing (a panic in debug builds, a backoff reset in release)
 
 ## [0.5.1] - 2026-11-11
 
