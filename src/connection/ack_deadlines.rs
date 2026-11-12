@@ -125,9 +125,9 @@ impl AckDeadlines {
             deadline,
             slot: Arc::clone(&slot),
         };
-        // Fails only once the sweeper's receiver is gone, together with the driver: the
-        // driver dropped the publish too, so its answer (closed) arrives without a timeout.
-        let _ = self.0.intake.send(entry);
+        // Fails only once the sweeper's receiver is gone, together with the driver. Its answer
+        // (closed) comes anyway; the runtime timer still bounds the wait should it not.
+        self.0.intake.send(entry).ok()?;
         // Pairs with the fence in `Sweeper::sleep`: either it sees this entry, or this sees idle.
         fence(Ordering::SeqCst);
         if self.0.idle.load(Ordering::Relaxed) && self.0.idle.swap(false, Ordering::AcqRel) {
