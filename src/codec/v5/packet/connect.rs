@@ -627,7 +627,7 @@ mod tests {
 
     #[test]
     fn connect_decodes_password_only_without_username() {
-        // v5 allows Password without User Name (e.g. token/JWT auth); v3.1.1 [MQTT-3.1.2-22] does not.
+        // v5 allows Password without User Name (e.g. token/JWT auth); MQTT 3.1.1 did not.
         let mut payload = minimal_connect_payload(0x40, b"\x00");
         payload.extend_from_slice(b"\x00\x05token");
         let mut src = Bytes::from(payload);
