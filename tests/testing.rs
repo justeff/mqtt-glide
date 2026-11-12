@@ -589,6 +589,29 @@ async fn response_information_is_a_prefix_for_response_topics() {
     assert_eq!(&response.payload[..], b"noon");
 }
 
+/// A shared subscription cannot be a response topic (responses go to the topic itself, the
+/// subscription to the topic after the group), and a requester closed through one clone fails
+/// a request on another at once instead of publishing it and waiting out the timeout.
+#[tokio::test]
+async fn requester_refuses_shared_topics_and_requests_after_close() {
+    let broker = TestBroker::start().await.expect("broker");
+    let (asking, _rx) = client(&broker.url(), "asking").await;
+    let refused = asking.requester("$share/group/replies").await.expect_err("shared");
+    assert!(matches!(refused, AppError::InvalidRequest(_)), "{refused:?}");
+
+    let requester = asking.requester("replies/closed").await.expect("requester");
+    let clone = requester.clone();
+    requester.close().await.expect("close");
+    let failed = tokio::time::timeout(
+        Duration::from_secs(1),
+        clone.request("service/echo", "ping").timeout(Duration::from_secs(30)),
+    )
+    .await
+    .expect("fails at once")
+    .expect_err("closed");
+    assert!(matches!(failed, AppError::InvalidRequest(_)), "{failed:?}");
+}
+
 /// Closing every clone of one requester gives the response topic back once: another requester
 /// the client made for the same topic keeps its route and subscription.
 #[tokio::test]

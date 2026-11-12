@@ -159,6 +159,13 @@ impl Requester {
                 "response topic must be a non-empty topic name without wildcards".into(),
             ));
         }
+        // Subscribing to `$share/{group}/{topic}` subscribes to `{topic}`, so the responses,
+        // published to the Response Topic itself, would never arrive (§4.8.2).
+        if crate::util::is_shared_subscription_filter(&response_topic) {
+            return Err(AppError::InvalidRequest(
+                "response topic must not be a shared subscription ($share/...)".into(),
+            ));
+        }
         let router = client.response_router();
         // Route before the subscription exists, so an early response is never missed. The
         // guard takes the route back unless the subscription is granted, also when the caller
@@ -294,6 +301,10 @@ impl RequestBuilder<'_> {
     /// Publishes the request and waits for its response (same as `.await`, without boxing).
     pub async fn send(self) -> Result<InboundMessage, AppError> {
         let requester = self.requester;
+        // After `close()` nobody routes the response topic: the request would only time out.
+        if requester.closed.load(Ordering::Acquire) {
+            return Err(AppError::InvalidRequest("requester is closed".into()));
+        }
         let router = requester.client.response_router();
         let correlation = Bytes::copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         let (reply_tx, reply_rx) = oneshot::channel();

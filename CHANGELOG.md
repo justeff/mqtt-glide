@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - After the DISCONNECT for a broker packet the client could not accept, no PUBACK can follow it ([MQTT-3.14.4-1])
 - Restoring subscriptions after a reconnect: PINGREQs keep going out while a slow consumer takes QoS 0 messages just under the Keep Alive apart ([MQTT-3.1.2-22]), and a PUBACK the broker does not read, like the DISCONNECT for an inconsistent Session Present ([MQTT-3.2.2-2]), can no longer hold the connection for good
 - A connection the broker resets while `shutdown()` drains it ends as a shutdown, no longer as a lost connection counted in `ConnectionStats::connection_losses`
+- `MqttClient::requester` refuses a `$share/` response topic, whose responses could never arrive, and a request through a clone of a closed requester fails at once with `InvalidRequest` instead of being published and timing out
 
 ## [0.5.1] - 2026-11-11
 

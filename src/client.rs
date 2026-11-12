@@ -496,9 +496,9 @@ impl MqttClient {
     /// requests and awaits their responses there (MQTT 5 request / response, §4.10).
     ///
     /// Pick a topic only this client uses (for example including its client id) that the
-    /// broker's ACLs allow it to subscribe to; no wildcards. Responses on it are routed to
-    /// the waiting requests and never reach the inbound sink. The subscription is restored
-    /// on reconnect like any other.
+    /// broker's ACLs allow it to subscribe to; no wildcards and no `$share/` prefix. Responses
+    /// on it are routed to the waiting requests and never reach the inbound sink. The
+    /// subscription is restored on reconnect like any other.
     pub async fn requester(&self, response_topic: impl Into<ByteString>) -> Result<crate::Requester, AppError> {
         crate::Requester::subscribe(self, response_topic.into()).await
     }
