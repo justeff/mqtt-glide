@@ -56,7 +56,7 @@ impl QoS {
     ///
     /// # Example
     /// ```
-    /// use mqtt_glide::codec::QoS;
+    /// use mqtt_glide::QoS;
     ///
     /// let lower = QoS::ExactlyOnce.min(QoS::AtLeastOnce);
     /// assert_eq!(lower, QoS::AtLeastOnce);

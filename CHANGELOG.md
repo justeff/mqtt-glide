@@ -13,18 +13,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A CONNACK with an undefined Reason Code below 0x80 is a malformed packet instead of a refused connection, and one that refuses the connection with Session Present set is a protocol error ([MQTT-3.2.2-6]); a table test now runs every reason-code byte through every decoder
-- On 32-bit targets, thousands of User Properties or filters sharing one buffer can no longer wrap the size sum to a small value that passes the packet size checks
-- Credentials the CONNECT cannot carry (a user name or password over 65 535 bytes, U+0000 in the user name) fail as `AuthError::Provider` before anything is sent, instead of a protocol error retried on every reconnect; a CONNECT the encoder refuses is no longer followed by a DISCONNECT ([MQTT-3.1.0-1])
-- After the DISCONNECT for a broker packet the client could not accept, no PUBACK can follow it ([MQTT-3.14.4-1])
-- Restoring subscriptions after a reconnect: PINGREQs keep going out while a slow consumer takes QoS 0 messages just under the Keep Alive apart ([MQTT-3.1.2-22]), and a PUBACK the broker does not read, like the DISCONNECT for an inconsistent Session Present ([MQTT-3.2.2-2]), can no longer hold the connection for good
-- A connection the broker resets while `shutdown()` drains it ends as a shutdown, no longer as a lost connection counted in `ConnectionStats::connection_losses`
-- `MqttClient::requester` refuses a `$share/` response topic, whose responses could never arrive, and a request through a clone of a closed requester fails at once with `InvalidRequest` instead of being published and timing out
-- WebSocket over TLS: with `TlsConfig::server_name` set, the upgrade request's `Host` header carries that name like the TLS SNI, so a virtual-hosting proxy or ingress reached through an IP address routes it
-- `ClientBuilder::connect()` reports which connect step ran out of `connect_timeout` (TCP, TLS, proxy, CONNACK) instead of a generic "timed out waiting for Connected"
-- `BrokerUrl::parse` accepts schemes in any letter case and names an unsupported one (`tcp://`, `http://`) with `UnsupportedScheme` instead of a misleading host or port error; `validate_share_name` and `shared_filter` refuse U+0000 ([MQTT-1.5.4-2]); a proxy user name with `:` set through `HttpProxy::basic_auth` fails before the request instead of sending other credentials
-- `StandardReconnectPolicy`: the auth failure streak saturates instead of overflowing (a panic in debug builds, a backoff reset in release)
-- `testing::TestBroker`: `wait_for_publishes`, `wait_for_connects` and `wait_for_subscription` take `Duration::MAX` without panicking, and a CONNECT with a Receive Maximum or Maximum Packet Size of 0, or Authentication Data without a Method, is decoded as a protocol error, not a malformed packet
+- A CONNACK with an undefined Reason Code below 0x80 is a malformed packet, not a refused connection; one that refuses with Session Present set is a protocol error ([MQTT-3.2.2-6])
+- On 32-bit targets, many User Properties or filters sharing one buffer can no longer wrap the size sum past the packet size checks
+- Credentials the CONNECT cannot carry (over 65 535 bytes, U+0000 in the user name) fail as `AuthError::Provider` instead of a protocol error retried on every reconnect
+- A CONNECT the encoder refuses is no longer followed by a DISCONNECT ([MQTT-3.1.0-1])
+- No PUBACK follows the DISCONNECT for a broker packet the client could not accept ([MQTT-3.14.4-1])
+- While subscriptions are restored after a reconnect, PINGREQs keep going out even when a slow consumer is taking QoS 0 messages ([MQTT-3.1.2-22])
+- While subscriptions are restored after a reconnect, writing a PUBACK or DISCONNECT the broker does not read times out like the SUBSCRIBE instead of holding the connection forever
+- A connection reset while `shutdown()` drains ends as a shutdown, not as a loss counted in `ConnectionStats::connection_losses`
+- `MqttClient::requester` refuses a `$share/` response topic, whose responses could never arrive
+- A request through a clone of a closed `Requester` fails at once with `InvalidRequest` instead of timing out
+- WebSocket over TLS: the upgrade's `Host` header carries `TlsConfig::server_name` when set, like the SNI
+- `ClientBuilder::connect()` names the connect step that ran out of `connect_timeout` instead of "timed out waiting for Connected"
+- `BrokerUrl::parse` accepts schemes in any letter case and reports an unsupported one as `UnsupportedScheme`, not as a host or port error
+- `validate_share_name` and `shared_filter` refuse U+0000 ([MQTT-1.5.4-2])
+- A proxy user name with `:` given to `HttpProxy::basic_auth` fails before the request instead of sending other credentials
+- `StandardReconnectPolicy`: the auth failure streak saturates instead of overflowing
+- `testing::TestBroker`: the `wait_for_*` helpers take `Duration::MAX`; a CONNECT with a Receive Maximum or Maximum Packet Size of 0, or Authentication Data without a Method, is decoded as a protocol error
+- The published crate ships its unit tests and their certificates, so `cargo test --lib` runs
 
 ## [0.5.1] - 2026-11-11
 

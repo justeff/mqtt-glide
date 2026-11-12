@@ -21,15 +21,15 @@ exclude = [
     "/benches/",
     "/conformance/",
     "/fuzz/",
-    "/tests/",
+    # Integration tests and their helpers; the certificates stay for the unit tests.
+    "/tests/*.rs",
+    "/tests/brokers/",
+    "/tests/common/",
+    "/tests/faults/",
     "/rustfmt.toml",
     "/BENCHMARKS.md",
     "/CONFORMANCE.md",
     "/CONTRIBUTING.md",
-    # Unit test modules, all behind #[cfg(test)].
-    "/src/**/*tests.rs",
-    "/src/connection/test_support.rs",
-    "/src/test_util.rs",
 ]
 
 [lints.rust]
