@@ -37,6 +37,8 @@ struct WriteTaskHandle {
     /// Whether the write task closed the shared PUBACK queue (no PUBACK may follow its
     /// DISCONNECT).
     acks_closed: Box<dyn Fn() -> bool + Send + Sync>,
+    /// The application's `shutdown()`.
+    shutdown_notify: CancellationToken,
 }
 
 type QueueAcks = Box<dyn Fn(&[u16]) -> bool + Send + Sync>;
@@ -93,6 +95,7 @@ where
     let (control_tx, control_rx) = mpsc::channel(8);
     let (command_tx, command_rx) = mpsc::channel(8);
     let (stub_tx, stub_rx) = mpsc::channel(1);
+    let shutdown_notify = CancellationToken::new();
     let cancel = StopSignal::new();
     let (read_done_tx, read_done_rx) = oneshot::channel();
     let _ = read_done_tx.send(());
@@ -111,7 +114,7 @@ where
         keep_alive: Duration::from_secs(3600),
         subscription_registry: Arc::clone(&subscription_registry),
         cancel: cancel.clone(),
-        shutdown_notify: CancellationToken::new(),
+        shutdown_notify: shutdown_notify.clone(),
         graceful_disconnect_timeout: Duration::from_secs(2),
         max_qos: overrides.max_qos,
         retain_available: overrides.retain_available,
@@ -150,6 +153,7 @@ where
         _stub_tx: stub_tx,
         queue_acks,
         acks_closed,
+        shutdown_notify,
     }
 }
 
@@ -598,6 +602,73 @@ async fn protocol_disconnect_is_terminal_no_frames_after() {
         WriteOutcome::Cancelled,
         "write waits for supervisor cancel after closing the socket"
     );
+}
+
+/// `shutdown()` while a protocol DISCONNECT is fed but its flush waits for a full socket: the
+/// DISCONNECT stays the last packet, no PUBACK or second DISCONNECT from the graceful drain
+/// follows it ([MQTT-3.14.4-1]).
+#[tokio::test]
+async fn shutdown_during_a_blocked_protocol_disconnect_sends_nothing_after_it() {
+    use crate::codec::{DecodedFrame, Packet};
+
+    let (framed, peer_end) = duplex_framed_write();
+    let harness = spawn_write_task(framed, WriteSessionOverrides::default());
+    // A publish that fills the pipe exactly: the broker is slow to read.
+    let delivery = PublishDelivery {
+        dup: false,
+        retain: false,
+        qos: QoS::AtMostOnce,
+        packet_id: None,
+    };
+    let filling = (DUPLEX_BUFFER - 16..DUPLEX_BUFFER)
+        .map(|payload| PublishMessage {
+            topic: ByteString::from_static("t"),
+            payload: Bytes::from(vec![b'x'; payload]),
+            properties: Default::default(),
+        })
+        .find(|message| {
+            let mut buf = BytesMut::new();
+            encode_publish(message, delivery, 0, &mut buf).expect("encode");
+            buf.len() == DUPLEX_BUFFER
+        })
+        .expect("a publish of exactly the pipe size");
+    let (reply, _ticket) = publish_reply(true);
+    harness
+        .command_tx
+        .send(ClientCommand::Publish {
+            message: filling,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            reply,
+        })
+        .await
+        .expect("publish");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    harness
+        .control_tx
+        .send(ControlMessage::ProtocolDisconnect(DisconnectReasonCode::ProtocolError))
+        .await
+        .expect("protocol disconnect");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    harness.queue_inbound_acks(&[7]);
+    harness.shutdown_notify.cancel();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut peer = FramedRead::new(peer_end, V5Codec::with_max_packet_size(0));
+    let mut frames = Vec::new();
+    while let Ok(Some(Ok((frame, _)))) = timeout(Duration::from_secs(3), peer.next()).await {
+        frames.push(match frame {
+            DecodedFrame::Publish(_) => "PUBLISH".to_owned(),
+            DecodedFrame::Control(Packet::Disconnect(d)) => format!("DISCONNECT({:?})", d.reason_code),
+            DecodedFrame::Control(other) => format!("{:?}", other.packet_type()),
+        });
+    }
+    assert_eq!(frames, ["PUBLISH", "DISCONNECT(ProtocolError)"]);
+    let outcome = timeout(Duration::from_secs(3), harness.join)
+        .await
+        .expect("write task ends")
+        .expect("join");
+    assert_eq!(outcome, WriteOutcome::Shutdown);
 }
 
 #[tokio::test]

@@ -111,7 +111,16 @@ where
 
     // Normal Disconnection, unless the read task reports a packet it could not accept.
     let mut disconnect_reason = DisconnectReasonCode::NormalDisconnection;
+    // A closed PUBACK queue here means a protocol DISCONNECT is already in the buffer and
+    // `shutdown()` cut its flush short: it stays the last packet ([MQTT-3.14.4-1]), so only
+    // its flush and the close are left.
+    let disconnect_fed = pending_acks.is_closed();
     let drain = async {
+        if disconnect_fed {
+            flush_writes(framed, flush_abort).await?;
+            let _ = SinkExt::<Packet>::close(framed).await;
+            return Ok(());
+        }
         // A PUBACK handled just before shutdown may have freed slots; the publishes parked
         // behind it are older than anything queued and no later PUBACK would send them.
         super::commands::send_parked_publishes(framed, inflight, publish_waiters)?;
@@ -206,11 +215,13 @@ where
         Err(_elapsed) => {
             // Budget exhausted: still attempt DISCONNECT so the peer sees a clean reason.
             // Bound the attempt so a stuck socket cannot hang past the graceful path.
-            let _ = tokio::time::timeout(
-                Duration::from_millis(50),
-                send_packet(framed, Packet::Disconnect(Disconnect::default()), flush_abort),
-            )
-            .await;
+            if !disconnect_fed {
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(50),
+                    send_packet(framed, Packet::Disconnect(Disconnect::default()), flush_abort),
+                )
+                .await;
+            }
             // The read task may still run: `read_done` was not awaited.
             pending_acks.close();
             WriteOutcome::Shutdown
