@@ -33,6 +33,26 @@ const SUBPROTOCOL: &str = "mqtt";
 /// does not build one huge frame.
 const MAX_PENDING_WRITE: usize = 64 * 1024;
 
+/// The URI of the upgrade request, which also gives its `Host` header. Over TLS with
+/// [`crate::TlsConfig::server_name`] set, the host is that name: the client then reaches the
+/// broker through an address its certificate does not name (a bare IP, a port-forward), and a
+/// virtual-hosting proxy or ingress routes the upgrade by the real name, like the TLS SNI.
+fn request_uri(options: &ConnectOptions) -> String {
+    let url = &options.broker_url;
+    let scheme = if url.use_tls() { "wss" } else { "ws" };
+    let host = options
+        .tls
+        .as_ref()
+        .and_then(crate::TlsConfig::server_name_override)
+        .unwrap_or_else(|| url.host().to_owned());
+    let host = if host.contains(':') { format!("[{host}]") } else { host };
+    format!(
+        "{scheme}://{host}:{}{}",
+        url.port(),
+        url.websocket_path().unwrap_or("/")
+    )
+}
+
 /// Runs the WebSocket client handshake over an established TCP or TLS `stream`.
 pub(crate) async fn handshake<S>(
     options: &ConnectOptions,
@@ -42,19 +62,7 @@ pub(crate) async fn handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let url = &options.broker_url;
-    let scheme = if url.use_tls() { "wss" } else { "ws" };
-    let host = if url.host().contains(':') {
-        format!("[{}]", url.host())
-    } else {
-        url.host().to_owned()
-    };
-    let uri = format!(
-        "{scheme}://{host}:{}{}",
-        url.port(),
-        url.websocket_path().unwrap_or("/")
-    );
-    let mut request = uri.into_client_request().map_err(ws_error)?;
+    let mut request = request_uri(options).into_client_request().map_err(ws_error)?;
     request
         .headers_mut()
         .insert("Sec-WebSocket-Protocol", HeaderValue::from_static(SUBPROTOCOL));
@@ -196,6 +204,27 @@ mod tests {
 
     use super::*;
     use crate::util::BrokerUrl;
+
+    #[test]
+    fn upgrade_request_names_the_tls_server_name() {
+        let options = |url: &str| ConnectOptions::new(BrokerUrl::parse(url).expect("url"));
+        assert_eq!(
+            request_uri(&options("wss://10.0.0.5:8443/mqtt")),
+            "wss://10.0.0.5:8443/mqtt"
+        );
+        let tls = crate::TlsConfig::default().server_name("broker.example").expect("name");
+        assert_eq!(
+            request_uri(&options("wss://10.0.0.5:8443/mqtt").tls(tls.clone())),
+            "wss://broker.example:8443/mqtt"
+        );
+        // `tls()` turns TLS on for a ws:// URL too, with the same SNI.
+        assert_eq!(
+            request_uri(&options("ws://10.0.0.5:8080").tls(tls)),
+            "ws://broker.example:8080/"
+        );
+        let ip = crate::TlsConfig::default().server_name("::1").expect("ip");
+        assert_eq!(request_uri(&options("wss://host:443").tls(ip)), "wss://[::1]:443/");
+    }
 
     /// In-process WebSocket server; `subprotocol` is echoed in the handshake response.
     #[allow(clippy::result_large_err)] // tungstenite's handshake callback signature

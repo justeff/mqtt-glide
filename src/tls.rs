@@ -199,7 +199,8 @@ impl TlsConfig {
     ///
     /// For brokers reached through an address their certificate does not name: a bare IP,
     /// a port-forward, or an internal alias. The URL still decides where the client connects;
-    /// after a server redirect (§4.11) the certificate is still checked against `name`.
+    /// after a server redirect (§4.11) the certificate is still checked against `name`. Over
+    /// WebSocket the upgrade's `Host` header carries `name` too.
     pub fn server_name(mut self, name: &str) -> Result<Self, TlsConfigError> {
         self.server_name = Some(parse_server_name(name).ok_or_else(|| TlsConfigError::InvalidServerName(name.into()))?);
         Ok(self)
@@ -211,6 +212,12 @@ impl TlsConfig {
             Some(name) => Ok(name.clone()),
             None => parse_server_name(host).ok_or_else(|| format!("invalid TLS server name: {host}")),
         }
+    }
+
+    /// The name set with [`Self::server_name`], if any.
+    #[cfg(feature = "websocket")]
+    pub(crate) fn server_name_override(&self) -> Option<String> {
+        self.server_name.as_ref().map(|name| name.to_str().into_owned())
     }
 
     /// A fresh rustls configuration for one connection attempt, reading the files it names.
