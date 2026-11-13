@@ -9,7 +9,7 @@ bench run, named as in the refresh script in BENCHMARKS.md:
   payload                                              mqtt_compare, payload sizes (mock)
   fanin                                                ingress_fanin
 
-BENCHMARKS.md keeps its prose; only blocks between `<!-- bench:NAME:start -->` and
+BENCHMARKS.md and benches/results/inbound-sinks.md keep their prose; only blocks between `<!-- bench:NAME:start -->` and
 `<!-- bench:NAME:end -->` are replaced. Missing runs render as "not measured".
 
 Usage:
@@ -411,10 +411,10 @@ def main() -> None:
             "tuned": block_tuned(mosq),
             "capped": block_capped(load_run(r / "capped-mock")),
             "payload": block_payload(load_run(r / "payload"), mock),
-            "fanin": block_fanin(load_fanin(r / "fanin")),
         },
     )
     args.detail.mkdir(parents=True, exist_ok=True)
+    patch_blocks(args.detail / "inbound-sinks.md", {"fanin": block_fanin(load_fanin(r / "fanin"))})
     pages = (
         ("mosquitto-stock.md", "Peer comparison: stock Mosquitto (Receive Maximum 20)", stock,
          "eclipse-mosquitto 2.1.2-alpine with its default flow control: `max_inflight_messages 20` (CONNACK Receive Maximum 20), `max_queued_messages 1000`; `set_tcp_nodelay`, no persistence. Outbound QoS 0 is not run: without a wire counter the end of a burst is unknown."),

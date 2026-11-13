@@ -41,7 +41,7 @@ mqtt-glide = { version = "0.5", features = ["async-channel"] }
 async-channel = "2"
 ```
 
-Which one: `tokio::sync::mpsc` for one consumer. With several clients (brokers) feeding one queue that several consumers drain, async-channel was faster than flume in most cells of the [fan-in bench](BENCHMARKS.md#which-inbound-sink), by up to 69%; flume was a few percent ahead in some cells with real per-message work. One `tokio::sync::mpsc` per worker, chosen by a hash of the topic, was faster still and keeps per-topic order. Cheap per-message work is fastest in `.on_inbound`, with no queue at all.
+Which one: `tokio::sync::mpsc` for one consumer. With several clients (brokers) feeding one queue that several consumers drain, async-channel was faster than flume in most cells of the [fan-in bench](benches/results/inbound-sinks.md), by up to 69%; flume was a few percent ahead in some cells with real per-message work. One `tokio::sync::mpsc` per worker, chosen by a hash of the topic, was faster still and keeps per-topic order. Cheap per-message work is fastest in `.on_inbound`, with no queue at all.
 
 ## Quickstart
 
@@ -616,7 +616,7 @@ Mosquitto `2.1.2-alpine` with its default flow control, 256 B, QoS 1. Linux in a
 - glide publishes fastest and cheapest at every caller count and has the lowest latency at a fixed load. Against a broker that is never the bottleneck (mock), its pipelined publishing is 5 to 22× the peers'.
 - Receiving, all three reach Mosquitto's ceiling (about 100k msg/s at QoS 1); glide at the least CPU per message.
 
-[`BENCHMARKS.md`](BENCHMARKS.md) also has the mock-broker ceiling, Mosquitto without flow control, a broker with its own in-flight cap, payload sizes up to 16 KiB, which inbound sink to use with several brokers, the fairness rules and an x86 cross-check.
+[`BENCHMARKS.md`](BENCHMARKS.md) also has the mock-broker ceiling, Mosquitto without flow control, a broker with its own in-flight cap, payload sizes up to 16 KiB, the fairness rules and an x86 cross-check; [which inbound sink](benches/results/inbound-sinks.md) to use with several brokers has its own page.
 
 The wire codec alone, without broker or client, is measured by `cargo bench --bench codec_throughput` ([`benches/README.md`](benches/README.md)).
 
